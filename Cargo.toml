@@ -1,0 +1,31 @@
+[package]
+name = "stackpulse"
+version = "0.1.0"
+edition = "2021"
+description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pablogsal/stackpulse"
+keywords = ["profiler", "linux", "perf", "sampling", "unwind"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+bitflags = "2.4"
+framehop = "0.15"
+goblin = "0.9"
+integer-encoding = { version = "4.1.0", default-features = false }
+libc = "0.2"
+memchr = "2.7"
+memmap2 = "0.9"
+mio = { version = "1", features = ["os-ext", "os-poll"] }
+nix = { version = "0.29", features = ["fs", "process"] }
+perf-event-open = { version = "0.5", features = ["linux-5.13"] }
+perf-event-open-sys = "6.0"
+rustc-hash = "2.1"
+tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"] }
+tracing = "0.1"
+wholesym = "0.8.1"
+
+[features]
+default = []
+debuginfod = []
+wholesym-git-api = []
