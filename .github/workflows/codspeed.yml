@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:24.04
+      options: --security-opt seccomp=unconfined
     steps:
       - name: Install system dependencies
         run: |
