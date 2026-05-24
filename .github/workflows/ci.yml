@@ -99,13 +99,29 @@ jobs:
       - name: Relax perf restrictions when possible
         run: sysctl -w kernel.perf_event_paranoid=-1 || true
 
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Lint
+        run: make clippy
+
       - name: Test
         env:
           STACKPULSE_REQUIRE_PYTHON_PERF: ${{ matrix.require_python_perf }}
-        run: make ci
+        run: make test
 
       - name: Doc tests
         run: cargo test --doc
+
+      - name: Install coverage tool
+        if: matrix.distro == 'ubuntu-24.04'
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage
+        if: matrix.distro == 'ubuntu-24.04'
+        env:
+          STACKPULSE_REQUIRE_PYTHON_PERF: ${{ matrix.require_python_perf }}
+        run: make coverage-lcov
 
       - name: Package dry run
         if: matrix.distro == 'ubuntu-24.04'

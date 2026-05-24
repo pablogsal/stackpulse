@@ -24,13 +24,13 @@ doc:
 	$(CARGO) doc --workspace --no-deps $(CARGO_FLAGS)
 
 coverage: require-cargo-llvm-cov
-	$(CARGO) llvm-cov --workspace $(CARGO_FLAGS)
+	$(CARGO) llvm-cov --workspace --all-targets $(CARGO_FLAGS)
 
 coverage-html: require-cargo-llvm-cov
-	$(CARGO) llvm-cov --workspace $(CARGO_FLAGS) --html
+	$(CARGO) llvm-cov --workspace --all-targets $(CARGO_FLAGS) --html
 
 coverage-lcov: require-cargo-llvm-cov
-	$(CARGO) llvm-cov --workspace $(CARGO_FLAGS) --lcov --output-path lcov.info
+	$(CARGO) llvm-cov --workspace --all-targets $(CARGO_FLAGS) --lcov --output-path lcov.info
 
 ci: fmt-check clippy test
 
