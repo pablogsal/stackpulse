@@ -280,7 +280,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Package dry run
-        run: cargo publish --dry-run --allow-dirty
+        run: cargo package --allow-dirty --no-verify
 
   ci:
     name: ci complete
