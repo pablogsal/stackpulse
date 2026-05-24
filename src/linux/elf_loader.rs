@@ -13,10 +13,11 @@ use crate::error::{Error, Result};
 use crate::ModuleImageBase;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
-use goblin::elf::section_header::SectionHeader;
+use goblin::elf::section_header::{SectionHeader, SHF_COMPRESSED};
 use goblin::elf::Elf;
 use goblin::strtab::Strtab;
 use memmap2::Mmap;
+use object::{CompressionFormat, Object, ObjectSection};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -185,13 +186,11 @@ pub fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
         }
     }
 
-    let eh_frame = find_section_range_in_file(".eh_frame", &elf).and_then(|(addr, range)| {
-        ElfSectionData::mmap(Arc::clone(&mmap), range).map(|data| (addr, data))
-    });
-    let eh_frame_hdr =
-        find_section_range_in_file(".eh_frame_hdr", &elf).and_then(|(addr, range)| {
-            ElfSectionData::mmap(Arc::clone(&mmap), range).map(|data| (addr, data))
-        });
+    let object_file = unwind_sections_have_compressed_data(&elf)
+        .then(|| object::File::parse(bytes).ok())
+        .flatten();
+    let eh_frame = find_unwind_section_data(".eh_frame", &elf, object_file.as_ref(), &mmap);
+    let eh_frame_hdr = find_unwind_section_data(".eh_frame_hdr", &elf, object_file.as_ref(), &mmap);
 
     Ok(ElfSectionInfo {
         base_svma: calculate_base_svma(&elf),
@@ -228,9 +227,66 @@ fn find_section_header<'a>(name: &str, elf: &'a Elf) -> Option<&'a goblin::elf::
 
 fn find_section_range_in_file(name: &str, elf: &Elf) -> Option<(u64, Range<usize>)> {
     let sh = find_section_header(name, elf)?;
+    section_range_in_file(sh)
+}
+
+fn section_range_in_file(sh: &goblin::elf::SectionHeader) -> Option<(u64, Range<usize>)> {
     let start = sh.sh_offset.try_into().ok()?;
     let size: usize = sh.sh_size.try_into().ok()?;
     Some((sh.sh_addr, start..start.checked_add(size)?))
+}
+
+fn find_unwind_section_data(
+    name: &str,
+    elf: &Elf,
+    object_file: Option<&object::File<'_>>,
+    mmap: &Arc<Mmap>,
+) -> Option<(u64, ElfSectionData)> {
+    let section = find_section_header(name, elf)?;
+    if section_has_compressed_data(section) {
+        return object_file.and_then(|file| find_section_data_with_object(name, file, mmap));
+    }
+
+    let (addr, range) = section_range_in_file(section)?;
+    ElfSectionData::mmap(Arc::clone(mmap), range).map(|data| (addr, data))
+}
+
+fn unwind_sections_have_compressed_data(elf: &Elf) -> bool {
+    [".eh_frame", ".eh_frame_hdr"]
+        .into_iter()
+        .filter_map(|name| find_section_header(name, elf))
+        .any(section_has_compressed_data)
+}
+
+fn section_has_compressed_data(section: &goblin::elf::SectionHeader) -> bool {
+    section.sh_flags & u64::from(SHF_COMPRESSED) != 0
+}
+
+fn find_section_data_with_object(
+    name: &str,
+    file: &object::File<'_>,
+    mmap: &Arc<Mmap>,
+) -> Option<(u64, ElfSectionData)> {
+    let section = file.section_by_name(name)?;
+    let file_range = section.compressed_file_range().ok()?;
+    let data = match file_range.format {
+        CompressionFormat::None => {
+            let range = checked_usize_range(file_range.offset, file_range.uncompressed_size)?;
+            ElfSectionData::mmap(Arc::clone(mmap), range)
+        }
+        _ => {
+            let compressed = file_range.data(&mmap[..]).ok()?;
+            let decompressed = compressed.decompress().ok()?;
+            Some(ElfSectionData::owned(decompressed.into_owned()))
+        }
+    }?;
+    Some((section.address(), data))
+}
+
+fn checked_usize_range(start: u64, size: u64) -> Option<Range<usize>> {
+    let start = usize::try_from(start).ok()?;
+    let size = usize::try_from(size).ok()?;
+    Some(start..start.checked_add(size)?)
 }
 
 /// Find a section by name and return its SVMA range.
@@ -518,6 +574,83 @@ mod tests {
             }
         }
         eprintln!("No ELF binary found, skipping test");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_compressed_section_data_is_decompressed() {
+        use std::fs::{self, File};
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if !command_available("cc") || !command_available("objcopy") {
+            eprintln!("cc or objcopy missing, skipping compressed-section test");
+            return;
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "stackpulse-compressed-section-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let expected = vec![b'A'; 4096];
+        let asm_path = root.join("section.s");
+        let object_path = root.join("section.o");
+        let compressed_path = root.join("section-compressed.o");
+        let mut asm = File::create(&asm_path).unwrap();
+        writeln!(asm, ".section .debug_stackpulse,\"\",@progbits").unwrap();
+        writeln!(asm, ".fill {},1,{}", expected.len(), expected[0]).unwrap();
+
+        let cc_status = Command::new("cc")
+            .arg("-c")
+            .arg(&asm_path)
+            .arg("-o")
+            .arg(&object_path)
+            .status()
+            .unwrap();
+        assert!(cc_status.success(), "cc failed to build test object");
+
+        let objcopy_status = Command::new("objcopy")
+            .arg("--compress-debug-sections=zlib-gabi")
+            .arg(&object_path)
+            .arg(&compressed_path)
+            .status()
+            .unwrap();
+        assert!(
+            objcopy_status.success(),
+            "objcopy failed to compress test object"
+        );
+
+        let file = File::open(&compressed_path).unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&file).unwrap() });
+        let object_file = object::File::parse(&mmap[..]).unwrap();
+        let compressed_range = object_file
+            .section_by_name(".debug_stackpulse")
+            .unwrap()
+            .compressed_file_range()
+            .unwrap();
+        assert_ne!(compressed_range.format, CompressionFormat::None);
+
+        let (_addr, data) =
+            find_section_data_with_object(".debug_stackpulse", &object_file, &mmap).unwrap();
+        assert_eq!(&data[..], expected.as_slice());
+
+        fs::remove_dir_all(root).unwrap();
+
+        fn command_available(command: &str) -> bool {
+            Command::new(command)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        }
     }
 
     #[test]

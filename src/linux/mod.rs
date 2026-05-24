@@ -12,7 +12,7 @@ mod types;
 use std::io;
 use std::path::Path;
 
-use crate::state::{poll_exit_watcher, process_exists, try_new_exit_watcher, ProcessExitWatcher};
+use crate::state::{process_is_alive, try_new_exit_watcher, ProcessExitWatcher};
 use crate::{SampleErrorKind, SampleErrorStats};
 use framehop::{Error as FramehopError, FrameAddress, Unwinder};
 use perf_event_open::sample::record::mmap::{Info as MmapInfo, Mmap};
@@ -391,7 +391,7 @@ impl PerfRecorder {
 
     fn reconcile_active_processes(&mut self) {
         self.active_processes
-            .retain(|&pid, watcher| !poll_exit_watcher(watcher, pid) && process_exists(pid));
+            .retain(|&pid, watcher| process_is_alive(watcher, pid));
     }
 
     fn track_process(&mut self, pid: i32) {
@@ -739,25 +739,19 @@ fn record_sample_view<W: std::io::Write>(
         ctx.stack_scratch,
         ctx.summary,
     );
-    let truncated_frames = ctx
-        .stack_scratch
-        .iter()
-        .filter(|frame| matches!(frame, StackFrame::TruncatedStackMarker))
-        .count();
-    ctx.summary.truncated_frame_markers = ctx
-        .summary
-        .truncated_frame_markers
-        .saturating_add(truncated_frames as u64);
-
-    let stack_id = ctx.writer.write_sample_frames(
-        timestamp_ns,
-        pid,
-        tid as u64,
-        ctx.stack_scratch
-            .iter()
-            .copied()
-            .filter_map(|frame| resolve_stack_frame(ctx.modules, pid, frame)),
-    )?;
+    let stack_id = {
+        let modules = &mut *ctx.modules;
+        let summary = &mut *ctx.summary;
+        ctx.writer.write_sample_frames(
+            timestamp_ns,
+            pid,
+            tid as u64,
+            ctx.stack_scratch
+                .iter()
+                .copied()
+                .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
+        )?
+    };
     if stack_id.is_none() {
         bump(&mut ctx.summary.empty_stack_samples);
         return Ok(());
@@ -1124,13 +1118,17 @@ fn read_stack_u64(stack: &[u8], index: usize) -> Result<u64, ()> {
 
 fn resolve_stack_frame(
     modules: &mut ModuleTable,
+    summary: &mut PerfSummary,
     process_id: i32,
     frame: StackFrame,
 ) -> Option<FrameRecord> {
     let (address, mode) = match frame {
         StackFrame::InstructionPointer(address, mode) => (address, mode),
         StackFrame::ReturnAddress(address, mode) => (address.saturating_sub(1), mode),
-        StackFrame::TruncatedStackMarker => return None,
+        StackFrame::TruncatedStackMarker => {
+            summary.truncated_frame_markers = summary.truncated_frame_markers.saturating_add(1);
+            return None;
+        }
     };
     Some(modules.resolve_frame(process_id, address, frame_mode(mode)))
 }

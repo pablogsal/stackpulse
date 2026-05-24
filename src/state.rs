@@ -74,6 +74,17 @@ pub fn poll_exit_watcher(watcher: &mut Option<ProcessExitWatcher>, _pid: i32) ->
     }
 }
 
+pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: i32) -> bool {
+    if let Some(active) = watcher.as_mut() {
+        match active.poll() {
+            Ok(ProcessExitState::Exited) => return false,
+            Ok(ProcessExitState::RunningOrUnknown) => return true,
+            Err(_) => *watcher = None,
+        }
+    }
+    process_exists(pid)
+}
+
 pub fn process_exists(pid: i32) -> bool {
     let mut tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
         Ok(tasks) => tasks,

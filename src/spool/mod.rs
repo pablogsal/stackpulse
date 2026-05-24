@@ -205,6 +205,7 @@ pub struct SampleRecord<'a> {
 struct StackNodeRecord {
     prefix: Option<u32>,
     frame_id: u32,
+    depth: usize,
 }
 
 pub struct PerfSpoolWriter<W: Write> {
@@ -367,6 +368,7 @@ pub struct StackFrameRefs<'a> {
     frames: &'a [FrameRecord],
     stack_nodes: &'a [StackNodeRecord],
     current: Option<u32>,
+    remaining: usize,
 }
 
 impl<'a> Iterator for StackFrameRefs<'a> {
@@ -376,7 +378,18 @@ impl<'a> Iterator for StackFrameRefs<'a> {
         let id = self.current?;
         let node = self.stack_nodes.get(id as usize)?;
         self.current = node.prefix;
+        self.remaining = self.remaining.saturating_sub(1);
         self.frames.get(node.frame_id as usize)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for StackFrameRefs<'_> {
+    fn len(&self) -> usize {
+        self.remaining
     }
 }
 
@@ -402,11 +415,9 @@ impl PerfSpoolReader {
             match tag {
                 REC_MODULE => modules.push(read_module_mmap(&mut reader)?),
                 REC_FRAME => frames.push(read_frame(&mut reader, &modules, frames.len())?),
-                REC_STACK => stack_nodes.push(read_stack_node(
-                    &mut reader,
-                    stack_nodes.len(),
-                    frames.len(),
-                )?),
+                REC_STACK => {
+                    stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
+                }
                 REC_THREAD => threads.push(read_thread(&mut reader, threads.len())?),
                 REC_SAMPLE => samples.push(read_sample(
                     &mut reader,
@@ -443,15 +454,23 @@ impl PerfSpoolReader {
         &self.process_execs
     }
 
+    /// Return absolute kernel instruction pointers present in interned frame records.
+    pub fn kernel_frame_addresses(&self) -> impl Iterator<Item = u64> + '_ {
+        self.frames
+            .iter()
+            .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip))
+    }
+
     /// Borrow raw frames for `stack_id` without copying them.
     pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
-        self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
+        let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
             invalid_data(format!("sample references missing stack node {stack_id}"))
         })?;
         Ok(StackFrameRefs {
             frames: &self.frames,
             stack_nodes: &self.stack_nodes,
             current: Some(stack_id),
+            remaining: node.depth,
         })
     }
 
@@ -536,6 +555,8 @@ impl Read for MmapSpoolCursor {
 pub struct ModuleTable {
     modules: Vec<ModuleRecord>,
     active: Vec<bool>,
+    index: ModuleIndex,
+    index_dirty: bool,
 }
 
 impl ModuleTable {
@@ -562,12 +583,14 @@ impl ModuleTable {
         writer.write_module(&module)?;
         self.modules.push(module);
         self.active.push(true);
+        self.index_dirty = true;
         Ok(id)
     }
 
     pub fn deactivate_process_modules(&mut self, process_id: i32) {
         for (module, active) in self.modules.iter().zip(self.active.iter_mut()) {
             if module.process_id == process_id && !module.is_kernel {
+                self.index_dirty |= *active;
                 *active = false;
             }
         }
@@ -596,21 +619,14 @@ impl ModuleTable {
         Ok(())
     }
 
-    pub fn resolve_frame(&self, process_id: i32, abs_ip: u64, mode: FrameMode) -> FrameRecord {
+    pub fn resolve_frame(&mut self, process_id: i32, abs_ip: u64, mode: FrameMode) -> FrameRecord {
+        self.rebuild_index_if_needed();
         let module = self
-            .modules
-            .iter()
-            .zip(&self.active)
-            .rev()
-            .find(|(m, &active)| {
-                active
-                    && (m.process_id == process_id || m.is_kernel)
-                    && m.start <= abs_ip
-                    && abs_ip < m.end
-            })
-            .map(|(m, _)| m);
+            .index
+            .find(process_id, abs_ip)
+            .and_then(|id| self.modules.get(id as usize).map(|module| (id, module)));
         let (module_id, rel_ip) = match module {
-            Some(m) => (Some(m.id), abs_ip.saturating_sub(m.start) + m.file_offset),
+            Some((id, m)) => (Some(id), abs_ip.saturating_sub(m.start) + m.file_offset),
             None => (None, abs_ip),
         };
         FrameRecord {
@@ -619,6 +635,170 @@ impl ModuleTable {
             abs_ip,
             mode,
         }
+    }
+
+    fn rebuild_index_if_needed(&mut self) {
+        if !self.index_dirty {
+            return;
+        }
+        self.index = ModuleIndex::build(&self.modules, &self.active);
+        self.index_dirty = false;
+    }
+}
+
+#[derive(Default)]
+struct ModuleIndex {
+    by_process: FxHashMap<i32, ModuleIndexGroup>,
+    kernel: ModuleIndexGroup,
+}
+
+impl ModuleIndex {
+    fn build(modules: &[ModuleRecord], active: &[bool]) -> Self {
+        let mut index = Self::default();
+        for (module, &active) in modules.iter().zip(active) {
+            if !active {
+                continue;
+            }
+            let entry = ModuleIndexEntry {
+                start: module.start,
+                end: module.end,
+                id: module.id,
+            };
+            if module.is_kernel {
+                index.kernel.push(entry);
+            } else {
+                index
+                    .by_process
+                    .entry(module.process_id)
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        index.kernel.finish();
+        for group in index.by_process.values_mut() {
+            group.finish();
+        }
+        index
+    }
+
+    fn find(&self, process_id: i32, address: u64) -> Option<u32> {
+        let process_module = self
+            .by_process
+            .get(&process_id)
+            .and_then(|group| group.find(address));
+        let kernel_module = self.kernel.find(address);
+        process_module.into_iter().chain(kernel_module).max()
+    }
+}
+
+#[derive(Default)]
+struct ModuleIndexGroup {
+    entries: Vec<ModuleIndexEntry>,
+    has_overlaps: bool,
+}
+
+impl ModuleIndexGroup {
+    fn push(&mut self, entry: ModuleIndexEntry) {
+        self.entries.push(entry);
+    }
+
+    fn finish(&mut self) {
+        let mut sorted = self.entries.clone();
+        sorted.sort_by_key(|entry| (entry.start, entry.id));
+        self.has_overlaps = sorted
+            .windows(2)
+            .any(|window| window[0].end > window[1].start);
+        if !self.has_overlaps {
+            self.entries = sorted;
+        }
+    }
+
+    fn find(&self, address: u64) -> Option<u32> {
+        if self.has_overlaps {
+            return self
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.start <= address && address < entry.end)
+                .map(|entry| entry.id);
+        }
+        let idx = self.entries.partition_point(|entry| entry.start <= address);
+        let entry = self.entries.get(idx.checked_sub(1)?)?;
+        (address < entry.end).then_some(entry.id)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModuleIndexEntry {
+    start: u64,
+    end: u64,
+    id: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writer() -> PerfSpoolWriter<Vec<u8>> {
+        PerfSpoolWriter {
+            writer: Vec::new(),
+            last_timestamp_ns: 0,
+            frame_cache: FxHashMap::default(),
+            stack_cache: FxHashMap::default(),
+            thread_cache: FxHashMap::default(),
+        }
+    }
+
+    fn module(process_id: i32, start: u64, end: u64, path: &str, is_kernel: bool) -> ModuleRecord {
+        ModuleRecord {
+            id: 0,
+            process_id,
+            start,
+            end,
+            file_offset: 0,
+            inode: 0,
+            path: path.into(),
+            is_kernel,
+        }
+    }
+
+    #[test]
+    fn module_table_resolves_with_index_and_latest_overlap_wins() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let first = table
+            .intern_module(module(7, 0x1000, 0x3000, "/first", false), &mut writer)
+            .unwrap();
+        let second = table
+            .intern_module(module(7, 0x0800, 0x4000, "/second", false), &mut writer)
+            .unwrap();
+
+        let resolved = table.resolve_frame(7, 0x2000, FrameMode::User);
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(resolved.module_id, Some(second));
+    }
+
+    #[test]
+    fn module_table_rebuilds_index_after_deactivation() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let first = table
+            .intern_module(module(7, 0x1000, 0x3000, "/first", false), &mut writer)
+            .unwrap();
+        let _second = table
+            .intern_module(module(7, 0x0800, 0x4000, "/second", false), &mut writer)
+            .unwrap();
+
+        table.deactivate_process_modules(7);
+        table
+            .intern_module(module(7, 0x1000, 0x3000, "/first", false), &mut writer)
+            .unwrap();
+        let resolved = table.resolve_frame(7, 0x2000, FrameMode::User);
+
+        assert_ne!(resolved.module_id, Some(first));
+        assert!(resolved.module_id.is_some());
     }
 }
 
@@ -739,16 +919,22 @@ fn frame_mode(is_kernel: bool) -> FrameMode {
 
 fn read_stack_node(
     reader: &mut impl Read,
-    expected_id: usize,
+    stack_nodes: &[StackNodeRecord],
     frame_count: usize,
 ) -> io::Result<StackNodeRecord> {
+    let expected_id = stack_nodes.len();
     check_id(reader, expected_id, "stack")?;
     let raw_prefix = reader.read_varint::<u64>()?;
     let prefix = (raw_prefix != u64::from(NONE_U32))
         .then(|| bounded_id(raw_prefix, expected_id, "stack prefix"))
         .transpose()?;
     let frame_id = read_id_within(reader, frame_count, "stack frame")?;
-    Ok(StackNodeRecord { prefix, frame_id })
+    let depth = prefix.map_or(1, |id| stack_nodes[id as usize].depth.saturating_add(1));
+    Ok(StackNodeRecord {
+        prefix,
+        frame_id,
+        depth,
+    })
 }
 
 fn read_thread(reader: &mut impl Read, expected_id: usize) -> io::Result<(i32, u64)> {

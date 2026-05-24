@@ -23,7 +23,8 @@ use wholesym::CodeId;
 use wholesym::MultiArchDisambiguator;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use wholesym::{
-    AddressInfo, LookupAddress, SymbolManager, SymbolManagerConfig, SymbolMap as WholeSymbolMap,
+    AddressInfo, FramesLookupResult, LookupAddress, SymbolManager, SymbolManagerConfig,
+    SymbolMap as WholeSymbolMap,
 };
 
 use std::collections::HashMap;
@@ -645,9 +646,28 @@ fn build_native_symbols_from_wholesym(
     is_python_runtime: bool,
     include_inlines: bool,
 ) -> Vec<NativeSymbol> {
-    let fallback_name = symbol_map
-        .resolve_symbol_name(addr_info.symbol.name)
-        .into_owned();
+    build_native_symbols_from_wholesym_parts(
+        addr_info.symbol.name,
+        addr_info.frames,
+        symbol_map,
+        module,
+        module_offset,
+        is_python_runtime,
+        include_inlines,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_native_symbols_from_wholesym_parts(
+    symbol_name: wholesym::SymbolNameHandle,
+    frames: Option<Vec<wholesym::FrameDebugInfo>>,
+    symbol_map: &WholeSymbolMap,
+    module: &Rc<str>,
+    module_offset: u64,
+    is_python_runtime: bool,
+    include_inlines: bool,
+) -> Vec<NativeSymbol> {
+    let fallback_name = symbol_map.resolve_symbol_name(symbol_name).into_owned();
     let fallback_symbol = move |source: SourceLocation| {
         build_native_symbol(
             fallback_name.clone(),
@@ -658,7 +678,7 @@ fn build_native_symbols_from_wholesym(
         )
     };
 
-    let frame_capacity = addr_info.frames.as_ref().map_or(1, |frames| {
+    let frame_capacity = frames.as_ref().map_or(1, |frames| {
         if include_inlines {
             frames.len().max(1)
         } else {
@@ -691,7 +711,7 @@ fn build_native_symbols_from_wholesym(
         symbols.push(symbol);
     };
 
-    if let Some(frames) = addr_info.frames {
+    if let Some(frames) = frames {
         let mut frames = frames.into_iter();
         if include_inlines {
             for frame in frames {
@@ -1034,9 +1054,17 @@ impl SymbolizerWrapper {
     ) -> Option<Vec<NativeSymbol>> {
         self.ensure_symbol_map_loaded(path);
         let symbol_map = self.symbol_maps.get(path).and_then(|map| map.as_ref())?;
-        let addr_info = self.runtime.block_on(symbol_map.lookup(lookup_address))?;
-        Some(build_native_symbols_from_wholesym(
-            addr_info,
+        let addr_info = symbol_map.lookup_sync(lookup_address)?;
+        let frames = match addr_info.frames {
+            Some(FramesLookupResult::Available(frames)) => Some(frames),
+            Some(FramesLookupResult::External(external)) => {
+                self.runtime.block_on(symbol_map.lookup_external(&external))
+            }
+            None => None,
+        };
+        Some(build_native_symbols_from_wholesym_parts(
+            addr_info.symbol.name,
+            frames,
             symbol_map,
             module_rc,
             module_offset,

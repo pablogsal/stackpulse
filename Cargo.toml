@@ -21,6 +21,7 @@ memchr = "2.7"
 memmap2 = "0.9"
 mio = { version = "1", features = ["os-ext", "os-poll"] }
 nix = { version = "0.29", features = ["fs", "process"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "elf", "compression"] }
 perf-event-open = { version = "0.5", features = ["linux-5.13"] }
 perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
@@ -31,6 +32,13 @@ wholesym = "0.8.1"
 [features]
 default = []
 debuginfod = []
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "stackpulse_suite"
+harness = false
 
 [workspace.lints.clippy]
 # Enable lint groups (priority -1 so specific lints take precedence)
