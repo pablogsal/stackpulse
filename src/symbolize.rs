@@ -104,25 +104,43 @@ impl PerfSymbolizer {
         stack_id: u32,
         frames: &[FrameRecord],
     ) -> StackFrames {
+        self.stack_refs_to_cached_frames(process_id, stack_id, frames.iter())
+    }
+
+    /// Resolve borrowed raw frames for one sample, caching by process and stack id.
+    pub fn stack_refs_to_cached_frames<'a>(
+        &mut self,
+        process_id: i32,
+        stack_id: u32,
+        frames: impl IntoIterator<Item = &'a FrameRecord>,
+    ) -> StackFrames {
         let cache_key = (process_id, stack_id);
         if let Some(frames) = self.stack_cache.get(&cache_key) {
             return Arc::clone(frames);
         }
-        let frames = self.stack_to_frames(process_id, frames);
+        let frames = self.stack_refs_to_frames(process_id, frames);
         self.stack_cache.insert(cache_key, Arc::clone(&frames));
         frames
     }
 
     fn stack_to_frames(&mut self, process_id: i32, sample_frames: &[FrameRecord]) -> StackFrames {
+        self.stack_refs_to_frames(process_id, sample_frames.iter())
+    }
+
+    fn stack_refs_to_frames<'a>(
+        &mut self,
+        process_id: i32,
+        sample_frames: impl IntoIterator<Item = &'a FrameRecord>,
+    ) -> StackFrames {
         let frames = sample_frames
-            .iter()
+            .into_iter()
             .map(|frame| self.resolve_cached_frame(process_id, frame))
             .collect::<Vec<_>>();
         Arc::from(frames.into_boxed_slice())
     }
 
     fn resolve_cached_frame(&mut self, process_id: i32, frame: &FrameRecord) -> ResolvedFrame {
-        let cache_key = (process_id, frame.clone());
+        let cache_key = (process_id, *frame);
         if let Some(cached) = self.frame_cache.get(&cache_key) {
             return cached.clone();
         }
@@ -551,7 +569,8 @@ mod tests {
             path: std::env::current_exe()
                 .expect("current test executable")
                 .to_string_lossy()
-                .into_owned(),
+                .into_owned()
+                .into(),
             is_kernel: false,
         }
     }
@@ -564,7 +583,7 @@ mod tests {
             end: start + 0x1000,
             file_offset: 0,
             inode: 0,
-            path: path.to_string(),
+            path: path.into(),
             is_kernel: false,
         }
     }

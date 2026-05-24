@@ -10,7 +10,7 @@ use crate::spool::ModuleRecord;
 
 #[derive(Clone, Default)]
 pub(crate) struct ElfSectionCache {
-    by_path: FxHashMap<String, Option<Arc<ElfSectionInfo>>>,
+    by_path: FxHashMap<crate::spool::ModulePath, Option<Arc<ElfSectionInfo>>>,
 }
 
 impl ElfSectionCache {
@@ -41,7 +41,7 @@ impl ElfSectionCache {
 }
 
 fn module_info_with_sections(module: &ModuleRecord, section_info: &ElfSectionInfo) -> ModuleInfo {
-    let path = PathBuf::from(&module.path);
+    let path = PathBuf::from(module.path.as_str());
     let name = crate::path_to_name(&path);
     let image_base = resolve_image_base(module, section_info);
     let is_python = crate::is_python_module(&name);

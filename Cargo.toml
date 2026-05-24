@@ -8,9 +8,12 @@ repository = "https://github.com/pablogsal/stackpulse"
 keywords = ["profiler", "linux", "perf", "sampling", "unwind"]
 categories = ["development-tools::profiling"]
 
+[lints]
+workspace = true
+
 [dependencies]
 bitflags = "2.4"
-framehop = "0.15"
+framehop = { git = "https://github.com/mstange/framehop", rev = "fceeebab2e9cd77f47d47c63e5c2a6de3d4a88b3" }
 goblin = "0.9"
 integer-encoding = { version = "4.1.0", default-features = false }
 libc = "0.2"
@@ -23,9 +26,13 @@ perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
 tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"] }
 tracing = "0.1"
-wholesym = "0.8.1"
+wholesym = { git = "https://github.com/mstange/samply", rev = "d31a3e9ed59f06d309d6984455c824a03a15f081" }
 
 [features]
 default = []
 debuginfod = []
-wholesym-git-api = []
+
+[workspace.lints.clippy]
+# Enable lint groups (priority -1 so specific lints take precedence)
+all = { level = "warn", priority = -1 }
+cognitive_complexity = "warn"

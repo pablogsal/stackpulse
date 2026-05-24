@@ -8,7 +8,6 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
 use super::perf_event::{EventRef, EventSource, Perf, PerfOptions, TaskInheritance};
-use super::sorter::EventSorter;
 
 struct StoppedProcess(u32);
 
@@ -33,7 +32,6 @@ struct Member {
 }
 
 pub struct PerfGroup {
-    event_sorter: EventSorter<RawFd, u64, EventRef>,
     members: BTreeMap<RawFd, Member>,
     ready_fds: BTreeSet<RawFd>,
     poll: Poll,
@@ -90,7 +88,6 @@ impl PerfGroup {
         inherit_child_processes: bool,
     ) -> io::Result<Self> {
         Ok(PerfGroup {
-            event_sorter: EventSorter::new(),
             members: Default::default(),
             ready_fds: BTreeSet::new(),
             poll: Poll::new()?,
@@ -422,37 +419,23 @@ impl PerfGroup {
         let mut fds_to_remove = Vec::new();
         let ready_fds = std::mem::take(&mut self.ready_fds);
         let consume_all = ready_fds.is_empty();
-        loop {
-            for (&fd, member) in &mut self.members {
-                if !consume_all && !ready_fds.contains(&fd) && !member.is_closed {
-                    continue;
-                }
-                self.event_sorter.begin_group(fd);
-                while let Some(ev) = self.event_sorter.pop() {
-                    cb(ev);
-                }
-                let mut consumed_record = false;
-                self.event_sorter
-                    .extend(member.perf.iter().filter_map(|event| {
-                        consumed_record = true;
-                        Some((event.timestamp()?, event))
-                    }));
-                if member.is_closed && !consumed_record {
-                    fds_to_remove.push(fd);
-                }
+        for (&fd, member) in &mut self.members {
+            if !consume_all && !ready_fds.contains(&fd) && !member.is_closed {
+                continue;
             }
-            self.event_sorter.advance_round();
-            while let Some(ev) = self.event_sorter.pop() {
-                cb(ev);
+            let mut consumed_record = false;
+            member.perf.consume_events(&mut |event| {
+                consumed_record = true;
+                cb(event);
+            });
+            if member.is_closed && !consumed_record {
+                fds_to_remove.push(fd);
             }
-            for fd in fds_to_remove.drain(..) {
-                // Deregister can fail on already-closed fds; drop member anyway.
-                let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
-                self.members.remove(&fd);
-            }
-            if !self.event_sorter.has_more() {
-                break;
-            }
+        }
+        for fd in fds_to_remove {
+            // Deregister can fail on already-closed fds; drop member anyway.
+            let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
+            self.members.remove(&fd);
         }
     }
 }

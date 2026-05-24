@@ -1,8 +1,12 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufWriter, Read, Write};
+use std::ops::{Deref, Range};
 use std::path::Path;
+use std::sync::Arc;
 
 use integer_encoding::{VarIntReader, VarIntWriter};
+use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
 const MAGIC: &[u8; 8] = b"CHPERF2\0";
@@ -13,6 +17,115 @@ const REC_THREAD: u8 = 4;
 const REC_SAMPLE: u8 = 5;
 const REC_PROCESS_EXEC: u8 = 6;
 const NONE_U32: u32 = u32::MAX;
+
+/// File path or display name for a recorded module.
+#[derive(Clone)]
+pub struct ModulePath(ModulePathStorage);
+
+#[derive(Clone)]
+enum ModulePathStorage {
+    Owned(Arc<str>),
+    Mmap {
+        mmap: Arc<Mmap>,
+        range: Range<usize>,
+    },
+}
+
+impl ModulePath {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            ModulePathStorage::Owned(path) => path,
+            ModulePathStorage::Mmap { mmap, range } => std::str::from_utf8(&mmap[range.clone()])
+                .expect("mmap-backed module path was validated while reading the spool"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
+    }
+
+    fn from_mmap(mmap: Arc<Mmap>, range: Range<usize>) -> io::Result<Self> {
+        std::str::from_utf8(&mmap[range.clone()]).map_err(|err| invalid_data(err.to_string()))?;
+        Ok(Self(ModulePathStorage::Mmap { mmap, range }))
+    }
+}
+
+impl Deref for ModulePath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for ModulePath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ModulePath {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        std::ffi::OsStr::new(self.as_str())
+    }
+}
+
+impl std::borrow::Borrow<str> for ModulePath {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<String> for ModulePath {
+    fn from(path: String) -> Self {
+        Self(ModulePathStorage::Owned(Arc::from(path.into_boxed_str())))
+    }
+}
+
+impl From<&str> for ModulePath {
+    fn from(path: &str) -> Self {
+        Self(ModulePathStorage::Owned(Arc::from(path)))
+    }
+}
+
+impl From<ModulePath> for std::rc::Rc<str> {
+    fn from(path: ModulePath) -> Self {
+        path.as_str().into()
+    }
+}
+
+impl std::fmt::Debug for ModulePath {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(fmt)
+    }
+}
+
+impl std::fmt::Display for ModulePath {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.write_str(self.as_str())
+    }
+}
+
+impl PartialEq for ModulePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for ModulePath {}
+
+impl Hash for ModulePath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
 
 /// A code area recorded in a profile file.
 #[derive(Clone, Debug)]
@@ -30,7 +143,7 @@ pub struct ModuleRecord {
     /// File inode, when available.
     pub inode: u64,
     /// File path or display name.
-    pub path: String,
+    pub path: ModulePath,
     /// Whether this record represents kernel code.
     pub is_kernel: bool,
 }
@@ -45,7 +158,7 @@ pub enum FrameMode {
 }
 
 /// A raw frame stored in a profile file.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRecord {
     /// Module id when the frame was matched to a module.
     pub module_id: Option<u32>,
@@ -100,8 +213,6 @@ pub struct PerfSpoolWriter<W: Write> {
     frame_cache: FxHashMap<FrameRecord, u32>,
     stack_cache: FxHashMap<(u32, u32), u32>,
     thread_cache: FxHashMap<(i32, u64), u32>,
-    last_stack_frames: Vec<FrameRecord>,
-    last_stack_id: Option<u32>,
 }
 
 impl PerfSpoolWriter<BufWriter<File>> {
@@ -115,8 +226,6 @@ impl PerfSpoolWriter<BufWriter<File>> {
             frame_cache: FxHashMap::default(),
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
-            last_stack_frames: Vec::new(),
-            last_stack_id: None,
             last_timestamp_ns: 0,
         };
         writer.writer.write_all(MAGIC)?;
@@ -140,15 +249,38 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 
     pub fn write_sample(&mut self, sample: &SampleRecord<'_>) -> io::Result<()> {
-        let thread_id = self.intern_thread(sample.process_id, sample.thread_id)?;
-        let stack_id = self.intern_stack_cached(sample.frames)?;
-        let delta = sample.timestamp_ns as i64 - self.last_timestamp_ns as i64;
-        self.last_timestamp_ns = sample.timestamp_ns;
+        self.write_sample_frames(
+            sample.timestamp_ns,
+            sample.process_id,
+            sample.thread_id,
+            sample.frames.iter().copied(),
+        )
+        .map(drop)
+    }
+
+    pub fn write_sample_frames<I>(
+        &mut self,
+        timestamp_ns: u64,
+        process_id: i32,
+        thread_id: u64,
+        frames: I,
+    ) -> io::Result<Option<u32>>
+    where
+        I: IntoIterator<Item = FrameRecord>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        let Some(stack_id) = self.intern_stack(frames)? else {
+            return Ok(None);
+        };
+        let thread_id = self.intern_thread(process_id, thread_id)?;
+        let delta = timestamp_ns as i64 - self.last_timestamp_ns as i64;
+        self.last_timestamp_ns = timestamp_ns;
 
         self.writer.write_all(&[REC_SAMPLE])?;
         self.writer.write_varint(delta)?;
         self.writer.write_varint(u64::from(thread_id))?;
-        self.writer.write_varint(u64::from(stack_id)).map(drop)
+        self.writer.write_varint(u64::from(stack_id))?;
+        Ok(Some(stack_id))
     }
 
     pub fn write_process_exec(
@@ -181,20 +313,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(id)
     }
 
-    fn intern_stack_cached(&mut self, frames: &[FrameRecord]) -> io::Result<u32> {
-        if let Some(stack_id) = self.last_stack_id {
-            if self.last_stack_frames.as_slice() == frames {
-                return Ok(stack_id);
-            }
-        }
-
-        let stack_id = self.intern_stack(frames)?;
-        self.last_stack_frames.clear();
-        self.last_stack_frames.extend_from_slice(frames);
-        self.last_stack_id = Some(stack_id);
-        Ok(stack_id)
-    }
-
     fn intern_frame(&mut self, frame: &FrameRecord) -> io::Result<u32> {
         if let Some(&id) = self.frame_cache.get(frame) {
             return Ok(id);
@@ -203,14 +321,20 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[REC_FRAME])?;
         self.writer.write_varint(u64::from(id))?;
         write_compact_frame(&mut self.writer, frame)?;
-        self.frame_cache.insert(frame.clone(), id);
+        self.frame_cache.insert(*frame, id);
         Ok(id)
     }
 
-    fn intern_stack(&mut self, frames: &[FrameRecord]) -> io::Result<u32> {
+    fn intern_stack<I>(&mut self, frames: I) -> io::Result<Option<u32>>
+    where
+        I: IntoIterator<Item = FrameRecord>,
+        I::IntoIter: DoubleEndedIterator,
+    {
         let mut prefix = NONE_U32;
-        for frame in frames.iter().rev() {
-            let frame_id = self.intern_frame(frame)?;
+        let mut saw_frame = false;
+        for frame in frames.into_iter().rev() {
+            saw_frame = true;
+            let frame_id = self.intern_frame(&frame)?;
             let key = (prefix, frame_id);
             if let Some(&stack_id) = self.stack_cache.get(&key) {
                 prefix = stack_id;
@@ -224,7 +348,7 @@ impl<W: Write> PerfSpoolWriter<W> {
             self.stack_cache.insert(key, stack_id);
             prefix = stack_id;
         }
-        Ok(prefix)
+        Ok(saw_frame.then_some(prefix))
     }
 }
 
@@ -238,15 +362,31 @@ pub struct PerfSpoolReader {
     process_execs: Vec<ProcessExecRecord>,
 }
 
+/// Borrowed raw frames for one interned stack.
+pub struct StackFrameRefs<'a> {
+    frames: &'a [FrameRecord],
+    stack_nodes: &'a [StackNodeRecord],
+    current: Option<u32>,
+}
+
+impl<'a> Iterator for StackFrameRefs<'a> {
+    type Item = &'a FrameRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let id = self.current?;
+        let node = self.stack_nodes.get(id as usize)?;
+        self.current = node.prefix;
+        self.frames.get(node.frame_id as usize)
+    }
+}
+
 impl PerfSpoolReader {
     /// Open and read a profile file.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
-        let mut magic = [0_u8; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(invalid_data("invalid stackpulse spool magic"));
-        }
+        let file = File::open(path)?;
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+        let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
+        reader.check_magic()?;
         let start_timestamp_us = reader.read_varint::<u64>()?;
         let _sample_interval_us = reader.read_varint::<u64>()?;
         let (mut modules, mut frames, mut stack_nodes, mut threads, mut samples, mut process_execs) = (
@@ -258,15 +398,9 @@ impl PerfSpoolReader {
             Vec::new(),
         );
         let mut last_timestamp_ns = 0_u64;
-        let mut tag = [0_u8; 1];
-        loop {
-            match reader.read_exact(&mut tag) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err),
-            }
-            match tag[0] {
-                REC_MODULE => modules.push(read_module(&mut reader)?),
+        while let Some(tag) = reader.read_tag()? {
+            match tag {
+                REC_MODULE => modules.push(read_module_mmap(&mut reader)?),
                 REC_FRAME => frames.push(read_frame(&mut reader, &modules, frames.len())?),
                 REC_STACK => stack_nodes.push(read_stack_node(
                     &mut reader,
@@ -309,25 +443,24 @@ impl PerfSpoolReader {
         &self.process_execs
     }
 
+    /// Borrow raw frames for `stack_id` without copying them.
+    pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
+        self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
+            invalid_data(format!("sample references missing stack node {stack_id}"))
+        })?;
+        Ok(StackFrameRefs {
+            frames: &self.frames,
+            stack_nodes: &self.stack_nodes,
+            current: Some(stack_id),
+        })
+    }
+
     /// Expand `stack_id` into raw frames.
     ///
     /// `out` is cleared before the frames are written.
     pub fn stack_frames(&self, stack_id: u32, out: &mut Vec<FrameRecord>) -> io::Result<()> {
         out.clear();
-        let mut current = Some(stack_id);
-        while let Some(id) = current {
-            let node = self.stack_nodes.get(id as usize).ok_or_else(|| {
-                invalid_data(format!("sample references missing stack node {id}"))
-            })?;
-            let frame = self.frames.get(node.frame_id as usize).ok_or_else(|| {
-                invalid_data(format!(
-                    "stack node references missing frame {}",
-                    node.frame_id
-                ))
-            })?;
-            out.push(frame.clone());
-            current = node.prefix;
-        }
+        out.extend(self.stack_frame_refs(stack_id)?.copied());
         Ok(())
     }
 
@@ -339,6 +472,63 @@ impl PerfSpoolReader {
             .map_or(sample.timestamp_ns, |s| s.timestamp_ns);
         self.start_timestamp_us
             .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
+    }
+}
+
+struct MmapSpoolCursor {
+    mmap: Arc<Mmap>,
+    position: usize,
+}
+
+impl MmapSpoolCursor {
+    fn new(mmap: Arc<Mmap>) -> Self {
+        Self { mmap, position: 0 }
+    }
+
+    fn check_magic(&mut self) -> io::Result<()> {
+        let mut magic = [0_u8; 8];
+        self.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(invalid_data("invalid stackpulse spool magic"));
+        }
+        Ok(())
+    }
+
+    fn read_tag(&mut self) -> io::Result<Option<u8>> {
+        if self.position == self.mmap.len() {
+            return Ok(None);
+        }
+        let tag = *self
+            .mmap
+            .get(self.position)
+            .ok_or_else(|| invalid_data("truncated spool record tag"))?;
+        self.position += 1;
+        Ok(Some(tag))
+    }
+
+    fn read_bytes_range(&mut self, len: usize) -> io::Result<Range<usize>> {
+        let start = self.position;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| invalid_data("spool byte range overflow"))?;
+        if end > self.mmap.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated spool byte range",
+            ));
+        }
+        self.position = end;
+        Ok(start..end)
+    }
+}
+
+impl Read for MmapSpoolCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.mmap.len().saturating_sub(self.position);
+        let len = available.min(buf.len());
+        buf[..len].copy_from_slice(&self.mmap[self.position..self.position + len]);
+        self.position += len;
+        Ok(len)
     }
 }
 
@@ -432,7 +622,7 @@ impl ModuleTable {
     }
 }
 
-fn read_module(reader: &mut impl Read) -> io::Result<ModuleRecord> {
+fn read_module_mmap(reader: &mut MmapSpoolCursor) -> io::Result<ModuleRecord> {
     let id = reader.read_varint::<u64>()? as u32;
     let process_id = reader.read_varint::<i64>()? as i32;
     let start = reader.read_varint::<u64>()?;
@@ -441,8 +631,9 @@ fn read_module(reader: &mut impl Read) -> io::Result<ModuleRecord> {
     let inode = reader.read_varint::<u64>()?;
     let mut flag = [0_u8; 1];
     reader.read_exact(&mut flag)?;
-    let path = String::from_utf8(read_bytes(reader)?)
-        .map_err(|e| invalid_data(e.utf8_error().to_string()))?;
+    let len = reader.read_varint::<u64>()? as usize;
+    let range = reader.read_bytes_range(len)?;
+    let path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
     Ok(ModuleRecord {
         id,
         process_id,
@@ -593,11 +784,4 @@ fn read_sample(
 fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     writer.write_varint(bytes.len() as u64)?;
     writer.write_all(bytes)
-}
-
-fn read_bytes(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let len = reader.read_varint::<u64>()? as usize;
-    let mut bytes = vec![0_u8; len];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
 }

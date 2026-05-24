@@ -1,17 +1,13 @@
 # Reference
 
-This page documents the public `stackpulse` API. For exact trait bounds and
-crate-level examples, build rustdoc with:
-
-```sh
-make doc
-```
+A condensed map of the public surface. Each item links to its full rustdoc
+page.
 
 ## Module map
 
-The crate root re-exports the main profiling types:
+The crate root re-exports the recording, reading, and symbolization types:
 
-```rust
+```rust,ignore
 use stackpulse::{
     AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
 };
@@ -19,255 +15,248 @@ use stackpulse::{
 
 Public modules:
 
-| Module | Purpose |
+| Module | What it's for |
 | --- | --- |
-| `stackpulse::process` | Launch a process suspended before `execve` so profiling starts at process birth. |
-| `stackpulse::children` | Discover descendant PIDs through `/proc`. |
-| `stackpulse::profile` | Resolved frame and symbol data types. |
-| `stackpulse::state` | Process existence, exit watching, and signal helpers. |
+| [`process`] | Launch a process suspended before `execve` so sampling starts at birth. |
+| [`children`] | Walk descendant PIDs through `/proc`. |
+| [`profile`] | Resolved frames and symbol data types. |
+| [`state`] | Process liveness, exit watching, and signal helpers. |
 
 ## Recording
 
-### `PerfRecorder`
+### [`PerfRecorder`]
 
-`PerfRecorder` records stack samples for one or more Linux processes and writes a
-spool file.
+Records stack samples for one or more processes and writes a spool file.
 
-| Method | Purpose |
+| Method | What it does |
 | --- | --- |
-| `PerfRecorder::attach(pid, output, attach_mode, options)` | Open perf events for `pid`, create the spool writer, register known mappings, and start recording when appropriate. |
-| `consume_available()` | Drain readable perf events, update module/process state, unwind samples, and write spool records. |
-| `wait()` | Wait briefly for perf data to become readable. |
-| `open_process(pid, attach_mode)` | Add another process to the same recording. |
-| `refresh_threads(pid)` | Discover and open new threads when perf inheritance is unavailable or intentionally avoided. |
-| `disable()` | Disable sampling for all attached perf events. |
-| `has_pending_events()` | Return whether perf data is already queued for consumption. |
-| `summary()` | Return a snapshot of recording counters. |
-| `active_processes()` | Return PIDs still believed to be alive. |
-| `process_is_active(pid)` | Return whether one PID is still believed to be alive. |
-| `has_active_processes_except(pid)` | Return whether any active process other than `pid` remains. |
-| `active_processes_except(pid)` | Return active PIDs excluding `pid`. |
-| `finish()` | Flush the spool file and return final counters. Consumes the recorder. |
+| `attach(pid, output, mode, options)` | Open perf events, create the spool, register known mappings, start sampling. |
+| `consume_available()` | Drain perf data, update module/process state, unwind, write records. |
+| `wait()` | Block briefly for new perf data. |
+| `open_process(pid, mode)` | Add another process to the same recording. |
+| `refresh_threads(pid)` | Discover new threads when perf inheritance isn't doing it. |
+| `disable()` | Stop sampling for all attached events. |
+| `has_pending_events()` | Is there perf data ready to drain? |
+| `summary()` | Snapshot of recording counters. |
+| `active_processes()` / `process_is_active(pid)` | Which PIDs are still alive. |
+| `has_active_processes_except(pid)` / `active_processes_except(pid)` | Same, excluding one PID. |
+| `finish()` | Flush, return final counters, consume the recorder. |
 
-The recorder must be drained. Opening a recorder and sleeping without
-`consume_available` lets kernel buffers fill and prevents samples from reaching
-the spool file.
+The recorder is not just a handle. Opening one and never calling
+`consume_available` will fill kernel buffers and lose samples.
 
-### `AttachMode`
+### [`AttachMode`]
 
-| Variant | Use case |
+| Variant | Use |
 | --- | --- |
-| `StopAttachEnableResume` | Attach to an already-running process. The process is briefly stopped while perf events are opened, then resumed. |
-| `AttachWithEnableOnExec` | Attach to a process that has been forked but not yet executed. Use with `process::SuspendedLaunchedProcess`. |
+| `StopAttachEnableResume` | Attaching to a running process. The target is briefly stopped while events open, then resumed. |
+| `AttachWithEnableOnExec` | Attaching to a forked-but-not-yet-exec'd child. Pair with [`process::SuspendedLaunchedProcess`]. |
 
-### `PerfRecorderOptions`
+### [`PerfRecorderOptions`]
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `frequency` | `u32` | Requested samples per second. Must not exceed `/proc/sys/kernel/perf_event_max_sample_rate` when that limit is readable. |
-| `stack_size` | `u32` | Number of user stack bytes copied per sample. Must not exceed `MAX_SAMPLE_USER_STACK`. |
-| `include_kernel` | `bool` | Include kernel frames when permissions allow it. |
-| `inherit_child_processes` | `bool` | Follow child processes created after recording starts. |
-| `start_timestamp_us` | `u64` | Timeline anchor stored in the spool file. |
-| `sample_interval_us` | `u64` | Optional interval metadata stored in the spool file. |
+| `frequency` | `u32` | Samples per second. Must be ≤ `/proc/sys/kernel/perf_event_max_sample_rate` when readable. |
+| `stack_size` | `u32` | User stack bytes copied per sample. Capped at [`MAX_SAMPLE_USER_STACK`]. |
+| `include_kernel` | `bool` | Capture kernel frames when allowed. |
+| `inherit_child_processes` | `bool` | Follow children forked after recording starts. |
+| `start_timestamp_us` | `u64` | Timeline anchor stored in the spool. |
+| `sample_interval_us` | `u64` | Optional interval hint stored in the spool. |
 
-`Default` sets numeric fields to `0` and boolean fields to `false`. For real
-recordings, set at least `frequency` and `stack_size`.
+`Default` zero-fills everything. For a real recording, set `frequency` and
+`stack_size` at minimum.
 
-### `PerfSummary`
+### [`PerfSummary`]
 
-`PerfSummary` is a counter snapshot for recording quality and diagnostics.
+Counter snapshot for quality checks.
 
 | Field | Meaning |
 | --- | --- |
 | `sample_events` | Raw perf sample records seen. |
-| `samples` | Samples successfully written to the spool file. |
-| `lost_events` | Records the kernel reported as lost. |
-| `kernel_enabled` | Whether kernel frame capture remained enabled after attach. |
-| `missing_pid_samples` | Samples skipped because the process ID was missing or invalid. |
-| `missing_tid_samples` | Samples skipped because the thread ID was missing or invalid. |
-| `idle_tid_samples` | Samples skipped because they were attributed to idle thread ID `0`. |
-| `missing_timestamp_samples` | Samples skipped because perf did not provide a timestamp. |
-| `empty_stack_samples` | Samples skipped because no usable frames were produced. |
-| `truncated_frame_markers` | Internal truncation markers observed while unwinding. |
-| `ignored_user_callchain_frames` | User callchain frames ignored when kernel callchains were enabled. |
+| `samples` | Samples written to the spool. |
+| `lost_events` | Kernel-reported losses. |
+| `kernel_enabled` | Whether kernel capture stayed on after attach. |
+| `missing_pid_samples` / `missing_tid_samples` | Samples dropped for missing IDs. |
+| `idle_tid_samples` | Samples attributed to idle TID 0. |
+| `missing_timestamp_samples` | Samples without a perf timestamp. |
+| `empty_stack_samples` | Samples that produced no usable frames. |
+| `truncated_frame_markers` | Unwind truncation markers observed. |
+| `ignored_user_callchain_frames` | User callchain frames dropped because kernel callchains were on. |
 | `error_stats` | Per-kind sample error counters. |
 
 ## Reading spool files
 
-### `PerfSpoolReader`
+### [`PerfSpoolReader`]
 
-`PerfSpoolReader::open(path)` reads the entire spool file into memory and
-validates record references.
+`PerfSpoolReader::open(path)` reads the whole spool into memory and validates
+record references.
 
-| Method | Purpose |
+| Method | What it returns |
 | --- | --- |
-| `modules()` | Return recorded executable memory ranges. |
-| `samples()` | Return timestamped samples. |
-| `process_execs()` | Return process execution markers, including Python runtime on/off markers. |
-| `stack_frames(stack_id, out)` | Expand an interned stack ID into raw `FrameRecord` values. Clears `out` first. |
-| `timestamp_us(sample)` | Convert a sample timestamp to the profile timeline in microseconds. |
+| `modules()` | Recorded executable memory ranges. |
+| `samples()` | Timestamped samples. |
+| `process_execs()` | Process exec markers, including Python runtime on/off. |
+| `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`]s for an interned stack without copying. |
+| `stack_frames(stack_id, out)` | Expand an interned stack into [`FrameRecord`]s. Clears `out` first. |
+| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds. |
 
-### `ModuleRecord`
+### [`ModuleRecord`]
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Stable module ID within the profile. |
-| `process_id` | Owning process ID, or a kernel marker for kernel code. |
+| `id` | Stable module ID within this profile. |
+| `process_id` | Owning PID (or a kernel marker for kernel code). |
 | `start`, `end` | Runtime address range. |
-| `file_offset` | File offset corresponding to `start`. |
-| `inode` | Backing file inode when available. |
-| `path` | Path or display name. |
-| `is_kernel` | Whether the record represents kernel code. |
+| `file_offset` | File offset matching `start`. |
+| `inode` | Backing file inode, when known. |
+| `path` | Path or display name as [`ModulePath`]. Spool-read paths can borrow from the mmap-backed profile. |
+| `is_kernel` | Kernel range? |
 
-### `FrameRecord`
-
-| Field | Meaning |
-| --- | --- |
-| `module_id` | Matched module ID, when known. |
-| `rel_ip` | Address relative to the matched module. |
-| `abs_ip` | Absolute instruction pointer. |
-| `mode` | `FrameMode::User` or `FrameMode::Kernel`. |
-
-### `OwnedSampleRecord`
+### [`FrameRecord`]
 
 | Field | Meaning |
 | --- | --- |
-| `timestamp_ns` | Monotonic perf timestamp in nanoseconds. |
-| `process_id` | Process ID for the sampled thread. |
-| `thread_id` | Thread ID for the sample. |
-| `stack_id` | Interned stack identifier for `PerfSpoolReader::stack_frames`. |
+| `module_id` | Matched module, when known. |
+| `rel_ip` | Module-relative address. |
+| `abs_ip` | Absolute IP. |
+| `mode` | [`FrameMode::User`] or [`FrameMode::Kernel`]. |
 
-### `ProcessExecRecord`
+### [`OwnedSampleRecord`]
 
 | Field | Meaning |
 | --- | --- |
-| `timestamp_ns` | Monotonic timestamp in nanoseconds. |
-| `process_id` | Process ID. |
-| `is_python_runtime` | Whether the process most recently looked like a Python runtime with perf-map support. A later marker with `false` means the PID should no longer be treated as Python for perf-map lookup. |
+| `timestamp_ns` | Monotonic perf timestamp (ns). |
+| `process_id` | PID. |
+| `thread_id` | TID. |
+| `stack_id` | Pass to [`PerfSpoolReader::stack_frames`]. |
+
+### [`ProcessExecRecord`]
+
+| Field | Meaning |
+| --- | --- |
+| `timestamp_ns` | Monotonic timestamp (ns). |
+| `process_id` | PID. |
+| `is_python_runtime` | Latest observation: does this PID look like a Python runtime with perf-map support? A later marker with `false` means stop treating it as Python. |
 
 ## Symbolization
 
-### `PerfSymbolizer`
+### [`PerfSymbolizer`]
 
-`PerfSymbolizer` resolves raw frames into displayable frames. Construct one
-symbolizer per profile and reuse it.
+Resolves raw frames into displayable ones. One per profile, reused.
 
-| Constructor or method | Purpose |
+| Constructor or method | Use |
 | --- | --- |
-| `PerfSymbolizer::new(modules)` | Resolve using ELF/native symbols, kernel symbols, and currently available Python perf maps. |
-| `PerfSymbolizer::with_perf_maps(modules, allow_perf_maps)` | Enable or disable Python perf-map lookup globally. |
-| `PerfSymbolizer::with_perf_map_processes(modules, processes)` | Allow perf-map lookup only for listed PIDs. |
-| `stack_to_cached_frames(process_id, stack_id, frames)` | Resolve a raw stack and cache the result by `(process_id, stack_id)`. |
+| `new(modules)` | Default: ELF, kernel symbols, plus Python perf maps for any PID. |
+| `with_perf_maps(modules, allow)` | Globally enable or disable perf-map lookup. |
+| `with_perf_map_processes(modules, pids)` | Allow perf maps only for the listed PIDs. |
+| `stack_refs_to_cached_frames(pid, stack_id, frames)` | Resolve borrowed raw frames and cache by `(pid, stack_id)`. |
+| `stack_to_cached_frames(pid, stack_id, frames)` | Resolve a stack and cache by `(pid, stack_id)`. |
 
-Resolution order:
+Resolution order, top to bottom:
 
-1. Python perf map or native JIT perf map from `/tmp/perf-<pid>.map`, when
-   allowed and appropriate for the frame.
-2. Native ELF symbolization for file-backed user modules.
+1. Python or JIT perf map at `/tmp/perf-<pid>.map`, if allowed and the frame
+   matches.
+2. ELF symbols for file-backed user modules.
 3. Kernel symbol lookup for kernel frames.
 4. Address-only fallback.
 
-### `ResolvedFrame`
-
-`ResolvedFrame` is either:
+### [`ResolvedFrame`]
 
 | Variant | Meaning |
 | --- | --- |
-| `ResolvedFrame::Python(PythonFrame)` | A Python frame parsed from a perf-map symbol. |
-| `ResolvedFrame::Native(NativeFrame)` | A native, kernel, JIT, or address-only frame. |
+| `Python(PythonFrame)` | Python frame from a perf-map symbol. |
+| `Native(NativeFrame)` | Native, kernel, JIT, or address-only frame. |
 
-`ResolvedFrame::func_name()` returns a displayable function name for both
-variants.
+`ResolvedFrame::func_name()` gives you a displayable name for either.
 
-### `PythonFrame`
+### [`PythonFrame`]
 
-| Field or method | Meaning |
+| Field / method | Meaning |
 | --- | --- |
 | `file_name` | Python source filename. |
-| `location` | Line and column metadata when available. |
+| `location` | Line + column when available. |
 | `func_name` | Python function name. |
-| `opcode` | Optional Python opcode. |
-| `is_entry` | Whether the frame is an entry marker. |
-| `basename()` | Filename without leading directories. |
+| `opcode` | Optional opcode. |
+| `is_entry` | Entry marker? |
+| `basename()` | Filename without leading dirs. |
 
-### `NativeFrame` and `NativeSymbol`
+### [`NativeFrame`] and [`NativeSymbol`]
 
-`NativeFrame` carries the resolved symbol plus frame classification:
+`NativeFrame`:
 
 | Field | Meaning |
 | --- | --- |
 | `pc` | Program counter. |
-| `sp` | Stack pointer when available. Currently `0` for frames produced by the public symbolizer. |
-| `symbol` | Optional `NativeSymbol`. Missing means address-only fallback. |
-| `is_python_runtime` | Whether this frame belongs to Python runtime machinery. |
-| `kind` | `FrameKind::Native`, `Kernel`, or `Unknown`. |
-| `origin` | `SymbolOrigin` that explains where the name came from. |
-| `flags` | `FrameFlags` for UI policy. |
+| `sp` | Stack pointer when available (currently `0` from the public symbolizer). |
+| `symbol` | `Option<NativeSymbol>`. `None` means address-only. |
+| `is_python_runtime` | Belongs to Python runtime machinery. |
+| `kind` | [`FrameKind::Native`], `Kernel`, or `Unknown`. |
+| `origin` | [`SymbolOrigin`]. Where the name came from. |
+| `flags` | [`FrameFlags`] for UI policy. |
 
-`NativeSymbol` includes the symbol name, optional source file and line, module
-name, module/file basename offsets, module-relative offset, and Python-runtime
-helpers such as `is_eval_frame` and `should_ignore`.
+`NativeSymbol` carries the symbol name, optional source file / line, module
+name, basename offsets, module-relative offset, and Python-runtime helpers
+like `is_eval_frame` and `should_ignore`.
 
-### `FrameKind`, `SymbolOrigin`, and `FrameFlags`
+### Kinds, origins, flags
 
 | Type | Values |
 | --- | --- |
-| `FrameKind` | `Python`, `Native`, `Kernel`, `Unknown` |
-| `SymbolOrigin` | `Elf`, `PerfMap`, `KernelSymbols`, `AddressOnly` |
-| `FrameFlags` | `PYTHON_RUNTIME`, `PYTHON_EVAL`, `HIDDEN_DEFAULT`, `JIT`, `ANONYMOUS` |
+| [`FrameKind`] | `Python`, `Native`, `Kernel`, `Unknown` |
+| [`SymbolOrigin`] | `Elf`, `PerfMap`, `KernelSymbols`, `AddressOnly` |
+| [`FrameFlags`] | `PYTHON_RUNTIME`, `PYTHON_EVAL`, `HIDDEN_DEFAULT`, `JIT`, `ANONYMOUS` |
 
-UI code commonly hides `HIDDEN_DEFAULT`, labels `JIT`, groups by `FrameKind`,
-and exposes `SymbolOrigin` in debug or detail views.
+UIs typically hide `HIDDEN_DEFAULT`, badge `JIT`, group by [`FrameKind`], and
+expose [`SymbolOrigin`] in a details view.
 
-## Process launch and state helpers
+## Process launch and liveness
 
-### `process::SuspendedLaunchedProcess`
+### [`process::SuspendedLaunchedProcess`]
 
-| Method | Purpose |
+| Method | What it does |
 | --- | --- |
-| `launch_in_suspended_state(command_name, command_args, env_vars)` | Fork a child that waits before `execve`. |
-| `pid()` | Return the child PID before it has executed. |
-| `unsuspend_and_run()` | Allow the child to execute and return `RunningProcess`. |
+| `launch_in_suspended_state(cmd, args, env)` | Fork a child that waits before `execve`. |
+| `pid()` | The child's PID before it has executed. |
+| `unsuspend_and_run()` | Let it `execve`, returns [`process::RunningProcess`]. |
 
-### `process::RunningProcess`
+### [`process::RunningProcess`]
 
-| Method | Purpose |
+| Method | What it does |
 | --- | --- |
 | `try_wait()` | Non-blocking wait. |
-| `wait()` | Blocking wait until process exit. |
+| `wait()` | Blocking wait until exit. |
 
-### `children`
+### [`children`]
 
-| Function | Purpose |
+| Function | What it does |
 | --- | --- |
-| `discover_all_descendants(root)` | Discover descendant PIDs using `/proc/<pid>/task/*/children` with a `/proc/*/stat` fallback. |
+| `discover_all_descendants(root)` | Descendant PIDs via `/proc/<pid>/task/*/children`, falling back to `/proc/*/stat`. |
 
-### `state`
+### [`state`]
 
-| Function or type | Purpose |
+| Function or type | What it does |
 | --- | --- |
-| `ProcessExitWatcher::try_new(pid)` | Create a pidfd-based exit watcher. |
-| `ProcessExitWatcher::poll()` | Poll for exit without blocking. |
-| `process_exists(pid)` | Check whether a process appears alive. |
-| `interrupt_process(pid)` | Send `SIGINT`. |
-| `kill_process(pid)` | Send `SIGKILL`. |
+| `ProcessExitWatcher::try_new(pid)` | pidfd-based exit watcher. |
+| `ProcessExitWatcher::poll()` | Non-blocking exit check. |
+| `process_exists(pid)` | Does this PID look alive? |
+| `interrupt_process(pid)` | `SIGINT`. |
+| `kill_process(pid)` | `SIGKILL`. |
 
 ## Error statistics
 
-`SampleErrorStats` records per-kind sample failures. It is cloneable, resettable,
-and can be formatted with `ErrorStatsFormatter`.
+[`SampleErrorStats`] records per-kind failures. Cloneable, resettable,
+printable via [`ErrorStatsFormatter`].
 
-| Type or method | Purpose |
+| Item | What it does |
 | --- | --- |
-| `SampleErrorKind` | Enumerates stack, frame parsing, native unwind, merge, and thread-list failures. |
-| `SampleErrorStats::record(kind)` | Increment a counter. |
-| `SampleErrorStats::record_with_log(kind, context)` | Increment and emit a throttled debug log. |
+| [`SampleErrorKind`] | Stack, frame-parse, unwind, merge, and thread-list failure kinds. |
+| `record(kind)` | Bump a counter. |
+| `record_with_log(kind, ctx)` | Bump and emit a throttled debug log. |
 | `get(kind)` | Read one counter. |
-| `total()` | Sum all counters. |
-| `has_errors()` | Check if any counter is non-zero. |
-| `iter_nonzero()` | Iterate non-zero counters. |
-| `reset()` | Clear counters. |
+| `total()` | Sum across kinds. |
+| `has_errors()` | Any non-zero? |
+| `iter_nonzero()` | Iterate the non-zero counters. |
+| `reset()` | Zero everything. |
 | `ErrorStatsFormatter::new(stats, total_samples, successful_samples)` | Build a display formatter. |
 | `write_to(writer)` | Write a grouped report. |
 
@@ -275,25 +264,25 @@ and can be formatted with `ErrorStatsFormatter`.
 
 | Item | Meaning |
 | --- | --- |
-| `MAX_SAMPLE_USER_STACK` | Maximum user stack bytes accepted by the perf sampling configuration. |
-| `max_sample_rate()` | Read `/proc/sys/kernel/perf_event_max_sample_rate`, returning `None` if unavailable. |
-| `is_python_module(name)` | Return whether a basename looks like a Python executable or libpython name. |
-| `path_to_name(path)` | Return a display name from a path. |
-| `ModuleImageBase` | Helper for translating runtime AVMA addresses to static VMAs. |
-| `PerfFrequencyLimit` | Error payload used when requested frequency exceeds the kernel max sample rate. |
+| [`MAX_SAMPLE_USER_STACK`] | Maximum user stack bytes perf will accept. |
+| [`max_sample_rate`] | Reads `/proc/sys/kernel/perf_event_max_sample_rate`, `None` if unavailable. |
+| [`is_python_module`] | Does this basename look like a Python executable or `libpython`? |
+| [`path_to_name`] | Display name from a path. |
+| [`ModuleImageBase`] | Translates runtime AVMA addresses to static VMAs. |
+| [`PerfFrequencyLimit`] | Error payload when requested frequency exceeds the kernel cap. |
 
-## Spool file invariants
+## Spool format invariants
 
-The spool format is append-only and compact:
+Append-only and compact:
 
-- Modules, frames, stack nodes, threads, samples, and process exec markers are
-  separate record kinds.
-- Frames are interned. Repeated frames are stored once.
-- Stacks are represented as prefix nodes. Repeated stack suffixes are shared.
+- Modules, frames, stack nodes, threads, samples, and process exec markers
+  are separate record kinds.
+- Frames are interned. Repeated frames stored once.
+- Stacks are prefix nodes. Common suffixes shared.
 - Threads are interned by `(process_id, thread_id)`.
-- Sample timestamps are stored as deltas in nanoseconds.
-- `timestamp_us` maps sample time to the profile timeline using the stored start
-  timestamp and the first sample timestamp.
+- Sample timestamps stored as deltas (ns).
+- `timestamp_us` maps perf time to profile time using the stored start
+  timestamp and the first sample.
 
-The on-disk format is an implementation detail. Use `PerfSpoolReader` rather
-than parsing spool files directly.
+The on-disk layout is an implementation detail. Read spool files through
+[`PerfSpoolReader`].

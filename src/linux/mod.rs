@@ -21,11 +21,11 @@ use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::ElfSectionCache;
-use crate::spool::{
-    FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter, SampleRecord as SpoolSample,
-};
+use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
 use convert_regs::ConvertRegs;
-use perf_event::{EventRef, EventSource};
+use perf_event::{
+    CallChainEntry, CallChainRef, EventRecord, EventRef, EventSource, SampleRecordRef,
+};
 pub use perf_group::AttachMode;
 use perf_group::PerfGroupOptions;
 use types::{StackFrame, StackMode};
@@ -126,7 +126,6 @@ pub struct PerfRecorder {
     python_perf_support_processes: FxHashSet<i32>,
     python_runtime_processes: FxHashSet<i32>,
     stack_scratch: Vec<StackFrame>,
-    frame_scratch: Vec<FrameRecord>,
     summary: PerfSummary,
 }
 
@@ -139,7 +138,6 @@ struct EventContext<'a, W: std::io::Write> {
     writer: &'a mut PerfSpoolWriter<W>,
     summary: &'a mut PerfSummary,
     stack_scratch: &'a mut Vec<StackFrame>,
-    frame_scratch: &'a mut Vec<FrameRecord>,
     thread_actions: &'a mut Vec<ThreadAction>,
     process_actions: &'a mut Vec<ProcessAction>,
 }
@@ -207,7 +205,6 @@ impl PerfRecorder {
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch: Vec::with_capacity(128),
-            frame_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
                 ..PerfSummary::default()
@@ -229,7 +226,6 @@ impl PerfRecorder {
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch,
-            frame_scratch,
             writer,
             summary,
         } = self;
@@ -246,7 +242,6 @@ impl PerfRecorder {
                 writer,
                 summary,
                 stack_scratch,
-                frame_scratch,
                 thread_actions: &mut thread_actions,
                 process_actions: &mut process_actions,
             };
@@ -413,8 +408,9 @@ fn handle_event<W: std::io::Write>(
     let event_timestamp_ns = event_ref.timestamp().unwrap_or(0);
     let (privilege, record) = event_ref.into_parts();
     match record {
-        Record::Sample(sample) => record_sample(ctx, &sample, privilege),
-        Record::Mmap(mmap) => {
+        EventRecord::Sample(sample) => record_sample_ref(ctx, sample, privilege),
+        EventRecord::Owned(Record::Sample(sample)) => record_sample(ctx, &sample, privilege),
+        EventRecord::Owned(Record::Mmap(mmap)) => {
             record_mmap(ctx.modules, ctx.unwinders, ctx.writer, &mmap, privilege)?;
             record_python_runtime_mmap(
                 &mmap,
@@ -425,7 +421,7 @@ fn handle_event<W: std::io::Write>(
                 ctx.writer,
             )
         }
-        Record::Fork(fork) if fork.task.pid != fork.parent_task.pid => {
+        EventRecord::Owned(Record::Fork(fork)) if fork.task.pid != fork.parent_task.pid => {
             let Some(pid) = i32_from_u32(fork.task.pid) else {
                 return Ok(());
             };
@@ -447,7 +443,7 @@ fn handle_event<W: std::io::Write>(
             });
             ctx.modules.clone_process_modules(ppid, pid, ctx.writer)
         }
-        Record::Fork(fork) if fork.task.pid == fork.parent_task.pid => {
+        EventRecord::Owned(Record::Fork(fork)) if fork.task.pid == fork.parent_task.pid => {
             if fork.task.tid != fork.parent_task.tid {
                 ctx.thread_actions.push(ThreadAction::Fork {
                     tid: fork.task.tid,
@@ -456,7 +452,7 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        Record::Comm(comm) if comm.task.pid == comm.task.tid => {
+        EventRecord::Owned(Record::Comm(comm)) if comm.task.pid == comm.task.tid => {
             if let Some(pid) = i32_from_u32(comm.task.pid) {
                 if comm.by_execve {
                     cleanup_process_modules(pid, ctx.modules, ctx.unwinders);
@@ -505,7 +501,7 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        Record::Exit(exit) if exit.task.pid == exit.task.tid => {
+        EventRecord::Owned(Record::Exit(exit)) if exit.task.pid == exit.task.tid => {
             if let Some(pid) = i32_from_u32(exit.task.pid) {
                 if ctx.python_runtime_processes.remove(&pid) {
                     ctx.writer
@@ -522,18 +518,18 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        Record::Exit(exit) => {
+        EventRecord::Owned(Record::Exit(exit)) => {
             if exit.task.pid == exit.parent_task.pid {
                 ctx.thread_actions
                     .push(ThreadAction::Exit { tid: exit.task.tid });
             }
             Ok(())
         }
-        Record::LostRecords(lost) => {
+        EventRecord::Owned(Record::LostRecords(lost)) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_records);
             Ok(())
         }
-        Record::LostSamples(lost) => {
+        EventRecord::Owned(Record::LostSamples(lost)) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_samples);
             Ok(())
         }
@@ -647,16 +643,82 @@ fn record_sample<W: std::io::Write>(
     sample: &Sample,
     privilege: Priv,
 ) -> io::Result<()> {
+    record_sample_view(ctx, SampleView::from_owned(sample), privilege)
+}
+
+fn record_sample_ref<W: std::io::Write>(
+    ctx: &mut EventContext<'_, W>,
+    sample: SampleRecordRef<'_>,
+    privilege: Priv,
+) -> io::Result<()> {
+    record_sample_view(ctx, SampleView::from_ref(sample), privilege)
+}
+
+#[derive(Clone, Copy)]
+struct SampleView<'a> {
+    task: Option<(u32, u32)>,
+    timestamp_ns: Option<u64>,
+    code_addr: Option<(u64, bool)>,
+    user_regs: Option<&'a [u64]>,
+    user_stack: Option<&'a [u8]>,
+    call_chain: SampleCallChain<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum SampleCallChain<'a> {
+    None,
+    Owned(&'a [CallChain]),
+    Borrowed(CallChainRef<'a>),
+}
+
+impl<'a> SampleView<'a> {
+    fn from_owned(sample: &'a Sample) -> Self {
+        Self {
+            task: sample
+                .record_id
+                .task
+                .as_ref()
+                .map(|task| (task.pid, task.tid)),
+            timestamp_ns: sample.record_id.time,
+            code_addr: sample.code_addr,
+            user_regs: sample.user_regs.as_ref().map(|(regs, _)| regs.as_slice()),
+            user_stack: sample.user_stack.as_deref(),
+            call_chain: sample
+                .call_chain
+                .as_deref()
+                .map_or(SampleCallChain::None, SampleCallChain::Owned),
+        }
+    }
+
+    fn from_ref(sample: SampleRecordRef<'a>) -> Self {
+        Self {
+            task: sample.task.map(|task| (task.pid, task.tid)),
+            timestamp_ns: sample.time,
+            code_addr: sample.code_addr,
+            user_regs: sample.user_regs.map(|regs| regs.as_slice()),
+            user_stack: sample.user_stack,
+            call_chain: sample
+                .call_chain
+                .map_or(SampleCallChain::None, SampleCallChain::Borrowed),
+        }
+    }
+}
+
+fn record_sample_view<W: std::io::Write>(
+    ctx: &mut EventContext<'_, W>,
+    sample: SampleView<'_>,
+    privilege: Priv,
+) -> io::Result<()> {
     bump(&mut ctx.summary.sample_events);
-    let Some(task) = sample.record_id.task.as_ref() else {
+    let Some((raw_pid, raw_tid)) = sample.task else {
         bump(&mut ctx.summary.missing_pid_samples);
         return Ok(());
     };
-    let Some(pid) = i32_from_u32(task.pid) else {
+    let Some(pid) = i32_from_u32(raw_pid) else {
         bump(&mut ctx.summary.missing_pid_samples);
         return Ok(());
     };
-    let Some(tid) = i32_from_u32(task.tid) else {
+    let Some(tid) = i32_from_u32(raw_tid) else {
         bump(&mut ctx.summary.missing_tid_samples);
         return Ok(());
     };
@@ -664,7 +726,7 @@ fn record_sample<W: std::io::Write>(
         bump(&mut ctx.summary.idle_tid_samples);
         return Ok(());
     }
-    let Some(timestamp_ns) = sample.record_id.time else {
+    let Some(timestamp_ns) = sample.timestamp_ns else {
         bump(&mut ctx.summary.missing_timestamp_samples);
         return Ok(());
     };
@@ -677,27 +739,29 @@ fn record_sample<W: std::io::Write>(
         ctx.stack_scratch,
         ctx.summary,
     );
-    ctx.frame_scratch.clear();
-    for frame in ctx.stack_scratch.iter().copied() {
-        if matches!(frame, StackFrame::TruncatedStackMarker) {
-            bump(&mut ctx.summary.truncated_frame_markers);
-            continue;
-        }
-        if let Some(frame) = resolve_stack_frame(ctx.modules, pid, frame) {
-            ctx.frame_scratch.push(frame);
-        }
-    }
-    if ctx.frame_scratch.is_empty() {
+    let truncated_frames = ctx
+        .stack_scratch
+        .iter()
+        .filter(|frame| matches!(frame, StackFrame::TruncatedStackMarker))
+        .count();
+    ctx.summary.truncated_frame_markers = ctx
+        .summary
+        .truncated_frame_markers
+        .saturating_add(truncated_frames as u64);
+
+    let stack_id = ctx.writer.write_sample_frames(
+        timestamp_ns,
+        pid,
+        tid as u64,
+        ctx.stack_scratch
+            .iter()
+            .copied()
+            .filter_map(|frame| resolve_stack_frame(ctx.modules, pid, frame)),
+    )?;
+    if stack_id.is_none() {
         bump(&mut ctx.summary.empty_stack_samples);
         return Ok(());
     }
-
-    ctx.writer.write_sample(&SpoolSample {
-        timestamp_ns,
-        process_id: pid,
-        thread_id: tid as u64,
-        frames: ctx.frame_scratch.as_slice(),
-    })?;
     bump(&mut ctx.summary.samples);
     Ok(())
 }
@@ -776,7 +840,7 @@ fn record_mmap_event<W: std::io::Write>(
             start: event.address,
             end: event.address.saturating_add(event.length),
             file_offset: event.page_offset,
-            path: c_string_to_string(event.path),
+            path: c_string_to_string(event.path).into(),
             is_kernel,
             inode: event.inode,
         },
@@ -898,7 +962,7 @@ fn register_existing_maps<W: std::io::Write>(
                 start: region.start,
                 end: region.end,
                 file_offset: region.file_offset,
-                path: region.path,
+                path: region.path.into(),
                 is_kernel: false,
                 inode: region.inode,
             },
@@ -915,7 +979,7 @@ fn is_python_runtime_path(path: &str) -> bool {
 }
 
 fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
-    sample: &Sample,
+    sample: SampleView<'_>,
     privilege: Priv,
     process_unwinder: &mut ProcessUnwinder,
     stack: &mut Vec<StackFrame>,
@@ -923,36 +987,10 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
 ) {
     stack.clear();
 
-    if let Some(callchain) = &sample.call_chain {
-        for chain in callchain {
-            let (mode, addresses) = match chain {
-                CallChain::Kernel(addresses)
-                | CallChain::Hv(addresses)
-                | CallChain::GuestKernel(addresses) => (StackMode::Kernel, addresses.as_slice()),
-                CallChain::User(addresses)
-                | CallChain::Guest(addresses)
-                | CallChain::GuestUser(addresses)
-                | CallChain::Unknown(addresses) => (StackMode::User, addresses.as_slice()),
-                CallChain::UserDeferred { .. } => continue,
-            };
-            if mode == StackMode::User {
-                for _ in addresses {
-                    bump(&mut summary.ignored_user_callchain_frames);
-                }
-                continue;
-            }
-            for &address in addresses {
-                stack.push(if stack.is_empty() {
-                    StackFrame::InstructionPointer(address, mode)
-                } else {
-                    StackFrame::ReturnAddress(address, mode)
-                });
-            }
-        }
-    }
+    push_sample_callchain(sample.call_chain, stack, summary);
 
-    match (&sample.user_regs, &sample.user_stack) {
-        (Some((raw_regs, _)), Some(user_stack)) => {
+    match (sample.user_regs, sample.user_stack) {
+        (Some(raw_regs), Some(user_stack)) => {
             let Some((pc, sp, regs)) = C::convert_regs(raw_regs) else {
                 record_unwind_error(summary, SampleErrorKind::NativeRegisterCapture, || {
                     "perf sample contained incomplete user register state".to_string()
@@ -1014,6 +1052,68 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
     }
 }
 
+fn push_sample_callchain(
+    call_chain: SampleCallChain<'_>,
+    stack: &mut Vec<StackFrame>,
+    summary: &mut PerfSummary,
+) {
+    match call_chain {
+        SampleCallChain::None => {}
+        SampleCallChain::Owned(chains) => {
+            for chain in chains {
+                let (mode, addresses) = match chain {
+                    CallChain::Kernel(addresses)
+                    | CallChain::Hv(addresses)
+                    | CallChain::GuestKernel(addresses) => {
+                        (StackMode::Kernel, addresses.as_slice())
+                    }
+                    CallChain::User(addresses)
+                    | CallChain::Guest(addresses)
+                    | CallChain::GuestUser(addresses)
+                    | CallChain::Unknown(addresses) => (StackMode::User, addresses.as_slice()),
+                    CallChain::UserDeferred { .. } => continue,
+                };
+                push_callchain_addresses(mode, addresses, stack, summary);
+            }
+        }
+        SampleCallChain::Borrowed(chains) => {
+            for chain in chains.iter() {
+                let (mode, addresses) = match chain {
+                    CallChainEntry::Kernel(addresses)
+                    | CallChainEntry::Hv(addresses)
+                    | CallChainEntry::GuestKernel(addresses) => (StackMode::Kernel, addresses),
+                    CallChainEntry::User(addresses)
+                    | CallChainEntry::Guest(addresses)
+                    | CallChainEntry::GuestUser(addresses)
+                    | CallChainEntry::Unknown(addresses) => (StackMode::User, addresses),
+                };
+                push_callchain_addresses(mode, addresses, stack, summary);
+            }
+        }
+    }
+}
+
+fn push_callchain_addresses(
+    mode: StackMode,
+    addresses: &[u64],
+    stack: &mut Vec<StackFrame>,
+    summary: &mut PerfSummary,
+) {
+    if mode == StackMode::User {
+        summary.ignored_user_callchain_frames = summary
+            .ignored_user_callchain_frames
+            .saturating_add(addresses.len() as u64);
+        return;
+    }
+    for &address in addresses {
+        stack.push(if stack.is_empty() {
+            StackFrame::InstructionPointer(address, mode)
+        } else {
+            StackFrame::ReturnAddress(address, mode)
+        });
+    }
+}
+
 fn read_stack_u64(stack: &[u8], index: usize) -> Result<u64, ()> {
     let offset = index.checked_mul(std::mem::size_of::<u64>()).ok_or(())?;
     let bytes = stack
@@ -1023,7 +1123,7 @@ fn read_stack_u64(stack: &[u8], index: usize) -> Result<u64, ()> {
 }
 
 fn resolve_stack_frame(
-    modules: &ModuleTable,
+    modules: &mut ModuleTable,
     process_id: i32,
     frame: StackFrame,
 ) -> Option<FrameRecord> {

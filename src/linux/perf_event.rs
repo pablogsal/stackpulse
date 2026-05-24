@@ -2,6 +2,7 @@ use std::cmp::max;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::slice;
 
 use perf_event_open::config::{
     CallChain, Clock, Cpu, Inherit, OnExecve, Opts, Proc, RecordIdFormat, RegsMask, SampleOn, Size,
@@ -12,8 +13,10 @@ use perf_event_open::event::hw::Hardware;
 use perf_event_open::event::sw::Software;
 use perf_event_open::event::Event as PerfOpenEvent;
 use perf_event_open::sample::iter::Iter as PerfEventIter;
+use perf_event_open::sample::rb::CowChunk;
 use perf_event_open::sample::record::{Priv, Record, RecordId};
 use perf_event_open::sample::Sampler;
+use perf_event_open_sys::bindings as sys;
 
 pub const MAX_SAMPLE_USER_STACK: u32 = 65_528;
 /// Size of the perf metadata page that precedes the ring buffer in the mmap.
@@ -246,15 +249,114 @@ impl Perf {
             iter: self.sampler.iter(),
         }
     }
+
+    pub fn consume_events(&self, cb: &mut impl FnMut(EventRef<'_>)) {
+        let mut iter = self.sampler.iter().into_cow();
+        while iter
+            .next(|chunk, parser| dispatch_event(chunk, parser, cb))
+            .is_some()
+        {}
+    }
 }
 
-pub struct EventRef {
+pub struct EventRef<'a> {
     privilege: Priv,
-    record: Record,
+    record: EventRecord<'a>,
     timestamp: Option<u64>,
 }
 
-impl fmt::Debug for EventRef {
+pub enum EventRecord<'a> {
+    Sample(SampleRecordRef<'a>),
+    Owned(Record),
+}
+
+#[derive(Clone, Copy)]
+pub struct SampleRecordRef<'a> {
+    pub task: Option<TaskRef>,
+    pub time: Option<u64>,
+    pub code_addr: Option<(u64, bool)>,
+    pub user_regs: Option<RegsRef<'a>>,
+    pub user_stack: Option<&'a [u8]>,
+    pub call_chain: Option<CallChainRef<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TaskRef {
+    pub pid: u32,
+    pub tid: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum RegsRef<'a> {
+    Borrowed(&'a [u64]),
+}
+
+impl<'a> RegsRef<'a> {
+    #[inline]
+    pub fn as_slice(self) -> &'a [u64] {
+        match self {
+            Self::Borrowed(regs) => regs,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CallChainRef<'a> {
+    addresses: &'a [u64],
+}
+
+impl<'a> CallChainRef<'a> {
+    pub fn iter(&self) -> CallChainIter<'a> {
+        CallChainIter {
+            addresses: self.addresses,
+            cursor: 0,
+        }
+    }
+}
+
+pub struct CallChainIter<'a> {
+    addresses: &'a [u64],
+    cursor: usize,
+}
+
+pub enum CallChainEntry<'a> {
+    User(&'a [u64]),
+    Kernel(&'a [u64]),
+    Hv(&'a [u64]),
+    Guest(&'a [u64]),
+    GuestUser(&'a [u64]),
+    GuestKernel(&'a [u64]),
+    Unknown(&'a [u64]),
+}
+
+impl<'a> Iterator for CallChainIter<'a> {
+    type Item = CallChainEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let marker = *self.addresses.get(self.cursor)?;
+        self.cursor += 1;
+        let start = self.cursor;
+        while self
+            .addresses
+            .get(self.cursor)
+            .is_some_and(|&address| !is_callchain_marker(address))
+        {
+            self.cursor += 1;
+        }
+        let addresses = &self.addresses[start..self.cursor];
+        Some(match marker {
+            sys::PERF_CONTEXT_USER => CallChainEntry::User(addresses),
+            sys::PERF_CONTEXT_KERNEL => CallChainEntry::Kernel(addresses),
+            sys::PERF_CONTEXT_HV => CallChainEntry::Hv(addresses),
+            sys::PERF_CONTEXT_GUEST => CallChainEntry::Guest(addresses),
+            sys::PERF_CONTEXT_GUEST_USER => CallChainEntry::GuestUser(addresses),
+            sys::PERF_CONTEXT_GUEST_KERNEL => CallChainEntry::GuestKernel(addresses),
+            _ => CallChainEntry::Unknown(addresses),
+        })
+    }
+}
+
+impl fmt::Debug for EventRef<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("EventRef")
             .field("privilege", &self.privilege)
@@ -263,12 +365,12 @@ impl fmt::Debug for EventRef {
     }
 }
 
-impl EventRef {
+impl<'a> EventRef<'a> {
     fn new(privilege: Priv, record: Record) -> Self {
         let timestamp = record_timestamp(&record);
         Self {
             privilege,
-            record,
+            record: EventRecord::Owned(record),
             timestamp,
         }
     }
@@ -277,7 +379,7 @@ impl EventRef {
         self.timestamp
     }
 
-    pub fn into_parts(self) -> (Priv, Record) {
+    pub fn into_parts(self) -> (Priv, EventRecord<'a>) {
         (self.privilege, self.record)
     }
 }
@@ -287,7 +389,7 @@ pub struct EventIter<'a> {
 }
 
 impl Iterator for EventIter<'_> {
-    type Item = EventRef;
+    type Item = EventRef<'static>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -326,6 +428,247 @@ fn record_timestamp(record: &Record) -> Option<u64> {
         Record::LostRecords(lost) => record_id_time(&lost.record_id),
         Record::LostSamples(lost) => record_id_time(&lost.record_id),
         Record::Unknown(_) => None,
+    }
+}
+
+fn dispatch_event(
+    chunk: CowChunk<'_>,
+    parser: &perf_event_open::sample::record::Parser,
+    cb: &mut impl FnMut(EventRef<'_>),
+) {
+    if let Some((privilege, sample)) = parse_sample_record(chunk.as_bytes(), parser.as_unsafe()) {
+        cb(EventRef {
+            privilege,
+            timestamp: sample.time,
+            record: EventRecord::Sample(sample),
+        });
+        return;
+    }
+
+    let (privilege, record) = parser.parse(chunk);
+    cb(EventRef::new(privilege, record));
+}
+
+fn parse_sample_record<'a>(
+    bytes: &'a [u8],
+    parser: &perf_event_open::sample::record::UnsafeParser,
+) -> Option<(Priv, SampleRecordRef<'a>)> {
+    if !is_u64_aligned(bytes) {
+        return None;
+    }
+    let mut cursor = ByteCursor::new(bytes);
+    let misc = read_sample_header(&mut cursor)?;
+    let sample_type = parser.sample_type;
+    let mut sample = SampleRecordRef {
+        task: None,
+        time: None,
+        code_addr: None,
+        user_regs: None,
+        user_stack: None,
+        call_chain: None,
+    };
+
+    parse_common_sample_fields(sample_type, misc, &mut cursor, &mut sample)?;
+    skip_sample_fields(sample_type, &mut cursor)?;
+    parse_stack_sample_fields(sample_type, parser, &mut cursor, &mut sample)?;
+
+    Some((priv_from_misc(misc), sample))
+}
+
+fn read_sample_header(cursor: &mut ByteCursor<'_>) -> Option<u16> {
+    let record_type = cursor.read_u32()?;
+    let misc = cursor.read_u16()?;
+    let _size = cursor.read_u16()?;
+    (record_type == sys::PERF_RECORD_SAMPLE).then_some(misc)
+}
+
+fn parse_common_sample_fields<'a>(
+    sample_type: u64,
+    misc: u16,
+    cursor: &mut ByteCursor<'a>,
+    sample: &mut SampleRecordRef<'a>,
+) -> Option<()> {
+    if has_sample(sample_type, sys::PERF_SAMPLE_IP) {
+        sample.code_addr = Some((
+            cursor.read_u64()?,
+            u32::from(misc) & sys::PERF_RECORD_MISC_EXACT_IP != 0,
+        ));
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_TID) {
+        sample.task = Some(TaskRef {
+            pid: cursor.read_u32()?,
+            tid: cursor.read_u32()?,
+        });
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_TIME) {
+        sample.time = Some(cursor.read_u64()?);
+    }
+    Some(())
+}
+
+fn skip_sample_fields(sample_type: u64, cursor: &mut ByteCursor<'_>) -> Option<()> {
+    if has_sample(sample_type, sys::PERF_SAMPLE_ADDR) {
+        cursor.skip(size_of::<u64>())?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_ID) {
+        cursor.skip(size_of::<u64>())?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_STREAM_ID) {
+        cursor.skip(size_of::<u64>())?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_CPU) {
+        cursor.skip(size_of::<u32>() * 2)?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_PERIOD) {
+        cursor.skip(size_of::<u64>())?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_READ) {
+        return None;
+    }
+    Some(())
+}
+
+fn parse_stack_sample_fields<'a>(
+    sample_type: u64,
+    parser: &perf_event_open::sample::record::UnsafeParser,
+    cursor: &mut ByteCursor<'a>,
+    sample: &mut SampleRecordRef<'a>,
+) -> Option<()> {
+    if has_sample(sample_type, sys::PERF_SAMPLE_CALLCHAIN) {
+        let len = usize::try_from(cursor.read_u64()?).ok()?;
+        sample.call_chain = Some(CallChainRef {
+            addresses: cursor.read_u64_slice(len)?,
+        });
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_RAW) {
+        let len = cursor.read_u32()? as usize;
+        cursor.skip(len)?;
+        cursor.align_to_u64()?;
+    }
+    if has_sample(sample_type, sys::PERF_SAMPLE_BRANCH_STACK) {
+        return None;
+    }
+    parse_user_regs_sample(sample_type, parser, cursor, sample)?;
+    parse_user_stack_sample(sample_type, cursor, sample)
+}
+
+fn parse_user_regs_sample<'a>(
+    sample_type: u64,
+    parser: &perf_event_open::sample::record::UnsafeParser,
+    cursor: &mut ByteCursor<'a>,
+    sample: &mut SampleRecordRef<'a>,
+) -> Option<()> {
+    if has_sample(sample_type, sys::PERF_SAMPLE_REGS_USER) {
+        let abi = cursor.read_u64()? as u32;
+        if abi != sys::PERF_SAMPLE_REGS_ABI_NONE {
+            let abi = match abi {
+                sys::PERF_SAMPLE_REGS_ABI_32 | sys::PERF_SAMPLE_REGS_ABI_64 => abi,
+                _ => return None,
+            };
+            let regs = cursor.read_u64_slice(parser.user_regs)?;
+            debug_assert!(
+                abi == sys::PERF_SAMPLE_REGS_ABI_32 || abi == sys::PERF_SAMPLE_REGS_ABI_64
+            );
+            sample.user_regs = Some(RegsRef::Borrowed(regs));
+        }
+    }
+    Some(())
+}
+
+fn parse_user_stack_sample<'a>(
+    sample_type: u64,
+    cursor: &mut ByteCursor<'a>,
+    sample: &mut SampleRecordRef<'a>,
+) -> Option<()> {
+    if has_sample(sample_type, sys::PERF_SAMPLE_STACK_USER) {
+        let len = usize::try_from(cursor.read_u64()?).ok()?;
+        let bytes = cursor.read_bytes(len)?;
+        let dyn_len = if len == 0 {
+            0
+        } else {
+            usize::try_from(cursor.read_u64()?).ok()?
+        };
+        sample.user_stack = Some(bytes.get(..dyn_len)?);
+    }
+    Some(())
+}
+
+fn has_sample(sample_type: u64, flag: sys::perf_event_sample_format) -> bool {
+    sample_type & u64::from(flag) != 0
+}
+
+fn priv_from_misc(misc: u16) -> Priv {
+    match u32::from(misc) & sys::PERF_RECORD_MISC_CPUMODE_MASK {
+        sys::PERF_RECORD_MISC_USER => Priv::User,
+        sys::PERF_RECORD_MISC_KERNEL => Priv::Kernel,
+        sys::PERF_RECORD_MISC_HYPERVISOR => Priv::Hv,
+        sys::PERF_RECORD_MISC_GUEST_USER => Priv::GuestUser,
+        sys::PERF_RECORD_MISC_GUEST_KERNEL => Priv::GuestKernel,
+        _ => Priv::Unknown,
+    }
+}
+
+fn is_u64_aligned(bytes: &[u8]) -> bool {
+    (bytes.as_ptr() as usize).is_multiple_of(align_of::<u64>())
+}
+
+fn is_callchain_marker(address: u64) -> bool {
+    address.wrapping_add(4095) < 4095
+}
+
+struct ByteCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ByteCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_u16(&mut self) -> Option<u16> {
+        self.read_array().map(u16::from_ne_bytes)
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        self.read_array().map(u32::from_ne_bytes)
+    }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        self.read_array().map(u64::from_ne_bytes)
+    }
+
+    fn read_u64_slice(&mut self, len: usize) -> Option<&'a [u64]> {
+        let byte_len = len.checked_mul(size_of::<u64>())?;
+        let bytes = self.read_bytes(byte_len)?;
+        if !is_u64_aligned(bytes) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(bytes.as_ptr().cast::<u64>(), len) })
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let bytes = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(bytes)
+    }
+
+    fn skip(&mut self, len: usize) -> Option<()> {
+        self.read_bytes(len).map(drop)
+    }
+
+    fn align_to_u64(&mut self) -> Option<()> {
+        let aligned = self.offset.checked_add(align_of::<u64>() - 1)? & !(align_of::<u64>() - 1);
+        if aligned > self.bytes.len() {
+            return None;
+        }
+        self.offset = aligned;
+        Some(())
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.read_bytes(N)?.try_into().ok()
     }
 }
 

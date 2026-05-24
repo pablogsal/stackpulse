@@ -2,6 +2,7 @@ SHELL := /bin/sh
 
 CARGO ?= cargo
 CARGO_FLAGS ?=
+CLIPPY_ARGS ?= --workspace --all-targets --all-features $(CARGO_FLAGS) -- -D warnings
 
 .PHONY: check test fmt fmt-check clippy doc coverage coverage-html coverage-lcov ci clean require-cargo-llvm-cov
 
@@ -18,7 +19,7 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 
 clippy:
-	$(CARGO) clippy --workspace --all-targets $(CARGO_FLAGS) -- -D warnings
+	$(CARGO) clippy $(CLIPPY_ARGS)
 
 doc:
 	$(CARGO) doc --workspace --no-deps $(CARGO_FLAGS)

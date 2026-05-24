@@ -1,125 +1,74 @@
-# stackpulse API documentation
+A library for recording Linux CPU stack samples and resolving them into
+displayable frames. Designed to be embedded in profilers, capture agents,
+benchmark harnesses, and developer tooling.
 
-This directory is the user documentation for `stackpulse`. It is separate from
-the crate README on purpose: the README gives a short project overview, while
-these pages explain how to build reliable profilers and analysis tools on top
-of the Rust API.
+`stackpulse` does the recording and symbolization. It does not aggregate,
+render flame graphs, or choose an output format. That is left to the calling
+application.
 
-The docs follow the Diataxis shape:
+# Quick example
 
-| Need | Document |
-| --- | --- |
-| Learn the end-to-end workflow | [Tutorials](tutorials.md) |
-| Solve an operational problem | [How-to guides](how-to.md) |
-| Look up public types and fields | [Reference](reference.md) |
-| Understand how Linux perf sampling works here | [Explanation](explanation.md) |
-
-## The core workflow
-
-`stackpulse` has four main concepts:
-
-1. `PerfRecorder` attaches to one or more Linux processes and drains
-   `perf_event_open` records into a compact spool file.
-2. `PerfSpoolReader` reads that file back into samples, modules, process
-   execution markers, and interned stack frames.
-3. `PerfSymbolizer` turns raw frame addresses into displayable frames using ELF
-   symbols, Python perf maps, kernel symbols, and address-only fallbacks.
-4. The `profile` data types describe the resolved frames that a UI, exporter,
-   flame graph builder, or report generator can consume.
-
-The normal recording loop is:
-
-```rust
+```rust,ignore
 use std::time::{Duration, Instant};
+use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer};
 
-use stackpulse::{
-    AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
-};
+let mut recorder = PerfRecorder::attach(
+    pid,
+    "profile.spool",
+    AttachMode::StopAttachEnableResume,
+    PerfRecorderOptions { frequency: 99, stack_size: 60 * 1024, ..Default::default() },
+)?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pid = std::env::args().nth(1).expect("pid").parse::<u32>()?;
-
-    let mut recorder = PerfRecorder::attach(
-        pid,
-        "profile.spool",
-        AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions {
-            frequency: 99,
-            stack_size: 60 * 1024,
-            ..PerfRecorderOptions::default()
-        },
-    )?;
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && recorder.process_is_active(pid as i32) {
-        recorder.wait()?;
-        recorder.consume_available()?;
-    }
-
-    let summary = recorder.finish()?;
-    eprintln!("wrote {} samples", summary.samples);
-
-    let reader = PerfSpoolReader::open("profile.spool")?;
-    let mut symbolizer = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
-
-    for sample in reader.samples().iter().take(5) {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
-        let frames = symbolizer.stack_to_cached_frames(
-            sample.process_id,
-            sample.stack_id,
-            &raw_frames,
-        );
-
-        println!(
-            "{} us pid={} tid={}",
-            reader.timestamp_us(sample),
-            sample.process_id,
-            sample.thread_id
-        );
-        for frame in frames.iter() {
-            println!("  {}", frame.func_name());
-        }
-    }
-
-    Ok(())
+let deadline = Instant::now() + Duration::from_secs(10);
+while Instant::now() < deadline && recorder.process_is_active(pid as i32) {
+    recorder.wait()?;
+    recorder.consume_available()?;
 }
+recorder.finish()?;
+
+let reader = PerfSpoolReader::open("profile.spool")?;
+let mut symbolizer = PerfSymbolizer::new(reader.modules());
+
+for sample in reader.samples() {
+    let raw = reader.stack_frame_refs(sample.stack_id)?;
+    let frames = symbolizer.stack_refs_to_cached_frames(sample.process_id, sample.stack_id, raw);
+    for frame in frames.iter() {
+        println!("{}", frame.func_name());
+    }
+}
+# Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
-## What the library is good at
+# Core types
 
-Use `stackpulse` when you need to embed Linux CPU stack sampling in another Rust
-program. It is designed for profilers, CI performance capture, local developer
-tools, and service-side capture agents that want to store a profile first and
-render or export it later.
+| Type | Role |
+| --- | --- |
+| [`PerfRecorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
+| [`PerfSpoolReader`] | Reads a spool file back into samples, modules, exec markers, and interned stack frames. |
+| [`PerfSymbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. |
+| [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
 
-It is not a command-line profiler by itself. It does not choose a report format
-for you, and it intentionally leaves aggregation, flame graph construction,
-storage policy, and UI decisions to the application using the crate.
+Recording and symbolization are deliberately separate. The recorder writes a
+self-contained spool file; symbolization happens later, off the hot path, and
+can run on a different host as long as the binaries and perf maps are
+preserved.
 
-## Runtime requirements
+# Vocabulary
 
-`stackpulse` is Linux-only. The crate uses `perf_event_open`, `/proc`, ELF
-metadata, optional `/proc/kallsyms`, and optional Python perf maps in `/tmp`.
-
-Most user-space recordings work as the same user that owns the target process.
-Kernel frames, restricted systems, containerized environments, and high sample
-rates can require extra permissions or sysctl changes. See
-[How Linux perf sampling works in stackpulse](explanation.md) for the model and
-[How-to guides](how-to.md) for practical recipes.
-
-## Documentation quality contract
-
-The API docs use the same vocabulary across pages:
-
-- A **sample** is one timestamped observation of one thread.
-- A **module** is an executable memory range such as a binary, shared object,
+- A sample is one timestamped observation of one thread.
+- A module is an executable memory range: a binary, shared object,
   anonymous JIT mapping, or kernel range.
-- A **raw frame** is an address stored in the spool file.
-- A **resolved frame** is a displayable `ResolvedFrame` produced by
-  `PerfSymbolizer`.
-- A **spool file** is the compact on-disk profile written by `PerfRecorder`.
+- A raw frame is an address recorded in the spool file.
+- A resolved frame is a displayable [`ResolvedFrame`] produced by
+  [`PerfSymbolizer`].
+- A spool file is the compact on-disk profile written by [`PerfRecorder`].
 
-When adding new public APIs, update [Reference](reference.md). When adding new
-recording behaviors or operational constraints, update [How-to guides](how-to.md)
-and [Explanation](explanation.md).
+# Runtime requirements
+
+Linux only. Uses `perf_event_open`, `/proc`, ELF metadata, optional
+`/proc/kallsyms`, and optional Python perf maps under `/tmp`.
+
+User-space recording works as the same user that owns the target. Kernel
+frames, containers, hardened systems, and aggressive sample rates may need
+extra capabilities (typically `CAP_PERFMON`) or `perf_event_paranoid`
+adjustments. See [Permissions](#permissions-and-system-configuration).

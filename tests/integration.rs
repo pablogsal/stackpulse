@@ -491,11 +491,10 @@ fn assert_has_python_module(reader: &PerfSpoolReader) {
 
 fn assert_has_resolved_frame(reader: &PerfSpoolReader) -> io::Result<()> {
     let mut symbolizer = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
     for sample in reader.samples() {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
+        let raw_frames = reader.stack_frame_refs(sample.stack_id)?;
         let frames =
-            symbolizer.stack_to_cached_frames(sample.process_id, sample.stack_id, &raw_frames);
+            symbolizer.stack_refs_to_cached_frames(sample.process_id, sample.stack_id, raw_frames);
         if frames.iter().any(|frame| !frame.func_name().is_empty()) {
             return Ok(());
         }
@@ -513,12 +512,11 @@ fn resolved_python_stack_frames(
     reader: &PerfSpoolReader,
 ) -> io::Result<Vec<Vec<ResolvedPythonFrame>>> {
     let mut symbolizer = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
     let mut stacks = Vec::new();
     for sample in reader.samples() {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
+        let raw_frames = reader.stack_frame_refs(sample.stack_id)?;
         let frames =
-            symbolizer.stack_to_cached_frames(sample.process_id, sample.stack_id, &raw_frames);
+            symbolizer.stack_refs_to_cached_frames(sample.process_id, sample.stack_id, raw_frames);
         let names: Vec<_> = frames
             .iter()
             .filter_map(|frame| match frame {

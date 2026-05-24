@@ -53,14 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reader = PerfSpoolReader::open("profile.spool")?;
     let mut symbols = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
 
     if let Some(sample) = reader.samples().first() {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
-        let frames = symbols.stack_to_cached_frames(
+        let raw_frames = reader.stack_frame_refs(sample.stack_id)?;
+        let frames = symbols.stack_refs_to_cached_frames(
             sample.process_id,
             sample.stack_id,
-            &raw_frames,
+            raw_frames,
         );
 
         for frame in frames.iter() {

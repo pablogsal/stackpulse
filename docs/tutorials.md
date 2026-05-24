@@ -1,56 +1,32 @@
 # Tutorials
 
-These tutorials teach the API by building complete recording flows. They assume
-you are on Linux and have permission to profile the target process.
+## Attach to an existing process
 
-## Tutorial 1: record an existing process
-
-In this tutorial you will attach to a running process, record samples for a few
-seconds, read the resulting spool file, and print resolved stack frames.
-
-### 1. Start a target process
-
-Use any CPU-bound process you own. Python is convenient because it can also emit
-perf-map symbols for Python frames:
+Pick a CPU-bound target. Python emits perf-map entries for Python frames when
+run with perf support, which makes the resolved output more interesting:
 
 ```sh
 PYTHONPERFSUPPORT=1 python3 -X perf - <<'PY'
 import os
 print(os.getpid(), flush=True)
-
-def leaf():
-    value = 0
-    while True:
-        value = (value * 33 + 17) % 1000003
-
-def middle():
-    leaf()
-
-middle()
+v = 0
+while True:
+    v = (v * 33 + 17) % 1000003
 PY
 ```
 
-Copy the printed PID for the next step.
+Attach to that PID, drain for ten seconds, then read the spool file back:
 
-### 2. Attach and drain perf events
-
-Add `stackpulse` to a Rust program, then record the PID:
-
-```rust
+```rust,ignore
 use std::time::{Duration, Instant};
+use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer};
 
-use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions};
-
-fn record_for_ten_seconds(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn record(pid: u32) -> stackpulse::Result<()> {
     let mut recorder = PerfRecorder::attach(
         pid,
         "profile.spool",
         AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions {
-            frequency: 99,
-            stack_size: 60 * 1024,
-            ..PerfRecorderOptions::default()
-        },
+        PerfRecorderOptions { frequency: 99, stack_size: 60 * 1024, ..Default::default() },
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -58,197 +34,111 @@ fn record_for_ten_seconds(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
         recorder.wait()?;
         recorder.consume_available()?;
     }
+    recorder.finish()?;
 
-    let summary = recorder.finish()?;
-    println!("{summary:#?}");
-    Ok(())
-}
-```
-
-The important part is the `wait` and `consume_available` loop. `wait` blocks
-briefly until a perf ring buffer is readable. `consume_available` drains queued
-records, updates module state, unwinds samples, and writes compact records to
-the spool file. `finish` flushes the file and returns final counters.
-
-### 3. Read raw samples
-
-Open the spool file and inspect its samples:
-
-```rust
-use stackpulse::PerfSpoolReader;
-
-fn print_sample_index() -> Result<(), Box<dyn std::error::Error>> {
-    let reader = PerfSpoolReader::open("profile.spool")?;
-
-    println!("modules: {}", reader.modules().len());
-    println!("samples: {}", reader.samples().len());
-    println!("process exec markers: {}", reader.process_execs().len());
-
-    for sample in reader.samples().iter().take(10) {
-        println!(
-            "{} us pid={} tid={} stack={}",
-            reader.timestamp_us(sample),
-            sample.process_id,
-            sample.thread_id,
-            sample.stack_id
-        );
-    }
-
-    Ok(())
-}
-```
-
-Samples store stack IDs rather than repeating every frame inline. This is why
-large profiles stay small when hot code produces the same stacks repeatedly.
-
-### 4. Resolve frames
-
-Use one `PerfSymbolizer` per profile and reuse it across samples. It caches both
-individual frames and whole stacks:
-
-```rust
-use stackpulse::{PerfSpoolReader, PerfSymbolizer};
-
-fn print_resolved_stacks() -> Result<(), Box<dyn std::error::Error>> {
     let reader = PerfSpoolReader::open("profile.spool")?;
     let mut symbolizer = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
 
     for sample in reader.samples().iter().take(10) {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
-        let frames = symbolizer.stack_to_cached_frames(
-            sample.process_id,
-            sample.stack_id,
-            &raw_frames,
+        let raw = reader.stack_frame_refs(sample.stack_id)?;
+        let frames = symbolizer.stack_refs_to_cached_frames(
+            sample.process_id, sample.stack_id, raw,
         );
-
-        println!("sample pid={} tid={}", sample.process_id, sample.thread_id);
-        for frame in frames.iter() {
-            println!("  {}", frame.func_name());
+        println!("pid={} tid={}", sample.process_id, sample.thread_id);
+        for f in frames.iter() {
+            println!("  {}", f.func_name());
         }
     }
-
     Ok(())
 }
 ```
 
-For the Python target above, frames may include native interpreter frames,
-Python `py::` perf-map frames, shared library frames, and address-only fallbacks
-when debug or symbol data is unavailable.
+The `wait`/`consume_available` pair is the recording loop: `wait` blocks until
+a ring buffer is readable, `consume_available` drains queued records, unwinds
+samples, and writes them. Skipping this pair lets the kernel buffers fill and
+samples are dropped as `lost_events`.
 
-## Tutorial 2: launch a process without missing startup work
+Samples reference stack IDs, not inline frames. That is why profiles stay
+small when hot code produces the same stacks repeatedly, and why you reuse a
+single [`PerfSymbolizer`], which caches resolved frames by
+`(process_id, stack_id)`.
 
-Attaching to a running process is simple, but it can miss short-lived startup
-work. To capture from the beginning, launch the child in a suspended state,
-attach with `AttachWithEnableOnExec`, then let the child execute.
+## Capture process startup
 
-```rust
+Attaching to a running process misses early startup. To profile from the
+first instruction, launch the child suspended, attach with
+`AttachWithEnableOnExec`, and let it run:
+
+```rust,ignore
 use std::ffi::{OsStr, OsString};
 use std::time::{Duration, Instant};
+use stackpulse::{process::SuspendedLaunchedProcess, AttachMode, PerfRecorder, PerfRecorderOptions};
 
-use stackpulse::{
-    process::SuspendedLaunchedProcess, AttachMode, PerfRecorder, PerfRecorderOptions,
+let args = [OsString::from("-X"), OsString::from("perf"), OsString::from("-c"),
+    OsString::from("v = 0\nfor _ in range(50_000_000):\n    v = (v + 1) % 1009\n")];
+let env = [(OsString::from("PYTHONPERFSUPPORT"), OsString::from("1"))];
+
+let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
+    OsStr::new("python3"), &args, &env,
+)?;
+
+let mut recorder = PerfRecorder::attach(
+    launched.pid(),
+    "startup.spool",
+    AttachMode::AttachWithEnableOnExec,
+    PerfRecorderOptions { frequency: 199, stack_size: 60 * 1024, ..Default::default() },
+)?;
+
+let running = launched.unsuspend_and_run()?;
+let timeout = Instant::now() + Duration::from_secs(30);
+
+let status = loop {
+    if let Some(status) = running.try_wait()? { break status; }
+    if Instant::now() >= timeout {
+        recorder.disable();
+        return Err("child did not exit before timeout".into());
+    }
+    recorder.wait()?;
+    recorder.consume_available()?;
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = [
-        OsString::from("-X"),
-        OsString::from("perf"),
-        OsString::from("-c"),
-        OsString::from(
-            "value = 0\nfor _ in range(50_000_000):\n    value = (value + 1) % 1009\n",
-        ),
-    ];
-    let env = [(OsString::from("PYTHONPERFSUPPORT"), OsString::from("1"))];
-
-    let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
-        OsStr::new("python3"),
-        &args,
-        &env,
-    )?;
-
-    let mut recorder = PerfRecorder::attach(
-        launched.pid(),
-        "startup.spool",
-        AttachMode::AttachWithEnableOnExec,
-        PerfRecorderOptions {
-            frequency: 199,
-            stack_size: 60 * 1024,
-            ..PerfRecorderOptions::default()
-        },
-    )?;
-
-    let running = launched.unsuspend_and_run()?;
-    let timeout = Instant::now() + Duration::from_secs(30);
-
-    let status = loop {
-        if let Some(status) = running.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= timeout {
-            recorder.disable();
-            return Err("child did not exit before timeout".into());
-        }
-        recorder.wait()?;
-        recorder.consume_available()?;
-    };
-
-    recorder.consume_available()?;
-    let summary = recorder.finish()?;
-
-    println!("child status: {status:?}");
-    println!("samples written: {}", summary.samples);
-    Ok(())
-}
+recorder.consume_available()?;
+let summary = recorder.finish()?;
+println!("status={status:?} samples={}", summary.samples);
+# Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
-Use this pattern for profilers that launch the workload themselves, benchmarks
-where startup matters, and short-lived commands.
+The kernel enables the perf events on `execve`, so nothing is recorded before
+the child has loaded its binary, and nothing is missed after.
 
-## Tutorial 3: build a tiny stack counter
+## Aggregate into a stack histogram
 
-Most applications do not print raw samples directly. They aggregate repeated
-stacks first:
+Real consumers count repeated stacks rather than printing them. This is the
+seed of a flame graph exporter:
 
-```rust
+```rust,ignore
 use std::collections::BTreeMap;
-
 use stackpulse::{PerfSpoolReader, PerfSymbolizer};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let reader = PerfSpoolReader::open("profile.spool")?;
-    let mut symbolizer = PerfSymbolizer::new(reader.modules());
-    let mut raw_frames = Vec::new();
-    let mut counts = BTreeMap::<String, u64>::new();
+let reader = PerfSpoolReader::open("profile.spool")?;
+let mut symbolizer = PerfSymbolizer::new(reader.modules());
+let mut counts = BTreeMap::<String, u64>::new();
 
-    for sample in reader.samples() {
-        reader.stack_frames(sample.stack_id, &mut raw_frames)?;
-        let frames = symbolizer.stack_to_cached_frames(
-            sample.process_id,
-            sample.stack_id,
-            &raw_frames,
-        );
-
-        let key = frames
-            .iter()
-            .map(|frame| frame.func_name())
-            .collect::<Vec<_>>()
-            .join(";");
-        *counts.entry(key).or_default() += 1;
-    }
-
-    let mut rows = counts.into_iter().collect::<Vec<_>>();
-    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-
-    for (stack, count) in rows.iter().take(20) {
-        println!("{count:>8} {stack}");
-    }
-
-    Ok(())
+for sample in reader.samples() {
+    let raw = reader.stack_frame_refs(sample.stack_id)?;
+    let frames = symbolizer.stack_refs_to_cached_frames(sample.process_id, sample.stack_id, raw);
+    let key = frames.iter().map(|f| f.func_name()).collect::<Vec<_>>().join(";");
+    *counts.entry(key).or_default() += 1;
 }
+
+let mut rows: Vec<_> = counts.into_iter().collect();
+rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+for (stack, count) in rows.iter().take(20) {
+    println!("{count:>8} {stack}");
+}
+# Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
-This is the starting point for flame graph exporters and profile UIs. Production
-exporters usually preserve more metadata than the example above: process ID,
-thread ID, timestamp range, frame kind, symbol origin, file names, and line
-numbers when available.
+A production exporter preserves more metadata: process and thread IDs,
+timestamps, [`FrameKind`], [`SymbolOrigin`], file names, line numbers, and
+typically respects [`FrameFlags::HIDDEN_DEFAULT`] when rendering.

@@ -1,13 +1,13 @@
-# How-to guides
+# Recipes
 
-Use these guides when you already understand the basic recording flow and need
-to make a profiler behave correctly in a specific situation.
+Short snippets for things you usually want to do once you've got the basic
+recording loop working.
 
-## Choose recording options
+## Pick recording options
 
-Start with conservative options:
+Start conservative:
 
-```rust
+```rust,ignore
 use stackpulse::PerfRecorderOptions;
 
 let options = PerfRecorderOptions {
@@ -15,153 +15,141 @@ let options = PerfRecorderOptions {
     stack_size: 60 * 1024,
     include_kernel: false,
     inherit_child_processes: false,
-    ..PerfRecorderOptions::default()
+    ..Default::default()
 };
 ```
 
-Tune from there:
+Knobs:
 
-| Option | Use it when | Tradeoff |
+| Field | When to change it | What it costs |
 | --- | --- | --- |
-| `frequency` | You need more or fewer samples per second. | Higher values improve temporal detail but increase overhead and lost-event risk. |
-| `stack_size` | Native stacks are truncated or unwind errors show stack reads are too small. | Larger stacks increase per-sample memory copied by the kernel. Must not exceed `MAX_SAMPLE_USER_STACK`. |
-| `include_kernel` | You need syscall, scheduler, driver, or kernel lock attribution. | May require extra permissions. If the attach only fails because kernel sampling is denied, `PerfRecorder::attach` retries user-only and sets `summary.kernel_enabled` to `false`. |
-| `inherit_child_processes` | Forked child processes are part of the workload. | Opens more perf events and increases bookkeeping. |
-| `start_timestamp_us` | You need profile timestamps aligned to an external clock or trace. | Stored as profile metadata and used by `PerfSpoolReader::timestamp_us`. |
-| `sample_interval_us` | Your UI or export format expects an interval hint. | Stored as metadata; it does not drive kernel sampling. |
+| `frequency` | Need more or fewer samples per second. | Higher = more overhead and more lost events under load. |
+| `stack_size` | Stacks are getting truncated. | More memory copied per sample. Cap is [`MAX_SAMPLE_USER_STACK`]. |
+| `include_kernel` | Want syscall, scheduler, or kernel-lock attribution. | Often needs extra perms. If only kernel sampling is denied, [`PerfRecorder::attach`] retries user-only and reports `summary.kernel_enabled = false`. |
+| `inherit_child_processes` | Forked children are part of the workload. | Opens more perf events; more bookkeeping. |
+| `start_timestamp_us` | Aligning the profile to an external clock or trace. | Just metadata, used by [`PerfSpoolReader::timestamp_us`]. |
+| `sample_interval_us` | UI or export format wants an interval hint. | Metadata only; doesn't drive kernel sampling. |
 
-Check the kernel frequency limit before requesting aggressive sample rates:
+Check the kernel cap before asking for an aggressive rate:
 
-```rust
+```rust,ignore
 if let Some(limit) = stackpulse::max_sample_rate() {
-    println!("kernel max sample rate: {limit}");
+    println!("kernel cap: {limit}");
 }
 ```
 
-## Drain a recorder without losing queued data
+## Drain without dropping samples
 
-Always call `consume_available` in the recording loop and once more before
-`finish`:
+Call `consume_available` inside the loop and once more before `finish`:
 
-```rust
+```rust,ignore
 while recorder.process_is_active(pid as i32) {
     recorder.wait()?;
     recorder.consume_available()?;
 }
-
 recorder.consume_available()?;
 let summary = recorder.finish()?;
 ```
 
-If your application has its own event loop, call `wait` from a blocking worker
-or poll periodically and use `has_pending_events` to decide whether a drain is
-already useful. The important invariant is that a recorder is not just a handle:
-it must be drained for samples to reach the spool file.
+A recorder is not just a handle. If you don't drain it, samples don't make
+it to the spool file. If you have your own event loop, run `wait` from a
+worker thread or poll with [`PerfRecorder::has_pending_events`] before
+draining.
 
-## Attach to more than one process
+## Profile more than one process
 
-Create the recorder for the first process, then add more processes:
+After attaching the first PID, add the others:
 
-```rust
+```rust,ignore
 use stackpulse::AttachMode;
 
 recorder.open_process(other_pid, AttachMode::StopAttachEnableResume)?;
 ```
 
-`open_process` registers the process, discovers existing executable mappings,
-and enables sampling when `StopAttachEnableResume` is used. This is useful for
-profilers that discover a process tree themselves or attach to several service
-workers.
+To pick up everything under a known root:
 
-To discover descendants of a known root:
-
-```rust
+```rust,ignore
 for child in stackpulse::children::discover_all_descendants(root_pid) {
     recorder.open_process(child as u32, AttachMode::StopAttachEnableResume)?;
 }
 ```
 
-## Follow child processes created after recording starts
+## Follow children created after recording starts
 
-Set `inherit_child_processes`:
+Turn on `inherit_child_processes`:
 
-```rust
+```rust,ignore
 let options = stackpulse::PerfRecorderOptions {
     inherit_child_processes: true,
-    ..stackpulse::PerfRecorderOptions::default()
+    ..Default::default()
 };
 ```
 
-When enabled, `stackpulse` listens for fork events, clones module state from the
-parent, opens the new process, and records future samples for it. Existing
-descendants are not retroactively added; attach them explicitly if they were
-created before the recording started.
+The recorder watches for forks, clones the parent's module state, and opens
+the new process. Children that existed before recording started aren't picked
+up automatically; attach them yourself.
 
-## Capture newly-created threads
+## Catch threads created later
 
-`stackpulse` normally asks perf to inherit thread events. On systems or workloads
-where inheritance is unavailable or the event fan-out would be excessive, use
-periodic refresh:
+Perf inheritance usually catches new threads. When it doesn't (or you've
+deliberately turned it off to limit fan-out), refresh periodically:
 
-```rust
+```rust,ignore
 recorder.refresh_threads(pid)?;
 ```
 
-Call this from a low-frequency maintenance tick, not a hot path. The method
-scans `/proc/<pid>/task` and opens perf events for threads that were not already
-tracked.
+This scans `/proc/<pid>/task` and opens events for threads it hasn't seen.
+Run it from a slow maintenance tick, not the hot loop.
 
-## Resolve symbols efficiently
+## Resolve symbols
 
-Create one symbolizer per profile and reuse it:
+One symbolizer per profile, reused for every sample:
 
-```rust
+```rust,ignore
 let reader = stackpulse::PerfSpoolReader::open("profile.spool")?;
 let mut symbolizer = stackpulse::PerfSymbolizer::new(reader.modules());
-let mut raw_frames = Vec::new();
 
 for sample in reader.samples() {
-    reader.stack_frames(sample.stack_id, &mut raw_frames)?;
-    let frames = symbolizer.stack_to_cached_frames(
-        sample.process_id,
-        sample.stack_id,
-        &raw_frames,
+    let raw = reader.stack_frame_refs(sample.stack_id)?;
+    let frames = symbolizer.stack_refs_to_cached_frames(
+        sample.process_id, sample.stack_id, raw,
     );
-    // Render or aggregate frames here.
+    // render or aggregate
 }
 ```
 
-`stack_to_cached_frames` caches by `(process_id, stack_id)`. That matters because
-profiles often contain many samples with the same stack ID.
+`stack_refs_to_cached_frames` caches by `(process_id, stack_id)`, which matters
+because profiles tend to contain the same stacks over and over.
 
-Frame display policy is application-specific. A UI will commonly hide frames
-with `FrameFlags::HIDDEN_DEFAULT` by default, group by `FrameKind`, and expose
-`SymbolOrigin` so users can distinguish debug symbols from address fallbacks.
+Display policy is up to you. A UI typically hides
+[`FrameFlags::HIDDEN_DEFAULT`], groups by [`FrameKind`], and shows
+[`SymbolOrigin`] in detail views so users can tell ELF symbols from
+address-only fallbacks.
 
-## Get Python frames
+## Python frames
 
-`PerfSymbolizer` can use Python perf maps when the Python runtime emits them.
-Launch Python with either `-X perf` or `PYTHONPERFSUPPORT=1`; using both is fine:
+`PerfSymbolizer` reads Python perf maps when the runtime emits them. For
+modern CPython:
 
 ```sh
 PYTHONPERFSUPPORT=1 python3 -X perf app.py
 ```
 
-At read time, the default symbolizer permits perf-map lookups for all processes:
+The default symbolizer allows perf-map lookup for any PID:
 
-```rust
+```rust,ignore
 let mut symbolizer = stackpulse::PerfSymbolizer::new(reader.modules());
 ```
 
-The spool file stores Python-runtime process markers, not the contents of the
-perf-map file. If you need to symbolize later on another machine or after the
-runtime deletes `/tmp/perf-<pid>.map`, copy those perf-map files as profiling
-artifacts alongside the spool file.
+The spool file only stores Python runtime markers, not the perf-map content
+itself. If you want to symbolize later (on another machine, or after the
+runtime has cleaned up `/tmp/perf-<pid>.map`), copy those maps next to the
+spool.
 
-If stale `/tmp/perf-<pid>.map` files are a concern, restrict lookup to processes
-that your recorder most recently marked as Python runtimes:
+To avoid stale perf maps from PID reuse, restrict lookup to processes the
+recorder last saw as Python runtimes:
 
-```rust
+```rust,ignore
 let mut python_pids = std::collections::BTreeSet::new();
 for exec in reader.process_execs() {
     if exec.is_python_runtime {
@@ -172,95 +160,86 @@ for exec in reader.process_execs() {
 }
 
 let mut symbolizer = stackpulse::PerfSymbolizer::with_perf_map_processes(
-    reader.modules(),
-    python_pids,
+    reader.modules(), python_pids,
 );
 ```
 
-Disable perf maps entirely when you need purely native symbolization:
+Or skip perf maps entirely:
 
-```rust
+```rust,ignore
 let mut symbolizer = stackpulse::PerfSymbolizer::with_perf_maps(reader.modules(), false);
 ```
 
-## Include kernel frames
+## Kernel frames
 
-Set `include_kernel`:
-
-```rust
+```rust,ignore
 let options = stackpulse::PerfRecorderOptions {
     include_kernel: true,
-    ..stackpulse::PerfRecorderOptions::default()
+    ..Default::default()
 };
 ```
 
-Kernel frames are captured through perf callchains, while user frames are
-captured through copied registers and stack bytes. When kernel sampling is
-enabled, user callchain frames from perf are ignored so the native unwinder is
-still the source of user-space frames.
+Kernel frames come from perf callchains; user frames still come from the
+native unwinder. When kernel sampling is on, user callchain frames from perf
+are dropped to avoid duplicating the unwinder's work. They show up as
+`ignored_user_callchain_frames` in the summary.
 
-After attach, inspect:
+After attach, check whether kernel sampling actually stuck:
 
-```rust
+```rust,ignore
 let summary = recorder.summary();
 if !summary.kernel_enabled {
-    eprintln!("recording fell back to user-space frames only");
+    eprintln!("fell back to user-only frames");
 }
 ```
 
-Resolved kernel names come from `/proc/kallsyms` when readable. Otherwise
-kernel frames fall back to address-like names.
+Kernel names come from `/proc/kallsyms` when readable; otherwise kernel
+frames render as addresses.
 
-## Diagnose missing or low-quality samples
+## Diagnose bad profiles
 
-Use `PerfSummary` first:
+`PerfSummary` is the first place to look:
 
-```rust
+```rust,ignore
 let summary = recorder.finish()?;
-println!("events seen: {}", summary.sample_events);
-println!("samples written: {}", summary.samples);
-println!("lost events: {}", summary.lost_events);
-println!("empty stacks: {}", summary.empty_stack_samples);
-println!("truncated markers: {}", summary.truncated_frame_markers);
-println!("errors: {}", summary.error_stats.total());
+println!("events: {}",   summary.sample_events);
+println!("written: {}",  summary.samples);
+println!("lost: {}",     summary.lost_events);
+println!("empty: {}",    summary.empty_stack_samples);
+println!("truncated: {}",summary.truncated_frame_markers);
+println!("errors: {}",   summary.error_stats.total());
 ```
 
-Common interpretations:
+Reading the numbers:
 
-| Symptom | Likely cause | Next step |
+| Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `sample_events > samples` | Samples were skipped because they lacked task IDs, timestamps, or frames. | Inspect the specific summary counters. |
-| High `lost_events` | Ring buffers were overrun. | Lower frequency, drain more often, or reduce target fan-out. |
-| High `empty_stack_samples` | Register or stack capture failed, or frames could not be resolved into usable records. | Check `summary.error_stats`. |
-| High native stack truncation | `stack_size` is too small for the workload's call depth. | Increase `stack_size` up to `MAX_SAMPLE_USER_STACK`. |
-| Address-only frames | Symbol files or mappings were unavailable. | Preserve binaries/debug files and resolve on the same host when possible. |
+| `sample_events > samples` | Samples lacked PIDs, TIDs, timestamps, or frames. | Look at the specific skip counters. |
+| High `lost_events` | Ring buffers overran. | Lower `frequency`, drain more often, reduce fan-out. |
+| High `empty_stack_samples` | Register/stack capture failed, or unwind produced nothing. | Check `summary.error_stats`. |
+| Lots of truncation | `stack_size` too small. | Bump it, up to [`MAX_SAMPLE_USER_STACK`]. |
+| Mostly address-only frames | No symbols or mappings available. | Keep the binaries; symbolize on a host that has them. |
 
-For formatted error statistics:
+For a formatted breakdown:
 
-```rust
+```rust,ignore
 let mut report = String::new();
 stackpulse::ErrorStatsFormatter::new(
-    &summary.error_stats,
-    summary.sample_events,
-    summary.samples,
-)
-.write_to(&mut report)?;
+    &summary.error_stats, summary.sample_events, summary.samples,
+).write_to(&mut report)?;
 println!("{report}");
 ```
 
-## Handle permission failures
+## Permission failures
 
-Permission failures usually appear when opening perf events, reading target
-metadata from `/proc`, including kernel frames, or reading kernel symbols.
-Practical responses are:
+Most permission errors show up when opening perf events, reading `/proc`,
+asking for kernel frames, or reading `/proc/kallsyms`. Things to try:
 
-- Profile a process owned by the same user.
-- Lower `include_kernel` to `false`.
-- Request a sample rate at or below `stackpulse::max_sample_rate()`.
-- Run in an environment where `perf_event_open` is allowed.
-- Grant the profiler process the capabilities your system requires for perf
-  capture, such as `CAP_PERFMON` on newer Linux systems.
+- Profile a process you own.
+- Drop `include_kernel`.
+- Request a rate at or below `stackpulse::max_sample_rate()`.
+- Grant `CAP_PERFMON` (or whatever your kernel wants) to the profiler binary.
+- Loosen `perf_event_paranoid` in test environments.
 
-Do not treat all permission failures as fatal for user-space profiling. If the
-only denied operation was kernel frame capture, `PerfRecorder::attach` may have
-already retried without kernel frames.
+Don't bail out on every permission error. If only kernel sampling was denied,
+[`PerfRecorder::attach`] has already retried in user-only mode.

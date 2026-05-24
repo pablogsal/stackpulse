@@ -298,14 +298,7 @@ fn build_symbol_manager_config(
             config = config.redirect_path_for_testing(source.clone(), dest.clone());
         }
         for dir in debug_dirs {
-            #[cfg(feature = "wholesym-git-api")]
-            {
-                config = config.extra_symbol_directory(dir.clone());
-            }
-            #[cfg(not(feature = "wholesym-git-api"))]
-            {
-                config = config.extra_symbols_directory(dir.clone());
-            }
+            config = config.extra_symbol_directory(dir.clone());
         }
         #[cfg(feature = "debuginfod")]
         if std::env::var_os("DEBUGINFOD_URLS").is_some() {
@@ -643,78 +636,7 @@ fn build_native_symbol(
     }
 }
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "macos"),
-    not(feature = "wholesym-git-api")
-))]
-fn build_native_symbols_from_wholesym(
-    addr_info: AddressInfo,
-    _symbol_map: &WholeSymbolMap,
-    module: &Rc<str>,
-    module_offset: u64,
-    is_python_runtime: bool,
-    include_inlines: bool,
-) -> Vec<NativeSymbol> {
-    let fallback_name = addr_info.symbol.name.clone();
-    let fallback_symbol = move |source: SourceLocation| {
-        build_native_symbol(
-            fallback_name.clone(),
-            source,
-            module,
-            module_offset,
-            is_python_runtime,
-        )
-    };
-
-    let frame_capacity = addr_info.frames.as_ref().map_or(1, |frames| {
-        if include_inlines {
-            frames.len().max(1)
-        } else {
-            usize::from(!frames.is_empty())
-        }
-    });
-    let mut symbols = Vec::with_capacity(frame_capacity);
-    let mut push_frame_symbol = |frame: wholesym::FrameDebugInfo| {
-        let file = frame
-            .file_path
-            .map(|path| Rc::<str>::from(path.display_path()));
-        let source = SourceLocation {
-            file,
-            line: frame.line_number,
-            column: None,
-            function_start_line: None,
-            function_start_column: None,
-        };
-        let symbol = match frame.function {
-            Some(function) => {
-                build_native_symbol(function, source, module, module_offset, is_python_runtime)
-            }
-            None => fallback_symbol(source),
-        };
-        symbols.push(symbol);
-    };
-
-    if let Some(frames) = addr_info.frames {
-        let mut frames = frames.into_iter();
-        if include_inlines {
-            for frame in frames {
-                push_frame_symbol(frame);
-            }
-        } else if let Some(frame) = frames.next() {
-            push_frame_symbol(frame);
-        }
-    }
-
-    if symbols.is_empty() {
-        symbols.push(fallback_symbol(SourceLocation::default()));
-    }
-    symbols
-}
-
-#[cfg(all(
-    any(target_os = "linux", target_os = "macos"),
-    feature = "wholesym-git-api"
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_native_symbols_from_wholesym(
     addr_info: AddressInfo,
     symbol_map: &WholeSymbolMap,
