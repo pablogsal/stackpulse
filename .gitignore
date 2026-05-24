@@ -1,0 +1,6 @@
+/target/
+
+# Local profiler output and tool state.
+/*.spool
+/*.json
+/*.json.gz

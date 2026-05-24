@@ -1,0 +1,291 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: make fmt-check
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            git \
+            libclang-dev \
+            make \
+            pkg-config \
+            procps \
+            python3
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: make clippy
+
+  test:
+    name: test (${{ matrix.distro }})
+    needs: [fmt, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-24.04
+            image: ubuntu:24.04
+            family: apt
+            require_python_perf: "1"
+          - distro: ubuntu-22.04
+            image: ubuntu:22.04
+            family: apt
+            require_python_perf: "0"
+          - distro: debian-bookworm
+            image: debian:bookworm
+            family: apt
+            require_python_perf: "0"
+          - distro: debian-trixie
+            image: debian:trixie
+            family: apt
+            require_python_perf: "1"
+          - distro: fedora-latest
+            image: fedora:latest
+            family: dnf
+            require_python_perf: "1"
+          - distro: archlinux
+            image: archlinux:latest
+            family: pacman
+            require_python_perf: "1"
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    steps:
+      - name: Install system dependencies
+        run: |
+          if [ "${{ matrix.family }}" = "apt" ]; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              clang \
+              curl \
+              git \
+              libclang-dev \
+              make \
+              pkg-config \
+              procps \
+              python3
+          elif [ "${{ matrix.family }}" = "dnf" ]; then
+            dnf install -y \
+              ca-certificates \
+              clang \
+              clang-devel \
+              curl \
+              gcc \
+              gcc-c++ \
+              git \
+              make \
+              pkgconf-pkg-config \
+              procps-ng \
+              python3
+          else
+            pacman -Syu --noconfirm --needed \
+              base-devel \
+              ca-certificates \
+              clang \
+              curl \
+              git \
+              make \
+              pkgconf \
+              procps-ng \
+              python
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Relax perf restrictions when possible
+        run: sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - name: Test
+        env:
+          STACKPULSE_REQUIRE_PYTHON_PERF: ${{ matrix.require_python_perf }}
+        run: make test
+
+  doc-test:
+    name: doc tests
+    needs: [fmt, lint]
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            git \
+            libclang-dev \
+            make \
+            pkg-config \
+            procps \
+            python3
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Doc tests
+        run: cargo test --doc
+
+  coverage:
+    name: coverage
+    needs: [fmt, lint]
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            gnupg \
+            git \
+            libclang-dev \
+            make \
+            pkg-config \
+            procps \
+            python3
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Relax perf restrictions when possible
+        run: sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - name: Install coverage tool
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage
+        env:
+          STACKPULSE_REQUIRE_PYTHON_PERF: "1"
+        run: make coverage-lcov
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          flags: rust
+          name: stackpulse-coverage
+          disable_search: true
+          fail_ci_if_error: true
+
+  package:
+    name: package dry run
+    needs: [fmt, lint]
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            git \
+            libclang-dev \
+            make \
+            pkg-config \
+            procps \
+            python3
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Package dry run
+        run: cargo package --allow-dirty --no-verify
+
+  ci:
+    name: ci complete
+    needs: [test, doc-test, coverage, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Done
+        run: echo "CI complete"
