@@ -10,28 +10,78 @@ env:
 
 jobs:
   test:
-    name: test
+    name: test (${{ matrix.distro }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-24.04
+            image: ubuntu:24.04
+            family: apt
+          - distro: ubuntu-22.04
+            image: ubuntu:22.04
+            family: apt
+          - distro: debian-bookworm
+            image: debian:bookworm
+            family: apt
+          - distro: fedora-latest
+            image: fedora:latest
+            family: dnf
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
     steps:
+      - name: Install system dependencies
+        run: |
+          if [ "${{ matrix.family }}" = "apt" ]; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              clang \
+              curl \
+              git \
+              libclang-dev \
+              make \
+              pkg-config \
+              procps \
+              python3
+          else
+            dnf install -y \
+              ca-certificates \
+              clang \
+              clang-devel \
+              curl \
+              gcc \
+              gcc-c++ \
+              git \
+              make \
+              pkgconf-pkg-config \
+              procps-ng \
+              python3
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Relax perf restrictions when possible
+        run: sysctl -w kernel.perf_event_paranoid=-1 || true
 
       - name: Test
-        run: cargo test
+        run: make ci
+
+      - name: Doc tests
+        run: cargo test --doc
 
       - name: Package dry run
+        if: matrix.distro == 'ubuntu-24.04'
         run: cargo publish --dry-run --allow-dirty

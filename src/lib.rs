@@ -1,5 +1,52 @@
-//! Linux `perf_event_open` stack sampling, native unwinding, symbolization,
-//! and compact stack spooling.
+//! Linux process stack sampling with compact profile files.
+//!
+//! `stackpulse` records stack samples for a running process, writes them to a
+//! profile file, and reads that file back for display or export.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use stackpulse::{
+//!     AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let pid = std::env::args().nth(1).expect("pid").parse()?;
+//!
+//! let mut rec = PerfRecorder::attach(
+//!     pid,
+//!     "profile.spool",
+//!     AttachMode::StopAttachEnableResume,
+//!     PerfRecorderOptions {
+//!         frequency: 99,
+//!         stack_size: 60 * 1024,
+//!         ..PerfRecorderOptions::default()
+//!     },
+//! )?;
+//!
+//! rec.wait()?;
+//! rec.consume_available()?;
+//! rec.finish()?;
+//!
+//! let reader = PerfSpoolReader::open("profile.spool")?;
+//! let mut symbols = PerfSymbolizer::new(reader.modules());
+//! let mut raw_frames = Vec::new();
+//!
+//! if let Some(sample) = reader.samples().first() {
+//!     reader.stack_frames(sample.stack_id, &mut raw_frames)?;
+//!     let frames = symbols.stack_to_cached_frames(
+//!         sample.process_id,
+//!         sample.stack_id,
+//!         &raw_frames,
+//!     );
+//!
+//!     for frame in frames.iter() {
+//!         println!("{}", frame.func_name());
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg(target_os = "linux")]
 #![allow(dead_code)]
@@ -34,6 +81,7 @@ pub use symbolize::PerfSymbolizer;
 
 pub(crate) type FramehopSectionData = linux::elf_types::ElfSectionData;
 
+/// Return the current kernel sample-rate limit, if it can be read.
 pub fn max_sample_rate() -> Option<u64> {
     let data = std::fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate").ok()?;
     data.trim().parse().ok()

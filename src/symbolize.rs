@@ -12,6 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::native_module::ElfSectionCache;
 use crate::spool::{FrameMode, FrameRecord, ModuleRecord};
 
+/// Resolves raw profile frames into displayable frames.
 pub struct PerfSymbolizer {
     modules: Vec<ModuleRecord>,
     perf_map_processes: PerfMapProcesses,
@@ -25,8 +26,11 @@ pub struct PerfSymbolizer {
     stack_cache: FxHashMap<(i32, u32), StackFrames>,
 }
 
+/// Which processes may use Python perf-map lookups.
 pub enum PerfMapProcesses {
+    /// Allow perf-map lookup for every process.
     All,
+    /// Allow perf-map lookup only for the listed process ids.
     Pids(FxHashSet<i32>),
 }
 
@@ -49,10 +53,12 @@ struct NativeSymbolizerGroup {
 }
 
 impl PerfSymbolizer {
+    /// Create a resolver for the modules in a profile.
     pub fn new(modules: &[ModuleRecord]) -> Self {
         Self::with_perf_maps(modules, true)
     }
 
+    /// Create a resolver and choose whether Python perf-map lookup is allowed.
     pub fn with_perf_maps(modules: &[ModuleRecord], allow_perf_maps: bool) -> Self {
         let perf_map_processes = if allow_perf_maps {
             PerfMapProcesses::All
@@ -62,6 +68,7 @@ impl PerfSymbolizer {
         Self::with_perf_map_processes_inner(modules, perf_map_processes)
     }
 
+    /// Create a resolver that only uses Python perf maps for selected processes.
     pub fn with_perf_map_processes(
         modules: &[ModuleRecord],
         processes: impl IntoIterator<Item = i32>,
@@ -90,6 +97,7 @@ impl PerfSymbolizer {
         }
     }
 
+    /// Resolve `frames` for one sample, caching by process and stack id.
     pub fn stack_to_cached_frames(
         &mut self,
         process_id: i32,

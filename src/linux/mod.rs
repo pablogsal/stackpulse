@@ -70,32 +70,53 @@ impl Clone for ProcessUnwinder {
     }
 }
 
+/// Options used when attaching a [`PerfRecorder`] to a process.
 #[derive(Clone, Debug, Default)]
 pub struct PerfRecorderOptions {
+    /// Requested samples per second.
     pub frequency: u32,
+    /// Number of bytes of user stack to copy per sample.
     pub stack_size: u32,
+    /// Include kernel frames when the system permits it.
     pub include_kernel: bool,
+    /// Follow child processes created after recording starts.
     pub inherit_child_processes: bool,
+    /// Timestamp anchor stored in the profile file.
     pub start_timestamp_us: u64,
+    /// Optional sampling interval metadata stored in the profile file.
     pub sample_interval_us: u64,
 }
 
+/// Counters collected while recording.
 #[derive(Clone, Debug, Default)]
 pub struct PerfSummary {
+    /// Raw sample events seen by the recorder.
     pub sample_events: u64,
+    /// Samples written to the profile file.
     pub samples: u64,
+    /// Events reported lost by the kernel.
     pub lost_events: u64,
+    /// Whether kernel frame capture remained enabled after attach.
     pub kernel_enabled: bool,
+    /// Samples skipped because the process id was missing.
     pub missing_pid_samples: u64,
+    /// Samples skipped because the thread id was missing.
     pub missing_tid_samples: u64,
+    /// Samples skipped because they were attributed to an idle thread.
     pub idle_tid_samples: u64,
+    /// Samples skipped because the timestamp was missing.
     pub missing_timestamp_samples: u64,
+    /// Samples that did not contain frames.
     pub empty_stack_samples: u64,
+    /// Markers written when a stack had to be truncated.
     pub truncated_frame_markers: u64,
+    /// User callchain frames ignored when kernel callchains were being used.
     pub ignored_user_callchain_frames: u64,
+    /// Per-kind sample error counts.
     pub error_stats: SampleErrorStats,
 }
 
+/// Records stack samples for one or more Linux processes.
 pub struct PerfRecorder {
     perf: perf_group::PerfGroup,
     writer: PerfSpoolWriter<std::io::BufWriter<std::fs::File>>,
@@ -124,6 +145,11 @@ struct EventContext<'a, W: std::io::Write> {
 }
 
 impl PerfRecorder {
+    /// Attach to `pid` and start writing samples to `output`.
+    ///
+    /// Use [`AttachMode::StopAttachEnableResume`] for a process that is already
+    /// running. Use [`AttachMode::AttachWithEnableOnExec`] with
+    /// [`process::SuspendedLaunchedProcess`] when launching a new process.
     pub fn attach<P: AsRef<Path>>(
         pid: u32,
         output: P,
@@ -193,6 +219,7 @@ impl PerfRecorder {
         Ok(recorder)
     }
 
+    /// Drain currently readable events into the profile file.
     pub fn consume_available(&mut self) -> io::Result<()> {
         let Self {
             perf,
@@ -265,9 +292,12 @@ impl PerfRecorder {
         result
     }
 
+    /// Wait briefly for more profiling data to become readable.
     pub fn wait(&mut self) -> io::Result<()> {
         self.perf.wait()
     }
+
+    /// Add another process to this recording.
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
         self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
@@ -307,32 +337,48 @@ impl PerfRecorder {
         }
         Ok(())
     }
+
+    /// Discover newly-created threads for `pid` when needed.
     pub fn refresh_threads(&mut self, pid: u32) -> io::Result<()> {
         self.perf.refresh_threads(pid)
     }
+
+    /// Disable sampling for all attached processes.
     pub fn disable(&mut self) {
         self.perf.disable();
     }
+
+    /// Return whether unread profiling events are already queued.
     pub fn has_pending_events(&self) -> bool {
         self.perf.has_pending_events()
     }
+
+    /// Return a snapshot of the current counters.
     pub fn summary(&self) -> PerfSummary {
         self.summary.clone()
     }
+
+    /// Return the process ids still believed to be alive.
     pub fn active_processes(&mut self) -> Vec<i32> {
         self.reconcile_active_processes();
         self.active_processes.keys().copied().collect()
     }
+
+    /// Return whether `pid` is still believed to be alive.
     pub fn process_is_active(&mut self, pid: i32) -> bool {
         self.reconcile_active_processes();
         self.active_processes.contains_key(&pid)
     }
+
+    /// Return whether any active process other than `pid` remains.
     pub fn has_active_processes_except(&mut self, pid: i32) -> bool {
         self.reconcile_active_processes();
         self.active_processes
             .keys()
             .any(|&active_pid| active_pid != pid)
     }
+
+    /// Return active process ids, excluding `pid`.
     pub fn active_processes_except(&mut self, pid: i32) -> Vec<i32> {
         self.reconcile_active_processes();
         self.active_processes
@@ -342,6 +388,7 @@ impl PerfRecorder {
             .collect()
     }
 
+    /// Flush the profile file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.writer.flush()?;
         Ok(self.summary)

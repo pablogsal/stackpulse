@@ -20,6 +20,9 @@ pub struct SuspendedLaunchedProcess {
 }
 
 impl SuspendedLaunchedProcess {
+    /// Fork a child process that waits before executing `command_name`.
+    ///
+    /// This lets the parent attach a recorder before the child starts running.
     pub fn launch_in_suspended_state(
         command_name: &OsStr,
         command_args: &[OsString],
@@ -53,12 +56,14 @@ impl SuspendedLaunchedProcess {
         }
     }
 
+    /// Return the child process id.
     pub fn pid(&self) -> u32 {
         self.pid.as_raw() as u32
     }
 
     const EXECERR_MSG_FOOTER: [u8; 4] = *b"NOEX";
 
+    /// Allow the child to execute and return a handle for waiting on it.
     pub fn unsuspend_and_run(self) -> io::Result<RunningProcess> {
         // Signal the child to exec.
         write(&self.send_end_of_resume_pipe, &[0x42])?;
@@ -139,11 +144,13 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
     })
 }
 
+/// A launched process that is now running.
 pub struct RunningProcess {
     pid: Pid,
 }
 
 impl RunningProcess {
+    /// Check whether the process has exited without blocking.
     pub fn try_wait(&self) -> Result<Option<WaitStatus>, Errno> {
         Ok(match waitpid(self.pid, Some(WaitPidFlag::WNOHANG))? {
             WaitStatus::StillAlive => None,
@@ -151,6 +158,7 @@ impl RunningProcess {
         })
     }
 
+    /// Wait until the process exits.
     pub fn wait(self) -> Result<WaitStatus, Errno> {
         waitpid(self.pid, None)
     }

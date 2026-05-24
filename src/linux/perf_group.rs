@@ -61,9 +61,12 @@ fn task_gone(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
 }
 
+/// How recording should attach to a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachMode {
+    /// Attach before a not-yet-executed child is allowed to run.
     AttachWithEnableOnExec,
+    /// Briefly stop an already-running process, attach, then resume it.
     StopAttachEnableResume,
 }
 

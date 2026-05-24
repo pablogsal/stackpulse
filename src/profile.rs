@@ -3,19 +3,29 @@ use std::sync::Arc;
 
 use bitflags::bitflags;
 
+/// High-level frame category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
+    /// Python frame.
     Python,
+    /// Native user-space frame.
     Native,
+    /// Kernel frame.
     Kernel,
+    /// Frame that could not be classified.
     Unknown,
 }
 
+/// Where a symbol name came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolOrigin {
+    /// File-backed symbol information.
     Elf,
+    /// Python perf-map entry.
     PerfMap,
+    /// Kernel symbol table.
     KernelSymbols,
+    /// Address-only fallback.
     AddressOnly,
 }
 
@@ -38,6 +48,7 @@ pub struct LocationInfo {
     pub end_column: i32,
 }
 
+/// A resolved Python frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PythonFrame {
     pub file_name: Rc<str>,
@@ -85,6 +96,7 @@ pub struct SourceLocation {
     pub function_start_column: Option<u32>,
 }
 
+/// A resolved native or kernel symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeSymbol {
     pub name: Rc<str>,
@@ -131,6 +143,7 @@ impl NativeSymbol {
     }
 }
 
+/// A resolved native, kernel, or address-only frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeFrame {
     pub pc: u64,
@@ -164,9 +177,12 @@ impl NativeFrame {
     }
 }
 
+/// A resolved frame from a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedFrame {
+    /// Python frame.
     Python(PythonFrame),
+    /// Native, kernel, or address-only frame.
     Native(NativeFrame),
 }
 
@@ -180,6 +196,7 @@ impl ResolvedFrame {
     }
 }
 
+/// A resolved stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedStack {
     pub frames: Arc<[ResolvedFrame]>,

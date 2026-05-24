@@ -14,44 +14,70 @@ const REC_SAMPLE: u8 = 5;
 const REC_PROCESS_EXEC: u8 = 6;
 const NONE_U32: u32 = u32::MAX;
 
+/// A code area recorded in a profile file.
 #[derive(Clone, Debug)]
 pub struct ModuleRecord {
+    /// Stable module id within the profile.
     pub id: u32,
+    /// Process that owned this code area, or a kernel marker for kernel code.
     pub process_id: i32,
+    /// Start address in memory.
     pub start: u64,
+    /// End address in memory.
     pub end: u64,
+    /// File offset backing the start address.
     pub file_offset: u64,
+    /// File inode, when available.
     pub inode: u64,
+    /// File path or display name.
     pub path: String,
+    /// Whether this record represents kernel code.
     pub is_kernel: bool,
 }
 
+/// Whether a frame came from user code or kernel code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FrameMode {
+    /// User-space frame.
     User,
+    /// Kernel-space frame.
     Kernel,
 }
 
+/// A raw frame stored in a profile file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRecord {
+    /// Module id when the frame was matched to a module.
     pub module_id: Option<u32>,
+    /// Address relative to the matched module.
     pub rel_ip: u64,
+    /// Absolute instruction pointer.
     pub abs_ip: u64,
+    /// User/kernel mode for the frame.
     pub mode: FrameMode,
 }
 
+/// A sample record loaded from a profile file.
 #[derive(Clone, Debug)]
 pub struct OwnedSampleRecord {
+    /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
+    /// Process id for the sample.
     pub process_id: i32,
+    /// Thread id for the sample.
     pub thread_id: u64,
+    /// Stack id used with [`PerfSpoolReader::stack_frames`].
     pub stack_id: u32,
 }
 
+/// Marker for a process that executed during recording.
 #[derive(Clone, Debug)]
 pub struct ProcessExecRecord {
+    /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
+    /// Process id.
     pub process_id: i32,
+    /// Whether the process looked like a Python runtime.
     pub is_python_runtime: bool,
 }
 
@@ -202,6 +228,7 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 }
 
+/// Reader for profile files written by [`crate::PerfRecorder`].
 pub struct PerfSpoolReader {
     start_timestamp_us: u64,
     modules: Vec<ModuleRecord>,
@@ -212,6 +239,7 @@ pub struct PerfSpoolReader {
 }
 
 impl PerfSpoolReader {
+    /// Open and read a profile file.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut magic = [0_u8; 8];
@@ -266,16 +294,24 @@ impl PerfSpoolReader {
         })
     }
 
+    /// Return code areas recorded in the profile.
     pub fn modules(&self) -> &[ModuleRecord] {
         &self.modules
     }
+
+    /// Return samples recorded in the profile.
     pub fn samples(&self) -> &[OwnedSampleRecord] {
         &self.samples
     }
+
+    /// Return process execution markers recorded in the profile.
     pub fn process_execs(&self) -> &[ProcessExecRecord] {
         &self.process_execs
     }
 
+    /// Expand `stack_id` into raw frames.
+    ///
+    /// `out` is cleared before the frames are written.
     pub fn stack_frames(&self, stack_id: u32, out: &mut Vec<FrameRecord>) -> io::Result<()> {
         out.clear();
         let mut current = Some(stack_id);
@@ -295,6 +331,7 @@ impl PerfSpoolReader {
         Ok(())
     }
 
+    /// Convert a sample timestamp to the profile timeline in microseconds.
     pub fn timestamp_us(&self, sample: &OwnedSampleRecord) -> u64 {
         let first = self
             .samples
