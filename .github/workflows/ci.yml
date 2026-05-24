@@ -25,9 +25,15 @@ jobs:
           - distro: debian-bookworm
             image: debian:bookworm
             family: apt
+          - distro: debian-trixie
+            image: debian:trixie
+            family: apt
           - distro: fedora-latest
             image: fedora:latest
             family: dnf
+          - distro: archlinux
+            image: archlinux:latest
+            family: pacman
     container:
       image: ${{ matrix.image }}
       options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
@@ -47,7 +53,7 @@ jobs:
               pkg-config \
               procps \
               python3
-          else
+          elif [ "${{ matrix.family }}" = "dnf" ]; then
             dnf install -y \
               ca-certificates \
               clang \
@@ -60,6 +66,17 @@ jobs:
               pkgconf-pkg-config \
               procps-ng \
               python3
+          else
+            pacman -Syu --noconfirm --needed \
+              base-devel \
+              ca-certificates \
+              clang \
+              curl \
+              git \
+              make \
+              pkgconf \
+              procps-ng \
+              python
           fi
 
       - name: Checkout
@@ -77,6 +94,8 @@ jobs:
         run: sysctl -w kernel.perf_event_paranoid=-1 || true
 
       - name: Test
+        env:
+          STACKPULSE_REQUIRE_PYTHON_PERF: "1"
         run: make ci
 
       - name: Doc tests

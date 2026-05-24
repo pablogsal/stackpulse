@@ -26,7 +26,8 @@ fn records_samples_from_real_python_process() -> TestResult {
         None => return skip_or_fail("python3 was not found"),
     };
 
-    let ReadyPython { _child, mut stream } = spawn_ready_python(&python, busy_python_script())?;
+    let script = PythonScript::new("busy", busy_python_script())?;
+    let ReadyPython { _child, mut stream } = spawn_ready_python(&python, script.path(), &[])?;
     let ready = read_until(&mut stream, b"ready:", READY_TIMEOUT)?;
     let target_pid = parse_pid_line(&ready, "ready:")?;
     let profile_path = profile_path("python-samples");
@@ -115,22 +116,31 @@ fn resolves_python_perf_map_frames_when_runtime_provides_them() -> TestResult {
         None => return skip_or_fail("python3 was not found"),
     };
 
+    let script = PythonScript::new("busy", busy_python_script())?;
     let ReadyPython {
         _child: child,
         mut stream,
-    } = spawn_ready_python(&python, busy_python_script())?;
+    } = spawn_ready_python(&python, script.path(), &[])?;
     let ready = read_until(&mut stream, b"ready:", READY_TIMEOUT)?;
     let target_pid = parse_pid_line(&ready, "ready:")?;
     let perf_map_path = PathBuf::from(format!("/tmp/perf-{target_pid}.map"));
     let profile_path = profile_path("python-perf-map");
 
     if wait_for_file(&perf_map_path, Duration::from_secs(2)).is_none() {
+        if require_python_perf() {
+            return Err(format!(
+                "Python perf support did not create {}; run with -X perf or PYTHONPERFSUPPORT=1 on a Python runtime that supports perf maps",
+                perf_map_path.display()
+            )
+            .into());
+        }
         eprintln!(
             "skipping perf-map assertion: Python runtime did not create {}",
             perf_map_path.display()
         );
         return Ok(());
     }
+    assert_perf_map_has_python_symbols(&perf_map_path, script.path())?;
 
     let Some(_summary) = record_until_samples(target_pid as u32, &profile_path, false, 5)? else {
         return Ok(());
@@ -138,7 +148,7 @@ fn resolves_python_perf_map_frames_when_runtime_provides_them() -> TestResult {
     drop(child);
 
     let reader = PerfSpoolReader::open(&profile_path)?;
-    let python_stacks = resolved_python_stack_names(&reader)?;
+    let python_stacks = resolved_python_stack_frames(&reader)?;
     let expected = [
         "stackpulse_busy_leaf",
         "stackpulse_busy_middle",
@@ -152,10 +162,11 @@ fn resolves_python_perf_map_frames_when_runtime_provides_them() -> TestResult {
 
     assert!(
         python_stacks.iter().any(|stack| {
-            contains_ordered_subsequence(stack, &expected)
-                || contains_ordered_subsequence(stack, &reverse_expected)
+            contains_ordered_frame_subsequence(stack, &expected, script.path())
+                || contains_ordered_frame_subsequence(stack, &reverse_expected, script.path())
         }),
-        "expected one Python stack to contain {expected:?} in call order; resolved Python stacks: {python_stacks:?}"
+        "expected one Python stack to contain {expected:?} in call order from {}; resolved Python stacks: {python_stacks:?}",
+        script.path().display()
     );
 
     remove_file_if_exists(&profile_path);
@@ -192,12 +203,12 @@ struct ReadyPython {
     stream: TcpStream,
 }
 
-fn spawn_ready_python(python: &Path, script: &str) -> io::Result<ReadyPython> {
+fn spawn_ready_python(python: &Path, script: &Path, args: &[&str]) -> io::Result<ReadyPython> {
     let (listener, port) = listener()?;
     let mut child = python_command(python)
-        .arg("-c")
         .arg(script)
         .arg(port.to_string())
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -414,6 +425,10 @@ fn environment_skips_allowed() -> bool {
     std::env::var_os("CI").is_none() || std::env::var_os("STACKPULSE_ALLOW_PERF_SKIP").is_some()
 }
 
+fn require_python_perf() -> bool {
+    std::env::var_os("STACKPULSE_REQUIRE_PYTHON_PERF").is_some()
+}
+
 fn skip_or_fail(message: &str) -> TestResult {
     if environment_skips_allowed() {
         eprintln!("skipping integration test: {message}");
@@ -469,7 +484,15 @@ fn assert_has_resolved_frame(reader: &PerfSpoolReader) -> io::Result<()> {
     panic!("expected at least one resolved frame");
 }
 
-fn resolved_python_stack_names(reader: &PerfSpoolReader) -> io::Result<Vec<Vec<String>>> {
+#[derive(Debug)]
+struct ResolvedPythonFrame {
+    file_name: String,
+    func_name: String,
+}
+
+fn resolved_python_stack_frames(
+    reader: &PerfSpoolReader,
+) -> io::Result<Vec<Vec<ResolvedPythonFrame>>> {
     let mut symbolizer = PerfSymbolizer::new(reader.modules());
     let mut raw_frames = Vec::new();
     let mut stacks = Vec::new();
@@ -480,7 +503,10 @@ fn resolved_python_stack_names(reader: &PerfSpoolReader) -> io::Result<Vec<Vec<S
         let names: Vec<_> = frames
             .iter()
             .filter_map(|frame| match frame {
-                ResolvedFrame::Python(frame) => Some(frame.func_name.to_string()),
+                ResolvedFrame::Python(frame) => Some(ResolvedPythonFrame {
+                    file_name: frame.file_name.to_string(),
+                    func_name: frame.func_name.to_string(),
+                }),
                 ResolvedFrame::Native(_) => None,
             })
             .collect();
@@ -491,14 +517,40 @@ fn resolved_python_stack_names(reader: &PerfSpoolReader) -> io::Result<Vec<Vec<S
     Ok(stacks)
 }
 
-fn contains_ordered_subsequence(stack: &[String], expected: &[&str]) -> bool {
+fn contains_ordered_frame_subsequence(
+    stack: &[ResolvedPythonFrame],
+    expected: &[&str],
+    expected_file: &Path,
+) -> bool {
+    let expected_file = expected_file.to_string_lossy();
     let mut cursor = 0;
     for frame in stack {
-        if cursor < expected.len() && frame == expected[cursor] {
+        if cursor < expected.len()
+            && frame.func_name == expected[cursor]
+            && frame.file_name == expected_file
+        {
             cursor += 1;
         }
     }
     cursor == expected.len()
+}
+
+fn assert_perf_map_has_python_symbols(path: &Path, script: &Path) -> io::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let script = script.to_string_lossy();
+    for func in [
+        "stackpulse_busy_leaf",
+        "stackpulse_busy_middle",
+        "stackpulse_busy_entry",
+    ] {
+        let expected = format!("py::{func}:{script}");
+        assert!(
+            text.lines().any(|line| line.ends_with(&expected)),
+            "expected perf map {} to contain {expected:?}; map contents:\n{text}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<()> {
@@ -563,5 +615,29 @@ fn remove_file_if_exists(path: &Path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => eprintln!("failed to remove {}: {err}", path.display()),
+    }
+}
+
+struct PythonScript {
+    path: PathBuf,
+}
+
+impl PythonScript {
+    fn new(name: &str, contents: &str) -> io::Result<Self> {
+        let id = NEXT_PROFILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("stackpulse-{name}-{}-{id}.py", std::process::id()));
+        std::fs::write(&path, contents)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PythonScript {
+    fn drop(&mut self) {
+        remove_file_if_exists(&self.path);
     }
 }
