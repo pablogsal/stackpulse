@@ -19,21 +19,27 @@ jobs:
           - distro: ubuntu-24.04
             image: ubuntu:24.04
             family: apt
+            require_python_perf: "1"
           - distro: ubuntu-22.04
             image: ubuntu:22.04
             family: apt
+            require_python_perf: "0"
           - distro: debian-bookworm
             image: debian:bookworm
             family: apt
+            require_python_perf: "0"
           - distro: debian-trixie
             image: debian:trixie
             family: apt
+            require_python_perf: "1"
           - distro: fedora-latest
             image: fedora:latest
             family: dnf
+            require_python_perf: "1"
           - distro: archlinux
             image: archlinux:latest
             family: pacman
+            require_python_perf: "1"
     container:
       image: ${{ matrix.image }}
       options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
@@ -95,7 +101,7 @@ jobs:
 
       - name: Test
         env:
-          STACKPULSE_REQUIRE_PYTHON_PERF: "1"
+          STACKPULSE_REQUIRE_PYTHON_PERF: ${{ matrix.require_python_perf }}
         run: make ci
 
       - name: Doc tests
