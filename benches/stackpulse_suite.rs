@@ -3,7 +3,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 use integer_encoding::VarIntWriter;
 use rustc_hash::FxHashMap;
 use stackpulse::profile::{basename_start, LocationInfo, PythonFrame};
@@ -120,6 +122,7 @@ criterion_main!(benches);
 
 fn bench_spool_open(c: &mut Criterion) {
     let mut group = c.benchmark_group("stackpulse_cpu/spool/open");
+    group.sampling_mode(SamplingMode::Flat);
     for spec in SPOOL_SCENARIOS {
         let path = ensure_spool_fixture(*spec);
         let bytes = fs::metadata(&path).expect("synthetic spool metadata").len();
@@ -160,6 +163,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
         * BORROWED_ITERATE_BATCH;
 
     let mut borrowed = c.benchmark_group("stackpulse_cpu/spool/iterate/borrowed_stack_frame_refs");
+    borrowed.sampling_mode(SamplingMode::Flat);
     borrowed.throughput(Throughput::Elements(borrowed_frame_count));
     borrowed.bench_function("all_scenarios", |b| {
         b.iter(|| {
@@ -185,6 +189,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
 
     let mut expanded_group =
         c.benchmark_group("stackpulse_cpu/spool/iterate/expanded_stack_frames");
+    expanded_group.sampling_mode(SamplingMode::Flat);
     for (spec, reader) in &readers {
         let expanded_frame_count =
             spec.samples as u64 * spec.stack_depth as u64 * EXPANDED_ITERATE_BATCH;
@@ -217,6 +222,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
         * METADATA_BATCH;
 
     let mut metadata = c.benchmark_group("stackpulse_cpu/spool/iterate/sample_metadata");
+    metadata.sampling_mode(SamplingMode::Flat);
     metadata.throughput(Throughput::Elements(metadata_elements));
     metadata.bench_function("all_scenarios", |b| {
         b.iter(|| {
@@ -257,6 +263,7 @@ fn bench_spool_write(c: &mut Criterion) {
     let bytes = cases.iter().map(|(_, _, bytes)| *bytes).sum::<u64>();
 
     let mut group = c.benchmark_group("stackpulse_cpu/spool/write_memory");
+    group.sampling_mode(SamplingMode::Flat);
     group.throughput(Throughput::Bytes(bytes * WRITE_BATCH));
     group.bench_function("all_scenarios", |b| {
         b.iter(|| {
@@ -278,6 +285,7 @@ fn bench_spool_write(c: &mut Criterion) {
 fn bench_symbolization(c: &mut Criterion) {
     let address_stacks = address_only_stacks(256, 32, FrameMode::User, 0x7000_0000);
     let mut address_group = c.benchmark_group("stackpulse_cpu/symbolize/address_only");
+    address_group.sampling_mode(SamplingMode::Flat);
     address_group.throughput(Throughput::Elements(total_frames(&address_stacks) as u64));
     address_group.bench_function("unique_stacks", |b| {
         b.iter(|| {
@@ -333,6 +341,7 @@ fn bench_symbolization(c: &mut Criterion) {
 
     let mut spool_group =
         c.benchmark_group("stackpulse_cpu/symbolize/spool_samples_warm_stack_cache");
+    spool_group.sampling_mode(SamplingMode::Flat);
     spool_group.throughput(Throughput::Elements(spool_symbolize_frames));
     spool_group.bench_function("all_scenarios", |b| {
         b.iter(|| {
@@ -349,6 +358,7 @@ fn bench_symbolization(c: &mut Criterion) {
 
     let perf_map = PerfMapFixture::new(512);
     let mut perf_map_group = c.benchmark_group("stackpulse_cpu/symbolize/python_perf_map");
+    perf_map_group.sampling_mode(SamplingMode::Flat);
     perf_map_group.throughput(Throughput::Elements(
         perf_map.frames.len() as u64 * PERF_MAP_BATCH,
     ));
@@ -372,6 +382,7 @@ fn bench_symbolization(c: &mut Criterion) {
 
     if let Some((modules, frames)) = current_exe_symbolization_fixture() {
         let mut native_group = c.benchmark_group("stackpulse_cpu/symbolize/native_elf");
+        native_group.sampling_mode(SamplingMode::Flat);
         native_group.throughput(Throughput::Elements(frames.len() as u64));
         native_group.bench_function("cold_current_exe_batch", |b| {
             b.iter(|| {
@@ -421,6 +432,7 @@ fn bench_helpers(c: &mut Criterion) {
     let bases = module_image_base_inputs();
 
     let mut group = c.benchmark_group("stackpulse_cpu/helpers");
+    group.sampling_mode(SamplingMode::Flat);
     group.throughput(Throughput::Elements(HELPER_BATCH));
     group.bench_function("profile_and_path_helpers", |b| {
         b.iter(|| {

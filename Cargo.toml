@@ -34,7 +34,7 @@ default = []
 debuginfod = []
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "4.7.0", package = "codspeed-criterion-compat" }
 
 [[bench]]
 name = "stackpulse_suite"
