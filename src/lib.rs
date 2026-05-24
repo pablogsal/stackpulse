@@ -11,12 +11,18 @@
 #![allow(dead_code)]
 
 pub mod children;
+#[cfg(feature = "bench-internals")]
+pub mod elf;
+#[cfg(not(feature = "bench-internals"))]
 mod elf;
 mod error;
 mod linux;
 mod module_base;
 mod module_traits;
 mod native_module;
+#[cfg(feature = "bench-internals")]
+pub mod proc_maps;
+#[cfg(not(feature = "bench-internals"))]
 mod proc_maps;
 pub mod profile;
 mod spool;

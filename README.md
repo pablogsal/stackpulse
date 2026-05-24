@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/pablogsal/stackpulse/branch/main/graph/badge.svg)](https://codecov.io/gh/pablogsal/stackpulse)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/pablogsal/stackpulse?utm_source=badge)
 
 `stackpulse` records what a Linux process is doing over time by taking regular
 stack samples and saving them to a compact file. You can read that file later
