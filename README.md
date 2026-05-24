@@ -1,5 +1,8 @@
 # stackpulse
 
+[![CI](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pablogsal/stackpulse/branch/main/graph/badge.svg)](https://codecov.io/gh/pablogsal/stackpulse)
+
 `stackpulse` records what a Linux process is doing over time by taking regular
 stack samples and saving them to a compact file. You can read that file later
 and turn the raw frames into function names, source locations where available,
