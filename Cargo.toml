@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
 license = "MIT"
