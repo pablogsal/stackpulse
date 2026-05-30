@@ -230,13 +230,6 @@ pub struct ProcessExecRecord {
     pub is_python_runtime: bool,
 }
 
-pub struct SampleRecord<'a> {
-    pub timestamp_ns: u64,
-    pub process_id: i32,
-    pub thread_id: u64,
-    pub frames: &'a [FrameRecord],
-}
-
 #[derive(Clone, Copy, Debug)]
 struct StackNodeRecord {
     prefix: Option<u32>,
@@ -303,16 +296,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         write_bytes(&mut self.writer, module.path.as_bytes())?;
         self.frame_context_epoch = self.frame_context_epoch.wrapping_add(1);
         Ok(())
-    }
-
-    pub fn write_sample(&mut self, sample: &SampleRecord<'_>) -> io::Result<()> {
-        self.write_sample_frames(
-            sample.timestamp_ns,
-            sample.process_id,
-            sample.thread_id,
-            sample.frames.iter().copied(),
-        )
-        .map(drop)
     }
 
     pub fn write_sample_frames<I>(

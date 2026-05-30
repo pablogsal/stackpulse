@@ -38,7 +38,7 @@ pub struct PerfSymbolizer {
 }
 
 /// Which processes may use Python perf-map lookups.
-pub enum PerfMapProcesses {
+pub(crate) enum PerfMapProcesses {
     /// Allow perf-map lookup for every process.
     All,
     /// Allow perf-map lookup only for the listed process ids.
@@ -296,6 +296,7 @@ impl PerfSymbolizer {
         count
     }
 
+    #[cfg(test)]
     fn resolve_cached_frame_ref(&mut self, process_id: i32, frame: &FrameRecord) -> &ResolvedFrame {
         let frame_id =
             self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None)[0];
@@ -328,6 +329,7 @@ impl PerfSymbolizer {
         frame_ids
     }
 
+    #[cfg(test)]
     fn resolve_frame(&mut self, process_id: i32, frame: &FrameRecord) -> ResolvedFrame {
         self.resolve_frames(process_id, frame, None)
             .into_vec()
@@ -419,6 +421,7 @@ impl PerfSymbolizer {
         }
     }
 
+    #[cfg(test)]
     fn resolve_native_frame(
         &mut self,
         frame: &FrameRecord,
@@ -499,7 +502,7 @@ impl PerfSymbolizer {
                     SourceLocation::default(),
                     module.path,
                     rel_ip,
-                    is_eval_frame(&symbol_name),
+                    crate::symbols::is_eval_frame(&symbol_name),
                     is_python_runtime,
                 );
                 vec![NativeFrame {
@@ -715,10 +718,6 @@ fn perf_map_symbol_to_frame(process_id: i32, abs_ip: u64, symbol: &PerfMapSymbol
     })
 }
 
-fn is_python_perf_map_symbol(symbol: &PerfMapSymbol) -> bool {
-    parse_python_perf_map_symbol(&symbol.name).is_some()
-}
-
 fn parse_python_perf_map_symbol(name: &str) -> Option<(&str, &str)> {
     let body = name.strip_prefix("py::")?.trim();
     if body.is_empty() {
@@ -754,13 +753,6 @@ fn strip_python_perf_map_line_suffix(file: &str) -> &str {
 
 fn is_anonymous_module(path: &str) -> bool {
     path == "[anon]" || path == "//anon" || path.starts_with("[anon:")
-}
-
-fn is_eval_frame(name: &str) -> bool {
-    name.contains("PyEval_EvalFrameDefault")
-        || name.contains("PyEval_EvalFrameEx")
-        || ((name.starts_with("_TAIL_CALL_") || name.starts_with("TAIL_CALL_"))
-            && name.contains(".llvm."))
 }
 
 fn module_display_name(path: &str) -> &str {
@@ -846,14 +838,19 @@ fn load_sparse_kernel_symbols_from_file(
     }
 }
 
+/// In-memory entry point for benches and tests. Drives the same streaming
+/// sorted scanner the production load path uses, falling back to the unsorted
+/// parser when the data is detected to be out of order.
 fn parse_sparse_kernel_symbols(
     data: &[u8],
     requested_addresses: &[u64],
 ) -> Vec<(u64, KernelSymbol)> {
-    if kernel_symbols_sorted(data) {
-        parse_sparse_kernel_symbols_sorted(data, requested_addresses)
-    } else {
-        parse_sparse_kernel_symbols_unsorted(data, requested_addresses)
+    match parse_sparse_kernel_symbols_sorted_streaming(
+        &mut io::Cursor::new(data),
+        requested_addresses,
+    ) {
+        Ok(Some(symbols)) => symbols,
+        _ => parse_sparse_kernel_symbols_unsorted(data, requested_addresses),
     }
 }
 
@@ -905,7 +902,7 @@ fn parse_sparse_kernel_symbols_sorted_streaming(
             if buffer.is_empty() {
                 if !carry.is_empty() {
                     match scan.process_line(&carry) {
-                        SparseScanState::Continue | SparseScanState::Done => {}
+                        SparseScanState::Continue => {}
                         SparseScanState::Unsorted => return Ok(None),
                     }
                 }
@@ -953,7 +950,6 @@ struct SparseKernelSymbolScan<'a> {
 
 enum SparseScanState {
     Continue,
-    Done,
     Unsorted,
 }
 
@@ -991,7 +987,7 @@ impl<'a> SparseKernelSymbolScan<'a> {
             self.request_idx += 1;
         }
         if self.request_idx >= self.requested_addresses.len() {
-            return SparseScanState::Done;
+            return SparseScanState::Continue;
         }
         if self
             .last_symbol
@@ -1013,63 +1009,6 @@ impl<'a> SparseKernelSymbolScan<'a> {
         }
         self.result
     }
-}
-
-fn parse_sparse_kernel_symbols_sorted(
-    data: &[u8],
-    requested_addresses: &[u64],
-) -> Vec<(u64, KernelSymbol)> {
-    let mut result = Vec::with_capacity(requested_addresses.len());
-    let mut request_idx = 0;
-    let mut text_addr = None;
-    let mut last_symbol: Option<KernelSymbol> = None;
-
-    for (address, name) in KallSymIter::new(data) {
-        if !should_include_kernel_symbol(&mut text_addr, address, name) {
-            continue;
-        }
-
-        while request_idx < requested_addresses.len() && requested_addresses[request_idx] < address
-        {
-            if let Some(symbol) = &last_symbol {
-                result.push((requested_addresses[request_idx], symbol.clone()));
-            }
-            request_idx += 1;
-        }
-        if request_idx >= requested_addresses.len() {
-            break;
-        }
-        if last_symbol
-            .as_ref()
-            .is_none_or(|symbol| symbol.address != address)
-        {
-            last_symbol = Some(kernel_symbol_from_name(address, name));
-        }
-    }
-
-    while request_idx < requested_addresses.len() {
-        if let Some(symbol) = &last_symbol {
-            result.push((requested_addresses[request_idx], symbol.clone()));
-        }
-        request_idx += 1;
-    }
-
-    result
-}
-
-fn kernel_symbols_sorted(data: &[u8]) -> bool {
-    let mut text_addr = None;
-    let mut last_address = None;
-    for (address, name) in KallSymIter::new(data) {
-        if !should_include_kernel_symbol(&mut text_addr, address, name) {
-            continue;
-        }
-        if last_address.is_some_and(|last| address < last) {
-            return false;
-        }
-        last_address = Some(address);
-    }
-    true
 }
 
 fn parse_kernel_symbol_line_bytes(line: &[u8]) -> Option<(u64, KernelSymbolName<'_>)> {

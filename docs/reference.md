@@ -38,8 +38,8 @@ Records stack samples for one or more processes and writes a spool file.
 | `disable()` | Stop sampling for all attached events. |
 | `has_pending_events()` | Is there perf data ready to drain? |
 | `summary()` | Snapshot of recording counters. |
-| `active_processes()` / `process_is_active(pid)` | Which PIDs are still alive. |
-| `has_active_processes_except(pid)` / `active_processes_except(pid)` | Same, excluding one PID. |
+| `process_is_active(pid)` | Is a given PID still alive? |
+| `has_active_processes_except(pid)` | Is any PID other than the given one still alive? |
 | `finish()` | Flush, return final counters, consume the recorder. |
 
 The recorder is not just a handle. Opening one and never calling
@@ -218,7 +218,7 @@ like `is_eval_frame` and `should_ignore`.
 | --- | --- |
 | [`FrameKind`] | `Python`, `Native`, `Kernel`, `Unknown` |
 | [`SymbolOrigin`] | `Elf`, `PerfMap`, `KernelSymbols`, `AddressOnly` |
-| [`FrameFlags`] | `PYTHON_RUNTIME`, `PYTHON_EVAL`, `HIDDEN_DEFAULT`, `JIT`, `ANONYMOUS` |
+| [`FrameFlags`] | `PYTHON_RUNTIME`, `HIDDEN_DEFAULT`, `JIT` |
 
 UIs typically hide `HIDDEN_DEFAULT`, badge `JIT`, group by [`FrameKind`], and
 expose [`SymbolOrigin`] in a details view.
@@ -263,7 +263,7 @@ printable via [`ErrorStatsFormatter`].
 
 | Item | What it does |
 | --- | --- |
-| [`SampleErrorKind`] | Stack, frame-parse, unwind, merge, and thread-list failure kinds. |
+| [`SampleErrorKind`] | Native-unwinding failure kinds (register capture, stack read, framehop errors). |
 | `record(kind)` | Bump a counter. |
 | `record_with_log(kind, ctx)` | Bump and emit a throttled debug log. |
 | `get(kind)` | Read one counter. |

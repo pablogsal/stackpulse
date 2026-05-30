@@ -1,8 +1,8 @@
 //! Shared ELF section extraction for DWARF unwinding.
 //!
-//! This module provides common functionality for loading ELF sections
-//! needed by framehop for stack unwinding. Used by both `ModuleManager`
-//! (live processes) and `CoreModuleLoader` (core files).
+//! Loads the ELF sections framehop needs for stack unwinding and resolves a
+//! mapping's image base via [`ElfImageLayout`]. Consumed by the native
+//! live-process path (`native_module`).
 
 use super::elf_types::{ElfSectionData, ElfSectionInfo, ModuleInfo};
 use crate::elf::{
@@ -42,19 +42,6 @@ impl ReferenceContribution<'_> {
             Self::Text(range) => range,
         }
     }
-
-    fn is_executable(self) -> bool {
-        match self {
-            Self::Segment(seg) => (seg.p_flags & 0x1) != 0,
-            Self::Text(_) => true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResolvedElfMapping {
-    pub image_base: ModuleImageBase,
-    pub is_executable: bool,
 }
 
 pub struct ElfImageLayout<'a> {
@@ -67,29 +54,19 @@ impl<'a> ElfImageLayout<'a> {
     }
 
     #[must_use]
-    pub fn base_svma(&self) -> u64 {
-        self.info.base_svma
-    }
-
-    #[must_use]
     pub fn resolve_mapping(
         &self,
         mapping_start_file_offset: u64,
         mapping_start_avma: u64,
         mapping_span: u64,
-    ) -> Option<ResolvedElfMapping> {
+    ) -> Option<ModuleImageBase> {
         let reference = self.reference_contribution(mapping_start_file_offset, mapping_span)?;
-        let image_base = resolve_image_base_from_reference(
-            self.base_svma(),
+        Some(resolve_image_base_from_reference(
+            self.info.base_svma,
             reference.file_range(),
             mapping_start_file_offset,
             mapping_start_avma,
-        );
-
-        Some(ResolvedElfMapping {
-            image_base,
-            is_executable: reference.is_executable(),
-        })
+        ))
     }
 
     fn reference_contribution(
@@ -227,6 +204,7 @@ fn find_section_header<'a>(name: &str, elf: &'a Elf) -> Option<&'a goblin::elf::
     })
 }
 
+#[cfg(test)]
 fn find_section_range_in_file(name: &str, elf: &Elf) -> Option<(u64, Range<usize>)> {
     let sh = find_section_header(name, elf)?;
     section_range_in_file(sh)
@@ -343,18 +321,6 @@ fn calculate_memory_range(elf: &Elf) -> (u64, u64) {
     }
 }
 
-/// Convert a `ModuleInfo` to a framehop Module.
-///
-/// Uses one image-wide `base_avma` / `base_svma` pair together with the
-/// mapping-specific `avma_range`.
-///
-/// This is the shared conversion logic used by both `ModuleManager`
-/// and `CoreModuleLoader`.
-pub fn module_to_framehop(module: &ModuleInfo) -> Option<framehop::Module<ElfSectionData>> {
-    let section_info = module.section_info.as_ref()?;
-    module_to_framehop_with_section_info(module, section_info)
-}
-
 #[inline]
 fn svma_range(svma: Option<u64>, data: Option<&ElfSectionData>) -> Option<Range<u64>> {
     let addr = svma?;
@@ -468,9 +434,8 @@ mod tests {
     fn test_resolve_mapping_matches_samply_hard_case() {
         let section_info = fake_hard_case_section_info();
 
-        let resolved = ElfImageLayout::new(&section_info)
-            .resolve_mapping(0x14bd000, 0x55d605384000, 0xf5d000)
-            .map(|resolved| resolved.image_base);
+        let resolved =
+            ElfImageLayout::new(&section_info).resolve_mapping(0x14bd000, 0x55d605384000, 0xf5d000);
         assert_eq!(resolved, Some(ModuleImageBase::new(0x55d603ec6000, 0)));
     }
 
@@ -489,9 +454,8 @@ mod tests {
             load_segments: Box::default(),
         };
 
-        let resolved = ElfImageLayout::new(&section_info)
-            .resolve_mapping(0x3000, 0x7f00_1000, 0x1000)
-            .map(|resolved| resolved.image_base);
+        let resolved =
+            ElfImageLayout::new(&section_info).resolve_mapping(0x3000, 0x7f00_1000, 0x1000);
         assert_eq!(resolved, Some(ModuleImageBase::new(0x7eff_d000, 0)));
     }
 
@@ -517,9 +481,8 @@ mod tests {
             .into_boxed_slice(),
         };
 
-        let resolved = ElfImageLayout::new(&section_info)
-            .resolve_mapping(0x13000, 0x5555_5556_8000, 0x800)
-            .map(|resolved| resolved.image_base);
+        let resolved =
+            ElfImageLayout::new(&section_info).resolve_mapping(0x13000, 0x5555_5556_8000, 0x800);
         assert_eq!(resolved, None);
     }
 

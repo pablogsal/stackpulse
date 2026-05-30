@@ -78,23 +78,6 @@ pub fn try_new_exit_watcher(pid: i32) -> Option<ProcessExitWatcher> {
     ProcessExitWatcher::try_new(pid).ok()
 }
 
-/// Poll an optional watcher in-place: returns `true` once the target has
-/// exited. On poll error the watcher is dropped so callers don't keep hitting
-/// the same broken fd.
-pub fn poll_exit_watcher(watcher: &mut Option<ProcessExitWatcher>, _pid: i32) -> bool {
-    let Some(active) = watcher.as_mut() else {
-        return false;
-    };
-    match active.poll() {
-        Ok(ProcessExitState::Exited) => true,
-        Ok(ProcessExitState::RunningOrUnknown) => false,
-        Err(_) => {
-            *watcher = None;
-            false
-        }
-    }
-}
-
 /// Combined liveness check: prefers the pidfd watcher (race-free) and falls
 /// back to [`process_exists`] when no watcher is available or the poll errors.
 pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: i32) -> bool {

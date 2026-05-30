@@ -1,6 +1,5 @@
 //! Shared Linux module and ELF metadata types.
 
-use crate::module_traits::ModuleInfoRecord;
 use crate::ModuleImageBase;
 use memmap2::Mmap;
 use std::fmt;
@@ -97,36 +96,8 @@ pub struct ModuleInfo {
     /// resolved image base.
     pub image_base: Option<ModuleImageBase>,
 
-    /// File offset corresponding to `avma_range.start`.
-    pub file_off_start: u64,
-
-    /// Whether this is the Python runtime module
-    pub is_python: bool,
-
     /// Whether this mapping has executable permissions.
     pub is_executable: bool,
-
-    /// ELF section information for framehop. Wrapped in `Arc` so multiple
-    /// mappings of the same library and the elf-section cache share storage
-    /// without deep-cloning `Box<[LoadSegment]>` per copy.
-    pub section_info: Option<Arc<ElfSectionInfo>>,
-}
-
-impl ModuleInfoRecord for ModuleInfo {
-    fn avma_range(&self) -> &Range<u64> {
-        &self.avma_range
-    }
-
-    fn is_python(&self) -> bool {
-        self.is_python
-    }
-}
-
-impl ModuleInfo {
-    #[must_use]
-    pub fn mapping_span(&self) -> u64 {
-        self.avma_range.end.saturating_sub(self.avma_range.start)
-    }
 }
 
 /// ELF section addresses and data needed for DWARF unwinding.

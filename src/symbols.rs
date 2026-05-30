@@ -7,31 +7,17 @@ use crate::{ModuleImageBase, NativeSymbol, SourceLocation};
 
 #[cfg(target_os = "linux")]
 use crate::linux::elf_types::ModuleInfo as LinuxModuleInfo;
-#[cfg(target_os = "macos")]
-use crate::macos::map_file_readonly;
-#[cfg(target_os = "macos")]
-use crate::macos::ModuleInfo as MacOSModuleInfo;
-#[cfg(target_os = "macos")]
-use memmap2::Mmap;
-#[cfg(target_os = "macos")]
-use object::Object;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 #[cfg(target_os = "linux")]
 use wholesym::CodeId;
-#[cfg(target_os = "macos")]
-use wholesym::MultiArchDisambiguator;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use wholesym::{
-    AddressInfo, FramesLookupResult, LookupAddress, SymbolManager, SymbolManagerConfig,
+    FramesLookupResult, LookupAddress, SymbolManager, SymbolManagerConfig,
     SymbolMap as WholeSymbolMap,
 };
 
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-#[cfg(target_os = "macos")]
-use std::ops::Bound;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -71,25 +57,6 @@ impl From<&LinuxModuleInfo> for SymModule {
             avma_range: module.avma_range.clone(),
             image_base: module.image_base,
             is_executable: module.is_executable,
-            is_python_runtime: false,
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl From<&MacOSModuleInfo> for SymModule {
-    fn from(module: &MacOSModuleInfo) -> Self {
-        Self {
-            path: module.path.clone(),
-            avma_range: module.avma_range.clone(),
-            image_base: Some(ModuleImageBase::new(
-                module.base_avma,
-                module
-                    .section_info
-                    .as_ref()
-                    .map_or(0, |info| info.base_svma),
-            )),
-            is_executable: true,
             is_python_runtime: false,
         }
     }
@@ -209,7 +176,7 @@ pub trait NativeSymbolizer {
     fn symbolize_one(&mut self, addr: u64) -> SymbolsRc;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl NativeSymbolizer for SymbolizerWrapper {
     fn set_modules(&mut self, modules: Vec<SymModule>) {
         SymbolizerWrapper::set_modules(self, modules);
@@ -226,7 +193,7 @@ pub type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolize
 
 /// Default factory: returns stackpulse's bundled wholesym-backed
 /// `SymbolizerWrapper`, configured from `STACKPULSE_*` env vars.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
     Box::new(|pid: i32| -> Box<dyn NativeSymbolizer> {
@@ -235,17 +202,10 @@ pub fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
 }
 
 /// Symbols that indicate the Python eval loop.
-///
-/// Different symbol sources disagree on whether the leading Mach-O underscore
-/// is present, so we accept both spellings.
-const EVAL_FRAME_SYMBOLS: &[&str] = &[
-    "_PyEval_EvalFrameDefault",
-    "PyEval_EvalFrameDefault",
-    "PyEval_EvalFrameEx",
-];
+const EVAL_FRAME_SYMBOLS: &[&str] = &["PyEval_EvalFrameDefault", "PyEval_EvalFrameEx"];
 
 #[inline]
-fn is_eval_frame(func_name: &str) -> bool {
+pub(crate) fn is_eval_frame(func_name: &str) -> bool {
     if EVAL_FRAME_SYMBOLS.iter().any(|sym| func_name.contains(sym)) {
         return true;
     }
@@ -367,35 +327,25 @@ fn default_debuginfod_cache_dir() -> PathBuf {
     std::env::temp_dir().join("stackpulse-debuginfod")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn build_symbol_manager_config(
     debug_dirs: &[PathBuf],
     redirect_paths: &[(PathBuf, PathBuf)],
 ) -> SymbolManagerConfig {
     let mut config = SymbolManagerConfig::new();
 
-    #[cfg(target_os = "linux")]
-    {
-        for (source, dest) in redirect_paths {
-            config = config.redirect_path_for_testing(source.clone(), dest.clone());
-        }
-        for dir in debug_dirs {
-            config = config.extra_symbols_directory(dir.clone());
-        }
-        #[cfg(feature = "debuginfod")]
-        if std::env::var_os("DEBUGINFOD_URLS").is_some() {
-            let cache_dir = default_debuginfod_cache_dir();
-            config = config
-                .use_debuginfod(true)
-                .debuginfod_cache_dir_if_not_installed(cache_dir);
-        }
+    for (source, dest) in redirect_paths {
+        config = config.redirect_path_for_testing(source.clone(), dest.clone());
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = debug_dirs;
-        let _ = redirect_paths;
-        config = config.use_spotlight(true);
+    for dir in debug_dirs {
+        config = config.extra_symbols_directory(dir.clone());
+    }
+    #[cfg(feature = "debuginfod")]
+    if std::env::var_os("DEBUGINFOD_URLS").is_some() {
+        let cache_dir = default_debuginfod_cache_dir();
+        config = config
+            .use_debuginfod(true)
+            .debuginfod_cache_dir_if_not_installed(cache_dir);
     }
 
     config
@@ -459,9 +409,6 @@ pub struct SymbolizerWrapper {
     /// Per-path index into `cache` for selective eviction on layout change.
     cache_keys_by_path: HashMap<PathBuf, Vec<u64>>,
 
-    /// Whether to include inlined frames
-    include_inlines: bool,
-
     /// Local debug directories for `.build-id` lookup (Linux only).
     #[cfg(target_os = "linux")]
     local_debug_dirs: Box<[PathBuf]>,
@@ -471,227 +418,26 @@ pub struct SymbolizerWrapper {
     #[cfg(target_os = "linux")]
     redirect_cache: HashMap<PathBuf, (PathBuf, PathBuf)>,
 
-    /// Parsed symbol tables (macOS only)
-    /// Maps module path -> sorted symbol list
-    #[cfg(target_os = "macos")]
-    symbol_tables: HashMap<PathBuf, SymbolTable>,
-
-    /// Loaded dyld shared cache mmaps reused across system-library lookups.
-    #[cfg(target_os = "macos")]
-    dyld_shared_caches: Option<Box<[DyldSharedCacheData]>>,
-
     /// Shared symbol manager used for symbolization.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     symbol_manager: SymbolManager,
 
     /// Loaded wholesym maps keyed by module path.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     symbol_maps: HashMap<PathBuf, Option<WholeSymbolMap>>,
 
     /// Tokio runtime for wholesym async APIs.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     runtime: TokioRuntime,
 }
 
-/// A symbol table for a single module (macOS)
-#[cfg(target_os = "macos")]
-struct SymbolTable {
-    /// Sorted list of function ranges in relative-address space.
-    symbols: Box<[SymbolEntry]>,
-}
-
-#[cfg(target_os = "macos")]
-struct SymbolEntry {
-    start: u64,
-    end: Option<u64>,
-    name: String,
-}
-
-#[cfg(target_os = "macos")]
-struct DyldSharedCacheData {
-    path: PathBuf,
-    root: Mmap,
-    subcaches: Box<[Mmap]>,
-}
-
-#[cfg(target_os = "macos")]
-impl DyldSharedCacheData {
-    fn load(path: PathBuf) -> Option<Self> {
-        Some(Self {
-            root: map_file_readonly(&path).ok()?,
-            subcaches: load_dyld_subcaches(&path),
-            path,
-        })
-    }
-
-    fn load_symbol_table(&self, module_path: &str) -> Option<SymbolTable> {
-        let subcaches: Vec<&[u8]> = self.subcaches.iter().map(|mmap| &mmap[..]).collect();
-        let cache = object::read::macho::DyldCache::<object::Endianness, _>::parse(
-            &self.root[..],
-            &subcaches,
-        )
-        .ok()?;
-        let image = cache
-            .images()
-            .find(|image| image.path() == Ok(module_path))?;
-        let object = image.parse_object().ok()?;
-        let (data, header_offset) = image.image_data_and_offset().ok()?;
-        let image_base = get_image_base(&object);
-        let sym_table = build_symbol_table(
-            &object,
-            image_base,
-            MachOData::new(data, header_offset, object.is_64()),
-        );
-        (!sym_table.symbols.is_empty()).then_some(sym_table)
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl SymbolTable {
-    fn new() -> Self {
-        Self {
-            symbols: Box::default(),
-        }
-    }
-
-    fn lookup(&self, addr: u64) -> Option<&str> {
-        if self.symbols.is_empty() {
-            return None;
-        }
-
-        match self
-            .symbols
-            .binary_search_by_key(&addr, |entry| entry.start)
-        {
-            Ok(idx) => self.symbols[idx]
-                .contains(addr)
-                .then_some(self.symbols[idx].name.as_str()),
-            Err(idx) => {
-                if idx > 0 {
-                    let entry = &self.symbols[idx - 1];
-                    entry.contains(addr).then_some(entry.name.as_str())
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl SymbolEntry {
-    fn contains(&self, addr: u64) -> bool {
-        match self.end {
-            Some(end) => addr >= self.start && addr < end,
-            None => addr >= self.start,
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-struct MachOData<'a> {
-    data: &'a [u8],
-    header_offset: u64,
-    is_64: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl<'a> MachOData<'a> {
-    fn new(data: &'a [u8], header_offset: u64, is_64: bool) -> Self {
-        Self {
-            data,
-            header_offset,
-            is_64,
-        }
-    }
-
-    fn get_function_starts(&self) -> Option<Box<[u64]>> {
-        let data = self.function_start_data()?;
-        let mut function_starts = Vec::new();
-        let mut previous = 0u64;
-        let mut bytes = data;
-
-        while let Some((delta, rest)) = read_uleb128(bytes) {
-            if delta == 0 {
-                break;
-            }
-            previous = previous.checked_add(delta)?;
-            function_starts.push(previous);
-            bytes = rest;
-        }
-
-        Some(function_starts.into_boxed_slice())
-    }
-
-    fn function_start_data(&self) -> Option<&'a [u8]> {
-        use object::macho::{MachHeader32, MachHeader64};
-        use object::read::macho::MachHeader;
-        use object::Endianness;
-
-        if self.is_64 {
-            let header = MachHeader64::<Endianness>::parse(self.data, self.header_offset).ok()?;
-            extract_linkedit_section(header, self.data, self.header_offset)
-        } else {
-            let header = MachHeader32::<Endianness>::parse(self.data, self.header_offset).ok()?;
-            extract_linkedit_section(header, self.data, self.header_offset)
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn extract_linkedit_section<'a, H: object::read::macho::MachHeader>(
-    header: &H,
-    data: &'a [u8],
-    header_offset: u64,
-) -> Option<&'a [u8]> {
-    use object::macho::{LinkeditDataCommand, LC_FUNCTION_STARTS};
-
-    let endian = header.endian().ok()?;
-    let mut commands = header.load_commands(endian, data, header_offset).ok()?;
-    while let Ok(Some(command)) = commands.next() {
-        if command.cmd() == LC_FUNCTION_STARTS {
-            let command: &LinkeditDataCommand<_> = command.data().ok()?;
-            let offset: u64 = command.dataoff.get(endian).into();
-            let size: u64 = command.datasize.get(endian).into();
-            let end = offset.checked_add(size)?;
-            return data.get(offset as usize..end as usize);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn read_uleb128(mut bytes: &[u8]) -> Option<(u64, &[u8])> {
-    const CONTINUATION_BIT: u8 = 1 << 7;
-
-    let mut result = 0u64;
-    let mut shift = 0u32;
-
-    while !bytes.is_empty() {
-        let byte = bytes[0];
-        bytes = &bytes[1..];
-        if shift == 63 && byte != 0x00 && byte != 0x01 {
-            return None;
-        }
-
-        result |= u64::from(byte & !CONTINUATION_BIT) << shift;
-        if byte & CONTINUATION_BIT == 0 {
-            return Some((result, bytes));
-        }
-        shift += 7;
-    }
-
-    None
-}
-
 /// Extract a short module name from a path (file name, or full path as fallback).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn module_name_rc(path: &Path) -> Rc<str> {
     crate::path_to_name(path).into()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn build_native_symbol(
     name: String,
     source: SourceLocation,
@@ -701,10 +447,6 @@ fn build_native_symbol(
 ) -> NativeSymbol {
     let name_str: Rc<str> = name.into();
     let module_basename_start = crate::profile::basename_start(module);
-    let file_basename_start = source
-        .file
-        .as_deref()
-        .map_or(0, crate::profile::basename_start);
     NativeSymbol {
         is_eval_frame: is_eval_frame(&name_str),
         name: name_str,
@@ -715,46 +457,25 @@ fn build_native_symbol(
         function_start_column: source.function_start_column,
         module: Rc::clone(module),
         module_basename_start,
-        file_basename_start,
         offset,
         inline_depth: 0,
         should_ignore: is_python_runtime,
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[inline]
 fn inline_depth_for_frame(frame_count: usize, index: usize) -> u16 {
     u16::try_from(frame_count.saturating_sub(index + 1)).unwrap_or(u16::MAX)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn build_native_symbols_from_wholesym(
-    addr_info: AddressInfo,
-    _symbol_map: &WholeSymbolMap,
-    module: &Rc<str>,
-    module_offset: u64,
-    is_python_runtime: bool,
-    include_inlines: bool,
-) -> Vec<NativeSymbol> {
-    build_native_symbols_from_wholesym_parts(
-        addr_info.symbol.name,
-        addr_info.frames,
-        module,
-        module_offset,
-        is_python_runtime,
-        include_inlines,
-    )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
     module: &Rc<str>,
     module_offset: u64,
     is_python_runtime: bool,
-    include_inlines: bool,
 ) -> Vec<NativeSymbol> {
     let fallback_name = symbol_name;
     let fallback_symbol = move |source: SourceLocation| {
@@ -767,13 +488,7 @@ fn build_native_symbols_from_wholesym_parts(
         )
     };
 
-    let frame_capacity = frames.as_ref().map_or(1, |frames| {
-        if include_inlines {
-            frames.len().max(1)
-        } else {
-            usize::from(!frames.is_empty())
-        }
-    });
+    let frame_capacity = frames.as_ref().map_or(1, |frames| frames.len().max(1));
     let mut symbols = Vec::with_capacity(frame_capacity);
     let mut push_frame_symbol = |frame: wholesym::FrameDebugInfo, inline_depth| {
         let file = frame
@@ -798,14 +513,10 @@ fn build_native_symbols_from_wholesym_parts(
     };
 
     if let Some(frames) = frames {
-        if include_inlines {
-            let frame_count = frames.len();
-            for (index, frame) in frames.into_iter().enumerate() {
-                let inline_depth = inline_depth_for_frame(frame_count, index);
-                push_frame_symbol(frame, inline_depth);
-            }
-        } else if let Some(frame) = frames.into_iter().next() {
-            push_frame_symbol(frame, 0);
+        let frame_count = frames.len();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let inline_depth = inline_depth_for_frame(frame_count, index);
+            push_frame_symbol(frame, inline_depth);
         }
     }
 
@@ -835,48 +546,12 @@ impl SymbolizerWrapper {
             module_address_index: Box::default(),
             cache: HashMap::new(),
             cache_keys_by_path: HashMap::new(),
-            include_inlines: true,
             local_debug_dirs,
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
             runtime,
         }
-    }
-
-    /// Create a new symbolizer for the given process.
-    #[cfg(target_os = "macos")]
-    #[must_use]
-    pub fn new(_pid: u32) -> Self {
-        let runtime = TokioRuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for macOS symbolization");
-        let symbol_manager = SymbolManager::with_config(build_symbol_manager_config(&[], &[]));
-
-        Self {
-            modules: Vec::new(),
-            module_file_identities: HashMap::new(),
-            module_address_index: Box::default(),
-            cache: HashMap::new(),
-            cache_keys_by_path: HashMap::new(),
-            include_inlines: true,
-            symbol_tables: HashMap::new(),
-            dyld_shared_caches: None,
-            symbol_manager,
-            symbol_maps: HashMap::new(),
-            runtime,
-        }
-    }
-
-    /// Enable or disable inline frame expansion
-    pub fn set_include_inlines(&mut self, include: bool) {
-        if self.include_inlines == include {
-            return;
-        }
-        self.include_inlines = include;
-        self.cache.clear();
-        self.cache_keys_by_path.clear();
     }
 
     fn cache_insert(&mut self, addr: u64, path: &Path, value: SymbolsRc) {
@@ -902,13 +577,6 @@ impl SymbolizerWrapper {
         self.evict_cache_for_path(path);
         self.symbol_maps.remove(path);
         self.redirect_cache.remove(path).is_some()
-    }
-
-    #[cfg(target_os = "macos")]
-    fn evict_path_state(&mut self, path: &Path) {
-        self.evict_cache_for_path(path);
-        self.symbol_maps.remove(path);
-        self.symbol_tables.remove(path);
     }
 
     /// Set modules for symbolization.
@@ -951,16 +619,13 @@ impl SymbolizerWrapper {
                 self.rebuild_symbol_manager();
             }
         }
-        #[cfg(target_os = "macos")]
-        for path in &evicted {
-            self.evict_path_state(path);
-        }
 
         self.modules = modules;
         self.module_file_identities = new_file_identities;
         self.rebuild_module_address_index();
     }
 
+    #[cfg(test)]
     pub fn update_modules_for_path(&mut self, path: &Path, mut modules: Box<[SymModule]>) {
         mark_python_runtime_modules(modules.as_mut());
 
@@ -985,8 +650,6 @@ impl SymbolizerWrapper {
         if self.evict_path_state(path) {
             self.rebuild_symbol_manager();
         }
-        #[cfg(target_os = "macos")]
-        self.evict_path_state(path);
 
         self.modules.retain(|module| module.path != path);
         self.modules.extend(modules.into_vec());
@@ -1028,26 +691,21 @@ impl SymbolizerWrapper {
     /// Resolve one instruction address to symbol information.
     #[cfg(target_os = "linux")]
     pub fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
-        let empty = symbols_rc(Vec::new());
-        self.symbolize_one_with_empty(addr, &empty)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn symbolize_one_with_empty(&mut self, addr: u64, empty: &SymbolsRc) -> SymbolsRc {
         if let Some(cached) = self.cache.get(&addr) {
             return Rc::clone(cached);
         }
 
+        let empty = symbols_rc(Vec::new());
         let Some(module_idx) = self.find_module_index(addr, true) else {
-            return Rc::clone(empty);
+            return empty;
         };
         let module = &self.modules[module_idx];
         let path = module.path.clone();
         let image_base_opt = module.image_base;
         let is_python_runtime = module.is_python_runtime;
         let Some(image_base) = image_base_opt else {
-            self.cache_insert(addr, &path, Rc::clone(empty));
-            return Rc::clone(empty);
+            self.cache_insert(addr, &path, Rc::clone(&empty));
+            return empty;
         };
 
         let svma = image_base.svma_for_avma(addr);
@@ -1069,115 +727,7 @@ impl SymbolizerWrapper {
         symbols_rc
     }
 
-    /// Resolve a batch of instruction addresses to symbol information.
     #[cfg(target_os = "linux")]
-    pub fn symbolize_batch(&mut self, addrs: &[u64]) -> Vec<SymbolsRc> {
-        if addrs.is_empty() {
-            return Vec::new();
-        }
-
-        let empty = symbols_rc(Vec::new());
-        addrs
-            .iter()
-            .map(|&addr| self.symbolize_one_with_empty(addr, &empty))
-            .collect()
-    }
-
-    /// Resolve one instruction address to symbol information.
-    #[cfg(target_os = "macos")]
-    pub fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
-        let empty = symbols_rc(Vec::new());
-        self.symbolize_batch(&[addr])
-            .into_iter()
-            .next()
-            .unwrap_or(empty)
-    }
-
-    /// Resolve a batch of instruction addresses to symbol information.
-    #[cfg(target_os = "macos")]
-    pub fn symbolize_batch(&mut self, addrs: &[u64]) -> Vec<SymbolsRc> {
-        if addrs.is_empty() {
-            return Vec::new();
-        }
-
-        let empty = symbols_rc(Vec::new());
-        let mut results: Vec<SymbolsRc> = vec![Rc::clone(&empty); addrs.len()];
-
-        for (idx, &addr) in addrs.iter().enumerate() {
-            if let Some(cached) = self.cache.get(&addr) {
-                results[idx] = Rc::clone(cached);
-                continue;
-            }
-
-            let Some(module_idx) = self.find_module_index(addr, false) else {
-                continue;
-            };
-            let module = &self.modules[module_idx];
-            let path = module.path.clone();
-            let image_base_opt = module.image_base;
-            let is_python_runtime = module.is_python_runtime;
-            let Some(image_base) = image_base_opt else {
-                self.cache_insert(addr, &path, Rc::clone(&empty));
-                continue;
-            };
-
-            let relative_addr = image_base.relative_address(addr);
-            let module_rc = module_name_rc(&path);
-
-            if !is_macos_system_library(&path) {
-                if let Ok(relative_lookup) = u32::try_from(relative_addr) {
-                    if let Some(symbols) = self.symbolize_with_wholesym(
-                        &path,
-                        LookupAddress::Relative(relative_lookup),
-                        relative_addr,
-                        &module_rc,
-                        is_python_runtime,
-                    ) {
-                        let symbols_rc = symbols_rc(symbols);
-                        self.cache_insert(addr, &path, Rc::clone(&symbols_rc));
-                        results[idx] = symbols_rc;
-                        continue;
-                    }
-                }
-            }
-
-            if !self.symbol_tables.contains_key(&path) {
-                let sym_table = self.load_symbol_table_for_module(&path);
-                self.symbol_tables.insert(path.clone(), sym_table);
-            }
-
-            let mut symbols = Vec::new();
-            if let Some(sym_table) = self.symbol_tables.get(&path) {
-                if let Some(name) = sym_table.lookup(relative_addr) {
-                    let is_eval = is_eval_frame(name);
-                    let module_basename_start = crate::profile::basename_start(&module_rc);
-                    symbols.push(NativeSymbol {
-                        name: name.into(),
-                        file: None,
-                        line: None,
-                        column: None,
-                        function_start_line: None,
-                        function_start_column: None,
-                        module: Rc::clone(&module_rc),
-                        module_basename_start,
-                        file_basename_start: 0,
-                        offset: relative_addr,
-                        inline_depth: 0,
-                        is_eval_frame: is_eval,
-                        should_ignore: is_python_runtime,
-                    });
-                }
-            }
-
-            let symbols_rc = symbols_rc(symbols);
-            self.cache_insert(addr, &path, Rc::clone(&symbols_rc));
-            results[idx] = symbols_rc;
-        }
-
-        results
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn symbolize_with_wholesym(
         &mut self,
         path: &Path,
@@ -1202,19 +752,14 @@ impl SymbolizerWrapper {
             module_rc,
             module_offset,
             is_python_runtime,
-            self.include_inlines,
         ))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn ensure_symbol_map_loaded(&mut self, path: &Path) {
         if !self.symbol_maps.contains_key(path) {
-            #[cfg(target_os = "linux")]
             self.prefetch_linux_debug_redirects([path]);
 
-            #[cfg(target_os = "macos")]
-            let disambiguator = Some(MultiArchDisambiguator::BestMatchForNative);
-            #[cfg(target_os = "linux")]
             let disambiguator = None;
             let loaded = self.runtime.block_on(
                 self.symbol_manager
@@ -1235,7 +780,7 @@ impl SymbolizerWrapper {
     /// Discover and cache debug-file redirects for `paths` (skipping ones
     /// already cached); rebuild the `SymbolManager` once if anything new.
     #[cfg(target_os = "linux")]
-    pub fn prefetch_linux_debug_redirects<P>(&mut self, paths: impl IntoIterator<Item = P>)
+    fn prefetch_linux_debug_redirects<P>(&mut self, paths: impl IntoIterator<Item = P>)
     where
         P: AsRef<Path>,
     {
@@ -1256,309 +801,6 @@ impl SymbolizerWrapper {
             self.rebuild_symbol_manager();
         }
     }
-
-    #[cfg(target_os = "macos")]
-    fn dyld_shared_caches(&mut self) -> &[DyldSharedCacheData] {
-        let caches = self.dyld_shared_caches.get_or_insert_with(|| {
-            dyld_shared_cache_candidate_paths()
-                .filter_map(DyldSharedCacheData::load)
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        });
-        &caches[..]
-    }
-
-    #[cfg(target_os = "macos")]
-    fn load_symbol_table_for_module(&mut self, module_path: &Path) -> SymbolTable {
-        if is_macos_system_library(module_path) {
-            if let Some(sym_table) =
-                load_symbols_from_dyld_shared_cache(module_path, self.dyld_shared_caches())
-            {
-                return sym_table;
-            }
-        }
-
-        load_symbols_from_file(module_path)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_system_library(path: &Path) -> bool {
-    let path = path.to_string_lossy();
-    path.starts_with("/usr/") || path.starts_with("/System/")
-}
-
-#[cfg(target_os = "macos")]
-fn dyld_shared_cache_candidate_paths() -> impl Iterator<Item = PathBuf> {
-    #[cfg(target_arch = "aarch64")]
-    const ARCHES: &[&str] = &["arm64e", "arm64"];
-    #[cfg(target_arch = "x86_64")]
-    const ARCHES: &[&str] = &["x86_64h", "x86_64"];
-
-    [
-        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
-        "/System/Library/dyld",
-    ]
-    .into_iter()
-    .flat_map(|dir| {
-        ARCHES
-            .iter()
-            .map(move |arch| PathBuf::from(format!("{dir}/dyld_shared_cache_{arch}")))
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn with_path_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os = path.as_os_str().to_owned();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
-#[cfg(target_os = "macos")]
-fn load_dyld_subcaches(root_path: &Path) -> Box<[Mmap]> {
-    let mut subcaches = Vec::with_capacity(8);
-
-    for index in 1.. {
-        let plain = with_path_suffix(root_path, &format!(".{index}"));
-        let padded = with_path_suffix(root_path, &format!(".{index:02}"));
-        if let Some(mmap) = map_file_readonly(&plain)
-            .ok()
-            .or_else(|| map_file_readonly(&padded).ok())
-        {
-            subcaches.push(mmap);
-        } else {
-            break;
-        }
-    }
-
-    if let Ok(symbols_cache) = map_file_readonly(&with_path_suffix(root_path, ".symbols")) {
-        subcaches.push(symbols_cache);
-    }
-
-    subcaches.into_boxed_slice()
-}
-
-#[cfg(target_os = "macos")]
-fn load_symbols_from_dyld_shared_cache(
-    module_path: &Path,
-    dyld_shared_caches: &[DyldSharedCacheData],
-) -> Option<SymbolTable> {
-    let module_path = module_path.to_str()?;
-
-    for cache in dyld_shared_caches {
-        if let Some(sym_table) = cache.load_symbol_table(module_path) {
-            tracing::debug!(
-                name: "Symbols loaded",
-                module = module_path,
-                cache = %cache.path.display(),
-                count = sym_table.symbols.len(),
-                "Loaded symbols from dyld shared cache"
-            );
-            return Some(sym_table);
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn insert_symbol_name(symbols: &mut BTreeMap<u64, String>, addr: u64, name: &str) {
-    let name = name.strip_prefix('_').unwrap_or(name);
-    symbols.entry(addr).or_insert_with(|| name.to_string());
-}
-
-#[cfg(target_os = "macos")]
-fn next_boundary_after(boundaries: &BTreeSet<u64>, start: u64) -> Option<u64> {
-    boundaries
-        .range((Bound::Excluded(start), Bound::Unbounded))
-        .next()
-        .copied()
-}
-
-#[cfg(target_os = "macos")]
-fn build_symbol_table(
-    obj: &object::File<'_>,
-    image_base: u64,
-    macho_data: MachOData<'_>,
-) -> SymbolTable {
-    use object::{ObjectSection, ObjectSymbol, SectionFlags, SectionKind, SymbolKind};
-
-    let executable_sections: HashSet<_> = obj
-        .sections()
-        .filter_map(|section| match (section.kind(), section.flags()) {
-            (SectionKind::Text, _) => Some(section.index()),
-            (SectionKind::UninitializedData, SectionFlags::Elf { sh_flags })
-                if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0 =>
-            {
-                Some(section.index())
-            }
-            _ => None,
-        })
-        .collect();
-
-    let mut symbols_by_start = BTreeMap::<u64, String>::new();
-    let mut boundaries = BTreeSet::<u64>::new();
-
-    for symbol in obj.symbols().chain(obj.dynamic_symbols()) {
-        if symbol.address() == 0 {
-            continue;
-        }
-        match symbol.kind() {
-            SymbolKind::Text => {}
-            SymbolKind::Label if symbol.size() != 0 => {}
-            _ => continue,
-        }
-        if !matches!(symbol.section_index(), Some(idx) if executable_sections.contains(&idx)) {
-            continue;
-        }
-
-        let Some(start) = symbol.address().checked_sub(image_base) else {
-            continue;
-        };
-        boundaries.insert(start);
-        if let Some(end) = start.checked_add(symbol.size()) {
-            if symbol.size() != 0 {
-                boundaries.insert(end);
-            }
-        }
-
-        if let Ok(name) = symbol.name() {
-            insert_symbol_name(&mut symbols_by_start, start, name);
-        }
-    }
-
-    if let Ok(exports) = obj.exports() {
-        for export in exports {
-            let Some(start) = export.address().checked_sub(image_base) else {
-                continue;
-            };
-            boundaries.insert(start);
-            let name = String::from_utf8_lossy(export.name());
-            insert_symbol_name(&mut symbols_by_start, start, &name);
-        }
-    }
-
-    if let Some(function_starts) = macho_data.get_function_starts() {
-        boundaries.extend(function_starts.iter().copied());
-    }
-
-    boundaries.extend(obj.sections().filter_map(|section| {
-        (section.kind() == SectionKind::Text)
-            .then(|| {
-                section
-                    .address()
-                    .checked_add(section.size())?
-                    .checked_sub(image_base)
-            })
-            .flatten()
-    }));
-
-    SymbolTable {
-        symbols: symbols_by_start
-            .into_iter()
-            .map(|(start, name)| SymbolEntry {
-                start,
-                end: next_boundary_after(&boundaries, start),
-                name,
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    }
-}
-
-/// Load symbols from a file, handling both regular Mach-O and fat (universal) binaries.
-#[cfg(target_os = "macos")]
-fn load_symbols_from_file(path: &Path) -> SymbolTable {
-    use object::{FileKind, Object};
-
-    let mmap = match map_file_readonly(path) {
-        Ok(mmap) => mmap,
-        Err(e) => {
-            tracing::debug!(
-                name: "Binary read failed",
-                "Failed to read {}: {}",
-                path.display(),
-                e
-            );
-            return SymbolTable::new();
-        }
-    };
-
-    // Detect file kind to handle fat binaries
-    let kind = match FileKind::parse(&mmap[..]) {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::debug!(name: "File kind detection failed", "Failed to detect file kind for {}: {}", path.display(), e);
-            return SymbolTable::new();
-        }
-    };
-
-    let obj_data: &[u8] = match kind {
-        FileKind::MachOFat32 | FileKind::MachOFat64 => {
-            // Fat binary - extract the native architecture slice
-            if let Some(slice) = crate::macos::native_macho_slice(&mmap[..]) {
-                slice
-            } else {
-                tracing::debug!(name: "Fat binary arch mismatch", "No matching architecture in fat binary: {}", path.display());
-                return SymbolTable::new();
-            }
-        }
-        _ => &mmap[..],
-    };
-
-    match object::File::parse(obj_data) {
-        Ok(obj) => {
-            let image_base = get_image_base(&obj);
-            let sym_table =
-                build_symbol_table(&obj, image_base, MachOData::new(obj_data, 0, obj.is_64()));
-            tracing::debug!(
-                name: "Symbols loaded",
-                "Loaded {} symbols from {} (image_base=0x{:x})",
-                sym_table.symbols.len(),
-                path.display(),
-                image_base
-            );
-            for (i, entry) in sym_table.symbols.iter().take(5).enumerate() {
-                tracing::trace!(
-                    name: "Symbol entry",
-                    "  Symbol {}: 0x{:x}-{:?} {}",
-                    i,
-                    entry.start,
-                    entry.end,
-                    entry.name
-                );
-            }
-            sym_table
-        }
-        Err(e) => {
-            tracing::debug!(
-                name: "Mach-O parse failed",
-                "Failed to parse {}: {}",
-                path.display(),
-                e
-            );
-            SymbolTable::new()
-        }
-    }
-}
-
-/// Get the image base address for relative address calculation.
-/// For Mach-O, this is typically the __TEXT segment's vmaddr.
-#[cfg(target_os = "macos")]
-fn get_image_base(obj: &object::File<'_>) -> u64 {
-    use object::{Object, ObjectSegment};
-
-    // For Mach-O, find the __TEXT segment's vmaddr
-    for segment in obj.segments() {
-        if let Ok(Some(name)) = segment.name() {
-            if name == "__TEXT" {
-                return segment.address();
-            }
-        }
-    }
-
-    // Fallback: use 0 (symbols are already absolute)
-    0
 }
 
 #[cfg(test)]
@@ -1573,7 +815,7 @@ mod tests {
         assert!(!is_eval_frame("some_function.llvm.123"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_inline_depth_for_innermost_first_frames() {
         assert_eq!(inline_depth_for_frame(3, 0), 2);
@@ -1590,49 +832,6 @@ mod tests {
             is_executable: true,
             is_python_runtime: false,
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_symbol_table_lookup() {
-        let table = SymbolTable {
-            symbols: vec![
-                SymbolEntry {
-                    start: 0x1000,
-                    end: Some(0x1800),
-                    name: "func_a".to_string(),
-                },
-                SymbolEntry {
-                    start: 0x2000,
-                    end: Some(0x2800),
-                    name: "func_b".to_string(),
-                },
-                SymbolEntry {
-                    start: 0x3000,
-                    end: None,
-                    name: "func_c".to_string(),
-                },
-            ]
-            .into_boxed_slice(),
-        };
-
-        // Exact match
-        assert_eq!(table.lookup(0x1000), Some("func_a"));
-
-        // Within func_a's range
-        assert_eq!(table.lookup(0x1500), Some("func_a"));
-
-        // Gap between func_a and func_b should not overreach.
-        assert_eq!(table.lookup(0x1900), None);
-
-        // Within func_b's range
-        assert_eq!(table.lookup(0x2500), Some("func_b"));
-
-        // Before first symbol
-        assert_eq!(table.lookup(0x500), None);
-
-        // After last symbol
-        assert_eq!(table.lookup(0x4000), Some("func_c"));
     }
 
     #[test]

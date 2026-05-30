@@ -383,12 +383,6 @@ impl PerfRecorder {
         self.summary.clone()
     }
 
-    /// Return the process ids still believed to be alive.
-    pub fn active_processes(&mut self) -> Vec<i32> {
-        self.reconcile_active_processes();
-        self.active_processes.keys().copied().collect()
-    }
-
     /// Return whether `pid` is still believed to be alive.
     pub fn process_is_active(&mut self, pid: i32) -> bool {
         self.reconcile_active_processes();
@@ -401,16 +395,6 @@ impl PerfRecorder {
         self.active_processes
             .keys()
             .any(|&active_pid| active_pid != pid)
-    }
-
-    /// Return active process ids, excluding `pid`.
-    pub fn active_processes_except(&mut self, pid: i32) -> Vec<i32> {
-        self.reconcile_active_processes();
-        self.active_processes
-            .keys()
-            .copied()
-            .filter(|&active_pid| active_pid != pid)
-            .collect()
     }
 
     /// Flush the profile file and return the final counters.
@@ -776,7 +760,7 @@ impl<'a> SampleView<'a> {
             task: sample.task.map(|task| (task.pid, task.tid)),
             timestamp_ns: sample.time,
             code_addr: sample.code_addr,
-            user_regs: sample.user_regs.map(|regs| regs.as_slice()),
+            user_regs: sample.user_regs,
             user_stack: sample.user_stack,
             call_chain: sample
                 .call_chain

@@ -558,7 +558,7 @@ fn bench_helpers(c: &mut Criterion) {
             let mut checksum = 0usize;
             for _ in 0..ERROR_STATS_BATCH {
                 let stats = dense_error_stats();
-                stats.record(SampleErrorKind::FrameChainIncomplete);
+                stats.record(SampleErrorKind::NativeStackRead);
                 let mut output = String::new();
                 ErrorStatsFormatter::new(&stats, 100_000, 97_000)
                     .write_to(&mut output)

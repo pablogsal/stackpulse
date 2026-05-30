@@ -8,7 +8,6 @@
 #![doc = "\n\n"]
 #![doc = include_str!("../docs/explanation.md")]
 #![cfg(target_os = "linux")]
-#![allow(dead_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
@@ -23,7 +22,6 @@ mod elf;
 mod error;
 mod linux;
 mod module_base;
-mod module_traits;
 mod native_module;
 mod proc_maps;
 /// Post-symbolization frame model returned by [`PerfSymbolizer`].
@@ -65,8 +63,6 @@ pub use symbols::{
     default_native_symbolizer_factory, NativeSymbolizer, NativeSymbolizerFactory, SymModule,
     SymbolsRc,
 };
-
-pub(crate) type FramehopSectionData = linux::elf_types::ElfSectionData;
 
 /// Read the kernel's current maximum perf sample rate, in samples per second.
 ///
