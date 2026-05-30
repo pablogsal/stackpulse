@@ -10,105 +10,49 @@ use std::time::{Duration, Instant};
 
 /// Categories of sample failures for statistics tracking.
 ///
-/// Each variant represents a distinct failure reason that can occur
-/// during stack sampling. These are designed to be distinguishable
-/// for debugging and optimization purposes.
+/// Each variant is a distinct native-unwinding failure reason. Discriminants
+/// are the dense range `0..ALL.len()` so they double as indices into the
+/// fixed-size counter array in [`SampleErrorStats`]; the `const` assertion
+/// below enforces that invariant at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SampleErrorKind {
-    // Stack Chunks (0-9)
-    /// Stack chunk size is 0 or exceeds 64MB limit
-    StackChunkInvalidSize = 0,
-    /// Failed to read stack chunk from remote memory
-    StackChunkReadFailure = 1,
-    /// Stack chunk list cycle detected (corrupted remote memory)
-    StackChunkCycle = 2,
-    /// Too many stack chunks (possible corrupted chunk list)
-    StackChunkTooMany = 3,
-
-    // Frame Parsing (10-19)
-    /// Unknown frame owner type
-    FrameUnknownOwner = 10,
-    /// Failed to parse the initial frame in a chain (generic fallback)
-    FrameParseFailure = 11,
-    /// Initial frame had null code object address
-    FrameInitialNullCode = 12,
-    /// Initial frame was owned by a frame object (e.g. sys._getframe() keeping it alive)
-    FrameInitialFrameObjectOwned = 13,
-    /// Initial frame had an invalid owner value (likely memory corruption)
-    FrameInitialGarbageOwner = 14,
-
-    // Frame Chain (20-29)
-    /// Too many frames in chain (>1024, possible infinite loop)
-    FrameChainTooMany = 20,
-    /// Broken frame chain (expected vs actual address mismatch)
-    FrameChainBroken = 21,
-    /// Incomplete walk (didn't reach base frame)
-    FrameChainIncomplete = 22,
-
-    // Code Objects (30-39)
-    /// Failed to read code object from remote memory
-    CodeObjectReadFailure = 30,
-    /// NULL TLBC pointer (free-threaded Python)
-    CodeObjectTlbcNull = 31,
-    /// Invalid TLBC array size
-    CodeObjectTlbcInvalidSize = 32,
-
-    // Thread State (40-49)
-    /// Failed to read thread state from remote memory
-    ThreadStateReadFailure = 40,
-
-    // Native Unwinding (50-59)
     /// Failed to capture thread registers
-    NativeRegisterCapture = 50,
+    NativeRegisterCapture = 0,
     /// Failed to read native stack memory
-    NativeStackRead = 51,
+    NativeStackRead = 1,
     /// Native stack copy was too small and unwind was truncated
-    NativeStackTruncated = 52,
+    NativeStackTruncated = 2,
     /// Framehop error: unwinding did not advance frame/stack pointer
-    NativeFramehopDidNotAdvance = 53,
+    NativeFramehopDidNotAdvance = 3,
     /// Framehop error: return address became NULL
-    NativeFramehopReturnAddressNull = 54,
+    NativeFramehopReturnAddressNull = 4,
     /// Framehop error: frame pointer unwinding moved backwards
-    NativeFramehopMovedBackwards = 55,
+    NativeFramehopMovedBackwards = 5,
     /// Framehop error: integer overflow during unwind calculations
-    NativeFramehopIntegerOverflow = 56,
-
-    // Stack Merging (60-69)
-    /// More Python frame groups than native eval frames during merge
-    MergeTooManyPythonFrames = 60,
-    /// Fewer Python frame groups than native eval frames during merge
-    MergeTooFewPythonFrames = 61,
-
-    // Thread List (70-79)
-    /// Thread list cycle detected (corrupted remote memory)
-    ThreadListCycle = 70,
-    /// Too many threads (>4096, possible corrupted thread list)
-    ThreadListTooMany = 71,
+    NativeFramehopIntegerOverflow = 6,
 }
 
-/// Number of error kinds (must match the last discriminant + 1)
-const ERROR_KIND_COUNT: usize = 72;
+/// Number of error kinds; sizes the counter array. Derived from
+/// [`SampleErrorKind::ALL`] so it can never drift from the enum.
+const ERROR_KIND_COUNT: usize = SampleErrorKind::ALL.len();
+
+// Enforce that each variant's discriminant equals its index in `ALL`, so
+// `kind as usize` is always a valid, unique slot in the counter array.
+const _: () = {
+    let mut i = 0;
+    while i < SampleErrorKind::ALL.len() {
+        assert!(
+            SampleErrorKind::ALL[i] as usize == i,
+            "SampleErrorKind discriminants must be the dense range 0..ALL.len()",
+        );
+        i += 1;
+    }
+};
 
 impl SampleErrorKind {
-    /// All variants for iteration, ordered by category for grouped display.
+    /// All variants for iteration, in discriminant order.
     pub const ALL: &'static [SampleErrorKind] = &[
-        SampleErrorKind::StackChunkInvalidSize,
-        SampleErrorKind::StackChunkReadFailure,
-        SampleErrorKind::StackChunkCycle,
-        SampleErrorKind::StackChunkTooMany,
-        SampleErrorKind::FrameUnknownOwner,
-        SampleErrorKind::FrameParseFailure,
-        SampleErrorKind::FrameInitialNullCode,
-        SampleErrorKind::FrameInitialFrameObjectOwned,
-        SampleErrorKind::FrameInitialGarbageOwner,
-        SampleErrorKind::FrameChainTooMany,
-        SampleErrorKind::FrameChainBroken,
-        SampleErrorKind::FrameChainIncomplete,
-        SampleErrorKind::CodeObjectReadFailure,
-        SampleErrorKind::CodeObjectTlbcNull,
-        SampleErrorKind::CodeObjectTlbcInvalidSize,
-        SampleErrorKind::ThreadStateReadFailure,
         SampleErrorKind::NativeRegisterCapture,
         SampleErrorKind::NativeStackRead,
         SampleErrorKind::NativeStackTruncated,
@@ -116,57 +60,19 @@ impl SampleErrorKind {
         SampleErrorKind::NativeFramehopReturnAddressNull,
         SampleErrorKind::NativeFramehopMovedBackwards,
         SampleErrorKind::NativeFramehopIntegerOverflow,
-        SampleErrorKind::MergeTooManyPythonFrames,
-        SampleErrorKind::MergeTooFewPythonFrames,
-        SampleErrorKind::ThreadListCycle,
-        SampleErrorKind::ThreadListTooMany,
     ];
 
-    /// Category name for grouping in display.
+    /// Category name for grouping in display. All current failure kinds are
+    /// native-unwinding failures, so they share a single category.
     #[must_use]
     pub fn category(&self) -> &'static str {
-        match self {
-            Self::StackChunkInvalidSize
-            | Self::StackChunkReadFailure
-            | Self::StackChunkCycle
-            | Self::StackChunkTooMany => "Stack Chunks",
-            Self::FrameUnknownOwner
-            | Self::FrameParseFailure
-            | Self::FrameInitialNullCode
-            | Self::FrameInitialFrameObjectOwned
-            | Self::FrameInitialGarbageOwner => "Frame Parsing",
-            Self::FrameChainTooMany | Self::FrameChainBroken | Self::FrameChainIncomplete => {
-                "Frame Chain"
-            }
-            Self::CodeObjectReadFailure
-            | Self::CodeObjectTlbcNull
-            | Self::CodeObjectTlbcInvalidSize => "Code Objects",
-            Self::ThreadStateReadFailure => "Thread State",
-            Self::NativeRegisterCapture
-            | Self::NativeStackRead
-            | Self::NativeStackTruncated
-            | Self::NativeFramehopDidNotAdvance
-            | Self::NativeFramehopReturnAddressNull
-            | Self::NativeFramehopMovedBackwards
-            | Self::NativeFramehopIntegerOverflow => "Native Unwinding",
-            Self::MergeTooManyPythonFrames | Self::MergeTooFewPythonFrames => "Stack Merging",
-            Self::ThreadListCycle | Self::ThreadListTooMany => "Thread List",
-        }
+        "Native Unwinding"
     }
 
     /// Short human-readable description.
     #[must_use]
     pub fn description(&self) -> &'static str {
         match self {
-            Self::StackChunkInvalidSize => "Invalid chunk size",
-            Self::StackChunkReadFailure => "Chunk read failure",
-            Self::FrameUnknownOwner => "Unknown frame owner",
-            Self::FrameChainTooMany => "Too many frames",
-            Self::FrameChainBroken => "Broken chain",
-            Self::FrameChainIncomplete => "Incomplete walk",
-            Self::CodeObjectReadFailure | Self::ThreadStateReadFailure => "Read failure",
-            Self::CodeObjectTlbcNull => "NULL TLBC pointer",
-            Self::CodeObjectTlbcInvalidSize => "Invalid TLBC size",
             Self::NativeRegisterCapture => "Register capture failed",
             Self::NativeStackRead => "Stack read failed",
             Self::NativeStackTruncated => "Stack copy too small (truncated unwind)",
@@ -174,18 +80,6 @@ impl SampleErrorKind {
             Self::NativeFramehopReturnAddressNull => "Framehop: return address is NULL",
             Self::NativeFramehopMovedBackwards => "Framehop: frame pointer moved backwards",
             Self::NativeFramehopIntegerOverflow => "Framehop: integer overflow",
-            Self::MergeTooManyPythonFrames => "Too many Python frames for native eval slots",
-            Self::MergeTooFewPythonFrames => "Too few Python frames for native eval slots",
-            Self::ThreadListCycle => "Cycle detected",
-            Self::ThreadListTooMany => "Too many threads",
-            Self::StackChunkCycle => "Chunk list cycle",
-            Self::StackChunkTooMany => "Too many chunks",
-            Self::FrameParseFailure => "Initial frame parse failed",
-            Self::FrameInitialNullCode => "Initial frame: null code object",
-            Self::FrameInitialFrameObjectOwned => {
-                "Initial frame: held by frame object (sys._getframe)"
-            }
-            Self::FrameInitialGarbageOwner => "Initial frame: invalid owner (memory corruption)",
         }
     }
 }
@@ -317,54 +211,6 @@ impl Clone for SampleErrorStats {
     }
 }
 
-/// Snapshot of per-kind counters for emitting periodic delta summaries.
-#[derive(Debug, Clone)]
-pub struct SampleErrorSnapshot {
-    counts: [u64; ERROR_KIND_COUNT],
-}
-
-impl Default for SampleErrorSnapshot {
-    fn default() -> Self {
-        Self {
-            counts: [0u64; ERROR_KIND_COUNT],
-        }
-    }
-}
-
-impl SampleErrorSnapshot {
-    /// Take a snapshot of the current counter state.
-    #[must_use]
-    pub fn capture(stats: &SampleErrorStats) -> Self {
-        let mut counts = [0u64; ERROR_KIND_COUNT];
-        for (i, counter) in stats.counts.iter().enumerate() {
-            counts[i] = counter.load(Ordering::Relaxed);
-        }
-        Self { counts }
-    }
-
-    /// Iterate over kinds whose counter increased since `previous`.
-    pub fn delta_iter<'a>(
-        &'a self,
-        previous: &'a Self,
-    ) -> impl Iterator<Item = (SampleErrorKind, u64)> + 'a {
-        SampleErrorKind::ALL.iter().filter_map(move |&kind| {
-            let cur = self.counts[kind as usize];
-            let prev = previous.counts[kind as usize];
-            if cur > prev {
-                Some((kind, cur - prev))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Total errors across all categories in this snapshot.
-    #[must_use]
-    pub fn total(&self) -> u64 {
-        self.counts.iter().sum()
-    }
-}
-
 /// Format error statistics for display.
 ///
 /// Groups errors by category with counts and percentages.
@@ -493,32 +339,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_category_grouping() {
-        // Verify that related errors share categories
-        assert_eq!(
-            SampleErrorKind::StackChunkInvalidSize.category(),
-            SampleErrorKind::StackChunkReadFailure.category()
-        );
-        assert_eq!(
-            SampleErrorKind::StackChunkCycle.category(),
-            SampleErrorKind::StackChunkInvalidSize.category()
-        );
-        assert_eq!(
-            SampleErrorKind::StackChunkTooMany.category(),
-            SampleErrorKind::StackChunkInvalidSize.category()
-        );
-        assert_eq!(
-            SampleErrorKind::FrameChainTooMany.category(),
-            SampleErrorKind::FrameChainIncomplete.category()
-        );
-        assert_eq!(
-            SampleErrorKind::FrameUnknownOwner.category(),
-            SampleErrorKind::FrameParseFailure.category()
-        );
-        assert_eq!(
-            SampleErrorKind::NativeRegisterCapture.category(),
-            SampleErrorKind::NativeStackRead.category()
-        );
+    fn test_all_kinds_share_native_category() {
+        for kind in SampleErrorKind::ALL {
+            assert_eq!(kind.category(), "Native Unwinding");
+        }
+    }
+
+    #[test]
+    fn test_discriminants_match_all_order() {
+        for (i, kind) in SampleErrorKind::ALL.iter().enumerate() {
+            assert_eq!(
+                *kind as usize, i,
+                "{kind:?} discriminant must equal its ALL index"
+            );
+        }
+        assert_eq!(SampleErrorKind::ALL.len(), ERROR_KIND_COUNT);
     }
 
     // SampleErrorStats basic operations
@@ -537,16 +372,16 @@ mod tests {
     fn test_record_and_get() {
         let stats = SampleErrorStats::new();
 
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        assert_eq!(stats.get(SampleErrorKind::FrameChainIncomplete), 1);
+        stats.record(SampleErrorKind::NativeStackRead);
+        assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 1);
         assert!(stats.has_errors());
 
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        assert_eq!(stats.get(SampleErrorKind::FrameChainIncomplete), 2);
+        stats.record(SampleErrorKind::NativeStackRead);
+        assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 2);
 
-        stats.record(SampleErrorKind::StackChunkReadFailure);
-        assert_eq!(stats.get(SampleErrorKind::StackChunkReadFailure), 1);
-        assert_eq!(stats.get(SampleErrorKind::FrameUnknownOwner), 0);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
+        assert_eq!(stats.get(SampleErrorKind::NativeRegisterCapture), 1);
+        assert_eq!(stats.get(SampleErrorKind::NativeFramehopIntegerOverflow), 0);
         assert_eq!(stats.total(), 3);
     }
 
@@ -560,29 +395,29 @@ mod tests {
     #[test]
     fn test_iter_nonzero() {
         let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::FrameChainBroken);
-        stats.record(SampleErrorKind::FrameChainBroken);
-        stats.record(SampleErrorKind::MergeTooManyPythonFrames);
+        stats.record(SampleErrorKind::NativeStackTruncated);
+        stats.record(SampleErrorKind::NativeStackTruncated);
+        stats.record(SampleErrorKind::NativeFramehopDidNotAdvance);
 
         let nonzero: Vec<_> = stats.iter_nonzero().collect();
         assert_eq!(nonzero.len(), 2);
 
-        assert!(nonzero.contains(&(SampleErrorKind::FrameChainBroken, 2)));
-        assert!(nonzero.contains(&(SampleErrorKind::MergeTooManyPythonFrames, 1)));
+        assert!(nonzero.contains(&(SampleErrorKind::NativeStackTruncated, 2)));
+        assert!(nonzero.contains(&(SampleErrorKind::NativeFramehopDidNotAdvance, 1)));
     }
 
     #[test]
     fn test_iter_nonzero_preserves_order() {
         let stats = SampleErrorStats::new();
-        // Record in reverse order
-        stats.record(SampleErrorKind::MergeTooManyPythonFrames);
-        stats.record(SampleErrorKind::StackChunkInvalidSize);
+        // Record the higher-discriminant kind first.
+        stats.record(SampleErrorKind::NativeFramehopIntegerOverflow);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
 
         let nonzero: Vec<_> = stats.iter_nonzero().collect();
 
         // Should be in ALL order, not recording order
-        assert_eq!(nonzero[0].0, SampleErrorKind::StackChunkInvalidSize);
-        assert_eq!(nonzero[1].0, SampleErrorKind::MergeTooManyPythonFrames);
+        assert_eq!(nonzero[0].0, SampleErrorKind::NativeRegisterCapture);
+        assert_eq!(nonzero[1].0, SampleErrorKind::NativeFramehopIntegerOverflow);
     }
 
     // SampleErrorStats reset
@@ -613,36 +448,36 @@ mod tests {
     #[test]
     fn test_clone() {
         let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        stats.record(SampleErrorKind::StackChunkReadFailure);
+        stats.record(SampleErrorKind::NativeStackRead);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
 
         let cloned = stats.clone();
 
         // Clone has same values
-        assert_eq!(cloned.get(SampleErrorKind::FrameChainIncomplete), 1);
-        assert_eq!(cloned.get(SampleErrorKind::StackChunkReadFailure), 1);
+        assert_eq!(cloned.get(SampleErrorKind::NativeStackRead), 1);
+        assert_eq!(cloned.get(SampleErrorKind::NativeRegisterCapture), 1);
         assert_eq!(cloned.total(), 2);
     }
 
     #[test]
     fn test_clone_independence() {
         let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::FrameChainIncomplete);
+        stats.record(SampleErrorKind::NativeStackRead);
 
         let cloned = stats.clone();
 
         // Modify original
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        stats.record(SampleErrorKind::StackChunkReadFailure);
+        stats.record(SampleErrorKind::NativeStackRead);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
 
         // Clone is unaffected
-        assert_eq!(cloned.get(SampleErrorKind::FrameChainIncomplete), 1);
-        assert_eq!(cloned.get(SampleErrorKind::StackChunkReadFailure), 0);
+        assert_eq!(cloned.get(SampleErrorKind::NativeStackRead), 1);
+        assert_eq!(cloned.get(SampleErrorKind::NativeRegisterCapture), 0);
         assert_eq!(cloned.total(), 1);
 
         // Original has new values
-        assert_eq!(stats.get(SampleErrorKind::FrameChainIncomplete), 2);
-        assert_eq!(stats.get(SampleErrorKind::StackChunkReadFailure), 1);
+        assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 2);
+        assert_eq!(stats.get(SampleErrorKind::NativeRegisterCapture), 1);
         assert_eq!(stats.total(), 3);
     }
 
@@ -664,9 +499,9 @@ mod tests {
     #[test]
     fn test_formatter_with_errors() {
         let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        stats.record(SampleErrorKind::FrameChainIncomplete);
-        stats.record(SampleErrorKind::StackChunkReadFailure);
+        stats.record(SampleErrorKind::NativeStackRead);
+        stats.record(SampleErrorKind::NativeStackRead);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
 
         let formatter = ErrorStatsFormatter::new(&stats, 100, 97);
 
@@ -678,22 +513,22 @@ mod tests {
         assert!(output.contains("Successful:"));
         assert!(output.contains("97"));
         assert!(output.contains("Sample errors:"));
-        assert!(output.contains("Frame Chain:"));
-        assert!(output.contains("Incomplete walk:"));
-        assert!(output.contains("Stack Chunks:"));
+        assert!(output.contains("Native Unwinding:"));
+        assert!(output.contains("Stack read failed:"));
+        assert!(output.contains("Register capture failed:"));
     }
 
     #[test]
     fn test_formatter_errors_add_up() {
         let stats = SampleErrorStats::new();
         for _ in 0..50 {
-            stats.record(SampleErrorKind::CodeObjectReadFailure);
+            stats.record(SampleErrorKind::NativeStackRead);
         }
         for _ in 0..30 {
-            stats.record(SampleErrorKind::MergeTooManyPythonFrames);
+            stats.record(SampleErrorKind::NativeFramehopDidNotAdvance);
         }
         for _ in 0..20 {
-            stats.record(SampleErrorKind::FrameChainIncomplete);
+            stats.record(SampleErrorKind::NativeStackTruncated);
         }
 
         let formatter = ErrorStatsFormatter::new(&stats, 1000, 900);
@@ -706,23 +541,22 @@ mod tests {
     }
 
     #[test]
-    fn test_formatter_categories_grouped() {
+    fn test_formatter_lists_each_kind_under_one_category() {
         let stats = SampleErrorStats::new();
-        // Add errors from different categories
-        stats.record(SampleErrorKind::StackChunkInvalidSize);
-        stats.record(SampleErrorKind::StackChunkReadFailure);
-        stats.record(SampleErrorKind::FrameChainBroken);
-        stats.record(SampleErrorKind::MergeTooManyPythonFrames);
+        stats.record(SampleErrorKind::NativeRegisterCapture);
+        stats.record(SampleErrorKind::NativeStackRead);
+        stats.record(SampleErrorKind::NativeFramehopMovedBackwards);
 
         let formatter = ErrorStatsFormatter::new(&stats, 100, 96);
 
         let mut output = String::new();
         formatter.write_to(&mut output).unwrap();
 
-        // Verify category headers appear
-        assert!(output.contains("Stack Chunks:"));
-        assert!(output.contains("Frame Chain:"));
-        assert!(output.contains("Stack Merging:"));
+        // Single category header, one line per recorded kind.
+        assert_eq!(output.matches("Native Unwinding:").count(), 1);
+        assert!(output.contains("Register capture failed:"));
+        assert!(output.contains("Stack read failed:"));
+        assert!(output.contains("Framehop: frame pointer moved backwards:"));
     }
 
     #[test]
@@ -731,10 +565,10 @@ mod tests {
         // Add 80 of one type, 20 of another = 80% and 20% of errors
         // With 1000 total samples: 8% and 2% of samples
         for _ in 0..80 {
-            stats.record(SampleErrorKind::FrameChainIncomplete);
+            stats.record(SampleErrorKind::NativeStackRead);
         }
         for _ in 0..20 {
-            stats.record(SampleErrorKind::StackChunkReadFailure);
+            stats.record(SampleErrorKind::NativeRegisterCapture);
         }
 
         let formatter = ErrorStatsFormatter::new(&stats, 1000, 900);
@@ -755,7 +589,7 @@ mod tests {
         let stats = SampleErrorStats::new();
         stats.record(SampleErrorKind::NativeFramehopMovedBackwards);
         stats.record(SampleErrorKind::NativeFramehopDidNotAdvance);
-        stats.record(SampleErrorKind::MergeTooManyPythonFrames);
+        stats.record(SampleErrorKind::NativeFramehopReturnAddressNull);
 
         let formatter = ErrorStatsFormatter::new(&stats, 1000, 997);
         let mut output = String::new();
@@ -763,7 +597,7 @@ mod tests {
 
         let lines: Vec<&str> = output
             .lines()
-            .filter(|line| line.contains("Framehop:") || line.contains("Too many Python"))
+            .filter(|line| line.contains("Framehop:"))
             .collect();
         assert_eq!(lines.len(), 3);
 
@@ -794,7 +628,7 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 thread::spawn(move || {
                     for _ in 0..records_per_thread {
-                        stats.record(SampleErrorKind::FrameChainIncomplete);
+                        stats.record(SampleErrorKind::NativeStackRead);
                     }
                 })
             })
@@ -805,7 +639,7 @@ mod tests {
         }
 
         assert_eq!(
-            stats.get(SampleErrorKind::FrameChainIncomplete),
+            stats.get(SampleErrorKind::NativeStackRead),
             num_threads * records_per_thread
         );
     }

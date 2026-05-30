@@ -1,12 +1,11 @@
 //! Shared ELF segment types and helpers.
 //!
-//! This module provides [`LoadSegment`] and [`find_load_segment_for_file_offset`],
-//! used by both the native engine (module loading, framehop base computation)
-//! and the Python engine (PyRuntime address resolution from core files).
+//! Provides [`LoadSegment`] plus the helpers the native module loader uses to
+//! map a process memory mapping back to its backing `PT_LOAD` segment and to
+//! compute the SVMA-to-AVMA image-base bias for that mapping.
 
 use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::Elf;
-use std::sync::OnceLock;
 
 /// A PT_LOAD segment from an ELF binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,32 +40,6 @@ pub fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
     segments
 }
 
-/// Find the PT_LOAD segment that backs a memory mapping at the given file offset.
-///
-/// The Linux kernel page-aligns segment boundaries when creating memory mappings,
-/// so a mapping's `file_off_start` may be *before* the segment's raw `p_offset`.
-/// For example, with segments at offsets 0x0 (size 0x13c04) and 0x13c10, the kernel
-/// creates the code mapping at page-aligned offset 0x13000, which falls inside
-/// the first segment's raw range but actually belongs to the second segment.
-///
-/// # Matching invariant
-///
-/// A mapping at `file_off` is backed by segment `S` when:
-///   `page_floor(S.p_offset) <= file_off < page_ceil(S.p_offset + S.p_memsz)`
-///
-/// When two segments share a page boundary (their page-aligned ranges overlap),
-/// the segment with the larger `page_floor(p_offset)` wins. Since segments are
-/// sorted by `p_offset`, reverse iteration returns the most-specific match.
-///
-/// Uses the current host's runtime page size when evaluating page-aligned
-/// segment ranges.
-pub fn find_load_segment_for_file_offset(
-    segments: &[LoadSegment],
-    file_off: u64,
-) -> Option<&LoadSegment> {
-    find_load_segment_for_file_offset_pagesz(segments, file_off, system_page_size())
-}
-
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for a mapping.
 ///
@@ -84,40 +57,6 @@ pub fn find_load_contribution_for_file_range(
         .iter()
         .rev()
         .find(|seg| file_ranges_correlate(seg.p_offset, seg.p_filesz, file_off, mapping_span))
-}
-
-/// Compute the SVMA-to-AVMA bias for a mapping using the matching PT_LOAD
-/// contribution from the ELF image.
-///
-/// The returned bias is image-wide: adding it to the ELF image's base SVMA
-/// yields the actual image base AVMA in the target process.
-pub fn compute_vma_bias_for_mapping_strict(
-    segments: &[LoadSegment],
-    mapping_start_file_offset: u64,
-    mapping_start_avma: u64,
-    mapping_span: u64,
-) -> Option<u64> {
-    let seg =
-        find_load_contribution_for_file_range(segments, mapping_start_file_offset, mapping_span)?;
-    Some(compute_vma_bias_for_load_segment(
-        seg,
-        mapping_start_file_offset,
-        mapping_start_avma,
-    ))
-}
-
-const DEFAULT_PAGE_SIZE: u64 = 0x1000;
-
-fn system_page_size() -> u64 {
-    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
-    *PAGE_SIZE.get_or_init(|| {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size > 0 {
-            page_size as u64
-        } else {
-            DEFAULT_PAGE_SIZE
-        }
-    })
 }
 
 /// Check whether two file ranges mutually contain each other (either A
@@ -147,37 +86,6 @@ pub fn compute_vma_bias(
     reference_avma.wrapping_sub(reference_svma)
 }
 
-fn compute_vma_bias_for_load_segment(
-    seg: &LoadSegment,
-    mapping_start_file_offset: u64,
-    mapping_start_avma: u64,
-) -> u64 {
-    compute_vma_bias(
-        seg.p_offset,
-        seg.p_vaddr,
-        mapping_start_file_offset,
-        mapping_start_avma,
-    )
-}
-
-/// Inner implementation with explicit page size (for testing with non-4K pages).
-fn find_load_segment_for_file_offset_pagesz(
-    segments: &[LoadSegment],
-    file_off: u64,
-    page_size: u64,
-) -> Option<&LoadSegment> {
-    let page_mask = !(page_size - 1);
-
-    // Segments are sorted by p_offset ascending. Walk backwards so that
-    // when two segments share a page boundary, the later segment (more
-    // specific match) wins.
-    segments.iter().rev().find(|seg| {
-        let seg_page_start = seg.p_offset & page_mask;
-        let seg_page_end = (seg.p_offset + seg.p_memsz + page_size - 1) & page_mask;
-        file_off >= seg_page_start && file_off < seg_page_end
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,157 +109,6 @@ mod tests {
             seg(0x0000000000053cc0, 0x02e98, 0x03340, 0x0000000000055cc0), // RW
             seg(0x0000000000056b58, 0x009c0, 0x00a98, 0x0000000000059b58), // RW
         ]
-    }
-
-    /// Real C PIE layout (from `cc -g -O0`).
-    /// Key property: uniform bias for R/RE/R segments (p_vaddr == p_offset).
-    fn c_pie_segments() -> Vec<LoadSegment> {
-        vec![
-            seg(0x000, 0x5a8, 0x5a8, 0x000),   // R
-            seg(0x1000, 0x2c2, 0x2c2, 0x1000), // R E
-            seg(0x2000, 0x1a0, 0x1a0, 0x2000), // R
-            seg(0x2e00, 0x224, 0x240, 0x3e00), // RW (non-uniform bias here)
-        ]
-    }
-
-    #[test]
-    fn test_rust_pie_code_mapping_at_page_boundary() {
-        let segs = rust_pie_segments();
-        let matched = find_load_segment_for_file_offset(&segs, 0x13000).unwrap();
-        assert_eq!(
-            matched.p_offset, 0x13c10,
-            "must match the code segment, not the read-only one"
-        );
-        assert_eq!(
-            matched.p_vaddr - matched.p_offset,
-            0x1000,
-            "code segment bias must be 0x1000"
-        );
-    }
-
-    #[test]
-    fn test_rust_pie_readonly_mapping() {
-        let segs = rust_pie_segments();
-        let matched = find_load_segment_for_file_offset(&segs, 0x0).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
-    }
-
-    #[test]
-    fn test_rust_pie_data_mappings() {
-        let segs = rust_pie_segments();
-
-        let matched = find_load_segment_for_file_offset(&segs, 0x53000).unwrap();
-        assert_eq!(matched.p_offset, 0x53cc0);
-
-        let matched = find_load_segment_for_file_offset(&segs, 0x56000).unwrap();
-        assert_eq!(matched.p_offset, 0x56b58);
-    }
-
-    #[test]
-    fn test_rust_pie_mid_segment_offsets() {
-        let segs = rust_pie_segments();
-
-        let matched = find_load_segment_for_file_offset(&segs, 0x8000).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
-
-        let matched = find_load_segment_for_file_offset(&segs, 0x20000).unwrap();
-        assert_eq!(matched.p_offset, 0x13c10);
-    }
-
-    #[test]
-    fn test_c_pie_uniform_bias() {
-        let segs = c_pie_segments();
-        // These segments come from a real Linux C binary with 4 KiB pages.
-        let find = |off| find_load_segment_for_file_offset_pagesz(&segs, off, 0x1000);
-
-        let matched = find(0x0).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
-
-        let matched = find(0x1000).unwrap();
-        assert_eq!(matched.p_offset, 0x1000);
-
-        let matched = find(0x2000).unwrap();
-        assert!(
-            matched.p_offset == 0x2000 || matched.p_offset == 0x2e00,
-            "ambiguous case: either segment is acceptable"
-        );
-    }
-
-    #[test]
-    fn test_file_offset_past_all_segments_returns_none() {
-        let segs = rust_pie_segments();
-        assert!(find_load_segment_for_file_offset(&segs, 0x1000000).is_none());
-    }
-
-    #[test]
-    fn test_empty_segments_returns_none() {
-        assert!(find_load_segment_for_file_offset(&[], 0x1000).is_none());
-    }
-
-    #[test]
-    fn test_single_segment() {
-        let segs = vec![seg(0x0, 0x5000, 0x5000, 0x0)];
-        let find = |off| find_load_segment_for_file_offset_pagesz(&segs, off, 0x1000);
-
-        assert_eq!(find(0x0).unwrap().p_offset, 0x0);
-        assert_eq!(find(0x4000).unwrap().p_offset, 0x0);
-        assert!(find(0x5000).is_none());
-    }
-
-    #[test]
-    fn test_bss_memsz_extends_range() {
-        let segs = vec![seg(0x1000, 0x100, 0x2000, 0x1000)];
-        let find = |off| find_load_segment_for_file_offset_pagesz(&segs, off, 0x1000);
-
-        let matched = find(0x2000);
-        assert!(matched.is_some(), "BSS region must be covered by memsz");
-
-        assert!(find(0x3000).is_none());
-    }
-
-    #[test]
-    fn test_16k_pages_non_uniform_bias() {
-        let segs = rust_pie_segments();
-        let matched = find_load_segment_for_file_offset_pagesz(&segs, 0x10000, 0x4000).unwrap();
-        assert_eq!(matched.p_offset, 0x13c10);
-    }
-
-    #[test]
-    fn test_16k_pages_separates_segments() {
-        let segs = rust_pie_segments();
-        let matched = find_load_segment_for_file_offset_pagesz(&segs, 0x0, 0x4000).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
-
-        let matched = find_load_segment_for_file_offset_pagesz(&segs, 0x10000, 0x4000).unwrap();
-        assert_eq!(matched.p_offset, 0x13c10);
-    }
-
-    #[test]
-    fn test_64k_pages_shared_page_ambiguity() {
-        let segs = rust_pie_segments();
-        let matched = find_load_segment_for_file_offset_pagesz(&segs, 0x0, 0x10000).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
-
-        let matched = find_load_segment_for_file_offset_pagesz(&segs, 0x10000, 0x10000).unwrap();
-        assert_eq!(matched.p_offset, 0x13c10);
-    }
-
-    #[test]
-    fn test_bias_computation_with_matched_segment() {
-        let segs = rust_pie_segments();
-
-        let file_off: u64 = 0x13000;
-        let avma_start: u64 = 0x555555568000;
-        let seg = find_load_segment_for_file_offset(&segs, file_off).unwrap();
-        let base_avma = avma_start - file_off;
-        let base_svma = seg.p_vaddr - seg.p_offset;
-
-        let entry_svma: u64 = 0x14c10;
-        let entry_avma = entry_svma - base_svma + base_avma;
-        assert_eq!(entry_avma, 0x555555568c10, "entry point AVMA");
-
-        let computed_svma = entry_avma - base_avma + base_svma;
-        assert_eq!(computed_svma, entry_svma, "round-trip SVMA must match");
     }
 
     #[test]
@@ -384,13 +141,17 @@ mod tests {
         let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1000).unwrap();
         assert_eq!(matched.p_offset, 0x900);
 
-        let bias =
-            compute_vma_bias_for_mapping_strict(&segs, 0x0, 0x5555_5555_5000, 0x1000).unwrap();
+        // The bias derived from the matched contribution must map SVMA 0 to the
+        // expected image-base AVMA.
+        let bias = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, 0x5555_5555_5000);
         assert_eq!(0_u64.wrapping_add(bias), 0x5555_5555_4000);
     }
 
     #[test]
-    fn test_compute_vma_bias_for_mapping_strict_rejects_page_overlap_guess() {
+    fn test_find_load_contribution_rejects_page_overlap_guess() {
+        // A short mapping that only page-overlaps the segment (its file range
+        // neither contains nor is contained by the segment's) must not be
+        // attributed to that segment.
         let segs = vec![LoadSegment {
             p_offset: 0x13c10,
             p_filesz: 0x1000,
@@ -399,7 +160,6 @@ mod tests {
             p_flags: 0x5,
         }];
 
-        let strict = compute_vma_bias_for_mapping_strict(&segs, 0x13000, 0x5555_5556_8000, 0x800);
-        assert_eq!(strict, None);
+        assert!(find_load_contribution_for_file_range(&segs, 0x13000, 0x800).is_none());
     }
 }

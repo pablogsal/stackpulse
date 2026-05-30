@@ -130,11 +130,6 @@ impl SparseKernelSymbolsFixture {
     pub fn bytes(&self) -> u64 {
         self.data.len() as u64
     }
-
-    #[doc(hidden)]
-    pub fn requested_addresses(&self) -> u64 {
-        self.requested_addresses.len() as u64
-    }
 }
 
 #[doc(hidden)]

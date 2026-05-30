@@ -31,22 +31,17 @@ pub enum SymbolOrigin {
 bitflags! {
     /// Per-frame classification flags attached to every [`ResolvedFrame`].
     ///
-    /// Flags are additive: a Python eval-loop frame inside the Python runtime
-    /// library will set both `PYTHON_RUNTIME` and `PYTHON_EVAL`. Consumers
-    /// commonly use these to hide implementation-detail frames in default
-    /// views (see [`Self::HIDDEN_DEFAULT`]).
+    /// Flags are additive. Consumers commonly use these to hide
+    /// implementation-detail frames in default views (see
+    /// [`Self::HIDDEN_DEFAULT`]).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct FrameFlags: u32 {
         /// Frame is from the Python runtime binary or `libpython`.
         const PYTHON_RUNTIME = 1 << 0;
-        /// Frame is inside the Python bytecode evaluation loop.
-        const PYTHON_EVAL = 1 << 1;
         /// Frame should be hidden from default flame-graph / report views.
         const HIDDEN_DEFAULT = 1 << 2;
         /// Frame came from a JIT-emitted code region (perf-map entry).
         const JIT = 1 << 3;
-        /// Frame is from an anonymous (no on-disk path) mapping.
-        const ANONYMOUS = 1 << 4;
     }
 }
 
@@ -162,9 +157,6 @@ pub struct NativeSymbol {
     pub module: Rc<str>,
     /// Byte offset into [`Self::module`] where the basename starts.
     pub module_basename_start: usize,
-    /// Byte offset into [`Self::file`] where the basename starts (`0` if
-    /// `file` is `None`).
-    pub file_basename_start: usize,
     /// Byte offset of the instruction within its enclosing function.
     pub offset: u64,
     /// Nesting depth for inline expansions: `0` is the innermost (sampled)
@@ -179,7 +171,7 @@ pub struct NativeSymbol {
 
 impl NativeSymbol {
     /// Build a [`NativeSymbol`] for the innermost (non-inline) frame,
-    /// precomputing basename offsets for the module and source file.
+    /// precomputing the module basename offset.
     #[must_use]
     pub fn new(
         name: impl Into<Rc<str>>,
@@ -191,7 +183,6 @@ impl NativeSymbol {
     ) -> Self {
         let module = module.into();
         let module_basename_start = basename_start(&module);
-        let file_basename_start = source.file.as_deref().map_or(0, basename_start);
         Self {
             name: name.into(),
             file: source.file,
@@ -201,7 +192,6 @@ impl NativeSymbol {
             function_start_column: source.function_start_column,
             module,
             module_basename_start,
-            file_basename_start,
             offset,
             inline_depth: 0,
             is_eval_frame,

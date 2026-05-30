@@ -13,7 +13,6 @@ use perf_event_open::count::Counter;
 use perf_event_open::event::hw::Hardware;
 use perf_event_open::event::sw::Software;
 use perf_event_open::event::Event as PerfOpenEvent;
-use perf_event_open::sample::iter::Iter as PerfEventIter;
 use perf_event_open::sample::rb::CowChunk;
 use perf_event_open::sample::record::{Priv, Record, RecordId, UnsafeParser};
 use perf_event_open::sample::Sampler;
@@ -264,21 +263,6 @@ impl Perf {
         self.inherit
     }
 
-    #[inline]
-    pub fn iter(&self) -> EventIter<'_> {
-        EventIter {
-            iter: self.sampler.iter(),
-        }
-    }
-
-    pub fn consume_events(&self, cb: &mut impl FnMut(EventRef<'_>)) {
-        let mut iter = self.sampler.iter().into_cow();
-        while iter
-            .next(|chunk, parser| dispatch_event(chunk, parser, cb))
-            .is_some()
-        {}
-    }
-
     pub fn consume_owned_events(&self, cb: &mut impl FnMut(OwnedEventRecord)) {
         let mut iter = self.sampler.iter().into_cow();
         while iter
@@ -329,7 +313,7 @@ pub struct SampleRecordRef<'a> {
     pub task: Option<TaskRef>,
     pub time: Option<u64>,
     pub code_addr: Option<(u64, bool)>,
-    pub user_regs: Option<RegsRef<'a>>,
+    pub user_regs: Option<&'a [u64]>,
     pub user_stack: Option<&'a [u8]>,
     pub call_chain: Option<CallChainRef<'a>>,
 }
@@ -338,20 +322,6 @@ pub struct SampleRecordRef<'a> {
 pub struct TaskRef {
     pub pid: u32,
     pub tid: u32,
-}
-
-#[derive(Clone, Copy)]
-pub enum RegsRef<'a> {
-    Borrowed(&'a [u64]),
-}
-
-impl<'a> RegsRef<'a> {
-    #[inline]
-    pub fn as_slice(self) -> &'a [u64] {
-        match self {
-            Self::Borrowed(regs) => regs,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -438,21 +408,6 @@ impl<'a> EventRef<'a> {
     }
 }
 
-pub struct EventIter<'a> {
-    iter: PerfEventIter<'a>,
-}
-
-impl Iterator for EventIter<'_> {
-    type Item = EventRef<'static>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next()
-            .map(|(privilege, record)| EventRef::new(privilege, record))
-    }
-}
-
 fn record_id_time(record_id: &Option<RecordId>) -> Option<u64> {
     record_id.as_ref()?.time
 }
@@ -483,14 +438,6 @@ fn record_timestamp(record: &Record) -> Option<u64> {
         Record::LostSamples(lost) => record_id_time(&lost.record_id),
         Record::Unknown(_) => None,
     }
-}
-
-fn dispatch_event(
-    chunk: CowChunk<'_>,
-    parser: &perf_event_open::sample::record::Parser,
-    cb: &mut impl FnMut(EventRef<'_>),
-) {
-    dispatch_event_bytes(chunk.as_bytes(), parser.as_unsafe(), cb);
 }
 
 fn dispatch_event_bytes(bytes: &[u8], parser: &UnsafeParser, cb: &mut impl FnMut(EventRef<'_>)) {
@@ -635,7 +582,7 @@ fn parse_user_regs_sample<'a>(
             debug_assert!(
                 abi == sys::PERF_SAMPLE_REGS_ABI_32 || abi == sys::PERF_SAMPLE_REGS_ABI_64
             );
-            sample.user_regs = Some(RegsRef::Borrowed(regs));
+            sample.user_regs = Some(regs);
         }
     }
     Some(())
@@ -779,7 +726,7 @@ pub(crate) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) 
                 checksum = checksum.wrapping_add(time as usize);
             }
             if let Some(regs) = sample.user_regs {
-                for reg in regs.as_slice() {
+                for reg in regs {
                     checksum = checksum.rotate_left(5) ^ *reg as usize;
                 }
             }

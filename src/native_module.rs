@@ -55,17 +55,13 @@ fn module_info_with_sections(module: &ModuleRecord, section_info: &ElfSectionInf
     let path = PathBuf::from(module.path.as_str());
     let name = crate::path_to_name(&path);
     let image_base = resolve_image_base(module, section_info);
-    let is_python = crate::is_python_module(&name);
 
     ModuleInfo {
         name,
         path,
         avma_range: module.start..module.end,
         image_base,
-        file_off_start: module.file_offset,
-        is_python,
         is_executable: true,
-        section_info: None,
     }
 }
 
@@ -74,9 +70,11 @@ fn resolve_image_base(
     section_info: &ElfSectionInfo,
 ) -> Option<ModuleImageBase> {
     let span = module.end.saturating_sub(module.start);
-    elf_loader::ElfImageLayout::new(section_info)
-        .resolve_mapping(module.file_offset, module.start, span)
-        .map(|resolved| resolved.image_base)
+    elf_loader::ElfImageLayout::new(section_info).resolve_mapping(
+        module.file_offset,
+        module.start,
+        span,
+    )
 }
 
 #[cfg(test)]
