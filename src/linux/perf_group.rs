@@ -16,6 +16,20 @@ use super::sorter::EventSorter;
 
 const LARGE_PERF_EVENT_COUNT: usize = 1000;
 
+/// Reject pids that would not name a single real process once cast to the
+/// signed `pid_t` that `kill` takes: `0` targets the caller's own process
+/// group, and any value above `i32::MAX` wraps to a negative broadcast pid
+/// (`u32::MAX` becomes `-1`, i.e. "every process we may signal").
+fn validate_target_pid(pid: u32) -> io::Result<()> {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid target pid {pid}"),
+        ));
+    }
+    Ok(())
+}
+
 struct StoppedProcess(u32);
 
 impl StoppedProcess {
@@ -142,6 +156,7 @@ impl PerfGroup {
     }
 
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
+        validate_target_pid(pid)?;
         let stopped_process = if attach_mode == AttachMode::StopAttachEnableResume {
             Some(StoppedProcess::new(pid)?)
         } else {
@@ -633,6 +648,13 @@ mod tests {
         assert!(group.tracked_threads.contains(&200));
         assert!(group.inheriting_threads.contains(&200));
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn target_pid_validation_rejects_unsafe_pids() {
+        assert!(validate_target_pid(0).is_err());
+        assert!(validate_target_pid(u32::MAX).is_err());
+        assert!(validate_target_pid(std::process::id()).is_ok());
     }
 
     #[test]

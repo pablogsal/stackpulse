@@ -282,13 +282,15 @@ impl PerfRecorder {
                 }),
             }
         }
+        // Apply process forks before thread forks: a thread spawned by a
+        // freshly-forked child must see its parent marked inheriting first, or
+        // it gets explicit counters on top of the inherited ones (double count).
         if result.is_ok() && open_new_perf_events {
-            for action in &thread_actions {
+            for action in process_actions {
                 match action {
-                    ThreadAction::Fork { tid, parent_tid } => {
-                        result = perf.open_forked_threads(&[(*tid, *parent_tid)]);
+                    ProcessAction::Fork { pid, parent_tid } => {
+                        result = perf.open_forked_processes(&[(pid, parent_tid)]);
                     }
-                    ThreadAction::Exit { .. } => {}
                 }
                 if result.is_err() {
                     break;
@@ -296,11 +298,12 @@ impl PerfRecorder {
             }
         }
         if result.is_ok() && open_new_perf_events {
-            for action in process_actions {
+            for action in &thread_actions {
                 match action {
-                    ProcessAction::Fork { pid, parent_tid } => {
-                        result = perf.open_forked_processes(&[(pid, parent_tid)]);
+                    ThreadAction::Fork { tid, parent_tid } => {
+                        result = perf.open_forked_threads(&[(*tid, *parent_tid)]);
                     }
+                    ThreadAction::Exit { .. } => {}
                 }
                 if result.is_err() {
                     break;

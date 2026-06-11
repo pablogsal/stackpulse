@@ -69,7 +69,7 @@ impl SuspendedLaunchedProcess {
         if result.is_err() {
             // Reap the child on any failure after we took ownership of the
             // pipes; Drop's reap path is gated on the pipes still being Some.
-            let _ = waitpid(self.pid, None);
+            reap(self.pid);
         }
         result
     }
@@ -131,7 +131,9 @@ impl SuspendedLaunchedProcess {
             let mut buf = [0];
             match read(recv_end_of_resume_pipe.as_raw_fd(), &mut buf) {
                 // Parent gave up (closed pipe without signaling); exit silently.
-                Ok(0) => std::process::exit(0),
+                // Use _exit: this is a forked child that must not run the
+                // parent's atexit handlers or flush its inherited stdio buffers.
+                Ok(0) => unsafe { libc::_exit(0) },
                 Ok(_) => {
                     let _ = unsafe {
                         match envp {
@@ -146,10 +148,15 @@ impl SuspendedLaunchedProcess {
                     unsafe { libc::_exit(1) } // bypass at_exit destructors
                 }
                 Err(Errno::EINTR) => {}
-                Err(_) => std::process::exit(1),
+                Err(_) => unsafe { libc::_exit(1) },
             }
         }
     }
+}
+
+/// Reap `pid`, retrying only while interrupted by a signal.
+fn reap(pid: Pid) {
+    while let Err(Errno::EINTR) = waitpid(pid, None) {}
 }
 
 impl Drop for SuspendedLaunchedProcess {
@@ -158,13 +165,7 @@ impl Drop for SuspendedLaunchedProcess {
             return;
         }
         drop(self.recv_end_of_execerr_pipe.take());
-        loop {
-            match waitpid(self.pid, None) {
-                Ok(_) | Err(Errno::ECHILD) => break,
-                Err(Errno::EINTR) => {}
-                Err(_) => break,
-            }
-        }
+        reap(self.pid);
     }
 }
 

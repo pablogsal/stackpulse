@@ -291,9 +291,13 @@ pub struct OwnedEventRecord {
 
 impl OwnedEventRecord {
     fn new(chunk: CowChunk<'_>, parser: &UnsafeParser) -> Self {
-        let timestamp = record_timestamp_from_bytes(chunk.as_bytes(), parser);
+        // Build the aligned copy first, then read the timestamp from it: the
+        // raw chunk can be unaligned after a ring-buffer wrap, but the parser
+        // requires 8-byte alignment.
+        let record = AlignedPerfRecord::from_bytes(chunk.as_bytes());
+        let timestamp = record_timestamp_from_bytes(record.as_bytes(), parser);
         Self {
-            record: AlignedPerfRecord::from_bytes(chunk.as_bytes()),
+            record,
             parser: parser.clone(),
             timestamp,
         }

@@ -318,12 +318,14 @@ impl<W: Write> PerfSpoolWriter<W> {
             return Ok(None);
         };
         let thread_id = self.intern_thread(process_id, thread_id)?;
-        self.last_timestamp_ns = timestamp_ns;
 
         self.writer.write_all(&[REC_SAMPLE])?;
         self.writer.write_varint(delta)?;
         self.writer.write_varint(u64::from(thread_id))?;
         self.writer.write_varint(u64::from(stack_id))?;
+        // Advance the delta baseline only after the record is written; a failed
+        // write would otherwise skew every later sample's timestamp.
+        self.last_timestamp_ns = timestamp_ns;
         Ok(Some(stack_id))
     }
 
@@ -614,37 +616,51 @@ impl PerfSpoolReader {
         );
         let mut last_timestamp_ns = 0_u64;
         while let Some(tag) = reader.read_tag()? {
-            match tag {
-                REC_MODULE => {
-                    modules.push(read_module_mmap(&mut reader, modules.len())?);
-                    module_deactivated_at.push(None);
-                }
-                REC_FRAME => {
-                    let module_limit = modules.len();
-                    frames.push(read_frame(&mut reader, &modules, frames.len())?);
-                    frame_module_limits.push(module_limit);
-                }
-                REC_STACK => {
-                    stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
-                }
-                REC_THREAD => threads.push(read_thread(&mut reader, threads.len())?),
-                REC_SAMPLE => samples.push(read_sample(
-                    &mut reader,
-                    &threads,
-                    stack_nodes.len(),
-                    &mut last_timestamp_ns,
-                )?),
-                REC_PROCESS_EXEC => process_execs.push(read_process_exec(&mut reader)?),
-                REC_MODULE_DEACTIVATE => {
-                    let process_id = read_process_id(&mut reader)?;
-                    let deactivated_at = frames.len();
-                    for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at) {
-                        if module.process_id == process_id && !module.is_kernel {
-                            deactivated.get_or_insert(deactivated_at);
+            // Each record's reads run before any push, so a record truncated by
+            // a crash mid-write leaves the accumulated state untouched. Stop at
+            // such a tail and keep the prefix (records only reference earlier
+            // ones); still surface real corruption (bad tag, invalid data).
+            let parsed = (|| -> io::Result<()> {
+                match tag {
+                    REC_MODULE => {
+                        modules.push(read_module_mmap(&mut reader, modules.len())?);
+                        module_deactivated_at.push(None);
+                    }
+                    REC_FRAME => {
+                        let module_limit = modules.len();
+                        frames.push(read_frame(&mut reader, &modules, frames.len())?);
+                        frame_module_limits.push(module_limit);
+                    }
+                    REC_STACK => {
+                        stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
+                    }
+                    REC_THREAD => threads.push(read_thread(&mut reader, threads.len())?),
+                    REC_SAMPLE => samples.push(read_sample(
+                        &mut reader,
+                        &threads,
+                        stack_nodes.len(),
+                        &mut last_timestamp_ns,
+                    )?),
+                    REC_PROCESS_EXEC => process_execs.push(read_process_exec(&mut reader)?),
+                    REC_MODULE_DEACTIVATE => {
+                        let process_id = read_process_id(&mut reader)?;
+                        let deactivated_at = frames.len();
+                        for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at)
+                        {
+                            if module.process_id == process_id && !module.is_kernel {
+                                deactivated.get_or_insert(deactivated_at);
+                            }
                         }
                     }
+                    other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
                 }
-                other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
+                Ok(())
+            })();
+            if let Err(err) = parsed {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(err);
             }
         }
         let frame_contexts =
@@ -1400,6 +1416,33 @@ mod tests {
         path.push(format!("stackpulse-{name}-{}.spool", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn reader_recovers_records_before_a_crash_truncated_tail() {
+        let path = temp_spool_path("truncated-tail");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_sample_frames(1_000, 7, 11, [frame(0x1000)])
+            .unwrap();
+        writer
+            .write_sample_frames(2_000, 7, 11, [frame(0x2000)])
+            .unwrap();
+        writer.flush().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        drop(writer);
+
+        // Simulate a crash mid-write: drop the final byte of the last record.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+
+        let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
+        let _ = std::fs::remove_file(&path);
+        assert!(!reader.samples().is_empty());
     }
 
     #[test]
