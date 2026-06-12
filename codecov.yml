@@ -1,0 +1,9 @@
+coverage:
+  status:
+    project:
+      default:
+        # Tests drive real perf sampling, so line coverage is non-deterministic
+        # run to run, and correct libc::_exit() paths in forked children cannot
+        # be instrumented (no atexit flush). Allow small dips so the check flags
+        # real regressions, not these artifacts.
+        threshold: 1%

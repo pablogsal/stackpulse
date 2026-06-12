@@ -269,14 +269,20 @@ fn checked_usize_range(start: u64, size: u64) -> Option<Range<usize>> {
     Some(start..start.checked_add(size)?)
 }
 
+fn checked_u64_range(start: u64, size: u64) -> Option<Range<u64>> {
+    Some(start..start.checked_add(size)?)
+}
+
 /// Find a section by name and return its SVMA range.
 fn find_section_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
-    find_section_header(name, elf).map(|sh| sh.sh_addr..(sh.sh_addr + sh.sh_size))
+    let sh = find_section_header(name, elf)?;
+    checked_u64_range(sh.sh_addr, sh.sh_size)
 }
 
 /// Find a section by name and return its file-offset range.
 fn find_section_file_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
-    find_section_header(name, elf).map(|sh| sh.sh_offset..(sh.sh_offset + sh.sh_size))
+    let sh = find_section_header(name, elf)?;
+    checked_u64_range(sh.sh_offset, sh.sh_size)
 }
 
 fn contribution_from_segment(seg: &crate::elf::LoadSegment) -> SvmaFileRange {
@@ -325,7 +331,7 @@ fn calculate_memory_range(elf: &Elf) -> (u64, u64) {
 fn svma_range(svma: Option<u64>, data: Option<&ElfSectionData>) -> Option<Range<u64>> {
     let addr = svma?;
     let len = data?.len() as u64;
-    Some(addr..addr + len)
+    checked_u64_range(addr, len)
 }
 
 pub fn module_to_framehop_with_section_info(
