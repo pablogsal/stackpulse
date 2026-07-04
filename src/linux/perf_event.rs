@@ -549,25 +549,18 @@ fn parse_common_sample_fields<'a>(
 }
 
 fn skip_sample_fields(sample_type: u64, cursor: &mut ByteCursor<'_>) -> Option<()> {
-    if has_sample(sample_type, sys::PERF_SAMPLE_ADDR) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_ID) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_STREAM_ID) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_CPU) {
-        cursor.skip(size_of::<u32>() * 2)?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_PERIOD) {
-        cursor.skip(size_of::<u64>())?;
-    }
     if has_sample(sample_type, sys::PERF_SAMPLE_READ) {
         return None;
     }
-    Some(())
+    // ADDR, ID, STREAM_ID, CPU (u32 pair) and PERIOD are all fixed 8-byte
+    // fields; add them up and skip once instead of walking the cursor per
+    // field.
+    let words = u64::from(has_sample(sample_type, sys::PERF_SAMPLE_ADDR))
+        + u64::from(has_sample(sample_type, sys::PERF_SAMPLE_ID))
+        + u64::from(has_sample(sample_type, sys::PERF_SAMPLE_STREAM_ID))
+        + u64::from(has_sample(sample_type, sys::PERF_SAMPLE_CPU))
+        + u64::from(has_sample(sample_type, sys::PERF_SAMPLE_PERIOD));
+    cursor.skip(words as usize * size_of::<u64>())
 }
 
 fn parse_stack_sample_fields<'a>(
