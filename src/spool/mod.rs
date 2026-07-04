@@ -459,6 +459,7 @@ impl<W: Write> PerfSpoolWriter<W> {
 /// Reader for profile files written by [`crate::PerfRecorder`].
 pub struct PerfSpoolReader {
     start_timestamp_us: u64,
+    first_sample_timestamp_ns: Option<u64>,
     sample_interval_us: u64,
     modules: Vec<ModuleRecord>,
     frames: Vec<FrameRecord>,
@@ -728,6 +729,7 @@ impl PerfSpoolReader {
             SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
         Ok(Self {
             start_timestamp_us,
+            first_sample_timestamp_ns: samples.first().map(|s| s.timestamp_ns),
             sample_interval_us,
             modules,
             frames,
@@ -862,9 +864,8 @@ impl PerfSpoolReader {
     /// Convert a sample timestamp to the profile timeline in microseconds.
     pub fn timestamp_us(&self, sample: &OwnedSampleRecord) -> u64 {
         let first = self
-            .samples
-            .first()
-            .map_or(sample.timestamp_ns, |s| s.timestamp_ns);
+            .first_sample_timestamp_ns
+            .unwrap_or(sample.timestamp_ns);
         self.start_timestamp_us
             .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
     }
