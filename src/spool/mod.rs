@@ -381,7 +381,9 @@ impl<W: Write> PerfSpoolWriter<W> {
             next_frame_id,
             ..
         } = self;
-        let cache = if frame.module_id.is_some() {
+        // Truncated-stack markers resolve context-free on the read side, so
+        // they are as durable as module-pinned frames.
+        let cache = if frame.module_id.is_some() || frame.is_truncated_stack_marker() {
             pinned_frame_cache
         } else {
             unpinned_frame_cache
