@@ -287,6 +287,9 @@ pub struct OwnedEventRecord {
     record: AlignedPerfRecord,
     parser: UnsafeParser,
     timestamp: Option<u64>,
+    // Non-sample records are fully parsed once here so dispatch does not have
+    // to re-parse them; samples stay as raw bytes and are re-read zero-copy.
+    parsed: Option<(Priv, Record)>,
 }
 
 impl OwnedEventRecord {
@@ -295,11 +298,18 @@ impl OwnedEventRecord {
         // raw chunk can be unaligned after a ring-buffer wrap, but the parser
         // requires 8-byte alignment.
         let record = AlignedPerfRecord::from_bytes(chunk.as_bytes());
-        let timestamp = record_timestamp_from_bytes(record.as_bytes(), parser);
+        let (timestamp, parsed) = match parse_sample_record(record.as_bytes(), parser) {
+            Some((_, sample)) => (sample.time, None),
+            None => {
+                let (privilege, parsed, _) = unsafe { parser.parse(record.as_bytes()) };
+                (record_timestamp(&parsed), Some((privilege, parsed)))
+            }
+        };
         Self {
             record,
             parser: parser.clone(),
             timestamp,
+            parsed,
         }
     }
 
@@ -307,8 +317,11 @@ impl OwnedEventRecord {
         self.timestamp
     }
 
-    pub fn dispatch(&self, cb: &mut impl FnMut(EventRef<'_>)) {
-        dispatch_event_bytes(self.record.as_bytes(), &self.parser, cb);
+    pub fn dispatch(self, cb: &mut impl FnMut(EventRef<'_>)) {
+        match self.parsed {
+            Some((privilege, record)) => cb(EventRef::new(privilege, record)),
+            None => dispatch_event_bytes(self.record.as_bytes(), &self.parser, cb),
+        }
     }
 }
 
@@ -456,14 +469,6 @@ fn dispatch_event_bytes(bytes: &[u8], parser: &UnsafeParser, cb: &mut impl FnMut
 
     let (privilege, record, _) = unsafe { parser.parse(bytes) };
     cb(EventRef::new(privilege, record));
-}
-
-fn record_timestamp_from_bytes(bytes: &[u8], parser: &UnsafeParser) -> Option<u64> {
-    if let Some((_, sample)) = parse_sample_record(bytes, parser) {
-        return sample.time;
-    }
-    let (_, record, _) = unsafe { parser.parse(bytes) };
-    record_timestamp(&record)
 }
 
 fn parse_sample_record<'a>(
@@ -1019,10 +1024,9 @@ mod tests {
         let parser = stack_sample_parser(spec.user_regs);
         let record = build_bench_sample_record(&spec, 7);
 
-        assert_eq!(
-            record_timestamp_from_bytes(record.as_bytes(), &parser),
-            Some(1_700_000_000_000_000 + 7_000)
-        );
+        let (_, sample) =
+            parse_sample_record(record.as_bytes(), &parser).expect("sample should parse");
+        assert_eq!(sample.time, Some(1_700_000_000_000_000 + 7_000));
     }
 
     #[test]
