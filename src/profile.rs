@@ -167,8 +167,9 @@ pub struct NativeSymbol {
     /// address (`module+0x…`, `[kernel]+0x…`). For inline expansions the
     /// offset is relative to the outermost function's start.
     pub offset: u64,
-    /// Nesting depth for inline expansions: `0` is the innermost (sampled)
-    /// frame, higher values are the surrounding inlined callers.
+    /// Nesting depth for inline expansions: `0` is the outermost enclosing
+    /// function, higher values are deeper inlined frames (the highest being
+    /// the innermost, sampled expansion).
     pub inline_depth: u16,
     /// Whether this symbol is the CPython bytecode evaluation loop.
     pub is_eval_frame: bool,
