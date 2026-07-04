@@ -257,7 +257,9 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn open_forked_threads(&mut self, thread_forks: &[(u32, u32)]) -> io::Result<()> {
+    /// Open counters for freshly forked threads, given as
+    /// `(tid, owning pid, parent tid)` triples.
+    pub fn open_forked_threads(&mut self, thread_forks: &[(u32, u32, u32)]) -> io::Result<()> {
         if thread_forks.is_empty() {
             return Ok(());
         }
@@ -278,17 +280,10 @@ impl PerfGroup {
         let mut inheriting_threads =
             FxHashSet::with_capacity_and_hasher(thread_forks.len(), Default::default());
 
-        for &(tid, parent_tid) in thread_forks {
+        for &(tid, owner, parent_tid) in thread_forks {
             if self.tracked_threads.contains_key(&tid) || tracked_threads.contains_key(&tid) {
                 continue;
             }
-            // A forked thread lives in the same process as its parent thread.
-            let owner = self
-                .tracked_threads
-                .get(&parent_tid)
-                .or_else(|| tracked_threads.get(&parent_tid))
-                .copied()
-                .unwrap_or(parent_tid);
             if self.inheriting_threads.contains(&parent_tid)
                 || inheriting_threads.contains(&parent_tid)
             {
