@@ -1003,7 +1003,16 @@ struct SparseKernelSymbolScan<'a> {
     request_idx: usize,
     text_addr: Option<u64>,
     last_address: Option<u64>,
-    last_symbol: Option<KernelSymbol>,
+    // Raw parts of the most recent buffered line, kept as reusable byte
+    // buffers so a `KernelSymbol` is only materialized when a requested
+    // address actually falls inside the buffered symbol's range.
+    buffered_addr: Option<u64>,
+    name_buf: Vec<u8>,
+    module_buf: Vec<u8>,
+    has_module: bool,
+    // Materialized form of the buffered line, built lazily on first emit and
+    // reused if the same symbol covers several requested addresses.
+    materialized: Option<KernelSymbol>,
 }
 
 enum SparseScanState {
@@ -1019,7 +1028,11 @@ impl<'a> SparseKernelSymbolScan<'a> {
             request_idx: 0,
             text_addr: None,
             last_address: None,
-            last_symbol: None,
+            buffered_addr: None,
+            name_buf: Vec::new(),
+            module_buf: Vec::new(),
+            has_module: false,
+            materialized: None,
         }
     }
 
@@ -1038,30 +1051,47 @@ impl<'a> SparseKernelSymbolScan<'a> {
         while self.request_idx < self.requested_addresses.len()
             && self.requested_addresses[self.request_idx] < address
         {
-            if let Some(symbol) = &self.last_symbol {
+            if let Some(symbol) = self.buffered_symbol().cloned() {
                 self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
+                    .push((self.requested_addresses[self.request_idx], symbol));
             }
             self.request_idx += 1;
         }
         if self.request_idx >= self.requested_addresses.len() {
             return SparseScanState::Continue;
         }
-        if self
-            .last_symbol
-            .as_ref()
-            .is_none_or(|symbol| symbol.address != address)
-        {
-            self.last_symbol = Some(kernel_symbol_from_name(address, name));
+        // Keep the first symbol seen at a given address, matching the eager
+        // scanner's behavior for duplicate-address kallsyms lines.
+        if self.buffered_addr != Some(address) {
+            self.buffered_addr = Some(address);
+            self.materialized = None;
+            self.name_buf.clear();
+            self.name_buf.extend_from_slice(name.name);
+            self.module_buf.clear();
+            self.has_module = name.module.is_some();
+            if let Some(module) = name.module {
+                self.module_buf.extend_from_slice(module);
+            }
         }
         SparseScanState::Continue
     }
 
+    fn buffered_symbol(&mut self) -> Option<&KernelSymbol> {
+        let address = self.buffered_addr?;
+        let (name_buf, module_buf, has_module) =
+            (&self.name_buf, &self.module_buf, self.has_module);
+        Some(self.materialized.get_or_insert_with(|| KernelSymbol {
+            address,
+            name: kernel_symbol_name_to_string(name_buf),
+            module: has_module.then(|| kernel_symbol_module_to_string(module_buf)),
+        }))
+    }
+
     fn finish(mut self) -> Vec<(u64, KernelSymbol)> {
         while self.request_idx < self.requested_addresses.len() {
-            if let Some(symbol) = &self.last_symbol {
+            if let Some(symbol) = self.buffered_symbol().cloned() {
                 self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
+                    .push((self.requested_addresses[self.request_idx], symbol));
             }
             self.request_idx += 1;
         }
