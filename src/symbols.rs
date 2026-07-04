@@ -844,6 +844,27 @@ impl SymbolizerWrapper {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn block_on_runtime_falls_back_to_a_thread_inside_tokio() {
+        let outer = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let inner = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Inside a tokio context Runtime::block_on would panic; the scoped
+        // thread fallback must still run the future to completion.
+        let value = outer.block_on(async { block_on_runtime(&inner, async { 41 + 1 }) });
+        assert_eq!(value, 42);
+
+        // Outside any context the plain block_on path is taken.
+        assert_eq!(block_on_runtime(&inner, async { 7 }), 7);
+    }
+
     #[test]
     fn test_is_eval_frame_tail_call_variants() {
         assert!(is_eval_frame("_TAIL_CALL_BINARY_OP.llvm.1234567890"));
