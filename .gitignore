@@ -4,3 +4,4 @@
 /*.spool
 /*.json
 /*.json.gz
+.claude/
