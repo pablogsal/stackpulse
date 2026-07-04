@@ -283,44 +283,64 @@ pub enum EventRecord<'a> {
     Owned(Record),
 }
 
-pub struct OwnedEventRecord {
-    record: AlignedPerfRecord,
-    parser: UnsafeParser,
-    timestamp: Option<u64>,
-    // Non-sample records are fully parsed once here so dispatch does not have
-    // to re-parse them; samples stay as raw bytes and are re-read zero-copy.
-    parsed: Option<(Priv, Record)>,
+pub enum OwnedEventRecord {
+    // Samples keep the raw bytes and are re-read zero-copy at dispatch.
+    Sample {
+        record: AlignedPerfRecord,
+        parser: UnsafeParser,
+        time: Option<u64>,
+    },
+    // Everything else is parsed exactly once, at construction.
+    Parsed {
+        privilege: Priv,
+        record: Record,
+        time: Option<u64>,
+    },
 }
 
 impl OwnedEventRecord {
     fn new(chunk: CowChunk<'_>, parser: &UnsafeParser) -> Self {
-        // Build the aligned copy first, then read the timestamp from it: the
-        // raw chunk can be unaligned after a ring-buffer wrap, but the parser
-        // requires 8-byte alignment.
+        // Build the aligned copy first, then read from it: the raw chunk can
+        // be unaligned after a ring-buffer wrap, but the parser requires
+        // 8-byte alignment.
         let record = AlignedPerfRecord::from_bytes(chunk.as_bytes());
-        let (timestamp, parsed) = match parse_sample_record(record.as_bytes(), parser) {
-            Some((_, sample)) => (sample.time, None),
+        match parse_sample_record(record.as_bytes(), parser).map(|(_, sample)| sample.time) {
+            Some(time) => Self::Sample {
+                record,
+                parser: parser.clone(),
+                time,
+            },
             None => {
-                let (privilege, parsed, _) = unsafe { parser.parse(record.as_bytes()) };
-                (record_timestamp(&parsed), Some((privilege, parsed)))
+                let (privilege, record, _) = unsafe { parser.parse(record.as_bytes()) };
+                Self::Parsed {
+                    privilege,
+                    time: record_timestamp(&record),
+                    record,
+                }
             }
-        };
-        Self {
-            record,
-            parser: parser.clone(),
-            timestamp,
-            parsed,
         }
     }
 
     pub fn timestamp(&self) -> Option<u64> {
-        self.timestamp
+        match self {
+            Self::Sample { time, .. } | Self::Parsed { time, .. } => *time,
+        }
     }
 
     pub fn dispatch(self, cb: &mut impl FnMut(EventRef<'_>)) {
-        match self.parsed {
-            Some((privilege, record)) => cb(EventRef::new(privilege, record)),
-            None => dispatch_event_bytes(self.record.as_bytes(), &self.parser, cb),
+        match self {
+            Self::Sample { record, parser, .. } => {
+                dispatch_event_bytes(record.as_bytes(), &parser, cb);
+            }
+            Self::Parsed {
+                privilege,
+                record,
+                time,
+            } => cb(EventRef {
+                privilege,
+                timestamp: time,
+                record: EventRecord::Owned(record),
+            }),
         }
     }
 }
