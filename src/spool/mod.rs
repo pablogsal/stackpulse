@@ -374,25 +374,27 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 
     fn intern_frame(&mut self, frame: &FrameRecord) -> io::Result<u32> {
-        let pinned = frame.module_id.is_some();
-        let cached = if pinned {
-            self.pinned_frame_cache.get(frame)
+        let Self {
+            writer,
+            pinned_frame_cache,
+            unpinned_frame_cache,
+            next_frame_id,
+            ..
+        } = self;
+        let cache = if frame.module_id.is_some() {
+            pinned_frame_cache
         } else {
-            self.unpinned_frame_cache.get(frame)
+            unpinned_frame_cache
         };
-        if let Some(&id) = cached {
+        if let Some(&id) = cache.get(frame) {
             return Ok(id);
         }
-        let id = self.next_frame_id;
-        self.writer.write_all(&[REC_FRAME])?;
-        self.writer.write_varint(u64::from(id))?;
-        write_compact_frame(&mut self.writer, frame)?;
-        if pinned {
-            self.pinned_frame_cache.insert(*frame, id);
-        } else {
-            self.unpinned_frame_cache.insert(*frame, id);
-        }
-        self.next_frame_id += 1;
+        let id = *next_frame_id;
+        writer.write_all(&[REC_FRAME])?;
+        writer.write_varint(u64::from(id))?;
+        write_compact_frame(writer, frame)?;
+        cache.insert(*frame, id);
+        *next_frame_id += 1;
         Ok(id)
     }
 
@@ -903,7 +905,7 @@ impl Read for MmapSpoolCursor {
     }
 }
 
-type ModuleDedupKey = (i32, u64, u64, u64, u64, String);
+type ModuleDedupKey = (i32, u64, u64, u64, u64, ModulePath);
 
 fn module_dedup_key(module: &ModuleRecord) -> ModuleDedupKey {
     (
@@ -912,7 +914,7 @@ fn module_dedup_key(module: &ModuleRecord) -> ModuleDedupKey {
         module.end,
         module.file_offset,
         module.inode,
-        module.path.as_str().to_owned(),
+        module.path.clone(),
     )
 }
 
@@ -958,12 +960,12 @@ impl ModuleTable {
         let mut changed = false;
         for (module, active) in self.modules.iter().zip(self.active.iter_mut()) {
             if module.process_id == process_id && !module.is_kernel && *active {
-                self.index_dirty = true;
                 changed = true;
                 *active = false;
                 self.active_by_key.remove(&module_dedup_key(module));
             }
         }
+        self.index_dirty |= changed;
         if changed {
             writer.write_module_deactivation(process_id)?;
         }
