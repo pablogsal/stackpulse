@@ -6,7 +6,7 @@ use std::{fs, io};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::perf_event::{
     EventRef, EventSource, OwnedEventRecord, Perf, PerfOptions, TaskInheritance,
@@ -83,7 +83,9 @@ pub struct PerfGroup {
     event_source: EventSource,
     include_kernel: bool,
     pub(crate) inherit_child_processes: bool,
-    tracked_threads: BTreeSet<u32>,
+    // tid -> owning pid, so per-process reconciliation (refresh_threads) can
+    // tell foreign threads apart from this process's exited ones.
+    tracked_threads: BTreeMap<u32, u32>,
     inheriting_threads: BTreeSet<u32>,
     stopped_processes: Vec<StoppedProcess>,
 }
@@ -136,7 +138,7 @@ impl PerfGroup {
             regs_mask,
             include_kernel,
             inherit_child_processes,
-            tracked_threads: BTreeSet::new(),
+            tracked_threads: BTreeMap::new(),
             inheriting_threads: BTreeSet::new(),
             stopped_processes: Vec::new(),
         })
@@ -197,8 +199,9 @@ impl PerfGroup {
         }
 
         self.register_perfs(perf_events)?;
-        self.tracked_threads.insert(pid);
-        self.tracked_threads.extend(threads);
+        self.tracked_threads.insert(pid, pid);
+        self.tracked_threads
+            .extend(threads.into_iter().map(|tid| (tid, pid)));
         self.inheriting_threads.extend(inheriting_threads);
         if let Some(stopped_process) = stopped_process {
             self.stopped_processes.push(stopped_process);
@@ -217,11 +220,14 @@ impl PerfGroup {
         };
         threads.sort_unstable();
         let task_count = threads.len().saturating_add(1);
-        self.tracked_threads
-            .retain(|&tid| tid == pid || threads.binary_search(&tid).is_ok());
+        // Only reconcile this process's threads; other attached processes'
+        // tids are absent from /proc/<pid>/task and must survive.
+        self.tracked_threads.retain(|&tid, &mut owner| {
+            owner != pid || tid == pid || threads.binary_search(&tid).is_ok()
+        });
         let new_threads: Vec<_> = threads
             .into_iter()
-            .filter(|tid| !self.tracked_threads.contains(tid))
+            .filter(|tid| !self.tracked_threads.contains_key(tid))
             .collect();
         let cpu_ids = online_cpu_ids();
         let cpu_count = cpu_ids.len();
@@ -245,7 +251,8 @@ impl PerfGroup {
             }
         }
         self.enable_and_register_perfs(perf_events)?;
-        self.tracked_threads.extend(tracked_threads);
+        self.tracked_threads
+            .extend(tracked_threads.into_iter().map(|tid| (tid, pid)));
         self.inheriting_threads.extend(inheriting_threads);
         Ok(())
     }
@@ -267,18 +274,25 @@ impl PerfGroup {
             per_thread_only,
         ));
         let mut tracked_threads =
-            FxHashSet::with_capacity_and_hasher(thread_forks.len(), Default::default());
+            FxHashMap::with_capacity_and_hasher(thread_forks.len(), Default::default());
         let mut inheriting_threads =
             FxHashSet::with_capacity_and_hasher(thread_forks.len(), Default::default());
 
         for &(tid, parent_tid) in thread_forks {
-            if self.tracked_threads.contains(&tid) || tracked_threads.contains(&tid) {
+            if self.tracked_threads.contains_key(&tid) || tracked_threads.contains_key(&tid) {
                 continue;
             }
+            // A forked thread lives in the same process as its parent thread.
+            let owner = self
+                .tracked_threads
+                .get(&parent_tid)
+                .or_else(|| tracked_threads.get(&parent_tid))
+                .copied()
+                .unwrap_or(parent_tid);
             if self.inheriting_threads.contains(&parent_tid)
                 || inheriting_threads.contains(&parent_tid)
             {
-                tracked_threads.insert(tid);
+                tracked_threads.insert(tid, owner);
                 inheriting_threads.insert(tid);
                 continue;
             }
@@ -290,7 +304,7 @@ impl PerfGroup {
                     inheriting_threads.insert(tid);
                 }
                 perf_events.extend(thread_perfs.events);
-                tracked_threads.insert(tid);
+                tracked_threads.insert(tid, owner);
             }
         }
 
@@ -306,9 +320,10 @@ impl PerfGroup {
         }
 
         for &(pid, parent_tid) in process_forks {
-            if self.inheriting_threads.contains(&parent_tid) || self.tracked_threads.contains(&pid)
+            if self.inheriting_threads.contains(&parent_tid)
+                || self.tracked_threads.contains_key(&pid)
             {
-                self.tracked_threads.insert(pid);
+                self.tracked_threads.insert(pid, pid);
                 if self.inheriting_threads.contains(&parent_tid) {
                     self.inheriting_threads.insert(pid);
                 }
@@ -638,14 +653,14 @@ mod tests {
     fn inherited_forked_process_is_tracked_without_opening_new_fds() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
             .expect("create perf group");
-        group.tracked_threads.insert(100);
+        group.tracked_threads.insert(100, 100);
         group.inheriting_threads.insert(100);
 
         group
             .open_forked_processes(&[(200, 100)])
             .expect("track inherited child process");
 
-        assert!(group.tracked_threads.contains(&200));
+        assert!(group.tracked_threads.contains_key(&200));
         assert!(group.inheriting_threads.contains(&200));
         assert!(group.members.is_empty());
     }
