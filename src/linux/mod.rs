@@ -51,10 +51,6 @@ enum ThreadAction {
     Exit { tid: u32 },
 }
 
-enum ProcessAction {
-    Fork { pid: u32, parent_tid: u32 },
-}
-
 #[derive(Clone, Copy)]
 enum DrainMode {
     Consume,
@@ -156,7 +152,8 @@ struct EventContext<'a, W: std::io::Write> {
     stack_scratch: &'a mut Vec<StackFrame>,
     callchain_scratch: &'a mut Vec<StackFrame>,
     thread_actions: &'a mut Vec<ThreadAction>,
-    process_actions: &'a mut Vec<ProcessAction>,
+    // (pid, parent_tid) pairs for open_forked_processes.
+    process_fork_actions: &'a mut Vec<(u32, u32)>,
     inherit_child_processes: bool,
 }
 
@@ -200,14 +197,14 @@ impl PerfRecorder {
         let mut python_runtime_processes = FxHashSet::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
             active_processes.insert(pid_i32, try_new_exit_watcher(pid_i32));
-            python_perf_support_processes
-                .insert(pid_i32, process_has_python_perf_support_enabled(pid));
         }
+        let python_perf_support =
+            process_has_python_perf_support(pid, &mut python_perf_support_processes);
         let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
             && register_existing_maps(pid, &mut modules, &mut unwinders, &mut writer)?;
-        if let Some(pid_i32) = i32_from_u32(pid).filter(|pid_i32| {
-            registered_existing_maps && python_perf_support_processes.get(pid_i32) == Some(&true)
-        }) {
+        if let Some(pid_i32) =
+            i32_from_u32(pid).filter(|_| registered_existing_maps && python_perf_support)
+        {
             mark_python_runtime_process(&mut python_runtime_processes, &mut writer, 0, pid_i32)?;
         }
 
@@ -252,7 +249,7 @@ impl PerfRecorder {
         } = self;
         let mut result = Ok(());
         let mut thread_actions = Vec::new();
-        let mut process_actions = Vec::new();
+        let mut process_fork_actions = Vec::new();
         let inherit_child_processes = perf.inherit_child_processes;
         {
             let mut ctx = EventContext {
@@ -266,7 +263,7 @@ impl PerfRecorder {
                 stack_scratch,
                 callchain_scratch,
                 thread_actions: &mut thread_actions,
-                process_actions: &mut process_actions,
+                process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes,
             };
             match mode {
@@ -288,11 +285,7 @@ impl PerfRecorder {
         // freshly-forked child must see its parent marked inheriting first, or
         // it gets explicit counters on top of the inherited ones (double count).
         if result.is_ok() && open_new_perf_events {
-            let process_forks: Vec<_> = process_actions
-                .into_iter()
-                .map(|ProcessAction::Fork { pid, parent_tid }| (pid, parent_tid))
-                .collect();
-            result = perf.open_forked_processes(&process_forks);
+            result = perf.open_forked_processes(&process_fork_actions);
         }
         if result.is_ok() && open_new_perf_events {
             let thread_forks: Vec<_> = thread_actions
@@ -324,15 +317,15 @@ impl PerfRecorder {
         self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
             self.track_process(pid_i32);
-            self.python_perf_support_processes
-                .insert(pid_i32, process_has_python_perf_support_enabled(pid));
+            let python_perf_support =
+                process_has_python_perf_support(pid, &mut self.python_perf_support_processes);
             match register_existing_maps(
                 pid,
                 &mut self.modules,
                 &mut self.unwinders,
                 &mut self.writer,
             ) {
-                Ok(true) if self.python_perf_support_processes.get(&pid_i32) == Some(&true) => {
+                Ok(true) if python_perf_support => {
                     if let Err(err) = mark_python_runtime_process(
                         &mut self.python_runtime_processes,
                         &mut self.writer,
@@ -459,10 +452,8 @@ fn handle_event<W: std::io::Write>(
             if let Some(parent) = ctx.unwinders.get(&ppid).cloned() {
                 ctx.unwinders.insert(pid, parent);
             }
-            ctx.process_actions.push(ProcessAction::Fork {
-                pid: fork.task.pid,
-                parent_tid: fork.parent_task.tid,
-            });
+            ctx.process_fork_actions
+                .push((fork.task.pid, fork.parent_task.tid));
             ctx.modules.clone_process_modules(ppid, pid, ctx.writer)
         }
         EventRecord::Owned(Record::Fork(fork)) if fork.task.pid == fork.parent_task.pid => {
@@ -1363,7 +1354,7 @@ pub(crate) fn bench_record_live_perf_samples(
         let mut stack_scratch = Vec::with_capacity(128);
         let mut callchain_scratch = Vec::with_capacity(128);
         let mut thread_actions = Vec::new();
-        let mut process_actions = Vec::new();
+        let mut process_fork_actions = Vec::new();
         {
             let mut ctx = EventContext {
                 modules: &mut modules,
@@ -1376,7 +1367,7 @@ pub(crate) fn bench_record_live_perf_samples(
                 stack_scratch: &mut stack_scratch,
                 callchain_scratch: &mut callchain_scratch,
                 thread_actions: &mut thread_actions,
-                process_actions: &mut process_actions,
+                process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes: false,
             };
             for record in fixture.samples.records() {
@@ -1396,7 +1387,7 @@ pub(crate) fn bench_record_live_perf_samples(
             .wrapping_add(summary.sample_events as usize)
             .wrapping_add(summary.ignored_user_callchain_frames as usize)
             .wrapping_add(thread_actions.len())
-            .wrapping_add(process_actions.len());
+            .wrapping_add(process_fork_actions.len());
     }
     Ok(checksum)
 }
