@@ -47,8 +47,14 @@ type NativeUnwinder = framehop::UnwinderNative<elf_types::ElfSectionData, Unwind
 type NativeCache = framehop::CacheNative<UnwindPolicy>;
 
 enum ThreadAction {
-    Fork { tid: u32, parent_tid: u32 },
-    Exit { tid: u32 },
+    Fork {
+        tid: u32,
+        pid: u32,
+        parent_tid: u32,
+    },
+    Exit {
+        tid: u32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -291,7 +297,11 @@ impl PerfRecorder {
             let thread_forks: Vec<_> = thread_actions
                 .iter()
                 .filter_map(|action| match action {
-                    ThreadAction::Fork { tid, parent_tid } => Some((*tid, *parent_tid)),
+                    ThreadAction::Fork {
+                        tid,
+                        pid,
+                        parent_tid,
+                    } => Some((*tid, *pid, *parent_tid)),
                     ThreadAction::Exit { .. } => None,
                 })
                 .collect();
@@ -460,6 +470,7 @@ fn handle_event<W: std::io::Write>(
             if fork.task.tid != fork.parent_task.tid {
                 ctx.thread_actions.push(ThreadAction::Fork {
                     tid: fork.task.tid,
+                    pid: fork.task.pid,
                     parent_tid: fork.parent_task.tid,
                 });
             }
