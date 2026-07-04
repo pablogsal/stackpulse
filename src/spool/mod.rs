@@ -1503,6 +1503,72 @@ mod tests {
         let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
         let _ = std::fs::remove_file(&path);
         assert!(!reader.samples().is_empty());
+        assert!(reader.recovered_from_truncation());
+    }
+
+    #[test]
+    fn reader_recovers_when_a_length_prefixed_range_is_cut_short() {
+        let path = temp_spool_path("truncated-path-bytes");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_sample_frames(1_000, 7, 11, [frame(0x1000)])
+            .unwrap();
+        writer.flush().unwrap();
+        let boundary = std::fs::metadata(&path).unwrap().len();
+        writer
+            .write_module(&module(7, 0x1000, 0x2000, "/some/long/module/path", false))
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Cut the file in the middle of the module path string, inside the
+        // length-prefixed byte range.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(boundary + 8)
+            .unwrap();
+
+        let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(reader.samples().len(), 1);
+        assert!(reader.modules().is_empty());
+        assert!(reader.recovered_from_truncation());
+    }
+
+    #[test]
+    fn reader_rejects_overflowing_varint_corruption_mid_file() {
+        let path = temp_spool_path("overflow-varint");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_sample_frames(1_000, 7, 11, [frame(0x1000)])
+            .unwrap();
+        writer.flush().unwrap();
+        let boundary = std::fs::metadata(&path).unwrap().len() as usize;
+        writer
+            .write_sample_frames(2_000, 7, 11, [frame(0x2000)])
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Keep the record tag at the boundary valid but replace the varint
+        // after it with a complete 10-byte encoding that overflows u64. The
+        // varint reader reports this as UnexpectedEof even though the cursor
+        // is mid-file; it must surface as corruption, not clean truncation.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= boundary + 11, "second record too short");
+        bytes[boundary + 1..boundary + 11]
+            .copy_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match PerfSpoolReader::open(&path) {
+            Ok(_) => panic!("corruption must not open"),
+            Err(err) => err,
+        };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -1842,6 +1908,69 @@ mod tests {
             second.module.map(|module| module.module.path.as_str()),
             Some("/new")
         );
+    }
+
+    #[test]
+    fn writer_does_not_reintern_pinned_frames_when_module_context_changes() {
+        let path = temp_spool_path("pinned-frame-stability");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_module(&module(7, 0x1000, 0x2000, "/pinned", false))
+            .unwrap();
+        let pinned = FrameRecord {
+            module_id: Some(0),
+            rel_ip: 0x10,
+            abs_ip: 0x1010,
+            mode: FrameMode::User,
+        };
+        let first_stack = writer
+            .write_sample_frames(1_000, 7, 11, [pinned])
+            .unwrap()
+            .unwrap();
+        let mut unrelated = module(9, 0x9000, 0xa000, "/unrelated", false);
+        unrelated.id = 1;
+        writer.write_module(&unrelated).unwrap();
+        let second_stack = writer
+            .write_sample_frames(2_000, 7, 11, [pinned])
+            .unwrap()
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(first_stack, second_stack);
+        assert_eq!(reader.frames(), &[pinned]);
+    }
+
+    #[test]
+    fn module_table_dedupes_active_modules_and_reinterns_after_deactivation() {
+        let mut table = ModuleTable::default();
+        let mut spool = writer();
+
+        let first = table
+            .intern_module(module(7, 0x1000, 0x2000, "/m", false), &mut spool)
+            .unwrap();
+        let duplicate = table
+            .intern_module(module(7, 0x1000, 0x2000, "/m", false), &mut spool)
+            .unwrap();
+        assert_eq!(first, duplicate);
+
+        let kernel = table
+            .intern_module(module(7, 0x8000, 0x9000, "[kernel]", true), &mut spool)
+            .unwrap();
+        table.deactivate_process_modules(7, &mut spool).unwrap();
+
+        let reinterned = table
+            .intern_module(module(7, 0x1000, 0x2000, "/m", false), &mut spool)
+            .unwrap();
+        assert_ne!(first, reinterned);
+
+        let kernel_again = table
+            .intern_module(module(7, 0x8000, 0x9000, "[kernel]", true), &mut spool)
+            .unwrap();
+        assert_eq!(kernel, kernel_again);
     }
 
     #[test]
