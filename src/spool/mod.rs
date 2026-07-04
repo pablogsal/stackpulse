@@ -903,10 +903,26 @@ impl Read for MmapSpoolCursor {
     }
 }
 
+type ModuleDedupKey = (i32, u64, u64, u64, u64, String);
+
+fn module_dedup_key(module: &ModuleRecord) -> ModuleDedupKey {
+    (
+        module.process_id,
+        module.start,
+        module.end,
+        module.file_offset,
+        module.inode,
+        module.path.as_str().to_owned(),
+    )
+}
+
 #[derive(Default)]
 pub struct ModuleTable {
     modules: Vec<ModuleRecord>,
     active: Vec<bool>,
+    // Active modules keyed by identity, so interning dedupes in O(1) instead
+    // of scanning every module ever recorded (quadratic in fork count).
+    active_by_key: FxHashMap<ModuleDedupKey, u32>,
     index: ModuleIndex,
     index_dirty: bool,
 }
@@ -920,22 +936,16 @@ impl ModuleTable {
         if module.end <= module.start {
             return Ok(u32::MAX);
         }
-        if let Some((existing, _)) = self.modules.iter().zip(&self.active).find(|(m, &active)| {
-            active
-                && m.process_id == module.process_id
-                && m.start == module.start
-                && m.end == module.end
-                && m.file_offset == module.file_offset
-                && m.inode == module.inode
-                && m.path == module.path
-        }) {
-            return Ok(existing.id);
+        let key = module_dedup_key(&module);
+        if let Some(&id) = self.active_by_key.get(&key) {
+            return Ok(id);
         }
         let id = u32::try_from(self.modules.len()).unwrap_or(u32::MAX);
         module.id = id;
         writer.write_module(&module)?;
         self.modules.push(module);
         self.active.push(true);
+        self.active_by_key.insert(key, id);
         self.index_dirty = true;
         Ok(id)
     }
@@ -947,10 +957,11 @@ impl ModuleTable {
     ) -> io::Result<()> {
         let mut changed = false;
         for (module, active) in self.modules.iter().zip(self.active.iter_mut()) {
-            if module.process_id == process_id && !module.is_kernel {
-                self.index_dirty |= *active;
-                changed |= *active;
+            if module.process_id == process_id && !module.is_kernel && *active {
+                self.index_dirty = true;
+                changed = true;
                 *active = false;
+                self.active_by_key.remove(&module_dedup_key(module));
             }
         }
         if changed {
