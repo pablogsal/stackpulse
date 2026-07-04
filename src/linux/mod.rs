@@ -677,6 +677,11 @@ fn inherit_python_runtime_process<W: std::io::Write>(
     Ok(())
 }
 
+fn mmap_names_python_runtime(file: &std::ffi::CStr) -> bool {
+    // Borrowed lossy conversion: allocates only for non-UTF-8 paths.
+    is_python_runtime_path(&String::from_utf8_lossy(file.to_bytes()))
+}
+
 fn record_python_runtime_mmap<W: std::io::Write>(
     mmap: &Mmap,
     privilege: Priv,
@@ -691,8 +696,7 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     let Some(pid) = i32_from_u32(mmap.task.pid) else {
         return Ok(());
     };
-    // Borrowed lossy conversion: allocates only for non-UTF-8 paths.
-    if !is_python_runtime_path(&String::from_utf8_lossy(mmap.file.as_bytes())) {
+    if !mmap_names_python_runtime(&mmap.file) {
         return Ok(());
     }
     if process_has_python_perf_support(mmap.task.pid, python_perf_support_processes) {
@@ -1440,6 +1444,16 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mmap_names_python_runtime_matches_utf8_and_rejects_binary_paths() {
+        let python = std::ffi::CString::new("/usr/bin/python3.12").unwrap();
+        assert!(mmap_names_python_runtime(&python));
+        let other = std::ffi::CString::new("/usr/lib/libssl.so.3").unwrap();
+        assert!(!mmap_names_python_runtime(&other));
+        let binary = std::ffi::CString::new(&b"/usr/bin/pyth\xffn3"[..]).unwrap();
+        assert!(!mmap_names_python_runtime(&binary));
+    }
 
     #[test]
     fn resolve_stack_frame_preserves_truncated_stack_marker() {

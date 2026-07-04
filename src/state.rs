@@ -142,3 +142,20 @@ fn send_signal(pid: i32, signal: libc::c_int) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_exists_sees_the_current_process() {
+        assert!(process_exists(std::process::id() as i32));
+    }
+
+    #[test]
+    fn process_exists_rejects_a_pid_past_the_kernel_maximum() {
+        // pid_max is at most 2^22 on Linux, so this task directory can
+        // never exist and the ENOENT arm is taken.
+        assert!(!process_exists(i32::MAX));
+    }
+}
