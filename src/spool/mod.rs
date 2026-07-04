@@ -240,10 +240,16 @@ struct StackNodeRecord {
 pub struct PerfSpoolWriter<W: Write> {
     writer: W,
     last_timestamp_ns: u64,
-    frame_cache: FxHashMap<(FrameRecord, u64), u32>,
+    // Frames pinned to a module id resolve through that id on the read side
+    // regardless of surrounding module records, so they are interned once for
+    // the whole recording. Unpinned frames are resolved against the module
+    // set visible at their position in the file, so their cache must be
+    // dropped whenever that set changes (write_module / deactivation).
+    pinned_frame_cache: FxHashMap<FrameRecord, u32>,
+    unpinned_frame_cache: FxHashMap<FrameRecord, u32>,
+    next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
     thread_cache: FxHashMap<(i32, u64), u32>,
-    frame_context_epoch: u64,
 }
 
 impl PerfSpoolWriter<BufWriter<File>> {
@@ -268,11 +274,12 @@ impl<W: Write> PerfSpoolWriter<W> {
     ) -> io::Result<Self> {
         let mut writer = Self {
             writer,
-            frame_cache: FxHashMap::default(),
+            pinned_frame_cache: FxHashMap::default(),
+            unpinned_frame_cache: FxHashMap::default(),
+            next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
             last_timestamp_ns: 0,
-            frame_context_epoch: 0,
         };
         writer.writer.write_all(MAGIC)?;
         writer.writer.write_varint(start_timestamp_us)?;
@@ -294,7 +301,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(module.inode)?;
         self.writer.write_all(&[u8::from(module.is_kernel)])?;
         write_bytes(&mut self.writer, module.path.as_bytes())?;
-        self.frame_context_epoch = self.frame_context_epoch.wrapping_add(1);
+        self.unpinned_frame_cache.clear();
         Ok(())
     }
 
@@ -344,7 +351,7 @@ impl<W: Write> PerfSpoolWriter<W> {
     pub(crate) fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE])?;
         self.writer.write_varint(i64::from(process_id))?;
-        self.frame_context_epoch = self.frame_context_epoch.wrapping_add(1);
+        self.unpinned_frame_cache.clear();
         Ok(())
     }
 
@@ -367,15 +374,25 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 
     fn intern_frame(&mut self, frame: &FrameRecord) -> io::Result<u32> {
-        let key = (*frame, self.frame_context_epoch);
-        if let Some(&id) = self.frame_cache.get(&key) {
+        let pinned = frame.module_id.is_some();
+        let cached = if pinned {
+            self.pinned_frame_cache.get(frame)
+        } else {
+            self.unpinned_frame_cache.get(frame)
+        };
+        if let Some(&id) = cached {
             return Ok(id);
         }
-        let id = self.frame_cache.len() as u32;
+        let id = self.next_frame_id;
         self.writer.write_all(&[REC_FRAME])?;
         self.writer.write_varint(u64::from(id))?;
         write_compact_frame(&mut self.writer, frame)?;
-        self.frame_cache.insert(key, id);
+        if pinned {
+            self.pinned_frame_cache.insert(*frame, id);
+        } else {
+            self.unpinned_frame_cache.insert(*frame, id);
+        }
+        self.next_frame_id += 1;
         Ok(id)
     }
 
@@ -1409,10 +1426,11 @@ mod tests {
         PerfSpoolWriter {
             writer: Vec::new(),
             last_timestamp_ns: 0,
-            frame_cache: FxHashMap::default(),
+            pinned_frame_cache: FxHashMap::default(),
+            unpinned_frame_cache: FxHashMap::default(),
+            next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
-            frame_context_epoch: 0,
         }
     }
 
