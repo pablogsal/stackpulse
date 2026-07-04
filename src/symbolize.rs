@@ -1670,6 +1670,52 @@ mod tests {
         let symbol = resolved.symbol.expect("kernel fallback symbol");
         assert_eq!(symbol.name.as_ref(), "[kernel]+0xffffffff80001234");
         assert_eq!(symbol.module.as_ref(), "[kernel]");
+        assert_eq!(symbol.offset, 0);
+    }
+
+    #[test]
+    fn resolved_kernel_symbols_carry_within_function_offsets() {
+        let mut symbolizer = PerfSymbolizer::new(&[]);
+        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([KernelSymbol {
+            address: 0xffff_ffff_8100_0000,
+            name: "vfs_read".to_owned(),
+            module: None,
+        }])));
+        let frame = FrameRecord {
+            module_id: None,
+            rel_ip: 0xffff_ffff_8100_0014,
+            abs_ip: 0xffff_ffff_8100_0014,
+            mode: FrameMode::Kernel,
+        };
+
+        let resolved = symbolizer.resolve_native_frame(&frame, None);
+
+        let symbol = resolved.symbol.expect("resolved kernel symbol");
+        assert_eq!(symbol.name.as_ref(), "vfs_read+0x14");
+        assert_eq!(symbol.module.as_ref(), "[kernel]");
+        assert_eq!(symbol.offset, 0x14);
+    }
+
+    #[test]
+    fn truncated_stack_markers_resolve_to_flagged_sentinels() {
+        let mut symbolizer = PerfSymbolizer::new(&[]);
+
+        let marker = symbolizer.resolve_native_frame(&FrameRecord::truncated_stack_marker(), None);
+        let null_pc = symbolizer.resolve_native_frame(
+            &FrameRecord {
+                module_id: None,
+                rel_ip: 0,
+                abs_ip: 0,
+                mode: FrameMode::User,
+            },
+            None,
+        );
+
+        assert!(marker.flags.contains(FrameFlags::TRUNCATED_STACK));
+        assert_eq!(marker.func_name(), "<stack truncated>");
+        assert_eq!(null_pc.func_name(), "<0x0>");
+        assert!(null_pc.flags.is_empty());
+        assert_ne!(marker, null_pc);
     }
 
     #[test]
