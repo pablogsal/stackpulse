@@ -42,6 +42,10 @@ bitflags! {
         const HIDDEN_DEFAULT = 1 << 2;
         /// Frame came from a JIT-emitted code region (perf-map entry).
         const JIT = 1 << 3;
+        /// Sentinel frame marking where native unwinding stopped because the
+        /// captured stack bytes were exhausted (`stack_size` too small for
+        /// the full stack), not a real (or failed) address resolution.
+        const TRUNCATED_STACK = 1 << 4;
     }
 }
 
@@ -241,6 +245,30 @@ impl NativeFrame {
             kind: FrameKind::Unknown,
             origin: SymbolOrigin::AddressOnly,
             flags: FrameFlags::empty(),
+        }
+    }
+
+    /// Sentinel resolved frame for a truncated-stack marker (see
+    /// [`crate::FrameRecord::truncated_stack_marker`]): the unwinder ran out
+    /// of captured stack bytes before reaching the root. Distinguishable from
+    /// a failed resolve via [`FrameFlags::TRUNCATED_STACK`].
+    #[must_use]
+    pub fn truncated_stack_marker() -> Self {
+        Self {
+            pc: 0,
+            sp: 0,
+            symbol: Some(NativeSymbol::new(
+                "<stack truncated>",
+                SourceLocation::default(),
+                "",
+                0,
+                false,
+                false,
+            )),
+            is_python_runtime: false,
+            kind: FrameKind::Unknown,
+            origin: SymbolOrigin::AddressOnly,
+            flags: FrameFlags::TRUNCATED_STACK,
         }
     }
 
