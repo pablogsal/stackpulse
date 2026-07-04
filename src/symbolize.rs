@@ -1035,16 +1035,19 @@ impl<'a> Iterator for KallSymIter<'a> {
     type Item = (u64, KernelSymbolName<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.is_empty() {
-            return None;
+        // Skip unparsable lines rather than ending iteration: one malformed
+        // line must not drop every symbol after it.
+        while !self.remaining.is_empty() {
+            let line_len = memchr(b'\n', self.remaining)
+                .map(|idx| idx + 1)
+                .unwrap_or(self.remaining.len());
+            let line = &self.remaining[..line_len];
+            self.remaining = self.remaining.get(line_len..).unwrap_or_default();
+            if let Some((address, name)) = parse_kernel_symbol_line_bytes(line) {
+                return Some((address, name));
+            }
         }
-        let line_len = memchr(b'\n', self.remaining)
-            .map(|idx| idx + 1)
-            .unwrap_or(self.remaining.len());
-        let line = &self.remaining[..line_len];
-        self.remaining = self.remaining.get(line_len..).unwrap_or_default();
-        let (address, name) = parse_kernel_symbol_line_bytes(line)?;
-        Some((address, name))
+        None
     }
 }
 
@@ -1119,7 +1122,19 @@ fn kernel_symbol_module_to_string(module: &[u8]) -> String {
 fn load_shared_kernel_symbols() -> KernelSymbolTable {
     static KERNEL_SYMBOLS: OnceLock<Arc<[KernelSymbol]>> = OnceLock::new();
     KernelSymbolTable::Full(Arc::clone(KERNEL_SYMBOLS.get_or_init(|| {
-        Arc::from(load_kernel_symbols().unwrap_or_default().into_boxed_slice())
+        let symbols = match load_kernel_symbols() {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                tracing::warn!("Failed to read /proc/kallsyms: {err}; kernel frames will not be symbolized");
+                Vec::new()
+            }
+        };
+        if symbols.is_empty() {
+            tracing::warn!(
+                "No usable kernel symbols in /proc/kallsyms (kptr_restrict or perf_event_paranoid may hide addresses); kernel frames will not be symbolized"
+            );
+        }
+        Arc::from(symbols.into_boxed_slice())
     })))
 }
 
@@ -1617,6 +1632,20 @@ mod tests {
         assert_eq!(name.name, b"syscall_return");
         assert_eq!(name.module, Some(b"kernel".as_slice()));
         assert_eq!(KallSymIter::new(b"not-an-address T broken\n").next(), None);
+    }
+
+    #[test]
+    fn kernel_symbol_iterator_skips_unparsable_lines() {
+        let mut iter = KallSymIter::new(
+            b"ffffffff89800000 T _text\nnot-an-address T broken\nffffffff89800137 t syscall_return\n",
+        );
+
+        assert_eq!(iter.next().expect("_text symbol").0, 0xffff_ffff_8980_0000);
+        assert_eq!(
+            iter.next().expect("symbol after bad line").0,
+            0xffff_ffff_8980_0137
+        );
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
