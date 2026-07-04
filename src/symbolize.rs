@@ -472,8 +472,7 @@ impl PerfSymbolizer {
                 }]
             }
             (false, Some((module, rel_ip))) => {
-                let symbols = self.resolve_module_symbols(&module, frame.abs_ip);
-                if !symbols.is_empty() {
+                if let Some(symbols) = self.resolve_module_symbols(&module, frame.abs_ip) {
                     return symbols
                         .iter()
                         .map(|symbol| {
@@ -523,11 +522,10 @@ impl PerfSymbolizer {
         }
     }
 
-    fn resolve_module_symbols(&mut self, module: &ModuleRecord, abs_ip: u64) -> SymbolsRc {
-        let Some(symbolizer) = self.ensure_native_symbolizer_for_module(module) else {
-            return SymbolsRc::from([]);
-        };
-        symbolizer.symbolize_one(abs_ip)
+    fn resolve_module_symbols(&mut self, module: &ModuleRecord, abs_ip: u64) -> Option<SymbolsRc> {
+        let symbolizer = self.ensure_native_symbolizer_for_module(module)?;
+        let symbols = symbolizer.symbolize_one(abs_ip);
+        (!symbols.is_empty()).then_some(symbols)
     }
 
     fn ensure_native_symbolizer_for_module(
@@ -767,6 +765,20 @@ fn load_kernel_symbols() -> io::Result<Vec<KernelSymbol>> {
     Ok(parse_kernel_symbols(&data))
 }
 
+/// Warn once, process-wide, when kernel symbolization is unavailable, from
+/// whichever kallsyms load path (full or sparse) hits the problem first.
+fn warn_kallsyms_unusable(err: Option<&io::Error>) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| match err {
+        Some(err) => tracing::warn!(
+            "Failed to read /proc/kallsyms: {err}; kernel frames will not be symbolized"
+        ),
+        None => tracing::warn!(
+            "No usable kernel symbols in /proc/kallsyms (kptr_restrict or perf_event_paranoid may hide addresses); kernel frames will not be symbolized"
+        ),
+    });
+}
+
 fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
     let mut symbols = Vec::new();
     let mut text_addr = None;
@@ -799,9 +811,16 @@ fn load_sparse_kernel_symbols(addresses: impl IntoIterator<Item = u64>) -> Kerne
         }
     }
 
-    let Ok(symbols) = load_sparse_kernel_symbols_from_file(&addresses) else {
-        return KernelSymbolTable::Sparse(Arc::from([]));
+    let symbols = match load_sparse_kernel_symbols_from_file(&addresses) {
+        Ok(symbols) => symbols,
+        Err(err) => {
+            warn_kallsyms_unusable(Some(&err));
+            return KernelSymbolTable::Sparse(Arc::from([]));
+        }
     };
+    if symbols.is_empty() {
+        warn_kallsyms_unusable(None);
+    }
     let symbols = Arc::from(symbols.into_boxed_slice());
     if let Ok(mut cache) = sparse_kernel_symbol_cache().lock() {
         cache.insert(cache_key, Arc::clone(&symbols));
@@ -1125,14 +1144,12 @@ fn load_shared_kernel_symbols() -> KernelSymbolTable {
         let symbols = match load_kernel_symbols() {
             Ok(symbols) => symbols,
             Err(err) => {
-                tracing::warn!("Failed to read /proc/kallsyms: {err}; kernel frames will not be symbolized");
+                warn_kallsyms_unusable(Some(&err));
                 Vec::new()
             }
         };
         if symbols.is_empty() {
-            tracing::warn!(
-                "No usable kernel symbols in /proc/kallsyms (kptr_restrict or perf_event_paranoid may hide addresses); kernel frames will not be symbolized"
-            );
+            warn_kallsyms_unusable(None);
         }
         Arc::from(symbols.into_boxed_slice())
     })))
