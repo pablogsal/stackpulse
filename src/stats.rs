@@ -381,6 +381,63 @@ mod tests {
     }
 
     #[test]
+    fn test_record_with_log_counts_without_a_debug_subscriber() {
+        let stats = SampleErrorStats::new();
+        let invoked = std::cell::Cell::new(false);
+        stats.record_with_log(SampleErrorKind::NativeStackRead, || {
+            invoked.set(true);
+            String::new()
+        });
+        assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 1);
+        assert!(
+            !invoked.get(),
+            "context must not be formatted when debug logging is off"
+        );
+    }
+
+    #[test]
+    fn test_record_with_log_throttles_under_a_debug_subscriber() {
+        struct EnableAll;
+        impl tracing::Subscriber for EnableAll {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        tracing::subscriber::with_default(EnableAll, || {
+            // Touch the span half of the subscriber so the stub above is
+            // fully exercised alongside the event path below.
+            let span = tracing::debug_span!("probe", value = 0);
+            span.record("value", 1);
+            span.follows_from(tracing::debug_span!("earlier").id());
+            span.in_scope(|| {});
+
+            let stats = SampleErrorStats::new();
+            let formats = std::cell::Cell::new(0);
+            for _ in 0..2 {
+                stats.record_with_log(SampleErrorKind::NativeStackRead, || {
+                    formats.set(formats.get() + 1);
+                    String::new()
+                });
+            }
+            assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 2);
+            assert_eq!(
+                formats.get(),
+                1,
+                "repeated same-kind errors within the interval must be throttled"
+            );
+        });
+    }
+
+    #[test]
     fn test_record_and_get() {
         let stats = SampleErrorStats::new();
 
