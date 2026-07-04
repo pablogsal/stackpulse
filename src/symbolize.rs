@@ -11,6 +11,7 @@ use crate::profile::{
 };
 use crate::symbols::{
     default_native_symbolizer_factory, NativeSymbolizer, NativeSymbolizerFactory, SymModule,
+    SymbolsRc,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -474,13 +475,13 @@ impl PerfSymbolizer {
                 let symbols = self.resolve_module_symbols(&module, frame.abs_ip);
                 if !symbols.is_empty() {
                     return symbols
-                        .into_iter()
+                        .iter()
                         .map(|symbol| {
                             let is_python_runtime = symbol.should_ignore;
                             NativeFrame {
                                 pc: frame.abs_ip,
                                 sp: 0,
-                                symbol: Some(symbol),
+                                symbol: Some(symbol.clone()),
                                 is_python_runtime,
                                 kind: FrameKind::Native,
                                 origin: SymbolOrigin::Elf,
@@ -522,12 +523,11 @@ impl PerfSymbolizer {
         }
     }
 
-    fn resolve_module_symbols(&mut self, module: &ModuleRecord, abs_ip: u64) -> Vec<NativeSymbol> {
+    fn resolve_module_symbols(&mut self, module: &ModuleRecord, abs_ip: u64) -> SymbolsRc {
         let Some(symbolizer) = self.ensure_native_symbolizer_for_module(module) else {
-            return Vec::new();
+            return SymbolsRc::from([]);
         };
-        let symbols = symbolizer.symbolize_one(abs_ip);
-        symbols.iter().cloned().collect()
+        symbolizer.symbolize_one(abs_ip)
     }
 
     fn ensure_native_symbolizer_for_module(
