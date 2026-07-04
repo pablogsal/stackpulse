@@ -132,6 +132,12 @@ impl SampleErrorStats {
     /// repeated failures of the same kind collapse to ~1 log per second.
     pub fn record_with_log(&self, kind: SampleErrorKind, context: impl FnOnce() -> String) {
         self.record(kind);
+        // Check the (cached) subscriber filter before touching the throttle:
+        // with debug logging off this skips a mutex lock and a clock read on
+        // every recorded error.
+        if !tracing::event_enabled!(target: "stackpulse::sampler::error", tracing::Level::DEBUG) {
+            return;
+        }
         if self.should_log(kind) {
             tracing::debug!(
                 target: "stackpulse::sampler::error",
