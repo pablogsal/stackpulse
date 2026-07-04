@@ -615,8 +615,8 @@ impl PerfSpoolReader {
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
         reader.check_magic()?;
-        let start_timestamp_us = reader.read_varint::<u64>()?;
-        let sample_interval_us = reader.read_varint::<u64>()?;
+        let start_timestamp_us = reader.read_varint_u64()?;
+        let sample_interval_us = reader.read_varint_u64()?;
         let (
             mut modules,
             mut module_deactivated_at,
@@ -907,6 +907,65 @@ impl Read for MmapSpoolCursor {
     }
 }
 
+/// Varint reads for the spool parser. The defaults go through
+/// [`VarIntReader`]'s byte-at-a-time `Read` loop; `MmapSpoolCursor` overrides
+/// them with a single pass over the mapped bytes while keeping the same
+/// results and error kinds (`UnexpectedEof` both for a truncated tail, which
+/// leaves the cursor at EOF, and for a varint that overflows `u64`).
+trait SpoolRead: Read {
+    fn read_varint_u64(&mut self) -> io::Result<u64>
+    where
+        Self: Sized,
+    {
+        VarIntReader::read_varint(self)
+    }
+
+    fn read_varint_i64(&mut self) -> io::Result<i64>
+    where
+        Self: Sized,
+    {
+        VarIntReader::read_varint(self)
+    }
+}
+
+impl SpoolRead for &[u8] {}
+
+impl SpoolRead for MmapSpoolCursor {
+    fn read_varint_u64(&mut self) -> io::Result<u64> {
+        let mut result = 0_u64;
+        let mut shift = 0_u32;
+        for (offset, &byte) in self.mmap[self.position..].iter().enumerate() {
+            result |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if shift > 63 {
+                // Tenth byte: a value above 1 carries bits past u64::MAX, and
+                // the cursor stays mid-file so this reads as corruption, not
+                // as a truncated tail.
+                self.position += offset + 1;
+                return if byte < 2 {
+                    Ok(result)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Reached EOF"))
+                };
+            }
+            if byte & 0x80 == 0 {
+                self.position += offset + 1;
+                return Ok(result);
+            }
+        }
+        // Unterminated varint at the end of the file: the byte-at-a-time
+        // reader consumes the partial tail, so EOF recovery still holds.
+        self.position = self.mmap.len();
+        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Reached EOF"))
+    }
+
+    fn read_varint_i64(&mut self) -> io::Result<i64> {
+        // Zigzag decode, matching integer-encoding's signed varints.
+        let raw = self.read_varint_u64()?;
+        Ok(((raw >> 1) as i64) ^ -((raw & 1) as i64))
+    }
+}
+
 type ModuleDedupKey = (i32, u64, u64, u64, u64, ModulePath);
 
 fn module_dedup_key(module: &ModuleRecord) -> ModuleDedupKey {
@@ -1118,13 +1177,13 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
     check_id(reader, expected_id, "module")?;
     let id = u32::try_from(expected_id).map_err(|_| invalid_data("module id too large"))?;
     let process_id = read_process_id(reader)?;
-    let start = reader.read_varint::<u64>()?;
-    let end = reader.read_varint::<u64>()?;
-    let file_offset = reader.read_varint::<u64>()?;
-    let inode = reader.read_varint::<u64>()?;
+    let start = reader.read_varint_u64()?;
+    let end = reader.read_varint_u64()?;
+    let file_offset = reader.read_varint_u64()?;
+    let inode = reader.read_varint_u64()?;
     let mut flag = [0_u8; 1];
     reader.read_exact(&mut flag)?;
-    let len = usize::try_from(reader.read_varint::<u64>()?)
+    let len = usize::try_from(reader.read_varint_u64()?)
         .map_err(|_| invalid_data("module path length too large"))?;
     let range = reader.read_bytes_range(len)?;
     let path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
@@ -1140,8 +1199,8 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
     })
 }
 
-fn read_process_exec(reader: &mut impl Read) -> io::Result<ProcessExecRecord> {
-    let timestamp_ns = reader.read_varint::<u64>()?;
+fn read_process_exec(reader: &mut impl SpoolRead) -> io::Result<ProcessExecRecord> {
+    let timestamp_ns = reader.read_varint_u64()?;
     let process_id = read_process_id(reader)?;
     let mut flag = [0_u8; 1];
     reader.read_exact(&mut flag)?;
@@ -1245,8 +1304,8 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn check_id(reader: &mut impl Read, expected: usize, kind: &str) -> io::Result<()> {
-    let id = usize::try_from(reader.read_varint::<u64>()?)
+fn check_id(reader: &mut impl SpoolRead, expected: usize, kind: &str) -> io::Result<()> {
+    let id = usize::try_from(reader.read_varint_u64()?)
         .map_err(|_| invalid_data(format!("{kind} id too large")))?;
     if id != expected {
         return Err(invalid_data(format!(
@@ -1297,22 +1356,22 @@ fn check_bounded_index(
     Ok(())
 }
 
-fn read_id_within(reader: &mut impl Read, limit: usize, kind: &str) -> io::Result<u32> {
-    bounded_id(reader.read_varint::<u64>()?, limit, kind)
+fn read_id_within(reader: &mut impl SpoolRead, limit: usize, kind: &str) -> io::Result<u32> {
+    bounded_id(reader.read_varint_u64()?, limit, kind)
 }
 
-fn read_index_within(reader: &mut impl Read, limit: usize, kind: &str) -> io::Result<usize> {
-    bounded_index(reader.read_varint::<u64>()?, limit, kind)
+fn read_index_within(reader: &mut impl SpoolRead, limit: usize, kind: &str) -> io::Result<usize> {
+    bounded_index(reader.read_varint_u64()?, limit, kind)
 }
 
 fn read_frame(
-    reader: &mut impl Read,
+    reader: &mut impl SpoolRead,
     modules: &[ModuleRecord],
     expected_id: usize,
 ) -> io::Result<FrameRecord> {
     check_id(reader, expected_id, "frame")?;
-    let tag = reader.read_varint::<u64>()?;
-    let encoded_ip = reader.read_varint::<u64>()?;
+    let tag = reader.read_varint_u64()?;
+    let encoded_ip = reader.read_varint_u64()?;
     if tag == TRUNCATED_STACK_MARKER_TAG {
         if encoded_ip != 0 {
             return Err(invalid_data("truncated stack marker has nonzero payload"));
@@ -1366,13 +1425,13 @@ fn frame_mode(is_kernel: bool) -> FrameMode {
 }
 
 fn read_stack_node(
-    reader: &mut impl Read,
+    reader: &mut impl SpoolRead,
     stack_nodes: &[StackNodeRecord],
     frame_count: usize,
 ) -> io::Result<StackNodeRecord> {
     let expected_id = stack_nodes.len();
     check_id(reader, expected_id, "stack")?;
-    let raw_prefix = reader.read_varint::<u64>()?;
+    let raw_prefix = reader.read_varint_u64()?;
     let prefix = (raw_prefix != u64::from(NONE_U32))
         .then(|| bounded_id_index(raw_prefix, expected_id, "stack prefix"))
         .transpose()?;
@@ -1387,15 +1446,15 @@ fn read_stack_node(
     })
 }
 
-fn read_thread(reader: &mut impl Read, expected_id: usize) -> io::Result<(i32, u64)> {
+fn read_thread(reader: &mut impl SpoolRead, expected_id: usize) -> io::Result<(i32, u64)> {
     check_id(reader, expected_id, "thread")?;
     let process_id = read_process_id(reader)?;
-    let thread_id = reader.read_varint::<u64>()?;
+    let thread_id = reader.read_varint_u64()?;
     Ok((process_id, thread_id))
 }
 
-fn read_process_id(reader: &mut impl Read) -> io::Result<i32> {
-    let process_id = reader.read_varint::<i64>()?;
+fn read_process_id(reader: &mut impl SpoolRead) -> io::Result<i32> {
+    let process_id = reader.read_varint_i64()?;
     i32::try_from(process_id)
         .map_err(|_| invalid_data(format!("process id {process_id} out of range")))
 }
@@ -1407,12 +1466,12 @@ fn checked_sample_timestamp_delta(last_timestamp_ns: u64, timestamp_ns: u64) -> 
 }
 
 fn read_sample(
-    reader: &mut impl Read,
+    reader: &mut impl SpoolRead,
     threads: &[(i32, u64)],
     stack_count: usize,
     last_timestamp_ns: &mut u64,
 ) -> io::Result<OwnedSampleRecord> {
-    let delta = reader.read_varint::<i64>()?;
+    let delta = reader.read_varint_i64()?;
     let timestamp_ns = last_timestamp_ns
         .checked_add_signed(delta)
         .ok_or_else(|| invalid_data(format!("sample timestamp delta {delta} out of range")))?;
