@@ -361,19 +361,21 @@ fn discover_linux_debug_file_redirect(
         return None;
     }
 
-    let library_info =
-        match block_on_runtime(runtime, SymbolManager::library_info_for_binary_at_path(path, None)) {
-            Ok(info) => info,
-            Err(err) => {
-                tracing::trace!(
-                    name: "wholesym library info failed",
-                    module = %path.display(),
-                    error = %err,
-                    "Skipping custom debug-dir redirect discovery"
-                );
-                return None;
-            }
-        };
+    let library_info = match block_on_runtime(
+        runtime,
+        SymbolManager::library_info_for_binary_at_path(path, None),
+    ) {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::trace!(
+                name: "wholesym library info failed",
+                module = %path.display(),
+                error = %err,
+                "Skipping custom debug-dir redirect discovery"
+            );
+            return None;
+        }
+    };
 
     let build_id = linux_build_id_string(&library_info)?;
     let standard_path = standard_build_id_debug_path(&build_id)?;

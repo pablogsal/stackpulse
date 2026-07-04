@@ -47,14 +47,8 @@ type NativeUnwinder = framehop::UnwinderNative<elf_types::ElfSectionData, Unwind
 type NativeCache = framehop::CacheNative<UnwindPolicy>;
 
 enum ThreadAction {
-    Fork {
-        tid: u32,
-        pid: u32,
-        parent_tid: u32,
-    },
-    Exit {
-        tid: u32,
-    },
+    Fork { tid: u32, pid: u32, parent_tid: u32 },
+    Exit { tid: u32 },
 }
 
 #[derive(Clone, Copy)]
