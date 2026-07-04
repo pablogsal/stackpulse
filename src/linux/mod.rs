@@ -137,7 +137,6 @@ pub struct PerfRecorder {
     python_perf_support_processes: FxHashMap<i32, bool>,
     python_runtime_processes: FxHashSet<i32>,
     stack_scratch: Vec<StackFrame>,
-    callchain_scratch: Vec<StackFrame>,
     summary: PerfSummary,
 }
 
@@ -150,7 +149,6 @@ struct EventContext<'a, W: std::io::Write> {
     writer: &'a mut PerfSpoolWriter<W>,
     summary: &'a mut PerfSummary,
     stack_scratch: &'a mut Vec<StackFrame>,
-    callchain_scratch: &'a mut Vec<StackFrame>,
     thread_actions: &'a mut Vec<ThreadAction>,
     // (pid, parent_tid) pairs for open_forked_processes.
     process_fork_actions: &'a mut Vec<(u32, u32)>,
@@ -217,7 +215,6 @@ impl PerfRecorder {
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch: Vec::with_capacity(128),
-            callchain_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
                 ..PerfSummary::default()
@@ -243,7 +240,6 @@ impl PerfRecorder {
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch,
-            callchain_scratch,
             writer,
             summary,
         } = self;
@@ -261,7 +257,6 @@ impl PerfRecorder {
                 writer,
                 summary,
                 stack_scratch,
-                callchain_scratch,
                 thread_actions: &mut thread_actions,
                 process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes,
@@ -804,7 +799,6 @@ fn record_sample_view<W: std::io::Write>(
         privilege,
         unwinder,
         ctx.stack_scratch,
-        ctx.callchain_scratch,
         ctx.summary,
     );
     let stack_id = {
@@ -1045,19 +1039,11 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
     privilege: Priv,
     process_unwinder: &mut ProcessUnwinder,
     stack: &mut Vec<StackFrame>,
-    callchain_stack: &mut Vec<StackFrame>,
     summary: &mut PerfSummary,
 ) {
     stack.clear();
-    callchain_stack.clear();
 
-    push_sample_callchain(sample.call_chain, callchain_stack);
-    let kernel_frame_count = callchain_stack
-        .iter()
-        .take_while(|&&frame| stack_frame_is_kernel(frame))
-        .count();
-    let (kernel_callchain_frames, fp_user_frames) = callchain_stack.split_at(kernel_frame_count);
-    stack.extend_from_slice(kernel_callchain_frames);
+    let fp_user_frames = split_kernel_callchain_prefix(sample.call_chain, stack);
     let dwarf_start = stack.len();
     let mut dwarf_truncated = false;
     let user_stack = sample.user_stack.filter(|stack| !stack.is_empty());
@@ -1125,10 +1111,10 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
     }
 
     let used_fp_user_frames =
-        append_fp_user_callchain(stack, dwarf_start, fp_user_frames, dwarf_truncated);
+        append_fp_user_callchain(stack, dwarf_start, &fp_user_frames, dwarf_truncated);
     summary.ignored_user_callchain_frames = summary
         .ignored_user_callchain_frames
-        .saturating_add(fp_user_frames.len().saturating_sub(used_fp_user_frames) as u64);
+        .saturating_add(fp_user_frames.len.saturating_sub(used_fp_user_frames) as u64);
     if dwarf_truncated && used_fp_user_frames == 0 {
         stack.push(StackFrame::TruncatedStackMarker);
     }
@@ -1143,15 +1129,15 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
 fn append_fp_user_callchain(
     stack: &mut Vec<StackFrame>,
     dwarf_start: usize,
-    fp_user_frames: &[StackFrame],
+    fp_user_frames: &FpUserCallchain<'_>,
     dwarf_truncated: bool,
 ) -> usize {
-    if fp_user_frames.is_empty() {
+    if fp_user_frames.len == 0 {
         return 0;
     }
     if stack.len() == dwarf_start {
-        stack.extend_from_slice(fp_user_frames);
-        return fp_user_frames.len();
+        stack.extend(fp_user_frames.frames());
+        return fp_user_frames.len;
     }
     if !dwarf_truncated {
         return 0;
@@ -1164,23 +1150,14 @@ fn append_fp_user_callchain(
     else {
         return 0;
     };
-    let Some(splice_index) = fp_user_frames
-        .iter()
-        .position(|&frame| stack_frame_address(frame) == Some(last_dwarf_address))
+    let mut frames = fp_user_frames.frames();
+    let Some(splice_index) =
+        frames.position(|frame| stack_frame_address(frame) == Some(last_dwarf_address))
     else {
         return 0;
     };
-    let tail = &fp_user_frames[splice_index + 1..];
-    stack.extend_from_slice(tail);
-    tail.len()
-}
-
-fn stack_frame_is_kernel(frame: StackFrame) -> bool {
-    matches!(
-        frame,
-        StackFrame::InstructionPointer(_, StackMode::Kernel)
-            | StackFrame::ReturnAddress(_, StackMode::Kernel)
-    )
+    stack.extend(frames);
+    fp_user_frames.len - splice_index - 1
 }
 
 fn stack_frame_address(frame: StackFrame) -> Option<u64> {
@@ -1192,12 +1169,75 @@ fn stack_frame_address(frame: StackFrame) -> Option<u64> {
     }
 }
 
-fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackFrame>) {
+struct FpUserCallchain<'a> {
+    segments: CallChainSegments<'a>,
+    first_frame_is_instruction_pointer: bool,
+    len: usize,
+}
+
+impl<'a> FpUserCallchain<'a> {
+    fn new(segments: CallChainSegments<'a>, first_frame_is_instruction_pointer: bool) -> Self {
+        let len = segments.clone().map(|(_, addresses)| addresses.len()).sum();
+        Self {
+            segments,
+            first_frame_is_instruction_pointer,
+            len,
+        }
+    }
+
+    fn frames(&self) -> impl Iterator<Item = StackFrame> + 'a {
+        let first_frame_is_instruction_pointer = self.first_frame_is_instruction_pointer;
+        self.segments
+            .clone()
+            .flat_map(|(mode, addresses)| addresses.iter().map(move |&address| (mode, address)))
+            .enumerate()
+            .map(move |(index, (mode, address))| {
+                if index == 0 && first_frame_is_instruction_pointer {
+                    StackFrame::InstructionPointer(address, mode)
+                } else {
+                    StackFrame::ReturnAddress(address, mode)
+                }
+            })
+    }
+}
+
+fn split_kernel_callchain_prefix<'a>(
+    call_chain: SampleCallChain<'a>,
+    stack: &mut Vec<StackFrame>,
+) -> FpUserCallchain<'a> {
+    let mut remainder = callchain_segments(call_chain);
+    let mut segments = remainder.clone();
+    while let Some((mode, addresses)) = segments.next() {
+        if mode == StackMode::User && !addresses.is_empty() {
+            break;
+        }
+        push_callchain_addresses(mode, addresses, stack.is_empty(), stack);
+        remainder = segments.clone();
+    }
+    FpUserCallchain::new(remainder, stack.is_empty())
+}
+
+#[derive(Clone)]
+enum CallChainSegments<'a> {
+    Owned(std::slice::Iter<'a, CallChain>),
+    Borrowed(perf_event::CallChainIter<'a>),
+}
+
+fn callchain_segments<'a>(call_chain: SampleCallChain<'a>) -> CallChainSegments<'a> {
     match call_chain {
-        SampleCallChain::None => {}
-        SampleCallChain::Owned(chains) => {
-            for chain in chains {
-                let (mode, addresses) = match chain {
+        SampleCallChain::None => CallChainSegments::Owned([].iter()),
+        SampleCallChain::Owned(chains) => CallChainSegments::Owned(chains.iter()),
+        SampleCallChain::Borrowed(chains) => CallChainSegments::Borrowed(chains.iter()),
+    }
+}
+
+impl<'a> Iterator for CallChainSegments<'a> {
+    type Item = (StackMode, &'a [u64]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let segment = match self {
+                Self::Owned(chains) => match chains.next()? {
                     CallChain::Kernel(addresses)
                     | CallChain::Hv(addresses)
                     | CallChain::GuestKernel(addresses) => {
@@ -1208,19 +1248,8 @@ fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackF
                     | CallChain::GuestUser(addresses)
                     | CallChain::Unknown(addresses) => (StackMode::User, addresses.as_slice()),
                     CallChain::UserDeferred { .. } => continue,
-                };
-                let first_address_is_instruction_pointer = stack.is_empty();
-                push_callchain_addresses(
-                    mode,
-                    addresses,
-                    first_address_is_instruction_pointer,
-                    stack,
-                );
-            }
-        }
-        SampleCallChain::Borrowed(chains) => {
-            for chain in chains.iter() {
-                let (mode, addresses) = match chain {
+                },
+                Self::Borrowed(chains) => match chains.next()? {
                     CallChainEntry::Kernel(addresses)
                     | CallChainEntry::Hv(addresses)
                     | CallChainEntry::GuestKernel(addresses) => (StackMode::Kernel, addresses),
@@ -1228,15 +1257,9 @@ fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackF
                     | CallChainEntry::Guest(addresses)
                     | CallChainEntry::GuestUser(addresses)
                     | CallChainEntry::Unknown(addresses) => (StackMode::User, addresses),
-                };
-                let first_address_is_instruction_pointer = stack.is_empty();
-                push_callchain_addresses(
-                    mode,
-                    addresses,
-                    first_address_is_instruction_pointer,
-                    stack,
-                );
-            }
+                },
+            };
+            return Some(segment);
         }
     }
 }
@@ -1366,7 +1389,6 @@ pub(crate) fn bench_record_live_perf_samples(
         let mut python_runtime_processes = FxHashSet::default();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
-        let mut callchain_scratch = Vec::with_capacity(128);
         let mut thread_actions = Vec::new();
         let mut process_fork_actions = Vec::new();
         {
@@ -1379,7 +1401,6 @@ pub(crate) fn bench_record_live_perf_samples(
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
-                callchain_scratch: &mut callchain_scratch,
                 thread_actions: &mut thread_actions,
                 process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes: false,
@@ -1489,16 +1510,24 @@ mod tests {
         assert_eq!(summary.truncated_frame_markers, 0);
     }
 
+    fn fp_user_callchain<'a>(
+        chains: &'a [CallChain],
+        first_frame_is_instruction_pointer: bool,
+    ) -> FpUserCallchain<'a> {
+        FpUserCallchain::new(
+            callchain_segments(SampleCallChain::Owned(chains)),
+            first_frame_is_instruction_pointer,
+        )
+    }
+
     #[test]
     fn fp_user_callchain_fills_missing_dwarf_stack() {
         let mut stack = vec![StackFrame::InstructionPointer(
             0xffff_1000,
             StackMode::Kernel,
         )];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
+        let chains = [CallChain::User(vec![0x1000, 0x2000])];
+        let fp_user_frames = fp_user_callchain(&chains, true);
 
         let used = append_fp_user_callchain(&mut stack, 1, &fp_user_frames, false);
 
@@ -1520,11 +1549,8 @@ mod tests {
             StackFrame::InstructionPointer(0x1000, StackMode::User),
             StackFrame::ReturnAddress(0x2000, StackMode::User),
         ];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-            StackFrame::ReturnAddress(0x3000, StackMode::User),
-        ];
+        let chains = [CallChain::User(vec![0x1000, 0x2000, 0x3000])];
+        let fp_user_frames = fp_user_callchain(&chains, true);
 
         let used = append_fp_user_callchain(&mut stack, 1, &fp_user_frames, true);
 
@@ -1543,10 +1569,8 @@ mod tests {
     #[test]
     fn fp_user_callchain_is_ignored_when_dwarf_stack_is_complete() {
         let mut stack = vec![StackFrame::InstructionPointer(0x1000, StackMode::User)];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
+        let chains = [CallChain::User(vec![0x1000, 0x2000])];
+        let fp_user_frames = fp_user_callchain(&chains, true);
 
         let used = append_fp_user_callchain(&mut stack, 0, &fp_user_frames, false);
 
@@ -1617,7 +1641,6 @@ mod tests {
         };
         let mut process_unwinder = ProcessUnwinder::default();
         let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
         let mut summary = PerfSummary::default();
 
         get_sample_stack::<ConvertRegsNative>(
@@ -1625,7 +1648,6 @@ mod tests {
             Priv::User,
             &mut process_unwinder,
             &mut stack,
-            &mut callchain_stack,
             &mut summary,
         );
 
@@ -1660,7 +1682,6 @@ mod tests {
         };
         let mut process_unwinder = ProcessUnwinder::default();
         let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
         let mut summary = PerfSummary::default();
 
         get_sample_stack::<ConvertRegsNative>(
@@ -1668,7 +1689,6 @@ mod tests {
             Priv::User,
             &mut process_unwinder,
             &mut stack,
-            &mut callchain_stack,
             &mut summary,
         );
 
@@ -1701,7 +1721,6 @@ mod tests {
         };
         let mut process_unwinder = ProcessUnwinder::default();
         let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
         let mut summary = PerfSummary::default();
 
         get_sample_stack::<ConvertRegsNative>(
@@ -1709,7 +1728,6 @@ mod tests {
             Priv::User,
             &mut process_unwinder,
             &mut stack,
-            &mut callchain_stack,
             &mut summary,
         );
 

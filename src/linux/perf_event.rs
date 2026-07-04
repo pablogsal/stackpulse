@@ -402,6 +402,7 @@ impl<'a> CallChainRef<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct CallChainIter<'a> {
     addresses: &'a [u64],
     cursor: usize,
