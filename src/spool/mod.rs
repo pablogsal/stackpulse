@@ -416,6 +416,7 @@ pub struct PerfSpoolReader {
     stack_nodes: Vec<StackNodeRecord>,
     samples: Vec<OwnedSampleRecord>,
     process_execs: Vec<ProcessExecRecord>,
+    truncated_tail: bool,
 }
 
 /// Recorded module context for a raw frame.
@@ -615,6 +616,7 @@ impl PerfSpoolReader {
             Vec::new(),
         );
         let mut last_timestamp_ns = 0_u64;
+        let mut truncated_tail = false;
         while let Some(tag) = reader.read_tag()? {
             // Each record's reads run before any push, so a record truncated by
             // a crash mid-write leaves the accumulated state untouched. Stop at
@@ -657,7 +659,16 @@ impl PerfSpoolReader {
                 Ok(())
             })();
             if let Err(err) = parsed {
-                if err.kind() == io::ErrorKind::UnexpectedEof {
+                // A record cut off by a crash leaves the cursor at EOF (see
+                // MmapSpoolCursor). An UnexpectedEof with bytes still left is
+                // a corrupt varint mid-file, not a truncated tail — an
+                // overflowing 10-byte varint decodes to the same error kind.
+                if err.kind() == io::ErrorKind::UnexpectedEof && reader.at_eof() {
+                    truncated_tail = true;
+                    tracing::warn!(
+                        "spool tail truncated mid-record; keeping {} samples",
+                        samples.len()
+                    );
                     break;
                 }
                 return Err(err);
@@ -674,6 +685,7 @@ impl PerfSpoolReader {
             stack_nodes,
             samples,
             process_execs,
+            truncated_tail,
         })
     }
 
@@ -705,6 +717,12 @@ impl PerfSpoolReader {
     /// Return process execution markers recorded in the profile.
     pub fn process_execs(&self) -> &[ProcessExecRecord] {
         &self.process_execs
+    }
+
+    /// Whether the file ended mid-record (e.g. the recorder crashed while
+    /// writing) and the reader recovered by keeping only the intact prefix.
+    pub fn recovered_from_truncation(&self) -> bool {
+        self.truncated_tail
     }
 
     /// Return absolute kernel instruction pointers present in interned frame records.
@@ -839,6 +857,11 @@ impl MmapSpoolCursor {
             .checked_add(len)
             .ok_or_else(|| invalid_data("spool byte range overflow"))?;
         if end > self.mmap.len() {
+            // Consume the partial tail so `at_eof` holds: every read that
+            // fails because the record extends past the end of the file must
+            // leave the cursor at EOF, distinguishing crash truncation from
+            // mid-file corruption in the recovery loop.
+            self.position = self.mmap.len();
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated spool byte range",
@@ -846,6 +869,10 @@ impl MmapSpoolCursor {
         }
         self.position = end;
         Ok(start..end)
+    }
+
+    fn at_eof(&self) -> bool {
+        self.position == self.mmap.len()
     }
 }
 
