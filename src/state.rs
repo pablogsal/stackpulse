@@ -108,7 +108,8 @@ pub fn process_exists(pid: i32) -> bool {
         let Ok(entry) = entry else {
             continue;
         };
-        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
             continue;
         };
         let Ok(tid) = file_name.parse::<i32>() else {

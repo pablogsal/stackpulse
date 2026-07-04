@@ -691,7 +691,8 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     let Some(pid) = i32_from_u32(mmap.task.pid) else {
         return Ok(());
     };
-    if !is_python_runtime_path(&c_string_to_string(&mmap.file)) {
+    // Borrowed lossy conversion: allocates only for non-UTF-8 paths.
+    if !is_python_runtime_path(&String::from_utf8_lossy(mmap.file.as_bytes())) {
         return Ok(());
     }
     if process_has_python_perf_support(mmap.task.pid, python_perf_support_processes) {
