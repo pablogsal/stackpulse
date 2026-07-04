@@ -33,7 +33,7 @@ pub struct PerfSymbolizer {
     perf_map_cache: FxHashMap<i32, Option<Vec<PerfMapSymbol>>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
-    frame_cache: FxHashMap<(i32, FrameCacheKey), Box<[usize]>>,
+    frame_cache: FxHashMap<(i32, FrameCacheKey), ResolvedFrameRange>,
     resolved_frames: Vec<ResolvedFrame>,
     stack_cache: FxHashMap<(i32, u32), Box<[usize]>>,
     native_factory: NativeSymbolizerFactory,
@@ -130,6 +130,23 @@ struct PerfMapSymbol {
 enum FrameCacheKey {
     Spool(u32),
     Raw(FrameRecord),
+}
+
+/// Contiguous run of entries in `PerfSymbolizer::resolved_frames` produced by
+/// resolving one raw frame. Stored by value in the frame cache so hits avoid
+/// allocating; `resolved_frames` only ever grows, so ranges stay valid for the
+/// symbolizer's lifetime.
+#[derive(Clone, Copy)]
+struct ResolvedFrameRange {
+    start: u32,
+    len: u32,
+}
+
+impl ResolvedFrameRange {
+    fn ids(self) -> std::ops::Range<usize> {
+        let start = self.start as usize;
+        start..start + self.len as usize
+    }
 }
 
 struct NativeSymbolizerGroup {
@@ -291,13 +308,13 @@ impl PerfSymbolizer {
 
         let mut frame_ids = Vec::with_capacity(frames.len());
         while let Some((frame_id, frame)) = frames.next_with_id() {
-            let resolved_ids = self.resolve_cached_frame_ids(
+            let resolved = self.resolve_cached_frame_range(
                 process_id,
                 frame,
                 FrameCacheKey::Spool(frame_id),
                 Some(frame_id),
             );
-            for frame_id in resolved_ids.iter().copied() {
+            for frame_id in resolved.ids() {
                 visit(&self.resolved_frames[frame_id]);
                 frame_ids.push(frame_id);
             }
@@ -317,9 +334,13 @@ impl PerfSymbolizer {
     ) -> usize {
         let mut count = 0;
         for frame in frames {
-            let resolved_ids =
-                self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None);
-            for frame_id in resolved_ids.iter().copied() {
+            let resolved = self.resolve_cached_frame_range(
+                process_id,
+                frame,
+                FrameCacheKey::Raw(*frame),
+                None,
+            );
+            for frame_id in resolved.ids() {
                 visit(&self.resolved_frames[frame_id]);
                 count += 1;
             }
@@ -329,63 +350,57 @@ impl PerfSymbolizer {
 
     #[cfg(test)]
     fn resolve_cached_frame_ref(&mut self, process_id: i32, frame: &FrameRecord) -> &ResolvedFrame {
-        let frame_id =
-            self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None)[0];
-        &self.resolved_frames[frame_id]
+        let resolved =
+            self.resolve_cached_frame_range(process_id, frame, FrameCacheKey::Raw(*frame), None);
+        &self.resolved_frames[resolved.start as usize]
     }
 
-    fn resolve_cached_frame_ids(
+    fn resolve_cached_frame_range(
         &mut self,
         process_id: i32,
         frame: &FrameRecord,
         cache_key: FrameCacheKey,
         spool_frame_id: Option<u32>,
-    ) -> Box<[usize]> {
+    ) -> ResolvedFrameRange {
         let cache_key = (process_id, cache_key);
-        if let Some(frame_ids) = self.frame_cache.get(&cache_key) {
-            return frame_ids.clone();
+        if let Some(&range) = self.frame_cache.get(&cache_key) {
+            return range;
         }
-        let frame_ids = self
-            .resolve_frames(process_id, frame, spool_frame_id)
-            .into_vec()
-            .into_iter()
-            .map(|resolved| {
-                let frame_id = self.resolved_frames.len();
-                self.resolved_frames.push(resolved);
-                frame_id
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        self.frame_cache.insert(cache_key, frame_ids.clone());
-        frame_ids
+        let start = self.resolved_frames.len();
+        self.resolve_frames_into(process_id, frame, spool_frame_id);
+        let range = ResolvedFrameRange {
+            start: start as u32,
+            len: (self.resolved_frames.len() - start) as u32,
+        };
+        self.frame_cache.insert(cache_key, range);
+        range
     }
 
     #[cfg(test)]
     fn resolve_frame(&mut self, process_id: i32, frame: &FrameRecord) -> ResolvedFrame {
-        self.resolve_frames(process_id, frame, None)
-            .into_vec()
-            .into_iter()
-            .next()
+        let start = self.resolved_frames.len();
+        self.resolve_frames_into(process_id, frame, None);
+        self.resolved_frames
+            .get(start)
             .expect("frame resolution returns at least one frame")
+            .clone()
     }
 
-    fn resolve_frames(
+    /// Resolve a raw frame and push the resulting frames onto
+    /// `self.resolved_frames`.
+    fn resolve_frames_into(
         &mut self,
         process_id: i32,
         frame: &FrameRecord,
         spool_frame_id: Option<u32>,
-    ) -> Box<[ResolvedFrame]> {
+    ) {
         if let Some(module) = frame
             .module_id
             .and_then(|module_id| self.modules.get(module_id as usize))
             .filter(|module| !perf_map_module_allowed(module))
         {
-            return self
-                .resolve_native_frames(frame, Some((module.clone(), frame.rel_ip)))
-                .into_iter()
-                .map(ResolvedFrame::Native)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let module = Some((module.clone(), frame.rel_ip));
+            return self.push_native_frames(frame, module);
         }
 
         let perf_map_symbol =
@@ -402,23 +417,21 @@ impl PerfSymbolizer {
                     (!perf_map_module_allowed(module.module)).then(|| module.into_owned())
                 });
             if let Some(module) = blocked_module {
-                return self
-                    .resolve_native_frames(frame, Some(module))
-                    .into_iter()
-                    .map(ResolvedFrame::Native)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                return self.push_native_frames(frame, Some(module));
             }
 
-            return vec![perf_map_symbol_to_frame(process_id, frame.abs_ip, symbol)]
-                .into_boxed_slice();
+            self.resolved_frames
+                .push(perf_map_symbol_to_frame(process_id, frame.abs_ip, symbol));
+            return;
         }
         let module = self.owned_module_for_frame(process_id, frame, spool_frame_id);
-        self.resolve_native_frames(frame, module)
-            .into_iter()
-            .map(ResolvedFrame::Native)
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
+        self.push_native_frames(frame, module);
+    }
+
+    fn push_native_frames(&mut self, frame: &FrameRecord, module: Option<(ModuleRecord, u64)>) {
+        let frames = self.resolve_native_frames(frame, module);
+        self.resolved_frames
+            .extend(frames.into_iter().map(ResolvedFrame::Native));
     }
 
     fn owned_module_for_frame(
