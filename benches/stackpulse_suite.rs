@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -7,7 +8,12 @@ use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use integer_encoding::VarIntWriter;
+use perf_event_open::sample::record::UnsafeParser;
+use perf_event_open_sys::bindings as sys;
 use rustc_hash::FxHashMap;
+use stackpulse::bench_support::drain::{
+    AlignedPerfRecord, EventRecord, EventRef, EventSorter, OwnedEventRecord,
+};
 use stackpulse::bench_support::{
     self, BenchSpoolSample, LivePerfSampleFixture, SparseKernelSymbolsFixture,
 };
@@ -35,6 +41,14 @@ const METADATA_BATCH: u64 = 4096;
 const WRITE_BATCH: u64 = 4;
 const LIVE_PARSE_BATCH: u64 = 64;
 const LIVE_RECORD_BATCH: u64 = 4;
+const RING_DRAIN_FDS: usize = 8;
+const RING_DRAIN_EVENTS_PER_FD: usize = 2048;
+/// Events drained from each fd per simulated wakeup (one sorter round).
+const RING_DRAIN_BATCH: usize = 256;
+const RING_DRAIN_USER_REGS: usize = 16;
+/// Order-sensitive checksum of the synthetic drain stream; any change to
+/// sorter ordering or record parsing shows up as a drift.
+const RING_DRAIN_CHECKSUM: u64 = 0x43f2_2cd2_ae50_7566;
 const SPOOL_SYMBOLIZE_BATCH: u64 = 8;
 const ADDRESS_CACHE_BATCH: u64 = 512;
 const PERF_MAP_BATCH: u64 = 256;
@@ -122,6 +136,7 @@ criterion_group! {
         bench_spool_iteration,
         bench_spool_write,
         bench_live_perf_events,
+        bench_ring_drain,
         bench_symbolization,
         bench_helpers
 }
@@ -354,6 +369,27 @@ fn bench_live_perf_events(c: &mut Criterion) {
         });
     });
 
+    group.finish();
+}
+
+fn bench_ring_drain(c: &mut Criterion) {
+    let (parser, streams) = ring_drain_streams(
+        RING_DRAIN_FDS,
+        RING_DRAIN_EVENTS_PER_FD,
+        RING_DRAIN_USER_REGS,
+    );
+    let total_events: u64 = streams.iter().map(|stream| stream.len() as u64).sum();
+    // Pin ordering and parsing before timing anything: the drive checksum
+    // is order sensitive, so a sorter or record-path change breaks here
+    // instead of silently shifting the measurement.
+    assert_eq!(drive_ring_drain(&parser, &streams), RING_DRAIN_CHECKSUM);
+
+    let mut group = c.benchmark_group("stackpulse_cpu/live_perf_events/ring_drain");
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(total_events));
+    group.bench_function("consume_sort_dispatch", |b| {
+        b.iter(|| black_box(drive_ring_drain(black_box(&parser), black_box(&streams))));
+    });
     group.finish();
 }
 
@@ -1174,4 +1210,278 @@ fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Resu
 fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     writer.write_varint(bytes.len() as u64)?;
     writer.write_all(bytes)
+}
+
+/// One full drain of the synthetic streams, mirroring
+/// `PerfGroup::consume_events`: construct an `OwnedEventRecord` per event,
+/// push it straight into the round-robin `EventSorter`, pop and dispatch
+/// with the group-wide parser, and force-flush at the end like
+/// `PerfGroup::flush_events`. Returns an order-sensitive checksum.
+fn drive_ring_drain(parser: &UnsafeParser, streams: &[Vec<AlignedPerfRecord>]) -> u64 {
+    fn fold(checksum: &mut u64, value: u64) {
+        *checksum = checksum.rotate_left(1) ^ value;
+    }
+
+    let mut sorter: EventSorter<i32, u64, OwnedEventRecord> = EventSorter::new();
+    let mut checksum = 0u64;
+    let mut cb = |event: EventRef<'_>| {
+        fold(&mut checksum, event.timestamp().unwrap_or(0));
+        let (_, record) = event.into_parts();
+        match record {
+            EventRecord::Sample(sample) => {
+                if let Some((ip, _)) = sample.code_addr {
+                    fold(&mut checksum, ip);
+                }
+                if let Some(task) = sample.task {
+                    fold(&mut checksum, u64::from(task.tid));
+                }
+                if let Some(chain) = sample.call_chain {
+                    fold(&mut checksum, chain.iter().count() as u64);
+                }
+                if let Some(stack) = sample.user_stack {
+                    fold(&mut checksum, stack.len() as u64);
+                }
+            }
+            EventRecord::Owned(_) => fold(&mut checksum, 1),
+        }
+    };
+
+    let passes = RING_DRAIN_EVENTS_PER_FD.div_ceil(RING_DRAIN_BATCH);
+    for pass in 0..passes {
+        let start = pass * RING_DRAIN_BATCH;
+        // One simulated wakeup: drain a batch from every fd.
+        for (fd_idx, stream) in streams.iter().enumerate() {
+            let fd = 100 + fd_idx as i32;
+            sorter.begin_group(fd);
+            let end = (start + RING_DRAIN_BATCH).min(stream.len());
+            for record in &stream[start..end] {
+                let event = OwnedEventRecord::from_chunk_bytes(record.as_bytes(), parser);
+                sorter.push(event.timestamp().unwrap_or(0), event);
+            }
+            while let Some(event) = sorter.pop() {
+                event.dispatch(parser, &mut cb);
+            }
+        }
+        sorter.advance_round();
+        while let Some(event) = sorter.pop() {
+            event.dispatch(parser, &mut cb);
+        }
+    }
+    while let Some(event) = sorter.force_pop() {
+        event.dispatch(parser, &mut cb);
+    }
+    checksum
+}
+
+/// Shape of the synthetic sample records; mirrors what the recorder sees
+/// for a busy multi-threaded process.
+struct RingSampleSpec {
+    user_frames: usize,
+    kernel_frames: usize,
+    user_regs: usize,
+    user_stack_bytes: usize,
+    process_id: u32,
+    thread_count: u32,
+    user_base: u64,
+    kernel_base: u64,
+}
+
+/// Synthesize per-fd perf record streams (~90% samples, ~10% mmap/fork/exit).
+/// Timestamps interleave across fds the way per-cpu buffers do in production.
+fn ring_drain_streams(
+    fd_count: usize,
+    events_per_fd: usize,
+    user_regs: usize,
+) -> (UnsafeParser, Vec<Vec<AlignedPerfRecord>>) {
+    const RING_TIME_BASE: u64 = 1_700_000_000_000_000;
+    let spec = RingSampleSpec {
+        user_frames: 24,
+        kernel_frames: 8,
+        user_regs,
+        user_stack_bytes: 512,
+        process_id: 42_000,
+        thread_count: 32,
+        user_base: 0x7000_0000_0000,
+        kernel_base: 0xffff_ffff_8100_0000,
+    };
+    let parser = UnsafeParser {
+        sample_id_all: true,
+        sample_type: u64::from(sys::PERF_SAMPLE_IP)
+            | u64::from(sys::PERF_SAMPLE_TID)
+            | u64::from(sys::PERF_SAMPLE_TIME)
+            | u64::from(sys::PERF_SAMPLE_CALLCHAIN)
+            | u64::from(sys::PERF_SAMPLE_REGS_USER)
+            | u64::from(sys::PERF_SAMPLE_STACK_USER),
+        read_format: 0,
+        user_regs,
+        intr_regs: 0,
+        branch_sample_type: 0,
+    };
+
+    let mut streams = Vec::with_capacity(fd_count);
+    for fd_idx in 0..fd_count {
+        let mut records = Vec::with_capacity(events_per_fd);
+        for event_idx in 0..events_per_fd {
+            let global = event_idx * fd_count + fd_idx;
+            let time = RING_TIME_BASE + global as u64 * 1_000;
+            let pid = spec.process_id;
+            let tid = pid + (global as u32 % spec.thread_count);
+            let record = if global % 10 == 3 {
+                match (global / 10) % 3 {
+                    0 => build_ring_mmap_record(&parser, pid, tid, time, global as u64),
+                    1 => build_ring_task_record(&parser, sys::PERF_RECORD_FORK, pid, tid, time),
+                    _ => build_ring_task_record(&parser, sys::PERF_RECORD_EXIT, pid, tid, time),
+                }
+            } else {
+                build_ring_sample_record(&spec, global)
+            };
+            records.push(record);
+        }
+        streams.push(records);
+    }
+    (parser, streams)
+}
+
+fn push_ring_record_id_trailer(
+    bytes: &mut Vec<u8>,
+    parser: &UnsafeParser,
+    task: (u32, u32),
+    time: u64,
+) {
+    debug_assert!(parser.sample_id_all);
+    if has_sample(parser.sample_type, sys::PERF_SAMPLE_TID) {
+        push_u32(bytes, task.0);
+        push_u32(bytes, task.1);
+    }
+    if has_sample(parser.sample_type, sys::PERF_SAMPLE_TIME) {
+        push_u64(bytes, time);
+    }
+}
+
+fn finish_ring_record(mut bytes: Vec<u8>) -> AlignedPerfRecord {
+    let padded_len = bytes.len().next_multiple_of(size_of::<u64>());
+    bytes.resize(padded_len, 0);
+    let size = u16::try_from(bytes.len()).expect("synthetic perf record fits in u16");
+    bytes[6..8].copy_from_slice(&size.to_ne_bytes());
+    AlignedPerfRecord::from_bytes(&bytes)
+}
+
+fn build_ring_task_record(
+    parser: &UnsafeParser,
+    record_type: u32,
+    pid: u32,
+    tid: u32,
+    time: u64,
+) -> AlignedPerfRecord {
+    let mut bytes = Vec::with_capacity(64);
+    push_u32(&mut bytes, record_type);
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 0); // size, patched by finish_ring_record
+    push_u32(&mut bytes, pid); // pid
+    push_u32(&mut bytes, pid); // ppid
+    push_u32(&mut bytes, tid); // tid
+    push_u32(&mut bytes, tid); // ptid
+    push_u64(&mut bytes, time);
+    push_ring_record_id_trailer(&mut bytes, parser, (pid, tid), time);
+    finish_ring_record(bytes)
+}
+
+fn build_ring_mmap_record(
+    parser: &UnsafeParser,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    variant: u64,
+) -> AlignedPerfRecord {
+    let mut bytes = Vec::with_capacity(128);
+    push_u32(&mut bytes, sys::PERF_RECORD_MMAP);
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 0); // size, patched by finish_ring_record
+    push_u32(&mut bytes, pid);
+    push_u32(&mut bytes, tid);
+    push_u64(&mut bytes, 0x7000_0000_0000 + variant * 0x1000); // addr
+    push_u64(&mut bytes, 0x2000); // len
+    push_u64(&mut bytes, 0); // page offset
+    bytes.extend_from_slice(b"/opt/stackpulse/drain-bench/libworkload.so\0");
+    // The kernel u64-aligns the filename before the sample_id trailer.
+    bytes.resize(bytes.len().next_multiple_of(size_of::<u64>()), 0);
+    push_ring_record_id_trailer(&mut bytes, parser, (pid, tid), time);
+    finish_ring_record(bytes)
+}
+
+fn build_ring_sample_record(spec: &RingSampleSpec, sample_idx: usize) -> AlignedPerfRecord {
+    let mut bytes = Vec::with_capacity(
+        64 + (spec.user_frames + spec.kernel_frames) * size_of::<u64>()
+            + spec.user_regs * size_of::<u64>()
+            + spec.user_stack_bytes,
+    );
+    push_u32(&mut bytes, sys::PERF_RECORD_SAMPLE);
+    push_u16(
+        &mut bytes,
+        (sys::PERF_RECORD_MISC_USER | sys::PERF_RECORD_MISC_EXACT_IP) as u16,
+    );
+    push_u16(&mut bytes, 0);
+
+    let sample_variant = sample_idx as u64;
+    let user_ip = spec.user_base + (sample_variant % 512) * 0x40 + 0x11;
+    push_u64(&mut bytes, user_ip);
+    push_u32(&mut bytes, spec.process_id);
+    push_u32(
+        &mut bytes,
+        spec.process_id + (sample_idx as u32 % spec.thread_count.max(1)),
+    );
+    push_u64(&mut bytes, 1_700_000_000_000_000 + sample_variant * 1_000);
+
+    push_u64(
+        &mut bytes,
+        (2 + spec.kernel_frames + spec.user_frames) as u64,
+    );
+    push_u64(&mut bytes, sys::PERF_CONTEXT_KERNEL);
+    for frame_idx in 0..spec.kernel_frames {
+        push_u64(
+            &mut bytes,
+            spec.kernel_base + ((sample_variant + frame_idx as u64 * 13) % 4096) * 0x20,
+        );
+    }
+    push_u64(&mut bytes, sys::PERF_CONTEXT_USER);
+    for frame_idx in 0..spec.user_frames {
+        push_u64(
+            &mut bytes,
+            spec.user_base + ((sample_variant + frame_idx as u64 * 17) % 4096) * 0x20,
+        );
+    }
+
+    push_u64(&mut bytes, u64::from(sys::PERF_SAMPLE_REGS_ABI_64));
+    for reg_idx in 0..spec.user_regs {
+        push_u64(
+            &mut bytes,
+            spec.user_base + 0x8000 + sample_variant * 8 + reg_idx as u64 * 0x10,
+        );
+    }
+
+    push_u64(&mut bytes, spec.user_stack_bytes as u64);
+    let stack_start = bytes.len();
+    bytes.resize(stack_start + spec.user_stack_bytes, 0);
+    for (offset, byte) in bytes[stack_start..].iter_mut().enumerate() {
+        *byte = sample_idx.wrapping_add(offset) as u8;
+    }
+    push_u64(&mut bytes, spec.user_stack_bytes as u64);
+
+    finish_ring_record(bytes)
+}
+
+fn has_sample(sample_type: u64, flag: sys::perf_event_sample_format) -> bool {
+    sample_type & u64::from(flag) != 0
+}
+
+fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
 }

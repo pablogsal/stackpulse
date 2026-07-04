@@ -3,6 +3,16 @@ use std::io;
 use crate::linux;
 use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, ProcessExecRecord};
 
+/// Internals of the perf ring-buffer drain path, exposed for the
+/// `drain_bench` example only.
+#[doc(hidden)]
+pub mod drain {
+    pub use crate::linux::perf_event::{
+        AlignedPerfRecord, EventRecord, EventRef, OwnedEventRecord,
+    };
+    pub use crate::linux::sorter::EventSorter;
+}
+
 #[doc(hidden)]
 pub struct BenchSpoolSample {
     pub timestamp_ns: u64,

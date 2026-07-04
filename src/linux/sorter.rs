@@ -35,6 +35,7 @@ impl<G: Clone + Ord, K: Ord, V> PartialOrd for EventHeapItem<G, K, V> {
 /// `G` is the ring-buffer identifier, `K` the sort key (typically a
 /// timestamp), `V` the consumed event. Per-group events are held back until
 /// every other group has been read past them in the current round.
+#[doc(hidden)]
 pub struct EventSorter<G: Clone + Ord, K: Ord, V> {
     heap: BinaryHeap<EventHeapItem<G, K, V>>,
     round: usize,
@@ -43,6 +44,7 @@ pub struct EventSorter<G: Clone + Ord, K: Ord, V> {
 }
 
 impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         EventSorter {
             heap: BinaryHeap::new(),
@@ -72,6 +74,24 @@ impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
             "Group keys must be monotonically increasing"
         );
         self.current_group = Some(group);
+    }
+
+    /// Insert a single event for the current group. Panics if `begin_group`
+    /// has not been called.
+    pub fn push(&mut self, key: K, value: V) {
+        let group = self
+            .current_group
+            .clone()
+            .expect("begin_group must be called before insertion");
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.heap.push(EventHeapItem {
+            group,
+            round: self.round,
+            key,
+            sequence,
+            value,
+        });
     }
 
     /// Try to consume an event.
@@ -237,6 +257,55 @@ mod tests {
 
         assert_eq!(out, ["g7 t10", "g3 t30", "g7 t40", "g3 t50"]);
         assert!(!sorter.has_more());
+    }
+
+    #[test]
+    fn push_matches_extend_ordering_including_ties() {
+        let group_3 = [
+            (30_u64, "g3 t30 a"),
+            (30_u64, "g3 t30 b"),
+            (50_u64, "g3 t50"),
+        ];
+        let group_7 = [(10_u64, "g7 t10"), (30_u64, "g7 t30"), (40_u64, "g7 t40")];
+
+        let mut extended = EventSorter::new();
+        extended.begin_group(3);
+        extended.extend(group_3);
+        extended.begin_group(7);
+        extended.extend(group_7);
+
+        let mut pushed = EventSorter::new();
+        pushed.begin_group(3);
+        for (key, value) in group_3 {
+            pushed.push(key, value);
+        }
+        pushed.begin_group(7);
+        for (key, value) in group_7 {
+            pushed.push(key, value);
+        }
+
+        // Pushed events respect the same round hold-back as extended ones.
+        assert_eq!(pushed.pop(), None);
+        assert!(pushed.has_more());
+
+        extended.advance_round();
+        pushed.advance_round();
+
+        let mut expected = Vec::new();
+        while let Some(event) = extended.pop() {
+            expected.push(event);
+        }
+        let mut got = Vec::new();
+        while let Some(event) = pushed.pop() {
+            got.push(event);
+        }
+
+        assert_eq!(got, expected);
+        // Equal keys pop in push order, matching the extend-based tie-break.
+        assert_eq!(
+            got,
+            ["g7 t10", "g3 t30 a", "g3 t30 b", "g7 t30", "g7 t40", "g3 t50"]
+        );
     }
 
     #[test]

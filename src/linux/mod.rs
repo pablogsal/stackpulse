@@ -10,7 +10,7 @@ mod perf_group;
 /// so a recorder can be wired up before the target executes its first
 /// instruction, and unsuspended afterwards.
 pub mod process;
-mod sorter;
+pub(crate) mod sorter;
 #[cfg(test)]
 mod test_fixtures;
 mod types;

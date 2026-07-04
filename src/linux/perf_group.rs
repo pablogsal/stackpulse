@@ -8,6 +8,8 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use perf_event_open::sample::record::UnsafeParser;
+
 use super::perf_event::{
     EventRef, EventSource, OwnedEventRecord, Perf, PerfOptions, TaskInheritance,
 };
@@ -73,6 +75,10 @@ impl ThreadPerfEvents {
 
 pub struct PerfGroup {
     event_sorter: EventSorter<RawFd, u64, OwnedEventRecord>,
+    // All members share one parser configuration (they are opened from the
+    // same option template), captured when the first member is registered
+    // and used to re-read buffered sample records at dispatch.
+    parser: Option<UnsafeParser>,
     members: BTreeMap<RawFd, Member>,
     ready_fds: BTreeSet<RawFd>,
     poll: Poll,
@@ -128,6 +134,7 @@ impl PerfGroup {
     ) -> io::Result<Self> {
         Ok(PerfGroup {
             event_sorter: EventSorter::new(),
+            parser: None,
             members: Default::default(),
             ready_fds: BTreeSet::new(),
             poll: Poll::new()?,
@@ -401,6 +408,9 @@ impl PerfGroup {
             Token(fd as usize),
             Interest::READABLE,
         )?;
+        if self.parser.is_none() {
+            self.parser = Some(perf.parser().clone());
+        }
         self.members.insert(
             fd,
             Member {
@@ -527,28 +537,38 @@ impl PerfGroup {
     pub fn consume_events(&mut self, cb: &mut impl FnMut(EventRef)) {
         let mut fds_to_remove = Vec::new();
         self.ready_fds.clear();
+        // Destructure so the consume closure can push into the sorter while
+        // the member is borrowed.
+        let Self {
+            event_sorter,
+            parser,
+            members,
+            ..
+        } = self;
+        // Any buffered event came from a registered member, which captured
+        // the parser.
+        let parser = parser.as_ref();
+        let dispatch_parser = || parser.expect("parser captured at perf registration");
         // Drain every ring buffer on every pass. Poll readiness is only a wakeup
         // hint; using it as a filter can let older mmap/fork records sit behind
         // newer samples from another fd, which breaks timestamp-ordered unwinding.
-        for (&fd, member) in &mut self.members {
-            self.event_sorter.begin_group(fd);
+        for (&fd, member) in members.iter_mut() {
+            event_sorter.begin_group(fd);
             let mut consumed_record = false;
-            let mut events = Vec::new();
             member.perf.consume_owned_events(&mut |event| {
                 consumed_record = true;
-                events.push((event.timestamp().unwrap_or(0), event));
+                event_sorter.push(event.timestamp().unwrap_or(0), event);
             });
-            self.event_sorter.extend(events);
-            while let Some(event) = self.event_sorter.pop() {
-                event.dispatch(cb);
+            while let Some(event) = event_sorter.pop() {
+                event.dispatch(dispatch_parser(), cb);
             }
             if member.is_closed && !consumed_record {
                 fds_to_remove.push(fd);
             }
         }
-        self.event_sorter.advance_round();
-        while let Some(event) = self.event_sorter.pop() {
-            event.dispatch(cb);
+        event_sorter.advance_round();
+        while let Some(event) = event_sorter.pop() {
+            event.dispatch(dispatch_parser(), cb);
         }
         for fd in fds_to_remove {
             self.remove_member_fd(fd);
@@ -558,7 +578,11 @@ impl PerfGroup {
     pub fn flush_events(&mut self, cb: &mut impl FnMut(EventRef)) {
         self.consume_events(cb);
         while let Some(event) = self.event_sorter.force_pop() {
-            event.dispatch(cb);
+            let parser = self
+                .parser
+                .as_ref()
+                .expect("parser captured at perf registration");
+            event.dispatch(parser, cb);
         }
     }
 }
