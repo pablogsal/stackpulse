@@ -362,7 +362,7 @@ fn discover_linux_debug_file_redirect(
     }
 
     let library_info =
-        match runtime.block_on(SymbolManager::library_info_for_binary_at_path(path, None)) {
+        match block_on_runtime(runtime, SymbolManager::library_info_for_binary_at_path(path, None)) {
             Ok(info) => info,
             Err(err) => {
                 tracing::trace!(
@@ -426,9 +426,40 @@ pub struct SymbolizerWrapper {
     #[cfg(target_os = "linux")]
     symbol_maps: HashMap<PathBuf, Option<WholeSymbolMap>>,
 
-    /// Tokio runtime for wholesym async APIs.
+    /// Tokio runtime for wholesym async APIs. Wrapped so Drop can hand it to
+    /// `shutdown_background`, which is safe even inside another tokio runtime
+    /// (a plain runtime drop there panics mid-unwind and aborts the process).
     #[cfg(target_os = "linux")]
-    runtime: TokioRuntime,
+    runtime: std::mem::ManuallyDrop<TokioRuntime>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SymbolizerWrapper {
+    fn drop(&mut self) {
+        let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        runtime.shutdown_background();
+    }
+}
+
+/// Run `future` on `runtime` from any thread. `Runtime::block_on` panics when
+/// the calling thread is already driving a tokio runtime (e.g. a consumer
+/// symbolizing from inside an async task); in that case run the blocking wait
+/// on a temporary OS thread instead.
+#[cfg(target_os = "linux")]
+fn block_on_runtime<F>(runtime: &TokioRuntime, future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return runtime.block_on(future);
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| runtime.block_on(future))
+            .join()
+            .expect("symbolization future panicked")
+    })
 }
 
 /// Extract a short module name from a path (file name, or full path as fallback).
@@ -550,7 +581,7 @@ impl SymbolizerWrapper {
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
-            runtime,
+            runtime: std::mem::ManuallyDrop::new(runtime),
         }
     }
 
@@ -742,7 +773,7 @@ impl SymbolizerWrapper {
         let frames = match addr_info.frames {
             Some(FramesLookupResult::Available(frames)) => Some(frames),
             Some(FramesLookupResult::External(external)) => {
-                self.runtime.block_on(symbol_map.lookup_external(&external))
+                block_on_runtime(&self.runtime, symbol_map.lookup_external(&external))
             }
             None => None,
         };
@@ -761,7 +792,8 @@ impl SymbolizerWrapper {
             self.prefetch_linux_debug_redirects([path]);
 
             let disambiguator = None;
-            let loaded = self.runtime.block_on(
+            let loaded = block_on_runtime(
+                &self.runtime,
                 self.symbol_manager
                     .load_symbol_map_for_binary_at_path(path, disambiguator),
             );
