@@ -1697,6 +1697,45 @@ mod tests {
     }
 
     #[test]
+    fn sparse_kernel_symbol_cache_is_bounded_and_evicts_fifo() {
+        let mut cache = SparseKernelSymbolCache::default();
+        let value: Arc<[(u64, KernelSymbol)]> = Arc::from([]);
+        let key = |i: u64| SparseKernelSymbolCacheKey {
+            kernel_id: Arc::from("boot"),
+            addresses: Arc::from(vec![i].into_boxed_slice()),
+        };
+
+        for i in 0..=SPARSE_KERNEL_SYMBOL_CACHE_CAP as u64 {
+            cache.insert(key(i), Arc::clone(&value));
+        }
+
+        assert_eq!(cache.entries.len(), SPARSE_KERNEL_SYMBOL_CACHE_CAP);
+        assert!(cache.get(&key(0)).is_none(), "oldest entry must be evicted");
+        assert!(cache.get(&key(1)).is_some());
+
+        // Re-inserting an existing key must not duplicate its queue slot.
+        cache.insert(key(1), value);
+        assert_eq!(cache.insertion_order.len(), SPARSE_KERNEL_SYMBOL_CACHE_CAP);
+    }
+
+    #[test]
+    fn sparse_kernel_symbol_loads_are_cached_per_address_set() {
+        let addresses = [0xffff_ffff_9990_0000_u64, 0xffff_ffff_9990_1234];
+
+        let first = load_sparse_kernel_symbols(addresses);
+        let second = load_sparse_kernel_symbols(addresses);
+
+        let (KernelSymbolTable::Sparse(first), KernelSymbolTable::Sparse(second)) = (first, second)
+        else {
+            panic!("sparse loads must produce sparse tables");
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical address sets must hit the cache"
+        );
+    }
+
+    #[test]
     fn truncated_stack_markers_resolve_to_flagged_sentinels() {
         let mut symbolizer = PerfSymbolizer::new(&[]);
 
