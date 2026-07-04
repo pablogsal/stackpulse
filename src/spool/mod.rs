@@ -5,7 +5,7 @@ use std::ops::{Deref, Range};
 use std::path::Path;
 use std::sync::Arc;
 
-use integer_encoding::{VarIntReader, VarIntWriter};
+use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
@@ -237,6 +237,31 @@ struct StackNodeRecord {
     depth: usize,
 }
 
+/// Assembles one tag byte plus up to three varints so sample-rate records
+/// (frame, stack node, sample, thread) reach the sink in a single write call
+/// instead of one call per field.
+struct RecordBuf {
+    buf: [u8; 1 + 3 * 10],
+    len: usize,
+}
+
+impl RecordBuf {
+    fn new(tag: u8) -> Self {
+        let mut buf = [0_u8; 1 + 3 * 10];
+        buf[0] = tag;
+        Self { buf, len: 1 }
+    }
+
+    fn push_varint(&mut self, value: impl VarInt) -> &mut Self {
+        self.len += value.encode_var(&mut self.buf[self.len..]);
+        self
+    }
+
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        writer.write_all(&self.buf[..self.len])
+    }
+}
+
 pub struct PerfSpoolWriter<W: Write> {
     writer: W,
     last_timestamp_ns: u64,
@@ -326,10 +351,11 @@ impl<W: Write> PerfSpoolWriter<W> {
         };
         let thread_id = self.intern_thread(process_id, thread_id)?;
 
-        self.writer.write_all(&[REC_SAMPLE])?;
-        self.writer.write_varint(delta)?;
-        self.writer.write_varint(u64::from(thread_id))?;
-        self.writer.write_varint(u64::from(stack_id))?;
+        RecordBuf::new(REC_SAMPLE)
+            .push_varint(delta)
+            .push_varint(u64::from(thread_id))
+            .push_varint(u64::from(stack_id))
+            .write_to(&mut self.writer)?;
         // Advance the delta baseline only after the record is written; a failed
         // write would otherwise skew every later sample's timestamp.
         self.last_timestamp_ns = timestamp_ns;
@@ -365,10 +391,11 @@ impl<W: Write> PerfSpoolWriter<W> {
             return Ok(id);
         }
         let id = self.thread_cache.len() as u32;
-        self.writer.write_all(&[REC_THREAD])?;
-        self.writer.write_varint(u64::from(id))?;
-        self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_varint(thread_id)?;
+        RecordBuf::new(REC_THREAD)
+            .push_varint(u64::from(id))
+            .push_varint(i64::from(process_id))
+            .push_varint(thread_id)
+            .write_to(&mut self.writer)?;
         self.thread_cache.insert(key, id);
         Ok(id)
     }
@@ -392,9 +419,10 @@ impl<W: Write> PerfSpoolWriter<W> {
             return Ok(id);
         }
         let id = *next_frame_id;
-        writer.write_all(&[REC_FRAME])?;
-        writer.write_varint(u64::from(id))?;
-        write_compact_frame(writer, frame)?;
+        let mut record = RecordBuf::new(REC_FRAME);
+        record.push_varint(u64::from(id));
+        push_compact_frame(&mut record, frame);
+        record.write_to(writer)?;
         cache.insert(*frame, id);
         *next_frame_id += 1;
         Ok(id)
@@ -416,10 +444,11 @@ impl<W: Write> PerfSpoolWriter<W> {
                 continue;
             }
             let stack_id = self.stack_cache.len() as u32;
-            self.writer.write_all(&[REC_STACK])?;
-            self.writer.write_varint(u64::from(stack_id))?;
-            self.writer.write_varint(u64::from(prefix))?;
-            self.writer.write_varint(u64::from(frame_id))?;
+            RecordBuf::new(REC_STACK)
+                .push_varint(u64::from(stack_id))
+                .push_varint(u64::from(prefix))
+                .push_varint(u64::from(frame_id))
+                .write_to(&mut self.writer)?;
             self.stack_cache.insert(key, stack_id);
             prefix = stack_id;
         }
@@ -1152,10 +1181,12 @@ fn read_process_exec(reader: &mut impl Read) -> io::Result<ProcessExecRecord> {
     })
 }
 
-fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Result<()> {
+fn push_compact_frame(record: &mut RecordBuf, frame: &FrameRecord) {
     if frame.is_truncated_stack_marker() {
-        writer.write_varint(TRUNCATED_STACK_MARKER_TAG)?;
-        return writer.write_varint(0).map(drop);
+        record
+            .push_varint(TRUNCATED_STACK_MARKER_TAG)
+            .push_varint(0_u64);
+        return;
     }
 
     let (tag, address) = match frame.module_id {
@@ -1165,8 +1196,7 @@ fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Resu
             frame.abs_ip,
         ),
     };
-    writer.write_varint(tag)?;
-    writer.write_varint(address).map(drop)
+    record.push_varint(tag).push_varint(address);
 }
 
 pub(crate) fn module_for_frame_unbounded<'a>(
