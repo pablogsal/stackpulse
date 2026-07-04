@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::Path;
@@ -86,7 +87,34 @@ struct SparseKernelSymbolCacheKey {
     addresses: Arc<[u64]>,
 }
 
-type SparseKernelSymbolCache = FxHashMap<SparseKernelSymbolCacheKey, Arc<[(u64, KernelSymbol)]>>;
+/// Process-global cache of sparse kernel symbol lookups, bounded FIFO. Hits
+/// only happen for byte-identical kernel address sets (same spool reopened),
+/// so a small capacity covers the useful cases while keeping long-running
+/// services that open many distinct profiles from accumulating dead entries.
+#[derive(Default)]
+struct SparseKernelSymbolCache {
+    entries: FxHashMap<SparseKernelSymbolCacheKey, Arc<[(u64, KernelSymbol)]>>,
+    insertion_order: VecDeque<SparseKernelSymbolCacheKey>,
+}
+
+const SPARSE_KERNEL_SYMBOL_CACHE_CAP: usize = 16;
+
+impl SparseKernelSymbolCache {
+    fn get(&self, key: &SparseKernelSymbolCacheKey) -> Option<Arc<[(u64, KernelSymbol)]>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: SparseKernelSymbolCacheKey, value: Arc<[(u64, KernelSymbol)]>) {
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.insertion_order.push_back(key);
+            if self.insertion_order.len() > SPARSE_KERNEL_SYMBOL_CACHE_CAP {
+                if let Some(oldest) = self.insertion_order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PerfMapSymbol {
@@ -807,7 +835,7 @@ fn load_sparse_kernel_symbols(addresses: impl IntoIterator<Item = u64>) -> Kerne
     };
     if let Ok(cache) = sparse_kernel_symbol_cache().lock() {
         if let Some(symbols) = cache.get(&cache_key) {
-            return KernelSymbolTable::Sparse(Arc::clone(symbols));
+            return KernelSymbolTable::Sparse(symbols);
         }
     }
 
@@ -830,7 +858,7 @@ fn load_sparse_kernel_symbols(addresses: impl IntoIterator<Item = u64>) -> Kerne
 
 fn sparse_kernel_symbol_cache() -> &'static Mutex<SparseKernelSymbolCache> {
     static CACHE: OnceLock<Mutex<SparseKernelSymbolCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    CACHE.get_or_init(|| Mutex::new(SparseKernelSymbolCache::default()))
 }
 
 fn running_kernel_cache_id() -> Arc<str> {
