@@ -517,12 +517,18 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        EventRecord::Owned(Record::Exit(exit)) if exit.task.pid == exit.task.tid => {
+        EventRecord::Owned(Record::Exit(exit)) => {
+            let is_process_exit = exit.task.pid == exit.task.tid;
             // The main thread's exit is the whole process's exit; drop its tid
             // from the perf group's tracking sets like any other thread exit,
             // or dead pids accumulate and recycled pids get misattributed.
-            ctx.thread_actions
-                .push(ThreadAction::Exit { tid: exit.task.tid });
+            if is_process_exit || exit.task.pid == exit.parent_task.pid {
+                ctx.thread_actions
+                    .push(ThreadAction::Exit { tid: exit.task.tid });
+            }
+            if !is_process_exit {
+                return Ok(());
+            }
             if let Some(pid) = i32_from_u32(exit.task.pid) {
                 if ctx.python_runtime_processes.remove(&pid) {
                     ctx.writer
@@ -537,13 +543,6 @@ fn handle_event<W: std::io::Write>(
                     ctx.python_perf_support_processes,
                     ctx.python_runtime_processes,
                 )?;
-            }
-            Ok(())
-        }
-        EventRecord::Owned(Record::Exit(exit)) => {
-            if exit.task.pid == exit.parent_task.pid {
-                ctx.thread_actions
-                    .push(ThreadAction::Exit { tid: exit.task.tid });
             }
             Ok(())
         }
