@@ -469,6 +469,9 @@ impl PerfSymbolizer {
         frame: &FrameRecord,
         module: Option<(ModuleRecord, u64)>,
     ) -> Vec<NativeFrame> {
+        if frame.is_truncated_stack_marker() {
+            return vec![NativeFrame::truncated_stack_marker()];
+        }
         let is_kernel_frame =
             frame.mode == FrameMode::Kernel || module.as_ref().is_some_and(|(m, _)| m.is_kernel);
 
