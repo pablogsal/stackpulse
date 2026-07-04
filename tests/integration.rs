@@ -1190,17 +1190,27 @@ fn assert_perf_map_has_python_symbols(
     script: &Path,
     funcs: &[&str],
 ) -> io::Result<()> {
-    let text = std::fs::read_to_string(path)?;
+    // Python appends a trampoline entry when a function first executes, so
+    // the map exists before the expected functions are in it; poll instead
+    // of racing interpreter startup.
     let script = script.to_string_lossy();
-    for func in funcs {
-        let expected = format!("py::{func}:{script}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(path)?;
+        let missing = funcs.iter().find(|func| {
+            let expected = format!("py::{func}:{script}");
+            !text.lines().any(|line| line.ends_with(&expected))
+        });
+        let Some(func) = missing else {
+            return Ok(());
+        };
         assert!(
-            text.lines().any(|line| line.ends_with(&expected)),
-            "expected perf map {} to contain {expected:?}; map contents:\n{text}",
+            Instant::now() < deadline,
+            "expected perf map {} to contain \"py::{func}:{script}\"; map contents:\n{text}",
             path.display()
         );
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<()> {
