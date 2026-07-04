@@ -235,7 +235,10 @@ impl<'a> ErrorStatsFormatter<'a> {
     fn progress_bar(percentage: f64, width: usize) -> String {
         let filled = ((percentage / 100.0) * width as f64).round() as usize;
         let empty = width.saturating_sub(filled);
-        format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+        let mut bar = String::with_capacity((filled + empty) * '█'.len_utf8());
+        bar.extend(std::iter::repeat_n('█', filled));
+        bar.extend(std::iter::repeat_n('░', empty));
+        bar
     }
 
     /// Write formatted stats to the provided writer.
@@ -305,11 +308,14 @@ impl<'a> ErrorStatsFormatter<'a> {
             };
             let bar = Self::progress_bar(pct_of_errors, 20);
 
+            let description = kind.description();
+            let pad = desc_width.saturating_sub(description.len() + 1);
             writeln!(
                 w,
-                "  {:3} {:<desc_width$} {:>8} ({:>5.1}% of errors, {:>5.2}% of samples)  {}",
+                "  {:3} {}:{:pad$} {:>8} ({:>5.1}% of errors, {:>5.2}% of samples)  {}",
                 "●",
-                format!("{}:", kind.description()),
+                description,
+                "",
                 format_number(*count),
                 pct_of_errors,
                 pct_of_samples,
@@ -325,13 +331,13 @@ impl<'a> ErrorStatsFormatter<'a> {
 fn format_number(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(c);
     }
-    result.chars().rev().collect()
+    result
 }
 
 #[cfg(test)]
