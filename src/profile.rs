@@ -158,6 +158,10 @@ pub struct NativeSymbol {
     /// Byte offset into [`Self::module`] where the basename starts.
     pub module_basename_start: usize,
     /// Byte offset of the instruction within its enclosing function.
+    ///
+    /// `0` for fallback pseudo-symbols whose [`Self::name`] already embeds an
+    /// address (`module+0x…`, `[kernel]+0x…`). For inline expansions the
+    /// offset is relative to the outermost function's start.
     pub offset: u64,
     /// Nesting depth for inline expansions: `0` is the innermost (sampled)
     /// frame, higher values are the surrounding inlined callers.

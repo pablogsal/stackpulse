@@ -73,6 +73,8 @@ struct KernelSymbolName<'a> {
 struct ResolvedKernelSymbol {
     name: String,
     module: String,
+    // Byte offset of the instruction within the resolved kernel function.
+    offset: u64,
 }
 
 #[derive(Clone)]
@@ -473,19 +475,21 @@ impl PerfSymbolizer {
         match (is_kernel_frame, module) {
             (false, None) => vec![NativeFrame::from_address(frame.abs_ip)],
             (true, _) => {
-                let resolved_symbol = self.resolve_kernel(frame.abs_ip);
-                let symbol_name = resolved_symbol
-                    .as_ref()
-                    .map(|symbol| symbol.name.clone())
-                    .unwrap_or_else(|| format!("[kernel]+0x{:x}", frame.abs_ip));
-                let module_name = resolved_symbol
-                    .map(|symbol| symbol.module)
-                    .unwrap_or_else(|| "[kernel]".to_owned());
+                // Unresolved kernel frames get offset 0: the fallback name
+                // already embeds the absolute PC.
+                let (symbol_name, module_name, offset) = match self.resolve_kernel(frame.abs_ip) {
+                    Some(symbol) => (symbol.name, symbol.module, symbol.offset),
+                    None => (
+                        format!("[kernel]+0x{:x}", frame.abs_ip),
+                        "[kernel]".to_owned(),
+                        0,
+                    ),
+                };
                 let symbol = NativeSymbol::new(
                     symbol_name,
                     SourceLocation::default(),
                     module_name,
-                    frame.abs_ip,
+                    offset,
                     false,
                     false,
                 );
@@ -525,11 +529,13 @@ impl PerfSymbolizer {
                 let is_python_runtime = frame.mode == FrameMode::User
                     && crate::is_python_runtime_module_path(&module.path);
                 let symbol_name = format!("{}+0x{:x}", module_display_name(&module.path), rel_ip);
+                // Pseudo-symbol without a function: the name embeds the
+                // module-relative address, so the function offset is 0.
                 let symbol = NativeSymbol::new(
                     symbol_name.clone(),
                     SourceLocation::default(),
                     module.path,
-                    rel_ip,
+                    0,
                     crate::symbols::is_eval_frame(&symbol_name),
                     is_python_runtime,
                 );
@@ -643,12 +649,14 @@ impl PerfSymbolizer {
             .kernel_symbols
             .get_or_insert_with(load_shared_kernel_symbols);
         let symbol = find_kernel_symbol_in_table(symbols, abs_ip)?;
+        let offset = abs_ip.saturating_sub(symbol.address);
         Some(ResolvedKernelSymbol {
-            name: format_symbol(&symbol.name, abs_ip.saturating_sub(symbol.address)),
+            name: format_symbol(&symbol.name, offset),
             module: symbol
                 .module
                 .clone()
                 .unwrap_or_else(|| "[kernel]".to_owned()),
+            offset,
         })
     }
 

@@ -505,7 +505,7 @@ fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
     module: &Rc<str>,
-    module_offset: u64,
+    function_offset: u64,
     is_python_runtime: bool,
 ) -> Vec<NativeSymbol> {
     let fallback_name = symbol_name;
@@ -514,7 +514,7 @@ fn build_native_symbols_from_wholesym_parts(
             fallback_name.clone(),
             source,
             module,
-            module_offset,
+            function_offset,
             is_python_runtime,
         )
     };
@@ -534,7 +534,7 @@ fn build_native_symbols_from_wholesym_parts(
         };
         let symbol = match frame.function {
             Some(function) => {
-                build_native_symbol(function, source, module, module_offset, is_python_runtime)
+                build_native_symbol(function, source, module, function_offset, is_python_runtime)
             }
             None => fallback_symbol(source),
         };
@@ -777,11 +777,14 @@ impl SymbolizerWrapper {
             }
             None => None,
         };
+        // symbol.address is the function start in the same relative space as
+        // module_offset, so this is the documented within-function offset.
+        let function_offset = module_offset.saturating_sub(u64::from(addr_info.symbol.address));
         Some(build_native_symbols_from_wholesym_parts(
             addr_info.symbol.name,
             frames,
             module_rc,
-            module_offset,
+            function_offset,
             is_python_runtime,
         ))
     }
