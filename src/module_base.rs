@@ -26,6 +26,7 @@ impl ModuleImageBase {
     ///
     /// Saturates to `0` if `avma` lies below the base; a debug build also
     /// asserts that this never happens for legitimate samples.
+    #[inline]
     #[must_use]
     pub fn relative_address(self, avma: u64) -> u64 {
         debug_assert!(
@@ -38,6 +39,7 @@ impl ModuleImageBase {
 
     /// Translate a runtime AVMA into the SVMA used by the object's symbol
     /// tables, debug info, and unwind sections.
+    #[inline]
     #[must_use]
     pub fn svma_for_avma(self, avma: u64) -> u64 {
         self.relative_address(avma) + self.svma
