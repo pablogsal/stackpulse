@@ -135,7 +135,10 @@ pub struct PerfRecorder {
     modules: ModuleTable,
     unwinders: FxHashMap<i32, ProcessUnwinder>,
     active_processes: FxHashMap<i32, Option<ProcessExitWatcher>>,
-    python_perf_support_processes: FxHashSet<i32>,
+    // Cached per-exec probe results (environ + cmdline); false entries avoid
+    // re-reading /proc for every executable python-runtime mmap. Cleared on
+    // execve, inherited across fork.
+    python_perf_support_processes: FxHashMap<i32, bool>,
     python_runtime_processes: FxHashSet<i32>,
     stack_scratch: Vec<StackFrame>,
     callchain_scratch: Vec<StackFrame>,
@@ -146,7 +149,7 @@ struct EventContext<'a, W: std::io::Write> {
     modules: &'a mut ModuleTable,
     unwinders: &'a mut FxHashMap<i32, ProcessUnwinder>,
     active_processes: &'a mut FxHashMap<i32, Option<ProcessExitWatcher>>,
-    python_perf_support_processes: &'a mut FxHashSet<i32>,
+    python_perf_support_processes: &'a mut FxHashMap<i32, bool>,
     python_runtime_processes: &'a mut FxHashSet<i32>,
     writer: &'a mut PerfSpoolWriter<W>,
     summary: &'a mut PerfSummary,
@@ -193,18 +196,17 @@ impl PerfRecorder {
         let mut modules = ModuleTable::default();
         let mut unwinders = FxHashMap::default();
         let mut active_processes = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashSet::default();
+        let mut python_perf_support_processes = FxHashMap::default();
         let mut python_runtime_processes = FxHashSet::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
             active_processes.insert(pid_i32, try_new_exit_watcher(pid_i32));
-            if process_has_python_perf_support_enabled(pid) {
-                python_perf_support_processes.insert(pid_i32);
-            }
+            python_perf_support_processes
+                .insert(pid_i32, process_has_python_perf_support_enabled(pid));
         }
         let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
             && register_existing_maps(pid, &mut modules, &mut unwinders, &mut writer)?;
         if let Some(pid_i32) = i32_from_u32(pid).filter(|pid_i32| {
-            registered_existing_maps && python_perf_support_processes.contains(pid_i32)
+            registered_existing_maps && python_perf_support_processes.get(pid_i32) == Some(&true)
         }) {
             mark_python_runtime_process(&mut python_runtime_processes, &mut writer, 0, pid_i32)?;
         }
@@ -322,16 +324,15 @@ impl PerfRecorder {
         self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
             self.track_process(pid_i32);
-            if process_has_python_perf_support_enabled(pid) {
-                self.python_perf_support_processes.insert(pid_i32);
-            }
+            self.python_perf_support_processes
+                .insert(pid_i32, process_has_python_perf_support_enabled(pid));
             match register_existing_maps(
                 pid,
                 &mut self.modules,
                 &mut self.unwinders,
                 &mut self.writer,
             ) {
-                Ok(true) if self.python_perf_support_processes.contains(&pid_i32) => {
+                Ok(true) if self.python_perf_support_processes.get(&pid_i32) == Some(&true) => {
                     if let Err(err) = mark_python_runtime_process(
                         &mut self.python_runtime_processes,
                         &mut self.writer,
@@ -445,8 +446,8 @@ fn handle_event<W: std::io::Write>(
             ctx.active_processes
                 .entry(pid)
                 .or_insert_with(|| try_new_exit_watcher(pid));
-            if ctx.python_perf_support_processes.contains(&ppid) {
-                ctx.python_perf_support_processes.insert(pid);
+            if let Some(&supported) = ctx.python_perf_support_processes.get(&ppid) {
+                ctx.python_perf_support_processes.insert(pid, supported);
             }
             inherit_python_runtime_process(
                 ctx.python_runtime_processes,
@@ -477,6 +478,9 @@ fn handle_event<W: std::io::Write>(
             if let Some(pid) = i32_from_u32(comm.task.pid) {
                 if comm.by_execve {
                     cleanup_process_modules(pid, ctx.modules, ctx.unwinders, ctx.writer)?;
+                    // execve replaces environ and cmdline; drop the cached
+                    // probe result so the new image is re-checked.
+                    ctx.python_perf_support_processes.remove(&pid);
                 }
                 if let Some(is_python_runtime) = process_executable_is_python_runtime(comm.task.pid)
                 {
@@ -569,7 +573,7 @@ fn cleanup_process(
     unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
     writer: &mut PerfSpoolWriter<impl std::io::Write>,
     active_processes: &mut FxHashMap<i32, Option<ProcessExitWatcher>>,
-    python_perf_support_processes: &mut FxHashSet<i32>,
+    python_perf_support_processes: &mut FxHashMap<i32, bool>,
     python_runtime_processes: &mut FxHashSet<i32>,
 ) -> io::Result<()> {
     cleanup_process_modules(pid, modules, unwinders, writer)?;
@@ -635,19 +639,17 @@ fn cmdline_has_python_perf_support(cmdline: &[u8]) -> bool {
 
 fn process_has_python_perf_support(
     pid: u32,
-    python_perf_support_processes: &mut FxHashSet<i32>,
+    python_perf_support_processes: &mut FxHashMap<i32, bool>,
 ) -> bool {
     let Some(pid_i32) = i32_from_u32(pid) else {
         return false;
     };
-    if python_perf_support_processes.contains(&pid_i32) {
-        return true;
+    if let Some(&supported) = python_perf_support_processes.get(&pid_i32) {
+        return supported;
     }
-    if process_has_python_perf_support_enabled(pid) {
-        python_perf_support_processes.insert(pid_i32);
-        return true;
-    }
-    false
+    let supported = process_has_python_perf_support_enabled(pid);
+    python_perf_support_processes.insert(pid_i32, supported);
+    supported
 }
 
 fn mark_python_runtime_process<W: std::io::Write>(
@@ -679,7 +681,7 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     mmap: &Mmap,
     privilege: Priv,
     timestamp_ns: u64,
-    python_perf_support_processes: &mut FxHashSet<i32>,
+    python_perf_support_processes: &mut FxHashMap<i32, bool>,
     python_runtime_processes: &mut FxHashSet<i32>,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<()> {
@@ -1355,7 +1357,7 @@ pub(crate) fn bench_record_live_perf_samples(
         }
 
         let mut active_processes = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashSet::default();
+        let mut python_perf_support_processes = FxHashMap::default();
         let mut python_runtime_processes = FxHashSet::default();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
