@@ -283,7 +283,7 @@ printable via [`ErrorStatsFormatter`].
 
 | Item | What it does |
 | --- | --- |
-| [`SampleErrorKind`] | Native-unwinding failure kinds (register capture, stack read, framehop errors). |
+| [`SampleErrorKind`] | Native-unwinding failure kinds (register capture, missing user registers, stack read, framehop errors). |
 | `record(kind)` | Bump a counter. |
 | `record_with_log(kind, ctx)` | Bump and emit a throttled debug log. |
 | `get(kind)` | Read one counter. |
