@@ -1607,6 +1607,15 @@ mod tests {
     }
 
     #[test]
+    fn bench_replay_live_perf_ring_records_smoke() {
+        let fixture = live_perf_sample_bench_fixture();
+        let checksum = bench_replay_live_perf_ring_records(&fixture, 1)
+            .expect("replay synthetic ring records");
+
+        assert!(checksum > 0);
+    }
+
+    #[test]
     fn fp_user_callchain_fills_missing_dwarf_stack() {
         let mut stack = vec![StackFrame::InstructionPointer(
             0xffff_1000,
