@@ -42,6 +42,8 @@ pub mod state;
 mod stats;
 mod symbolize;
 mod symbols;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, Result};
 pub use linux::perf_event::PerfFrequencyLimit;

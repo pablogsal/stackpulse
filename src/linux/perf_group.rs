@@ -663,6 +663,39 @@ mod tests {
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
+    use crate::test_support::SleepChild;
+
+    struct EmptyConsumer {
+        calls: Vec<&'static str>,
+    }
+
+    impl EventConsumer for EmptyConsumer {
+        type Prepared = ();
+
+        fn begin_group(&mut self, _fd: RawFd) {
+            self.calls.push("begin_group");
+        }
+
+        fn prepare_event(&mut self, _event_ref: EventRef<'_>) -> Self::Prepared {
+            unreachable!("empty group has no events")
+        }
+
+        fn queue_event(&mut self, _timestamp: u64, _prepared: Self::Prepared) {
+            self.calls.push("queue_event");
+        }
+
+        fn drain_ready_events(&mut self) {
+            self.calls.push("drain_ready_events");
+        }
+
+        fn advance_round(&mut self) {
+            self.calls.push("advance_round");
+        }
+
+        fn flush_ready_events(&mut self) {
+            self.calls.push("flush_ready_events");
+        }
+    }
 
     #[test]
     fn failed_open_process_does_not_track_process() {
@@ -688,6 +721,27 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_invalid_pid_before_tracking_process() {
+        let err = match PerfGroup::open(
+            0,
+            AttachMode::AttachWithEnableOnExec,
+            PerfGroupOptions {
+                frequency: 1,
+                stack_size: 0,
+                regs_mask: 0,
+                event_source: EventSource::SwCpuClock,
+                include_kernel: false,
+                inherit_child_processes: false,
+            },
+        ) {
+            Ok(_) => panic!("pid 0 should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn inherited_forked_process_is_tracked_without_opening_new_fds() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
             .expect("create perf group");
@@ -701,6 +755,141 @@ mod tests {
         assert!(group.tracked_threads.contains_key(&200));
         assert!(group.inheriting_threads.contains(&200));
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn forked_processes_are_ignored_when_child_inheritance_is_disabled() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+
+        group
+            .open_forked_processes(&[(200, 100)])
+            .expect("ignore forked process");
+
+        assert!(group.tracked_threads.is_empty());
+        assert!(group.inheriting_threads.is_empty());
+        assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn forked_threads_under_inheriting_parent_are_tracked_without_opening_fds() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        group.tracked_threads.insert(100, 100);
+        group.inheriting_threads.insert(100);
+
+        group
+            .open_forked_threads(&[(101, 100, 100), (102, 100, 101), (101, 100, 100)])
+            .expect("track forked threads");
+
+        assert_eq!(group.tracked_threads.get(&101), Some(&100));
+        assert_eq!(group.tracked_threads.get(&102), Some(&100));
+        assert!(group.inheriting_threads.contains(&101));
+        assert!(group.inheriting_threads.contains(&102));
+        assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn empty_forked_threads_are_noop() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+
+        group.open_forked_threads(&[]).expect("empty fork list");
+
+        assert!(group.tracked_threads.is_empty());
+        assert!(group.inheriting_threads.is_empty());
+    }
+
+    #[test]
+    fn remove_thread_and_process_clear_bookkeeping() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        group.tracked_threads.insert(100, 100);
+        group.tracked_threads.insert(101, 100);
+        group.tracked_threads.insert(200, 200);
+        group.inheriting_threads.extend([101, 200]);
+
+        group.remove_thread(101);
+        group.remove_process(100);
+
+        assert!(!group.tracked_threads.contains_key(&100));
+        assert!(!group.tracked_threads.contains_key(&101));
+        assert_eq!(group.tracked_threads.get(&200), Some(&200));
+        assert!(!group.inheriting_threads.contains(&101));
+        assert!(group.inheriting_threads.contains(&200));
+    }
+
+    #[test]
+    fn empty_group_control_paths_are_noops() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        let mut consumer = EmptyConsumer { calls: Vec::new() };
+
+        assert!(!group.has_pending_events());
+        group.enable().expect("enable empty group");
+        group.disable();
+        group.resume_stopped_processes();
+        group.flush_events(&mut consumer);
+
+        assert_eq!(
+            consumer.calls,
+            vec!["advance_round", "drain_ready_events", "flush_ready_events"]
+        );
+    }
+
+    #[test]
+    fn task_inheritance_and_large_event_thresholds_follow_options() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+
+        assert_eq!(group.task_inheritance(), TaskInheritance::Threads);
+        assert!(!group.use_per_thread_only_events(10, 99));
+        assert!(group.use_per_thread_only_events(10, 100));
+        assert!(!perf_event_count_is_large(0, usize::MAX));
+
+        group.inherit_child_processes = true;
+
+        assert_eq!(group.task_inheritance(), TaskInheritance::Children);
+        assert!(!group.use_per_thread_only_events(10, 100));
+    }
+
+    #[test]
+    fn stopped_process_resumes_on_drop() {
+        let child = SleepChild::spawn();
+        let pid = child.pid_u32();
+        let stopper = StoppedProcess::new(child.pid_u32()).expect("stop child");
+        if process_state(pid).is_none() {
+            drop(stopper);
+            return;
+        }
+
+        assert_eq!(wait_for_process_state(pid, |state| state == 'T'), 'T');
+
+        drop(stopper);
+
+        assert_ne!(wait_for_process_state(pid, |state| state != 'T'), 'T');
+    }
+
+    fn wait_for_process_state(pid: u32, predicate: impl Fn(char) -> bool) -> char {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(state) = process_state(pid) {
+                if predicate(state) {
+                    return state;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} did not reach expected state"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn process_state(pid: u32) -> Option<char> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rfind(')')?;
+        stat.get(after_comm + 2..)?.chars().next()
     }
 
     #[test]

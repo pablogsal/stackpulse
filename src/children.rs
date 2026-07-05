@@ -51,9 +51,13 @@ fn discover_children_via_proc_children(entries: std::fs::ReadDir) -> Option<Vec<
 }
 
 fn descendants_via_stat(root: i32) -> Vec<i32> {
+    descendants_via_stat_from_proc(root, Path::new("/proc"))
+}
+
+fn descendants_via_stat_from_proc(root: i32, proc_root: &Path) -> Vec<i32> {
     let mut children_of: std::collections::HashMap<i32, Vec<i32>> =
         std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         return Vec::new();
     };
     for entry in entries.flatten() {
@@ -61,7 +65,7 @@ fn descendants_via_stat(root: i32) -> Vec<i32> {
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(proc_pid_path(pid).join("stat")) else {
+        let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
             continue;
         };
         if let Some(ppid) = parse_parent_pid_from_stat(&stat) {
@@ -94,4 +98,91 @@ fn parse_parent_pid_from_stat(stat: &str) -> Option<i32> {
         .nth(1)?
         .parse::<i32>()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{SleepChild, TempDir};
+    use std::fs;
+
+    #[test]
+    fn parse_parent_pid_from_stat_handles_command_names_with_parens() {
+        assert_eq!(
+            parse_parent_pid_from_stat("123 (cmd ) with parens) S 456 1 2 3"),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn parse_parent_pid_from_stat_rejects_malformed_stat_lines() {
+        assert_eq!(parse_parent_pid_from_stat("123 (cmd S 456"), None);
+        assert_eq!(parse_parent_pid_from_stat("123 (cmd) S"), None);
+        assert_eq!(parse_parent_pid_from_stat("123 (cmd) S nope"), None);
+    }
+
+    #[test]
+    fn discover_children_via_proc_children_sorts_dedupes_and_skips_bad_tokens() {
+        let temp = TempDir::new("proc-children");
+        let task = temp.path().join("task");
+        fs::create_dir_all(task.join("10")).expect("create thread dir");
+        fs::create_dir_all(task.join("11")).expect("create thread dir");
+        fs::create_dir_all(task.join("12")).expect("create thread dir");
+        fs::write(task.join("10").join("children"), "42 7 nope 42\n").expect("write children file");
+        fs::write(task.join("11").join("children"), "100 7").expect("write children file");
+
+        let children =
+            discover_children_via_proc_children(fs::read_dir(&task).expect("read task dir"))
+                .expect("children files read");
+
+        assert_eq!(children, vec![7, 42, 100]);
+    }
+
+    #[test]
+    fn discover_children_via_proc_children_returns_none_without_readable_files() {
+        let temp = TempDir::new("proc-children-empty");
+        let task = temp.path().join("task");
+        fs::create_dir_all(task.join("10")).expect("create thread dir");
+
+        assert_eq!(
+            discover_children_via_proc_children(fs::read_dir(&task).expect("read task dir")),
+            None
+        );
+    }
+
+    #[test]
+    fn descendants_via_stat_walks_transitive_fixture_tree() {
+        let temp = TempDir::new("proc-stat");
+        for (pid, stat) in [
+            (10, "10 (root) S 1 1 1 1"),
+            (11, "11 (child) S 10 1 1 1"),
+            (12, "12 (child with ) paren) S 10 1 1 1"),
+            (13, "13 (grandchild) S 11 1 1 1"),
+            (14, "14 (unrelated) S 1 1 1 1"),
+        ] {
+            let dir = temp.path().join(pid.to_string());
+            fs::create_dir_all(&dir).expect("create proc pid dir");
+            fs::write(dir.join("stat"), stat).expect("write proc stat");
+        }
+        fs::create_dir_all(temp.path().join("self")).expect("create non-pid proc entry");
+
+        let mut descendants = descendants_via_stat_from_proc(10, temp.path());
+        descendants.sort_unstable();
+
+        assert_eq!(descendants, vec![11, 12, 13]);
+    }
+
+    #[test]
+    fn discover_descendants_includes_live_child_process() {
+        let root = std::process::id() as i32;
+        if fs::read_dir(proc_pid_path(root).join("task")).is_err() {
+            return;
+        }
+        let child = SleepChild::spawn();
+
+        let descendants = discover_all_descendants(root);
+
+        assert!(descendants.contains(&child.pid_i32()));
+        assert!(!descendants.contains(&root));
+    }
 }

@@ -227,3 +227,24 @@ pub struct ProcessExecRecord {
     /// Whether the process looked like a Python runtime.
     pub is_python_runtime: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::mmap_from_bytes;
+
+    #[test]
+    fn mmap_module_path_validates_utf8_and_borrows_range() {
+        let mmap = mmap_from_bytes(b"prefix:/lib/libc.so\xff[vdso]");
+
+        let path = ModulePath::from_mmap(mmap.clone(), 7..19).expect("valid path");
+        let vdso = ModulePath::from_mmap(mmap.clone(), 20..26).expect("valid vdso path");
+
+        assert_eq!(path.as_str(), "/lib/libc.so");
+        assert_eq!(path.as_path(), Path::new("/lib/libc.so"));
+        assert_eq!(path, ModulePath::from("/lib/libc.so"));
+        assert!(!path.is_bracketed_mapping());
+        assert!(vdso.is_bracketed_mapping());
+        assert!(ModulePath::from_mmap(mmap, 19..20).is_err());
+    }
+}
