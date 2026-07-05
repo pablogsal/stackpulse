@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
 license = "MIT"
@@ -10,6 +10,7 @@ categories = ["development-tools::profiling"]
 include = [
     "Cargo.lock",
     "Cargo.toml",
+    "CHANGELOG.md",
     "LICENSE-MIT",
     "README.md",
     "benches/**",
