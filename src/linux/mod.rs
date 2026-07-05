@@ -1333,6 +1333,7 @@ fn c_string_to_string(data: &std::ffi::CString) -> String {
 const LIVE_BENCH_PROCESS_ID: u32 = 42_000;
 const LIVE_BENCH_USER_BASE: u64 = 0x7000_0000_0000;
 const LIVE_BENCH_KERNEL_BASE: u64 = 0xffff_ffff_8100_0000;
+const LIVE_BENCH_RING_COUNT: usize = 4;
 
 pub(crate) struct LivePerfSampleBenchFixture {
     samples: perf_event::BenchSampleBatch,
@@ -1430,6 +1431,94 @@ pub(crate) fn bench_record_live_perf_samples(
                 record_sample_ref(&mut ctx, sample, privilege)?;
             }
         }
+
+        writer.flush()?;
+        let bytes = writer.into_inner();
+        checksum = checksum
+            .wrapping_add(bytes.len())
+            .wrapping_add(summary.samples as usize)
+            .wrapping_add(summary.sample_events as usize)
+            .wrapping_add(summary.ignored_user_callchain_frames as usize)
+            .wrapping_add(thread_actions.len())
+            .wrapping_add(process_fork_actions.len());
+    }
+    Ok(checksum)
+}
+
+pub(crate) fn bench_replay_live_perf_ring_records(
+    fixture: &LivePerfSampleBenchFixture,
+    rounds: u64,
+) -> io::Result<usize> {
+    let mut checksum = 0usize;
+    for round in 0..rounds {
+        let mut writer = PerfSpoolWriter::from_writer(
+            Vec::with_capacity(fixture.spool_capacity),
+            1_700_000_000_000_000 + round,
+            1_000,
+        )?;
+        let mut modules = ModuleTable::default();
+        let mut unwinders = FxHashMap::default();
+        for module in &fixture.modules {
+            record_module(&mut modules, &mut unwinders, &mut writer, module.clone())?;
+        }
+
+        let mut active_processes = FxHashMap::default();
+        let mut python_perf_support_processes = FxHashMap::default();
+        let mut python_runtime_processes = FxHashSet::default();
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::with_capacity(128);
+        let mut callchain_scratch = Vec::with_capacity(128);
+        let mut thread_actions = Vec::new();
+        let mut process_fork_actions = Vec::new();
+        let mut sorter = sorter::EventSorter::new();
+        let mut result = Ok(());
+        {
+            let mut ctx = EventContext {
+                modules: &mut modules,
+                unwinders: &mut unwinders,
+                active_processes: &mut active_processes,
+                python_perf_support_processes: &mut python_perf_support_processes,
+                python_runtime_processes: &mut python_runtime_processes,
+                writer: &mut writer,
+                summary: &mut summary,
+                stack_scratch: &mut stack_scratch,
+                callchain_scratch: &mut callchain_scratch,
+                thread_actions: &mut thread_actions,
+                process_fork_actions: &mut process_fork_actions,
+                inherit_child_processes: false,
+            };
+            for ring in 0..LIVE_BENCH_RING_COUNT {
+                sorter.begin_group(ring);
+                sorter.extend(
+                    fixture
+                        .samples
+                        .records()
+                        .iter()
+                        .skip(ring)
+                        .step_by(LIVE_BENCH_RING_COUNT)
+                        .map(|record| {
+                            let event = fixture.samples.owned_event(record);
+                            (event.timestamp().unwrap_or(0), event)
+                        }),
+                );
+                while let Some(event) = sorter.pop() {
+                    event.dispatch(&mut |event| {
+                        if result.is_ok() {
+                            result = handle_event(event, &mut ctx);
+                        }
+                    });
+                }
+            }
+            sorter.advance_round();
+            while let Some(event) = sorter.pop() {
+                event.dispatch(&mut |event| {
+                    if result.is_ok() {
+                        result = handle_event(event, &mut ctx);
+                    }
+                });
+            }
+        }
+        result?;
 
         writer.flush()?;
         let bytes = writer.into_inner();
