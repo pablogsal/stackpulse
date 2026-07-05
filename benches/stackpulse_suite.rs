@@ -326,11 +326,11 @@ fn bench_spool_write(c: &mut Criterion) {
 
 fn bench_live_perf_events(c: &mut Criterion) {
     let fixture = LivePerfSampleFixture::new();
-    let mut group = c.benchmark_group("stackpulse_cpu/live_perf_events");
-    group.sampling_mode(SamplingMode::Flat);
 
-    group.throughput(Throughput::Bytes(fixture.event_bytes() * LIVE_PARSE_BATCH));
-    group.bench_function("parse_borrowed_sample_records", |b| {
+    let mut perf_event = c.benchmark_group("stackpulse_self/perf_event");
+    perf_event.sampling_mode(SamplingMode::Flat);
+    perf_event.throughput(Throughput::Bytes(fixture.event_bytes() * LIVE_PARSE_BATCH));
+    perf_event.bench_function("parse_synthetic_sample_records", |b| {
         b.iter(|| {
             black_box(bench_support::parse_live_perf_samples(
                 black_box(&fixture),
@@ -338,23 +338,25 @@ fn bench_live_perf_events(c: &mut Criterion) {
             ))
         });
     });
+    perf_event.finish();
 
-    group.throughput(Throughput::Elements(
-        fixture.frame_count() * LIVE_RECORD_BATCH,
+    let mut recorder = c.benchmark_group("stackpulse_self/ring_replay");
+    recorder.sampling_mode(SamplingMode::Flat);
+    recorder.throughput(Throughput::Elements(
+        fixture.sample_count() * LIVE_RECORD_BATCH,
     ));
-    group.bench_function("record_borrowed_samples_to_spool", |b| {
+    recorder.bench_function("mock_ring_records_to_spool", |b| {
         b.iter(|| {
             black_box(
-                bench_support::record_live_perf_samples_to_spool(
+                bench_support::replay_live_perf_ring_records_to_spool(
                     black_box(&fixture),
                     LIVE_RECORD_BATCH,
                 )
-                .expect("record synthetic live samples through recorder hot path"),
+                .expect("replay synthetic ring records through recorder hot path"),
             )
         });
     });
-
-    group.finish();
+    recorder.finish();
 }
 
 fn bench_symbolization(c: &mut Criterion) {

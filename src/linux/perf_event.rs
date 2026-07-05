@@ -322,6 +322,28 @@ impl OwnedEventRecord {
         }
     }
 
+    pub(crate) fn from_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Self {
+        let record = AlignedPerfRecord::from_bytes(bytes);
+        let bytes = record.as_bytes();
+        if PerfRecordHeader::from_bytes(bytes)
+            .is_some_and(|header| header.is_sample() && header.matches_len(bytes))
+        {
+            return Self::Sample {
+                time: parse_sample_timestamp(bytes, parser),
+                record,
+                parser: parser.clone(),
+            };
+        }
+
+        let (privilege, record) =
+            parse_aligned_event_record(bytes, parser).expect("perf record bytes should parse");
+        Self::Parsed {
+            privilege,
+            time: record_timestamp(&record),
+            record,
+        }
+    }
+
     pub fn timestamp(&self) -> Option<u64> {
         match self {
             Self::Sample { time, .. } | Self::Parsed { time, .. } => *time,
@@ -818,6 +840,10 @@ impl BenchSampleBatch {
         record: &'a AlignedPerfRecord,
     ) -> Option<(Priv, SampleRecordRef<'a>)> {
         parse_sample_record(record.as_bytes(), &self.parser)
+    }
+
+    pub(crate) fn owned_event(&self, record: &AlignedPerfRecord) -> OwnedEventRecord {
+        OwnedEventRecord::from_record_bytes(record.as_bytes(), &self.parser)
     }
 }
 

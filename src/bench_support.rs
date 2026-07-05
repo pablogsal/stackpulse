@@ -90,6 +90,14 @@ pub fn record_live_perf_samples_to_spool(
 }
 
 #[doc(hidden)]
+pub fn replay_live_perf_ring_records_to_spool(
+    fixture: &LivePerfSampleFixture,
+    rounds: u64,
+) -> io::Result<usize> {
+    linux::bench_replay_live_perf_ring_records(&fixture.inner, rounds)
+}
+
+#[doc(hidden)]
 pub struct SparseKernelSymbolsFixture {
     data: Vec<u8>,
     requested_addresses: Vec<u64>,
