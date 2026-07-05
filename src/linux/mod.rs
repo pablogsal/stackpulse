@@ -1383,10 +1383,16 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     let dwarf_start = stack.len();
     let mut dwarf_truncated = false;
     let user_stack = sample.user_stack.filter(|stack| !stack.is_empty());
+    let missing_user_regs_for_user_tail = sample.user_regs.is_none() && !fp_user_frames.is_empty();
 
     if sample.user_stack.is_some() && user_stack.is_none() {
         record_unwind_error(summary, SampleErrorKind::NativeStackRead, || {
             "perf sample reported zero user stack bytes".to_string()
+        });
+    }
+    if missing_user_regs_for_user_tail && is_kernel_mode(privilege) {
+        record_unwind_error(summary, SampleErrorKind::NativeRegisterCapture, || {
+            "perf sample did not include user register state for user callchain tail".to_string()
         });
     }
 
@@ -1453,7 +1459,7 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     summary.ignored_user_callchain_frames = summary
         .ignored_user_callchain_frames
         .saturating_add(fp_user_frames.len().saturating_sub(used_fp_user_frames) as u64);
-    if dwarf_truncated {
+    if dwarf_truncated || missing_user_regs_for_user_tail {
         stack.push(StackFrame::TruncatedStackMarker);
     }
 
@@ -2141,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn get_sample_stack_uses_user_callchain_when_unwind_inputs_are_missing() {
+    fn get_sample_stack_marks_user_callchain_truncated_when_unwind_inputs_are_missing() {
         let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
         let sample = SampleView {
             task: None,
@@ -2170,6 +2176,7 @@ mod tests {
             vec![
                 StackFrame::InstructionPointer(0x1000, StackMode::User),
                 StackFrame::ReturnAddress(0x2000, StackMode::User),
+                StackFrame::TruncatedStackMarker,
             ]
         );
         assert_eq!(summary.ignored_user_callchain_frames, 0);
@@ -2180,6 +2187,51 @@ mod tests {
             1
         );
         assert_eq!(summary.error_stats.get(SampleErrorKind::NativeStackRead), 1);
+    }
+
+    #[test]
+    fn get_sample_stack_marks_kernel_sample_user_tail_truncated_when_regs_are_missing() {
+        let chains = vec![
+            CallChain::Kernel(vec![0xffff_1000]),
+            CallChain::User(vec![0x1000]),
+        ];
+        let sample = SampleView {
+            task: None,
+            timestamp_ns: None,
+            code_addr: None,
+            user_regs: None,
+            user_stack: None,
+            call_chain: SampleCallChain::Owned(&chains),
+        };
+        let mut process_unwinder = ProcessUnwinder::default();
+        let mut stack = Vec::new();
+        let mut callchain_stack = Vec::new();
+        let mut summary = PerfSummary::default();
+
+        get_sample_stack::<ConvertRegsNative>(
+            sample,
+            Priv::Kernel,
+            &mut process_unwinder,
+            &mut stack,
+            &mut callchain_stack,
+            &mut summary,
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
+                StackFrame::ReturnAddress(0x1000, StackMode::User),
+                StackFrame::TruncatedStackMarker,
+            ]
+        );
+        assert_eq!(summary.ignored_user_callchain_frames, 0);
+        assert_eq!(
+            summary
+                .error_stats
+                .get(SampleErrorKind::NativeRegisterCapture),
+            1
+        );
     }
 
     #[test]
