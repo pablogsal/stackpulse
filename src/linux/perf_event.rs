@@ -13,8 +13,9 @@ use perf_event_open::count::Counter;
 use perf_event_open::event::hw::Hardware;
 use perf_event_open::event::sw::Software;
 use perf_event_open::event::Event as PerfOpenEvent;
+use perf_event_open::sample::iter::CowIter;
 use perf_event_open::sample::rb::CowChunk;
-use perf_event_open::sample::record::{Priv, Record, RecordId, UnsafeParser};
+use perf_event_open::sample::record::{Parser, Priv, Record, RecordId, UnsafeParser};
 use perf_event_open::sample::Sampler;
 use perf_event_open_sys::bindings as sys;
 
@@ -201,6 +202,26 @@ impl PerfOptions {
     }
 }
 
+fn sample_type_bits(
+    include_callchain: bool,
+    include_user_regs: bool,
+    include_user_stack: bool,
+) -> u64 {
+    let mut sample_type = u64::from(sys::PERF_SAMPLE_IP)
+        | u64::from(sys::PERF_SAMPLE_TID)
+        | u64::from(sys::PERF_SAMPLE_TIME);
+    if include_callchain {
+        sample_type |= u64::from(sys::PERF_SAMPLE_CALLCHAIN);
+    }
+    if include_user_regs {
+        sample_type |= u64::from(sys::PERF_SAMPLE_REGS_USER);
+    }
+    if include_user_stack {
+        sample_type |= u64::from(sys::PERF_SAMPLE_STACK_USER);
+    }
+    sample_type
+}
+
 fn open_counter_for_event<E>(
     event: E,
     pid: u32,
@@ -267,11 +288,21 @@ impl Perf {
         self.inherit
     }
 
-    pub fn owned_events(&self) -> impl Iterator<Item = OwnedEventRecord> + '_ {
-        let mut iter = self.sampler.iter().into_cow();
-        std::iter::from_fn(move || {
-            iter.next(|chunk, parser| OwnedEventRecord::new(chunk, parser.as_unsafe()))
-        })
+    pub fn event_drain(&self) -> EventDrain<'_> {
+        EventDrain {
+            iter: self.sampler.iter().into_cow(),
+        }
+    }
+}
+
+pub struct EventDrain<'a> {
+    iter: CowIter<'a>,
+}
+
+impl EventDrain<'_> {
+    pub fn next_event<R>(&mut self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> Option<R> {
+        self.iter
+            .next(|record, parser| OwnedEventRecord::new(record, parser).with_event_ref(cb))
     }
 }
 
@@ -286,11 +317,10 @@ pub enum EventRecord<'a> {
     Owned(Record),
 }
 
-pub enum OwnedEventRecord {
+enum OwnedEventRecord<'a> {
     Sample {
-        record: AlignedPerfRecord,
+        record: CowChunk<'a>,
         parser: UnsafeParser,
-        time: Option<u64>,
     },
     Parsed {
         privilege: Priv,
@@ -299,61 +329,40 @@ pub enum OwnedEventRecord {
     },
 }
 
-impl OwnedEventRecord {
-    fn new(chunk: CowChunk<'_>, parser: &UnsafeParser) -> Self {
-        let bytes = chunk.as_bytes();
-        if PerfRecordHeader::from_bytes(bytes)
-            .is_some_and(|header| header.is_sample() && header.matches_len(bytes))
-        {
-            let time = parse_sample_timestamp(bytes, parser);
-            return Self::Sample {
-                record: AlignedPerfRecord::from_chunk(chunk),
-                parser: parser.clone(),
-                time,
-            };
-        }
-
-        let (privilege, record) = parse_event_record_from_chunk(chunk, parser)
-            .expect("perf record bytes should be aligned and sized");
-        Self::Parsed {
-            privilege,
-            time: record_timestamp(&record),
-            record,
-        }
-    }
-
-    pub(crate) fn from_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Self {
-        let record = AlignedPerfRecord::from_bytes(bytes);
+impl<'a> OwnedEventRecord<'a> {
+    fn new(record: CowChunk<'a>, parser: &Parser) -> Self {
         let bytes = record.as_bytes();
         if PerfRecordHeader::from_bytes(bytes)
             .is_some_and(|header| header.is_sample() && header.matches_len(bytes))
+            && is_u64_aligned(bytes)
         {
             return Self::Sample {
-                time: parse_sample_timestamp(bytes, parser),
                 record,
-                parser: parser.clone(),
+                parser: parser.as_unsafe().clone(),
             };
         }
 
-        let (privilege, record) =
-            parse_aligned_event_record(bytes, parser).expect("perf record bytes should parse");
+        let (privilege, parsed_record) = if is_u64_aligned(bytes) {
+            parser.parse(record)
+        } else {
+            let parsed = parse_event_record_bytes(bytes, parser.as_unsafe())
+                .expect("aligned perf record bytes should parse");
+            drop(record);
+            parsed
+        };
         Self::Parsed {
             privilege,
-            time: record_timestamp(&record),
-            record,
+            time: record_timestamp(&parsed_record),
+            record: parsed_record,
         }
     }
 
-    pub fn timestamp(&self) -> Option<u64> {
+    pub fn with_event_ref<R>(self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> R {
         match self {
-            Self::Sample { time, .. } | Self::Parsed { time, .. } => *time,
-        }
-    }
-
-    pub fn dispatch(self, cb: &mut impl FnMut(EventRef<'_>)) {
-        match self {
-            Self::Sample { record, parser, .. } => {
-                dispatch_event_bytes(record.as_bytes(), &parser, cb);
+            Self::Sample { record, parser } => {
+                let result = dispatch_event_bytes(record.as_bytes(), &parser, cb);
+                drop(record);
+                result
             }
             Self::Parsed {
                 privilege,
@@ -395,6 +404,10 @@ impl<'a> CallChainRef<'a> {
             addresses: self.addresses,
             cursor: 0,
         }
+    }
+
+    pub fn raw_address_count(&self) -> usize {
+        self.addresses.len()
     }
 }
 
@@ -521,31 +534,22 @@ impl PerfRecordHeader {
     }
 }
 
-fn dispatch_event_bytes(bytes: &[u8], parser: &UnsafeParser, cb: &mut impl FnMut(EventRef<'_>)) {
+fn dispatch_event_bytes<R>(
+    bytes: &[u8],
+    parser: &UnsafeParser,
+    cb: &mut impl FnMut(EventRef<'_>) -> R,
+) -> R {
     if let Some((privilege, sample)) = parse_sample_record(bytes, parser) {
-        cb(EventRef {
+        return cb(EventRef {
             privilege,
             timestamp: sample.time,
             record: EventRecord::Sample(sample),
         });
-        return;
     }
 
-    if let Some((privilege, record)) = parse_aligned_event_record(bytes, parser) {
-        cb(EventRef::new(privilege, record));
-    }
-}
-
-fn parse_event_record_from_chunk(
-    chunk: CowChunk<'_>,
-    parser: &UnsafeParser,
-) -> Option<(Priv, Record)> {
-    let bytes = chunk.as_bytes();
-    if let Some(record) = parse_aligned_event_record(bytes, parser) {
-        return Some(record);
-    }
-    let record = AlignedPerfRecord::from_chunk(chunk);
-    parse_aligned_event_record(record.as_bytes(), parser)
+    let (privilege, record) =
+        parse_aligned_event_record(bytes, parser).expect("perf record bytes should parse");
+    cb(EventRef::new(privilege, record))
 }
 
 fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
@@ -554,6 +558,14 @@ fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Pr
     }
     let (privilege, record, _) = unsafe { parser.parse(bytes) };
     Some((privilege, record))
+}
+
+fn parse_event_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
+    if is_u64_aligned(bytes) {
+        return parse_aligned_event_record(bytes, parser);
+    }
+    let aligned = AlignedPerfRecord::from_unaligned_bytes(bytes);
+    parse_aligned_event_record(aligned.as_bytes(), parser)
 }
 
 fn parse_sample_record<'a>(
@@ -587,25 +599,6 @@ fn parse_sample_record<'a>(
     }
 
     Some((priv_from_misc(misc), sample))
-}
-
-fn parse_sample_timestamp(bytes: &[u8], parser: &UnsafeParser) -> Option<u64> {
-    let mut cursor = ByteCursor::new(bytes);
-    let header = read_sample_header(&mut cursor)?;
-    let sample_type = parser.sample_type;
-    if !sample_type_supported(sample_type) {
-        return None;
-    }
-    let mut sample = SampleRecordRef {
-        task: None,
-        time: None,
-        code_addr: None,
-        user_regs: None,
-        user_stack: None,
-        call_chain: None,
-    };
-    parse_common_sample_fields(sample_type, header.misc, &mut cursor, &mut sample)?;
-    sample.time
 }
 
 fn read_sample_header(cursor: &mut ByteCursor<'_>) -> Option<PerfRecordHeader> {
@@ -788,15 +781,9 @@ pub(crate) struct BenchSampleBatchSpec {
 
 impl BenchSampleBatch {
     pub(crate) fn new(spec: BenchSampleBatchSpec) -> Self {
-        let sample_type = u64::from(sys::PERF_SAMPLE_IP)
-            | u64::from(sys::PERF_SAMPLE_TID)
-            | u64::from(sys::PERF_SAMPLE_TIME)
-            | u64::from(sys::PERF_SAMPLE_CALLCHAIN)
-            | u64::from(sys::PERF_SAMPLE_REGS_USER)
-            | u64::from(sys::PERF_SAMPLE_STACK_USER);
         let parser = perf_event_open::sample::record::UnsafeParser {
             sample_id_all: false,
-            sample_type,
+            sample_type: sample_type_bits(true, true, true),
             read_format: 0,
             user_regs: spec.user_regs,
             intr_regs: 0,
@@ -842,8 +829,12 @@ impl BenchSampleBatch {
         parse_sample_record(record.as_bytes(), &self.parser)
     }
 
-    pub(crate) fn owned_event(&self, record: &AlignedPerfRecord) -> OwnedEventRecord {
-        OwnedEventRecord::from_record_bytes(record.as_bytes(), &self.parser)
+    pub(crate) fn dispatch_event<R>(
+        &self,
+        record: &AlignedPerfRecord,
+        cb: &mut impl FnMut(EventRef<'_>) -> R,
+    ) -> R {
+        dispatch_event_bytes(record.as_bytes(), &self.parser, cb)
     }
 }
 
@@ -908,14 +899,6 @@ pub(crate) struct AlignedPerfRecord {
 }
 
 impl AlignedPerfRecord {
-    fn from_chunk(chunk: CowChunk<'_>) -> Self {
-        Self::from_vec(chunk.into_owned())
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        Self::from_vec(bytes.to_vec())
-    }
-
     fn from_vec(bytes: Vec<u8>) -> Self {
         if is_u64_aligned(&bytes) {
             return Self {
@@ -1023,7 +1006,7 @@ fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> 
     bytes.resize(padded_len, 0);
     let size = u16::try_from(bytes.len()).expect("synthetic perf sample fits in u16");
     bytes[6..8].copy_from_slice(&size.to_ne_bytes());
-    AlignedPerfRecord::from_bytes(&bytes)
+    AlignedPerfRecord::from_vec(bytes)
 }
 
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {
@@ -1138,12 +1121,7 @@ mod tests {
     fn stack_sample_parser(user_regs: usize) -> UnsafeParser {
         UnsafeParser {
             sample_id_all: false,
-            sample_type: u64::from(sys::PERF_SAMPLE_IP)
-                | u64::from(sys::PERF_SAMPLE_TID)
-                | u64::from(sys::PERF_SAMPLE_TIME)
-                | u64::from(sys::PERF_SAMPLE_CALLCHAIN)
-                | u64::from(sys::PERF_SAMPLE_REGS_USER)
-                | u64::from(sys::PERF_SAMPLE_STACK_USER),
+            sample_type: sample_type_bits(true, true, true),
             read_format: 0,
             user_regs,
             intr_regs: 0,
@@ -1204,15 +1182,14 @@ mod tests {
     }
 
     #[test]
-    fn owned_event_from_record_bytes_dispatches_sample() {
+    fn bench_batch_dispatches_sample_event() {
         let spec = stack_sample_spec(16);
         let batch = BenchSampleBatch::new(spec);
-        let event = batch.owned_event(&batch.records()[0]);
 
-        assert_eq!(event.timestamp(), Some(1_700_000_000_000_000));
-
+        let mut timestamp = None;
         let mut task = None;
-        event.dispatch(&mut |event| {
+        batch.dispatch_event(&batch.records()[0], &mut |event| {
+            timestamp = event.timestamp();
             let (privilege, record) = event.into_parts();
             let EventRecord::Sample(sample) = record else {
                 panic!("expected sample record");
@@ -1221,9 +1198,37 @@ mod tests {
             task = sample.task;
         });
 
+        assert_eq!(timestamp, Some(1_700_000_000_000_000));
         let task = task.expect("sample task");
         assert_eq!(task.pid, 1234);
         assert_eq!(task.tid, 1234);
+    }
+
+    #[test]
+    fn event_parser_handles_unaligned_sample_bytes() {
+        let spec = stack_sample_spec(8);
+        let parser = stack_sample_parser(spec.user_regs);
+        let record = build_bench_sample_record(&spec, 0);
+        let mut unaligned = Vec::with_capacity(record.len() + 1);
+        unaligned.push(0);
+        unaligned.extend_from_slice(record.as_bytes());
+        let bytes = &unaligned[1..];
+
+        assert!(!is_u64_aligned(bytes));
+        let (privilege, record) =
+            parse_event_record_bytes(bytes, &parser).expect("unaligned sample should parse");
+        let Record::Sample(sample) = record else {
+            panic!("expected parsed sample record");
+        };
+        assert_eq!(privilege, Priv::User);
+        assert_eq!(
+            sample.record_id.task.map(|task| task.pid),
+            Some(spec.process_id)
+        );
+        assert_eq!(
+            sample.user_stack.as_deref(),
+            Some(&[0, 1, 2, 3, 4, 5, 6, 7][..])
+        );
     }
 
     #[test]

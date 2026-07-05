@@ -17,6 +17,7 @@ mod test_fixtures;
 mod types;
 
 use std::io;
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use crate::state::{process_is_alive, try_new_exit_watcher, ProcessExitWatcher};
@@ -35,7 +36,8 @@ use perf_event::{
     SampleRecordRef,
 };
 pub use perf_group::AttachMode;
-use perf_group::PerfGroupOptions;
+use perf_group::{EventConsumer, PerfGroupOptions};
+use sorter::EventSorter;
 use types::{StackFrame, StackMode};
 
 #[cfg(target_arch = "x86_64")]
@@ -129,6 +131,7 @@ pub struct PerfSummary {
 /// Records stack samples for one or more Linux processes.
 pub struct PerfRecorder {
     perf: perf_group::PerfGroup,
+    event_sorter: EventSorter<RawFd, u64, PreparedEvent>,
     writer: PerfSpoolWriter<std::io::BufWriter<std::fs::File>>,
     modules: ModuleTable,
     unwinders: FxHashMap<i32, ProcessUnwinder>,
@@ -139,7 +142,6 @@ pub struct PerfRecorder {
     python_perf_support_processes: FxHashMap<i32, bool>,
     python_runtime_processes: FxHashSet<i32>,
     stack_scratch: Vec<StackFrame>,
-    callchain_scratch: Vec<StackFrame>,
     summary: PerfSummary,
 }
 
@@ -152,11 +154,108 @@ struct EventContext<'a, W: std::io::Write> {
     writer: &'a mut PerfSpoolWriter<W>,
     summary: &'a mut PerfSummary,
     stack_scratch: &'a mut Vec<StackFrame>,
-    callchain_scratch: &'a mut Vec<StackFrame>,
     thread_actions: &'a mut Vec<ThreadAction>,
     // (pid, parent_tid) pairs for open_forked_processes.
     process_fork_actions: &'a mut Vec<(u32, u32)>,
     inherit_child_processes: bool,
+}
+
+enum PreparedEvent {
+    Sample(PreparedSample),
+    Record {
+        timestamp_ns: u64,
+        privilege: Priv,
+        record: Record,
+    },
+}
+
+struct PreparedSample {
+    timestamp_ns: u64,
+    pid: i32,
+    tid: u64,
+    privilege: Priv,
+    code_addr: Option<(u64, bool)>,
+    user_regs: Option<Vec<u64>>,
+    user_stack: Option<Vec<u8>>,
+    callchain_stack: Vec<StackFrame>,
+}
+
+struct PreparedSampleMeta {
+    timestamp_ns: u64,
+    pid: i32,
+    tid: u64,
+    privilege: Priv,
+    code_addr: Option<(u64, bool)>,
+}
+
+struct DrainSink<'a, W: std::io::Write> {
+    ctx: EventContext<'a, W>,
+    sorter: &'a mut EventSorter<RawFd, u64, PreparedEvent>,
+    result: io::Result<()>,
+}
+
+impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
+    type Prepared = Option<PreparedEvent>;
+
+    fn begin_group(&mut self, fd: RawFd) {
+        self.sorter.begin_group(fd);
+    }
+
+    fn prepare_event(&mut self, event_ref: EventRef<'_>) -> Self::Prepared {
+        if self.result.is_err() {
+            return None;
+        }
+        match prepare_event(event_ref, &mut self.ctx) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.result = Err(err);
+                None
+            }
+        }
+    }
+
+    fn queue_event(&mut self, timestamp: u64, prepared: Self::Prepared) {
+        let Some(prepared) = prepared else { return };
+        self.sorter.push_current_group(timestamp, prepared);
+    }
+
+    fn drain_ready_events(&mut self) {
+        self.drain_sorter(false);
+    }
+
+    fn advance_round(&mut self) {
+        self.sorter.advance_round();
+    }
+
+    fn flush_ready_events(&mut self) {
+        self.drain_sorter(true);
+    }
+}
+
+impl<W: std::io::Write> DrainSink<'_, W> {
+    fn drain_sorter(&mut self, force: bool) {
+        loop {
+            let prepared = if force {
+                self.sorter.force_pop()
+            } else {
+                self.sorter.pop()
+            };
+            let Some(prepared) = prepared else { break };
+            self.finish_event(prepared);
+            if self.result.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn finish_event(&mut self, prepared: PreparedEvent) {
+        if self.result.is_err() {
+            return;
+        }
+        if let Err(err) = finish_prepared_event(prepared, &mut self.ctx) {
+            self.result = Err(err);
+        }
+    }
 }
 
 impl PerfRecorder {
@@ -212,6 +311,7 @@ impl PerfRecorder {
 
         let mut recorder = Self {
             perf,
+            event_sorter: EventSorter::new(),
             writer,
             modules,
             unwinders,
@@ -219,7 +319,6 @@ impl PerfRecorder {
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch: Vec::with_capacity(128),
-            callchain_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
                 ..PerfSummary::default()
@@ -239,22 +338,21 @@ impl PerfRecorder {
     fn drain_events(&mut self, mode: DrainMode, open_new_perf_events: bool) -> io::Result<()> {
         let Self {
             perf,
+            event_sorter,
             modules,
             unwinders,
             active_processes,
             python_perf_support_processes,
             python_runtime_processes,
             stack_scratch,
-            callchain_scratch,
             writer,
             summary,
         } = self;
-        let mut result = Ok(());
         let mut thread_actions = Vec::new();
         let mut process_fork_actions = Vec::new();
         let inherit_child_processes = perf.inherit_child_processes;
-        {
-            let mut ctx = EventContext {
+        let mut result = {
+            let ctx = EventContext {
                 modules,
                 unwinders,
                 active_processes,
@@ -263,26 +361,21 @@ impl PerfRecorder {
                 writer,
                 summary,
                 stack_scratch,
-                callchain_scratch,
                 thread_actions: &mut thread_actions,
                 process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes,
             };
+            let mut sink = DrainSink {
+                ctx,
+                sorter: event_sorter,
+                result: Ok(()),
+            };
             match mode {
-                DrainMode::Consume => perf.consume_events(&mut |event_ref| {
-                    if result.is_err() {
-                        return;
-                    }
-                    result = handle_event(event_ref, &mut ctx);
-                }),
-                DrainMode::Flush => perf.flush_events(&mut |event_ref| {
-                    if result.is_err() {
-                        return;
-                    }
-                    result = handle_event(event_ref, &mut ctx);
-                }),
+                DrainMode::Consume => perf.consume_events(&mut sink),
+                DrainMode::Flush => perf.flush_events(&mut sink),
             }
-        }
+            sink.result
+        };
         // Apply process forks before thread forks: a thread spawned by a
         // freshly-forked child must see its parent marked inheriting first, or
         // it gets explicit counters on top of the inherited ones (double count).
@@ -315,6 +408,9 @@ impl PerfRecorder {
 
     /// Wait briefly for more profiling data to become readable.
     pub fn wait(&mut self) -> io::Result<()> {
+        if self.event_sorter.has_more() {
+            return Ok(());
+        }
         self.perf.wait()
     }
 
@@ -370,7 +466,7 @@ impl PerfRecorder {
 
     /// Return whether unread profiling events are already queued.
     pub fn has_pending_events(&self) -> bool {
-        self.perf.has_pending_events()
+        self.event_sorter.has_more() || self.perf.has_pending_events()
     }
 
     /// Return a snapshot of the current counters.
@@ -428,16 +524,31 @@ impl PerfRecorder {
     }
 }
 
-fn handle_event<W: std::io::Write>(
+fn prepare_event<W: std::io::Write>(
     event_ref: EventRef,
     ctx: &mut EventContext<'_, W>,
-) -> io::Result<()> {
+) -> io::Result<Option<PreparedEvent>> {
     let event_timestamp_ns = event_ref.timestamp().unwrap_or(0);
     let (privilege, record) = event_ref.into_parts();
     match record {
-        EventRecord::Sample(sample) => record_sample_ref(ctx, sample, privilege),
-        EventRecord::Owned(Record::Sample(sample)) => record_sample(ctx, &sample, privilege),
-        EventRecord::Owned(Record::Mmap(mmap)) => {
+        EventRecord::Sample(sample) => prepare_sample_ref(ctx, sample, privilege),
+        EventRecord::Owned(Record::Sample(sample)) => prepare_sample(ctx, *sample, privilege),
+        EventRecord::Owned(record) => Ok(Some(PreparedEvent::Record {
+            timestamp_ns: event_timestamp_ns,
+            privilege,
+            record,
+        })),
+    }
+}
+
+fn handle_non_sample_record<W: std::io::Write>(
+    event_timestamp_ns: u64,
+    privilege: Priv,
+    record: Record,
+    ctx: &mut EventContext<'_, W>,
+) -> io::Result<()> {
+    match record {
+        Record::Mmap(mmap) => {
             record_mmap(ctx.modules, ctx.unwinders, ctx.writer, &mmap, privilege)?;
             record_python_runtime_mmap(
                 &mmap,
@@ -448,7 +559,7 @@ fn handle_event<W: std::io::Write>(
                 ctx.writer,
             )
         }
-        EventRecord::Owned(Record::Fork(fork)) if fork.task.pid != fork.parent_task.pid => {
+        Record::Fork(fork) if fork.task.pid != fork.parent_task.pid => {
             if !ctx.inherit_child_processes {
                 return Ok(());
             }
@@ -478,7 +589,7 @@ fn handle_event<W: std::io::Write>(
                 .push((fork.task.pid, fork.parent_task.tid));
             ctx.modules.clone_process_modules(ppid, pid, ctx.writer)
         }
-        EventRecord::Owned(Record::Fork(fork)) if fork.task.pid == fork.parent_task.pid => {
+        Record::Fork(fork) if fork.task.pid == fork.parent_task.pid => {
             if fork.task.tid != fork.parent_task.tid {
                 ctx.thread_actions.push(ThreadAction::Fork {
                     tid: fork.task.tid,
@@ -488,7 +599,7 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        EventRecord::Owned(Record::Comm(comm)) if comm.task.pid == comm.task.tid => {
+        Record::Comm(comm) if comm.task.pid == comm.task.tid => {
             if let Some(pid) = i32_from_u32(comm.task.pid) {
                 if comm.by_execve {
                     cleanup_process_modules(pid, ctx.modules, ctx.unwinders, ctx.writer)?;
@@ -540,7 +651,7 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        EventRecord::Owned(Record::Exit(exit)) => {
+        Record::Exit(exit) => {
             let is_process_exit = exit.task.pid == exit.task.tid;
             // The main thread's exit is the whole process's exit; drop its tid
             // from the perf group's tracking sets like any other thread exit,
@@ -569,11 +680,11 @@ fn handle_event<W: std::io::Write>(
             }
             Ok(())
         }
-        EventRecord::Owned(Record::LostRecords(lost)) => {
+        Record::LostRecords(lost) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_records);
             Ok(())
         }
-        EventRecord::Owned(Record::LostSamples(lost)) => {
+        Record::LostSamples(lost) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_samples);
             Ok(())
         }
@@ -724,20 +835,45 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     Ok(())
 }
 
-fn record_sample<W: std::io::Write>(
+fn prepare_sample<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
-    sample: &Sample,
+    sample: Sample,
     privilege: Priv,
-) -> io::Result<()> {
-    record_sample_view(ctx, SampleView::from_owned(sample), privilege)
+) -> io::Result<Option<PreparedEvent>> {
+    let Sample {
+        record_id,
+        call_chain,
+        user_stack,
+        code_addr,
+        user_regs,
+        ..
+    } = sample;
+    let task = record_id.task.as_ref().map(|task| (task.pid, task.tid));
+    let Some(meta) = prepare_sample_meta(ctx, task, record_id.time, code_addr, privilege) else {
+        return Ok(None);
+    };
+
+    Ok(Some(PreparedEvent::Sample(PreparedSample {
+        timestamp_ns: meta.timestamp_ns,
+        pid: meta.pid,
+        tid: meta.tid,
+        privilege: meta.privilege,
+        code_addr: meta.code_addr,
+        user_regs: user_regs.map(|(regs, _)| regs),
+        user_stack,
+        callchain_stack: call_chain
+            .as_deref()
+            .map_or(SampleCallChain::None, SampleCallChain::Owned)
+            .to_stack_frames(),
+    })))
 }
 
-fn record_sample_ref<W: std::io::Write>(
+fn prepare_sample_ref<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
     sample: SampleRecordRef<'_>,
     privilege: Priv,
-) -> io::Result<()> {
-    record_sample_view(ctx, SampleView::from_ref(sample), privilege)
+) -> io::Result<Option<PreparedEvent>> {
+    prepare_sample_view(ctx, SampleView::from_ref(sample), privilege)
 }
 
 #[derive(Clone, Copy)]
@@ -748,6 +884,13 @@ struct SampleView<'a> {
     user_regs: Option<&'a [u64]>,
     user_stack: Option<&'a [u8]>,
     call_chain: SampleCallChain<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct StackInput<'a> {
+    code_addr: Option<(u64, bool)>,
+    user_regs: Option<&'a [u64]>,
+    user_stack: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -770,6 +913,20 @@ impl<'a> SampleCallChain<'a> {
             SampleCallChain::Owned(chains) => SampleCallChainIter::Owned(chains.iter()),
             SampleCallChain::Borrowed(chains) => SampleCallChainIter::Borrowed(chains.iter()),
         }
+    }
+
+    fn stack_frame_capacity(self) -> usize {
+        match self {
+            SampleCallChain::None => 0,
+            SampleCallChain::Borrowed(chains) => chains.raw_address_count(),
+            SampleCallChain::Owned(_) => self.iter().map(|(_, addresses)| addresses.len()).sum(),
+        }
+    }
+
+    fn to_stack_frames(self) -> Vec<StackFrame> {
+        let mut frames = Vec::with_capacity(self.stack_frame_capacity());
+        push_sample_callchain(self, &mut frames);
+        frames
     }
 }
 
@@ -811,24 +968,6 @@ impl<'a> Iterator for SampleCallChainIter<'a> {
 }
 
 impl<'a> SampleView<'a> {
-    fn from_owned(sample: &'a Sample) -> Self {
-        Self {
-            task: sample
-                .record_id
-                .task
-                .as_ref()
-                .map(|task| (task.pid, task.tid)),
-            timestamp_ns: sample.record_id.time,
-            code_addr: sample.code_addr,
-            user_regs: sample.user_regs.as_ref().map(|(regs, _)| regs.as_slice()),
-            user_stack: sample.user_stack.as_deref(),
-            call_chain: sample
-                .call_chain
-                .as_deref()
-                .map_or(SampleCallChain::None, SampleCallChain::Owned),
-        }
-    }
-
     fn from_ref(sample: SampleRecordRef<'a>) -> Self {
         Self {
             task: sample.task.map(|task| (task.pid, task.tid)),
@@ -841,63 +980,139 @@ impl<'a> SampleView<'a> {
                 .map_or(SampleCallChain::None, SampleCallChain::Borrowed),
         }
     }
+
+    #[cfg(test)]
+    fn stack_input(self) -> StackInput<'a> {
+        StackInput {
+            code_addr: self.code_addr,
+            user_regs: self.user_regs,
+            user_stack: self.user_stack,
+        }
+    }
 }
 
-fn record_sample_view<W: std::io::Write>(
+fn prepare_sample_view<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
     sample: SampleView<'_>,
     privilege: Priv,
-) -> io::Result<()> {
+) -> io::Result<Option<PreparedEvent>> {
+    let Some(meta) = prepare_sample_meta(
+        ctx,
+        sample.task,
+        sample.timestamp_ns,
+        sample.code_addr,
+        privilege,
+    ) else {
+        return Ok(None);
+    };
+
+    Ok(Some(PreparedEvent::Sample(PreparedSample {
+        timestamp_ns: meta.timestamp_ns,
+        pid: meta.pid,
+        tid: meta.tid,
+        privilege: meta.privilege,
+        code_addr: meta.code_addr,
+        user_regs: sample.user_regs.map(<[u64]>::to_vec),
+        user_stack: sample.user_stack.map(<[u8]>::to_vec),
+        callchain_stack: sample.call_chain.to_stack_frames(),
+    })))
+}
+
+fn prepare_sample_meta<W: std::io::Write>(
+    ctx: &mut EventContext<'_, W>,
+    task: Option<(u32, u32)>,
+    timestamp_ns: Option<u64>,
+    code_addr: Option<(u64, bool)>,
+    privilege: Priv,
+) -> Option<PreparedSampleMeta> {
     bump(&mut ctx.summary.sample_events);
-    let Some((raw_pid, raw_tid)) = sample.task else {
+    let Some((raw_pid, raw_tid)) = task else {
         bump(&mut ctx.summary.missing_pid_samples);
-        return Ok(());
+        return None;
     };
     let Some(pid) = i32_from_u32(raw_pid) else {
         bump(&mut ctx.summary.missing_pid_samples);
-        return Ok(());
+        return None;
     };
     let Some(tid) = i32_from_u32(raw_tid) else {
         bump(&mut ctx.summary.missing_tid_samples);
-        return Ok(());
+        return None;
     };
     if tid == 0 {
         bump(&mut ctx.summary.idle_tid_samples);
-        return Ok(());
+        return None;
     }
-    let Some(timestamp_ns) = sample.timestamp_ns else {
+    let Some(timestamp_ns) = timestamp_ns else {
         bump(&mut ctx.summary.missing_timestamp_samples);
-        return Ok(());
+        return None;
     };
 
-    let unwinder = ctx.unwinders.entry(pid).or_default();
-    get_sample_stack::<ConvertRegsNative>(
-        sample,
+    Some(PreparedSampleMeta {
+        timestamp_ns,
+        pid,
+        tid: tid as u64,
         privilege,
+        code_addr,
+    })
+}
+
+fn finish_prepared_event<W: std::io::Write>(
+    prepared: PreparedEvent,
+    ctx: &mut EventContext<'_, W>,
+) -> io::Result<()> {
+    match prepared {
+        PreparedEvent::Sample(sample) => record_prepared_sample(ctx, sample),
+        PreparedEvent::Record {
+            timestamp_ns,
+            privilege,
+            record,
+        } => handle_non_sample_record(timestamp_ns, privilege, record, ctx),
+    }
+}
+
+fn record_prepared_sample<W: std::io::Write>(
+    ctx: &mut EventContext<'_, W>,
+    sample: PreparedSample,
+) -> io::Result<()> {
+    let pid = sample.pid;
+    let input = StackInput {
+        code_addr: sample.code_addr,
+        user_regs: sample.user_regs.as_deref(),
+        user_stack: sample.user_stack.as_deref(),
+    };
+    let unwinder = ctx.unwinders.entry(pid).or_default();
+    build_sample_stack::<ConvertRegsNative>(
+        input,
+        sample.privilege,
         unwinder,
         ctx.stack_scratch,
-        ctx.callchain_scratch,
+        &sample.callchain_stack,
         ctx.summary,
     );
     let stack_id = {
         let modules = &mut *ctx.modules;
         let summary = &mut *ctx.summary;
         ctx.writer.write_sample_frames(
-            timestamp_ns,
+            sample.timestamp_ns,
             pid,
-            tid as u64,
+            sample.tid,
             ctx.stack_scratch
                 .iter()
                 .copied()
                 .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
-        )?
+        )
     };
-    if stack_id.is_none() {
-        bump(&mut ctx.summary.empty_stack_samples);
-        return Ok(());
+    match stack_id {
+        Ok(None) => {
+            bump(&mut ctx.summary.empty_stack_samples);
+            Ok(())
+        }
+        Ok(Some(_)) => {
+            bump(&mut ctx.summary.samples);
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
-    bump(&mut ctx.summary.samples);
-    Ok(())
 }
 
 fn bump(counter: &mut u64) {
@@ -1122,6 +1337,7 @@ fn c_string_is_python_runtime_path(path: &std::ffi::CString) -> bool {
     )))
 }
 
+#[cfg(test)]
 fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
     sample: SampleView<'_>,
     privilege: Priv,
@@ -1130,10 +1346,28 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
     callchain_stack: &mut Vec<StackFrame>,
     summary: &mut PerfSummary,
 ) {
-    stack.clear();
     callchain_stack.clear();
-
     push_sample_callchain(sample.call_chain, callchain_stack);
+    build_sample_stack::<C>(
+        sample.stack_input(),
+        privilege,
+        process_unwinder,
+        stack,
+        callchain_stack,
+        summary,
+    );
+}
+
+fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
+    sample: StackInput<'_>,
+    privilege: Priv,
+    process_unwinder: &mut ProcessUnwinder,
+    stack: &mut Vec<StackFrame>,
+    callchain_stack: &[StackFrame],
+    summary: &mut PerfSummary,
+) {
+    stack.clear();
+
     let kernel_frame_count = callchain_stack
         .iter()
         .take_while(|&&frame| stack_frame_is_kernel(frame))
@@ -1405,7 +1639,6 @@ pub(crate) fn bench_record_live_perf_samples(
         let mut python_runtime_processes = FxHashSet::default();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
-        let mut callchain_scratch = Vec::with_capacity(128);
         let mut thread_actions = Vec::new();
         let mut process_fork_actions = Vec::new();
         {
@@ -1418,7 +1651,6 @@ pub(crate) fn bench_record_live_perf_samples(
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
-                callchain_scratch: &mut callchain_scratch,
                 thread_actions: &mut thread_actions,
                 process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes: false,
@@ -1428,7 +1660,9 @@ pub(crate) fn bench_record_live_perf_samples(
                     .samples
                     .parse(record)
                     .expect("parse synthetic live sample");
-                record_sample_ref(&mut ctx, sample, privilege)?;
+                if let Some(prepared) = prepare_sample_ref(&mut ctx, sample, privilege)? {
+                    finish_prepared_event(prepared, &mut ctx)?;
+                }
             }
         }
 
@@ -1467,11 +1701,10 @@ pub(crate) fn bench_replay_live_perf_ring_records(
         let mut python_runtime_processes = FxHashSet::default();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
-        let mut callchain_scratch = Vec::with_capacity(128);
         let mut thread_actions = Vec::new();
         let mut process_fork_actions = Vec::new();
-        let mut sorter = sorter::EventSorter::new();
-        let mut result = Ok(());
+        let mut sorter = sorter::EventSorter::<usize, u64, PreparedEvent>::new();
+        let mut result: io::Result<()> = Ok(());
         {
             let mut ctx = EventContext {
                 modules: &mut modules,
@@ -1482,40 +1715,46 @@ pub(crate) fn bench_replay_live_perf_ring_records(
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
-                callchain_scratch: &mut callchain_scratch,
                 thread_actions: &mut thread_actions,
                 process_fork_actions: &mut process_fork_actions,
                 inherit_child_processes: false,
             };
             for ring in 0..LIVE_BENCH_RING_COUNT {
                 sorter.begin_group(ring);
-                sorter.extend(
-                    fixture
-                        .samples
-                        .records()
-                        .iter()
-                        .skip(ring)
-                        .step_by(LIVE_BENCH_RING_COUNT)
-                        .map(|record| {
-                            let event = fixture.samples.owned_event(record);
-                            (event.timestamp().unwrap_or(0), event)
-                        }),
-                );
-                while let Some(event) = sorter.pop() {
-                    event.dispatch(&mut |event| {
-                        if result.is_ok() {
-                            result = handle_event(event, &mut ctx);
+                for record in fixture
+                    .samples
+                    .records()
+                    .iter()
+                    .skip(ring)
+                    .step_by(LIVE_BENCH_RING_COUNT)
+                {
+                    if result.is_err() {
+                        break;
+                    }
+                    let (timestamp, prepared) =
+                        fixture.samples.dispatch_event(record, &mut |event| {
+                            let timestamp = event.timestamp().unwrap_or(0);
+                            (timestamp, prepare_event(event, &mut ctx))
+                        });
+                    match prepared {
+                        Ok(Some(prepared)) => sorter.push_current_group(timestamp, prepared),
+                        Ok(None) => {}
+                        Err(err) => {
+                            result = Err(err);
                         }
-                    });
+                    }
+                }
+                while let Some(prepared) = sorter.pop() {
+                    if result.is_ok() {
+                        result = finish_prepared_event(prepared, &mut ctx);
+                    }
                 }
             }
             sorter.advance_round();
-            while let Some(event) = sorter.pop() {
-                event.dispatch(&mut |event| {
-                    if result.is_ok() {
-                        result = handle_event(event, &mut ctx);
-                    }
-                });
+            while let Some(prepared) = sorter.pop() {
+                if result.is_ok() {
+                    result = finish_prepared_event(prepared, &mut ctx);
+                }
             }
         }
         result?;
@@ -1571,6 +1810,87 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_recorder_is_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<PerfRecorder>();
+    }
+
+    #[test]
+    fn sample_prepare_defers_unwind_until_finish() {
+        let mut modules = ModuleTable::default();
+        let mut unwinders = FxHashMap::default();
+        let mut active_processes = FxHashMap::default();
+        let mut python_perf_support_processes = FxHashMap::default();
+        let mut python_runtime_processes = FxHashSet::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).expect("spool writer");
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut thread_actions = Vec::new();
+        let mut process_fork_actions = Vec::new();
+        let user_stack = [0_u8; 8];
+        let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
+        let sample = SampleView {
+            task: Some((7, 8)),
+            timestamp_ns: Some(42),
+            code_addr: None,
+            user_regs: Some(&[]),
+            user_stack: Some(&user_stack),
+            call_chain: SampleCallChain::Owned(&chains),
+        };
+        let prepared = {
+            let mut ctx = EventContext {
+                modules: &mut modules,
+                unwinders: &mut unwinders,
+                active_processes: &mut active_processes,
+                python_perf_support_processes: &mut python_perf_support_processes,
+                python_runtime_processes: &mut python_runtime_processes,
+                writer: &mut writer,
+                summary: &mut summary,
+                stack_scratch: &mut stack_scratch,
+                thread_actions: &mut thread_actions,
+                process_fork_actions: &mut process_fork_actions,
+                inherit_child_processes: false,
+            };
+            prepare_sample_view(&mut ctx, sample, Priv::User)
+                .expect("prepare sample")
+                .expect("prepared sample")
+        };
+
+        assert!(unwinders.is_empty());
+        assert_eq!(summary.sample_events, 1);
+        assert_eq!(
+            summary
+                .error_stats
+                .get(SampleErrorKind::NativeRegisterCapture),
+            0
+        );
+
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            unwinders: &mut unwinders,
+            active_processes: &mut active_processes,
+            python_perf_support_processes: &mut python_perf_support_processes,
+            python_runtime_processes: &mut python_runtime_processes,
+            writer: &mut writer,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            thread_actions: &mut thread_actions,
+            process_fork_actions: &mut process_fork_actions,
+            inherit_child_processes: false,
+        };
+        finish_prepared_event(prepared, &mut ctx).expect("finish sample");
+
+        assert!(unwinders.contains_key(&7));
+        assert_eq!(
+            summary
+                .error_stats
+                .get(SampleErrorKind::NativeRegisterCapture),
+            1
+        );
+    }
 
     #[test]
     fn resolve_stack_frame_preserves_truncated_stack_marker() {

@@ -9,11 +9,8 @@ use mio::{Events, Interest, Poll, Token};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::cpu::{online_cpu_ids, thread_perf_event_capacity};
-use super::perf_event::{
-    EventRef, EventSource, OwnedEventRecord, Perf, PerfOptions, TaskInheritance,
-};
+use super::perf_event::{EventRef, EventSource, Perf, PerfOptions, TaskInheritance};
 use super::process_gone_error;
-use super::sorter::EventSorter;
 
 const LARGE_PERF_EVENT_COUNT: usize = 1000;
 
@@ -73,7 +70,6 @@ impl ThreadPerfEvents {
 }
 
 pub struct PerfGroup {
-    event_sorter: EventSorter<RawFd, u64, OwnedEventRecord>,
     members: BTreeMap<RawFd, Member>,
     ready_fds: BTreeSet<RawFd>,
     poll: Poll,
@@ -89,6 +85,22 @@ pub struct PerfGroup {
     tracked_threads: BTreeMap<u32, u32>,
     inheriting_threads: BTreeSet<u32>,
     stopped_processes: Vec<StoppedProcess>,
+}
+
+pub(crate) trait EventConsumer {
+    type Prepared;
+
+    fn begin_group(&mut self, fd: RawFd);
+
+    fn prepare_event(&mut self, event_ref: EventRef<'_>) -> Self::Prepared;
+
+    fn queue_event(&mut self, timestamp: u64, prepared: Self::Prepared);
+
+    fn drain_ready_events(&mut self);
+
+    fn advance_round(&mut self);
+
+    fn flush_ready_events(&mut self);
 }
 
 fn get_threads(pid: u32) -> io::Result<Vec<u32>> {
@@ -128,7 +140,6 @@ impl PerfGroup {
         inherit_child_processes: bool,
     ) -> io::Result<Self> {
         Ok(PerfGroup {
-            event_sorter: EventSorter::new(),
             members: Default::default(),
             ready_fds: BTreeSet::new(),
             poll: Poll::new()?,
@@ -508,7 +519,7 @@ impl PerfGroup {
     }
 
     pub fn has_pending_events(&self) -> bool {
-        !self.ready_fds.is_empty() || self.event_sorter.has_more()
+        !self.ready_fds.is_empty()
     }
 
     pub fn enable(&mut self) -> io::Result<()> {
@@ -530,6 +541,9 @@ impl PerfGroup {
     }
 
     pub fn wait(&mut self) -> io::Result<()> {
+        if !self.ready_fds.is_empty() {
+            return Ok(());
+        }
         // EINTR is normal (signals: e.g. parent's Ctrl-C handler).
         if let Err(err) = self
             .poll
@@ -555,41 +569,39 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn consume_events(&mut self, cb: &mut impl FnMut(EventRef)) {
+    pub fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) {
         let mut fds_to_remove = Vec::new();
         self.ready_fds.clear();
         // Drain every ring buffer on every pass. Poll readiness is only a wakeup
         // hint; using it as a filter can let older mmap/fork records sit behind
         // newer samples from another fd, which breaks timestamp-ordered unwinding.
         for (&fd, member) in &mut self.members {
-            self.event_sorter.begin_group(fd);
+            consumer.begin_group(fd);
             let mut consumed_record = false;
-            for event in member.perf.owned_events() {
+            let mut drain = member.perf.event_drain();
+            while let Some((timestamp, prepared)) = drain.next_event(&mut |event_ref| {
                 consumed_record = true;
-                self.event_sorter
-                    .push_current_group(event.timestamp().unwrap_or(0), event);
+                let timestamp = event_ref.timestamp().unwrap_or(0);
+                let prepared = consumer.prepare_event(event_ref);
+                (timestamp, prepared)
+            }) {
+                consumer.queue_event(timestamp, prepared);
             }
-            while let Some(event) = self.event_sorter.pop() {
-                event.dispatch(cb);
-            }
+            consumer.drain_ready_events();
             if member.is_closed && !consumed_record {
                 fds_to_remove.push(fd);
             }
         }
-        self.event_sorter.advance_round();
-        while let Some(event) = self.event_sorter.pop() {
-            event.dispatch(cb);
-        }
+        consumer.advance_round();
+        consumer.drain_ready_events();
         for fd in fds_to_remove {
             self.remove_member_fd(fd);
         }
     }
 
-    pub fn flush_events(&mut self, cb: &mut impl FnMut(EventRef)) {
-        self.consume_events(cb);
-        while let Some(event) = self.event_sorter.force_pop() {
-            event.dispatch(cb);
-        }
+    pub fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) {
+        self.consume_events(consumer);
+        consumer.flush_ready_events();
     }
 }
 
