@@ -1391,7 +1391,7 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
         });
     }
     if missing_user_regs_for_user_tail && is_kernel_mode(privilege) {
-        record_unwind_error(summary, SampleErrorKind::NativeRegisterCapture, || {
+        record_unwind_error(summary, SampleErrorKind::NativeUserRegistersMissing, || {
             "perf sample did not include user register state for user callchain tail".to_string()
         });
     }
@@ -1441,7 +1441,7 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
         }
         _ if !is_kernel_mode(privilege) => {
             if sample.user_regs.is_none() {
-                record_unwind_error(summary, SampleErrorKind::NativeRegisterCapture, || {
+                record_unwind_error(summary, SampleErrorKind::NativeUserRegistersMissing, || {
                     "perf sample did not include user register state".to_string()
                 });
             }
@@ -2183,7 +2183,7 @@ mod tests {
         assert_eq!(
             summary
                 .error_stats
-                .get(SampleErrorKind::NativeRegisterCapture),
+                .get(SampleErrorKind::NativeUserRegistersMissing),
             1
         );
         assert_eq!(summary.error_stats.get(SampleErrorKind::NativeStackRead), 1);
@@ -2229,7 +2229,7 @@ mod tests {
         assert_eq!(
             summary
                 .error_stats
-                .get(SampleErrorKind::NativeRegisterCapture),
+                .get(SampleErrorKind::NativeUserRegistersMissing),
             1
         );
     }

@@ -31,6 +31,8 @@ pub enum SampleErrorKind {
     NativeFramehopMovedBackwards = 5,
     /// Framehop error: integer overflow during unwind calculations
     NativeFramehopIntegerOverflow = 6,
+    /// Perf sample did not include user register state
+    NativeUserRegistersMissing = 7,
 }
 
 /// Number of error kinds; sizes the counter array. Derived from
@@ -60,6 +62,7 @@ impl SampleErrorKind {
         SampleErrorKind::NativeFramehopReturnAddressNull,
         SampleErrorKind::NativeFramehopMovedBackwards,
         SampleErrorKind::NativeFramehopIntegerOverflow,
+        SampleErrorKind::NativeUserRegistersMissing,
     ];
 
     /// Category name for grouping in display. All current failure kinds are
@@ -80,6 +83,7 @@ impl SampleErrorKind {
             Self::NativeFramehopReturnAddressNull => "Framehop: return address is NULL",
             Self::NativeFramehopMovedBackwards => "Framehop: frame pointer moved backwards",
             Self::NativeFramehopIntegerOverflow => "Framehop: integer overflow",
+            Self::NativeUserRegistersMissing => "User registers missing",
         }
     }
 }
