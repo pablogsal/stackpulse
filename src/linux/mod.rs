@@ -1453,7 +1453,7 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     summary.ignored_user_callchain_frames = summary
         .ignored_user_callchain_frames
         .saturating_add(fp_user_frames.len().saturating_sub(used_fp_user_frames) as u64);
-    if dwarf_truncated && used_fp_user_frames == 0 {
+    if dwarf_truncated {
         stack.push(StackFrame::TruncatedStackMarker);
     }
 
@@ -1989,6 +1989,90 @@ mod tests {
                 StackFrame::ReturnAddress(0x2000, StackMode::User),
                 StackFrame::ReturnAddress(0x3000, StackMode::User),
             ]
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    struct TestConvertRegs;
+
+    #[cfg(target_arch = "x86_64")]
+    impl ConvertRegs for TestConvertRegs {
+        type UnwindRegs = framehop::x86_64::UnwindRegsX86_64;
+
+        fn convert_regs(regs: &[u64]) -> Option<(u64, u64, Self::UnwindRegs)> {
+            let [pc, sp, bp] = *regs else {
+                return None;
+            };
+            Some((pc, sp, Self::UnwindRegs::new(pc, sp, bp)))
+        }
+
+        fn regs_mask() -> u64 {
+            0
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    impl ConvertRegs for TestConvertRegs {
+        type UnwindRegs = framehop::aarch64::UnwindRegsAarch64;
+
+        fn convert_regs(regs: &[u64]) -> Option<(u64, u64, Self::UnwindRegs)> {
+            let [pc, sp, fp] = *regs else {
+                return None;
+            };
+            Some((pc, sp, Self::UnwindRegs::new(0, sp, fp)))
+        }
+
+        fn regs_mask() -> u64 {
+            0
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn truncated_dwarf_stack_keeps_marker_after_spliced_user_callchain() {
+        let user_regs = [0x1000, 0, 8];
+        let user_stack: Vec<_> = [0, 40, 0x2000]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect();
+        let input = StackInput {
+            code_addr: None,
+            user_regs: Some(&user_regs),
+            user_stack: Some(&user_stack),
+        };
+        let callchain_stack = [
+            StackFrame::InstructionPointer(0x1000, StackMode::User),
+            StackFrame::ReturnAddress(0x2000, StackMode::User),
+            StackFrame::ReturnAddress(0x3000, StackMode::User),
+        ];
+        let mut process_unwinder = ProcessUnwinder::default();
+        let mut stack = Vec::new();
+        let mut summary = PerfSummary::default();
+
+        build_sample_stack::<TestConvertRegs>(
+            input,
+            Priv::User,
+            &mut process_unwinder,
+            &mut stack,
+            &callchain_stack,
+            &mut summary,
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(0x1000, StackMode::User),
+                StackFrame::ReturnAddress(0x2000, StackMode::User),
+                StackFrame::ReturnAddress(0x3000, StackMode::User),
+                StackFrame::TruncatedStackMarker,
+            ]
+        );
+        assert_eq!(summary.ignored_user_callchain_frames, 2);
+        assert_eq!(
+            summary
+                .error_stats
+                .get(SampleErrorKind::NativeStackTruncated),
+            1
         );
     }
 
