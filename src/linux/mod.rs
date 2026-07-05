@@ -488,6 +488,12 @@ impl PerfRecorder {
             .any(|&active_pid| active_pid != pid)
     }
 
+    /// Return the number of processes still believed to be alive.
+    pub fn active_process_count(&mut self) -> usize {
+        self.reconcile_active_processes();
+        self.active_processes.len()
+    }
+
     /// Flush the profile file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.perf.disable();
