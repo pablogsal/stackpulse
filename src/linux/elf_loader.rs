@@ -112,11 +112,16 @@ impl<'a> ElfImageLayout<'a> {
     }
 }
 
+#[cfg(test)]
 pub fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
     use std::fs::File;
 
     let file = File::open(path)?;
-    let mmap = Arc::new(unsafe { Mmap::map(&file) }?);
+    load_elf_sections_from_file(&file, path)
+}
+
+pub fn load_elf_sections_from_file(file: &std::fs::File, path: &Path) -> Result<ElfSectionInfo> {
+    let mmap = Arc::new(unsafe { Mmap::map(file) }?);
     let bytes = &mmap[..];
 
     // Use lazy parsing rather than Elf::parse to avoid reading symbol tables

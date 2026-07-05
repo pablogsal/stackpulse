@@ -797,15 +797,11 @@ fn total_frames(stacks: &[Vec<FrameRecord>]) -> usize {
 
 fn symbolize_reader(reader: &PerfSpoolReader, symbolizer: &mut PerfSymbolizer) -> usize {
     let mut checksum = 0usize;
-    for sample in reader.samples() {
-        let raw = reader
-            .stack_frame_refs(sample.stack_id)
-            .expect("borrow synthetic stack");
+    for stack in reader.sample_stacks() {
         let mut sample_score = 0usize;
-        let frames =
-            symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |frame| {
-                sample_score = sample_score.wrapping_add(resolved_frame_score(frame));
-            });
+        let frames = symbolizer.for_each_sample_stack(stack, |frame| {
+            sample_score = sample_score.wrapping_add(resolved_frame_score(frame));
+        });
         checksum = checksum.wrapping_add(sample_score).wrapping_add(frames);
     }
     checksum

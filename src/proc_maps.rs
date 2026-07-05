@@ -1,20 +1,26 @@
 //! Parser for Linux `/proc/<pid>/maps` entries.
 
+use std::ops::Range;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Region {
-    pub start: u64,
-    pub end: u64,
+pub struct Region<'a> {
+    pub address: Range<u64>,
     pub is_executable: bool,
     pub file_offset: u64,
     pub inode: u64,
-    pub path: String,
+    pub path: &'a str,
 }
 
-pub fn parse(maps: &str) -> Vec<Region> {
-    maps.lines().filter_map(parse_line).collect()
+#[cfg(test)]
+pub fn parse(maps: &str) -> Vec<Region<'_>> {
+    parse_iter(maps).collect()
 }
 
-pub fn parse_line(line: &str) -> Option<Region> {
+pub fn parse_iter(maps: &str) -> impl Iterator<Item = Region<'_>> + '_ {
+    maps.lines().filter_map(parse_line)
+}
+
+pub fn parse_line(line: &str) -> Option<Region<'_>> {
     let mut rest = line.trim();
     if rest.is_empty() {
         return None;
@@ -34,8 +40,7 @@ pub fn parse_line(line: &str) -> Option<Region> {
     let inode = inode.parse().ok()?;
 
     Some(Region {
-        start,
-        end,
+        address: start..end,
         is_executable: perms.as_bytes().get(2).copied() == Some(b'x'),
         file_offset,
         inode,
@@ -63,8 +68,8 @@ fn next_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
     }
 }
 
-fn normalize_path(path: &str) -> String {
-    path.strip_suffix(" (deleted)").unwrap_or(path).to_owned()
+fn normalize_path(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -84,36 +89,32 @@ mod tests {
             parse(maps),
             vec![
                 Region {
-                    start: 0x00400000,
-                    end: 0x0040c000,
+                    address: 0x00400000..0x0040c000,
                     is_executable: true,
                     file_offset: 0,
                     inode: 1321238,
-                    path: "/usr/bin/cat".to_owned(),
+                    path: "/usr/bin/cat",
                 },
                 Region {
-                    start: 0x0060d000,
-                    end: 0x0062e000,
+                    address: 0x0060d000..0x0062e000,
                     is_executable: false,
                     file_offset: 0,
                     inode: 0,
-                    path: "[heap]".to_owned(),
+                    path: "[heap]",
                 },
                 Region {
-                    start: 0x7ffff672c000,
-                    end: 0x7ffff69db000,
+                    address: 0x7ffff672c000..0x7ffff69db000,
                     is_executable: false,
                     file_offset: 0x1ac2,
                     inode: 1335289,
-                    path: "/usr/lib/locale/locale-archive".to_owned(),
+                    path: "/usr/lib/locale/locale-archive",
                 },
                 Region {
-                    start: 0x7ffff5600000,
-                    end: 0x7ffff5800000,
+                    address: 0x7ffff5600000..0x7ffff5800000,
                     is_executable: false,
                     file_offset: 0,
                     inode: 0,
-                    path: String::new(),
+                    path: "",
                 },
             ]
         );

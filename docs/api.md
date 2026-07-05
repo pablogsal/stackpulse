@@ -32,9 +32,8 @@ recorder.finish()?;
 let reader = PerfSpoolReader::open("profile.spool")?;
 let mut symbolizer = PerfSymbolizer::for_spool(&reader);
 
-for sample in reader.samples() {
-    let raw = reader.stack_frame_refs(sample.stack_id)?;
-    symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |frame| {
+for stack in reader.sample_stacks() {
+    symbolizer.for_each_sample_stack(stack, |frame| {
         println!("{}", frame.func_name());
     });
 }

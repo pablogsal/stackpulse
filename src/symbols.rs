@@ -32,6 +32,7 @@ use std::rc::Rc;
 /// that shared image base (`SVMA` on Linux, `Relative` on macOS). Unresolved
 /// mappings are skipped.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct SymModule {
     /// On-disk path of the mapped object file (ELF on Linux, Mach-O on macOS).
     pub path: PathBuf,
@@ -623,11 +624,11 @@ impl SymbolizerWrapper {
         let old_layouts = sym_module_layouts_by_path(&self.modules);
         let new_layouts = sym_module_layouts_by_path(&modules);
         let new_file_identities = module_file_identities(&modules);
-        let mut evicted: Vec<PathBuf> = Vec::new();
-        for (path, old) in &old_layouts {
-            match new_layouts.get(*path) {
-                None => evicted.push((*path).to_path_buf()),
-                Some(new) if new != old => evicted.push((*path).to_path_buf()),
+        let evicted: Vec<PathBuf> = old_layouts
+            .iter()
+            .filter_map(|(path, old)| match new_layouts.get(*path) {
+                None => Some((*path).to_path_buf()),
+                Some(new) if new != old => Some((*path).to_path_buf()),
                 Some(_) => {
                     let old_identity = self
                         .module_file_identities
@@ -636,11 +637,13 @@ impl SymbolizerWrapper {
                         .unwrap_or(None);
                     let new_identity = new_file_identities.get(*path).copied().unwrap_or(None);
                     if old_identity != new_identity {
-                        evicted.push((*path).to_path_buf());
+                        Some((*path).to_path_buf())
+                    } else {
+                        None
                     }
                 }
-            }
-        }
+            })
+            .collect();
 
         #[cfg(target_os = "linux")]
         {

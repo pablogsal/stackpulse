@@ -1,5 +1,6 @@
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::linux::elf_loader;
@@ -7,11 +8,26 @@ use crate::linux::elf_types::{ElfSectionInfo, ModuleInfo};
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
-use crate::spool::ModuleRecord;
+use crate::spool::{ModulePath, ModuleRecord};
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ModuleFileKey {
+    path: ModulePath,
+    inode: u64,
+}
+
+impl From<&ModuleRecord> for ModuleFileKey {
+    fn from(module: &ModuleRecord) -> Self {
+        Self {
+            path: module.path.clone(),
+            inode: module.inode,
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ElfSectionCache {
-    by_path: FxHashMap<(crate::spool::ModulePath, u64), Option<Arc<ElfSectionInfo>>>,
+    by_path: FxHashMap<ModuleFileKey, Option<Arc<ElfSectionInfo>>>,
 }
 
 impl ElfSectionCache {
@@ -19,21 +35,19 @@ impl ElfSectionCache {
         &mut self,
         module: &ModuleRecord,
     ) -> Option<(ModuleInfo, Arc<ElfSectionInfo>)> {
-        if module.is_kernel
-            || module.path.is_empty()
-            || !Path::new(&module.path).is_file()
-            || !module_path_matches_inode(module)
-        {
+        if module.is_kernel || module.path.is_empty() || module.path.is_bracketed_mapping() {
             return None;
         }
 
         let section_info = self
             .by_path
-            .entry((module.path.clone(), module.inode))
+            .entry(ModuleFileKey::from(module))
             .or_insert_with(|| {
-                elf_loader::load_elf_sections_from_path(Path::new(&module.path))
-                    .ok()
-                    .map(Arc::new)
+                open_module_file(module).and_then(|file| {
+                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path())
+                        .ok()
+                        .map(Arc::new)
+                })
             })
             .as_ref()
             .cloned()?;
@@ -45,14 +59,25 @@ impl ElfSectionCache {
     }
 }
 
+#[cfg(test)]
 fn module_path_matches_inode(module: &ModuleRecord) -> bool {
-    module.inode == 0
-        || std::fs::metadata(module.path.as_str())
-            .is_ok_and(|metadata| metadata.ino() == module.inode)
+    open_module_file(module).is_some()
+}
+
+fn open_module_file(module: &ModuleRecord) -> Option<File> {
+    let file = File::open(module.path.as_path()).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    if module.inode != 0 && metadata.ino() != module.inode {
+        return None;
+    }
+    Some(file)
 }
 
 fn module_info_with_sections(module: &ModuleRecord, section_info: &ElfSectionInfo) -> ModuleInfo {
-    let path = PathBuf::from(module.path.as_str());
+    let path = PathBuf::from(module.path.as_path());
     let name = crate::path_to_name(&path);
     let image_base = resolve_image_base(module, section_info);
 

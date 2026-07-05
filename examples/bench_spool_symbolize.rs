@@ -32,16 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match options.mode {
             Mode::Read => {
-                let mut expanded = Vec::new();
-                for sample in reader.samples() {
-                    reader.stack_frames(sample.stack_id, &mut expanded)?;
-                    frames += expanded.len();
-                    checksum = checksum.wrapping_add(raw_frame_score(&expanded));
+                for stack in reader.sample_stacks() {
+                    frames += stack.frames.len();
+                    checksum = checksum.wrapping_add(raw_frame_score(stack.frames));
                 }
             }
             Mode::Symbolize => {
                 let mut symbolizer = PerfSymbolizer::for_spool_with_perf_maps(&reader, false);
-                symbolize_samples(&reader, &mut symbolizer, &mut frames, &mut checksum)?;
+                symbolize_samples(&reader, &mut symbolizer, &mut frames, &mut checksum);
             }
         }
     }
@@ -64,18 +62,15 @@ fn symbolize_samples(
     symbolizer: &mut PerfSymbolizer,
     frames: &mut usize,
     checksum: &mut usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for sample in reader.samples() {
-        let raw = reader.stack_frame_refs(sample.stack_id)?;
+) {
+    for stack in reader.sample_stacks() {
         let mut stack_checksum = 0_usize;
-        let count =
-            symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |frame| {
-                stack_checksum = stack_checksum.wrapping_add(resolved_frame_score(frame));
-            });
+        let count = symbolizer.for_each_sample_stack(stack, |frame| {
+            stack_checksum = stack_checksum.wrapping_add(resolved_frame_score(frame));
+        });
         *frames += count;
         *checksum = checksum.wrapping_add(stack_checksum);
     }
-    Ok(())
 }
 
 fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
@@ -118,8 +113,8 @@ fn print_usage() {
     );
 }
 
-fn raw_frame_score(frames: &[FrameRecord]) -> usize {
-    frames.iter().fold(0, |score, frame| {
+fn raw_frame_score<'a>(frames: impl IntoIterator<Item = &'a FrameRecord>) -> usize {
+    frames.into_iter().fold(0, |score, frame| {
         score
             .wrapping_add(frame.abs_ip as usize)
             .wrapping_add(frame.rel_ip as usize)

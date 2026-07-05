@@ -20,8 +20,6 @@ use stackpulse::{
 const TOP_FUNCS: usize = 10;
 const TOP_STACKS: usize = 6;
 
-// --- Colors --------------------------------------------------------------
-
 #[derive(Clone, Copy)]
 struct C(bool);
 
@@ -88,6 +86,7 @@ fn classify(frame: &ResolvedFrame) -> Kind {
             FrameKind::Native => Kind::Native,
             FrameKind::Kernel => Kind::Kernel,
             FrameKind::Unknown => Kind::Unknown,
+            _ => Kind::Unknown,
         },
     }
 }
@@ -179,8 +178,6 @@ fn paranoid_explain(v: i64) -> &'static str {
     }
 }
 
-// --- Main ----------------------------------------------------------------
-
 #[allow(clippy::cognitive_complexity)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c = C::detect();
@@ -221,7 +218,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kernel_on = recorder.summary().kernel_enabled;
     let kallsyms_visible = kallsyms_addresses_visible();
 
-    // Snapshot environment for the report later.
     let paranoid = read_sysctl_i64("/proc/sys/kernel/perf_event_paranoid");
     let kptr = read_sysctl_i64("/proc/sys/kernel/kptr_restrict");
     let exe = read_link(&format!("/proc/{pid}/exe")).unwrap_or_else(|| "?".to_string());
@@ -260,7 +256,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pct = (elapsed_ms / total_ms).min(1.0);
             let s = recorder.summary();
 
-            // bar
             let width = 24;
             let filled = (pct * width as f64).round() as usize;
             let bar = format!(
@@ -269,7 +264,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 c.dim(&"·".repeat(width - filled)),
             );
 
-            // samples/sec since last redraw
             let dt = (now - last_sample_time).as_secs_f64().max(0.001);
             let rate = (s.samples.saturating_sub(last_sample_count)) as f64 / dt;
             last_sample_count = s.samples;
@@ -305,7 +299,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let summary = recorder.finish()?;
 
-    // Aggregate.
     let reader = PerfSpoolReader::open(spool)?;
     let mut symbolizer = PerfSymbolizer::for_spool(&reader);
 
@@ -315,10 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut origin_counts: HashMap<&'static str, u64> = HashMap::new();
     let mut total_frames: u64 = 0;
 
-    for sample in reader.samples() {
-        let raw = reader.stack_frame_refs(sample.stack_id)?;
+    for stack in reader.sample_stacks() {
         let mut visible = Vec::new();
-        symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |f| {
+        symbolizer.for_each_sample_stack(stack, |f| {
             total_frames += 1;
             let origin = match f {
                 ResolvedFrame::Python(_) => "perfmap",
@@ -327,6 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     SymbolOrigin::PerfMap => "perfmap",
                     SymbolOrigin::KernelSymbols => "kallsyms",
                     SymbolOrigin::AddressOnly => "address-only",
+                    _ => "other",
                 },
             };
             *origin_counts.entry(origin).or_default() += 1;
@@ -336,7 +329,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // root → leaf, with runtime machinery filtered out, consecutive dups collapsed.
         visible.reverse();
         visible.dedup_by(|a, b| a.0 == b.0);
 
@@ -350,7 +342,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *stack_counts.entry(visible).or_default() += 1;
     }
 
-    // --- Header ---
     println!();
     println!(
         "{}",
@@ -385,7 +376,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.bold(&c.cyan("└──────────────────────────────────────────────────────"))
     );
 
-    // --- Environment block ---
     println!("\n{}", c.bold(&c.cyan("▌ Environment")));
     println!("  {} {}", c.dim_pad("exe", 14), exe);
     let cmd_short: String = cmdline
@@ -424,7 +414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if pypef {
             c.green("PYTHONPERFSUPPORT=1 in target env")
         } else {
-            c.dim("env var not set — Python frames may be missing")
+            c.dim("env var not set. Python frames may be missing")
         },
     );
 
@@ -433,7 +423,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --- Top hot functions ---
     println!("\n{}", c.bold(&c.cyan("▌ Hot functions (leaf, self time)")));
     let mut hot: Vec<_> = leaf_counts.into_iter().collect();
     hot.sort_by_key(|row| Reverse(row.1));
@@ -454,7 +443,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // --- Top stacks (vertical) ---
     println!(
         "\n{}",
         c.bold(&c.cyan("▌ Hot stacks (call chains, runtime hidden)"))
@@ -488,10 +476,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- Diagnostics ---
     println!("\n{}", c.bold(&c.cyan("▌ Diagnostics")));
 
-    // Sample disposition.
     let written = summary.samples;
     let raw_events = summary.sample_events;
     println!(
@@ -508,7 +494,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // Skip-counter detail (only show non-zero).
     let skips: &[(&str, u64)] = &[
         ("missing_pid", summary.missing_pid_samples),
         ("missing_tid", summary.missing_tid_samples),
@@ -529,7 +514,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} {}", c.dim_pad("skip counters", 22), parts.join("  "));
     }
 
-    // Resolution breakdown by SymbolOrigin.
     if total_frames > 0 {
         let mut origins: Vec<_> = origin_counts.iter().collect();
         origins.sort_by_key(|(_, n)| Reverse(**n));
@@ -555,7 +539,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Module / exec counts.
     println!(
         "  {} modules={}  exec markers={}",
         c.dim_pad("recording state", 22),
@@ -563,12 +546,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.bold(&reader.process_execs().len().to_string()),
     );
 
-    // SampleErrorStats detail.
     if summary.error_stats.has_errors() {
         let mut report = String::new();
         ErrorStatsFormatter::new(&summary.error_stats, raw_events, written)
             .write_to(&mut report)?;
-        // Reindent each line under the diagnostics section.
         let indented: String = report
             .lines()
             .map(|l| format!("    {l}"))
@@ -578,7 +559,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", c.dim(&indented));
     }
 
-    // --- Legend ---
     if c.0 {
         println!(
             "\n  {}  {} python   native   {} kernel   {} unknown",
@@ -589,7 +569,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // --- Warnings ---
     let mut warned = false;
     let mut warn = |msg: String| {
         if !warned {
@@ -616,7 +595,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !kernel_on {
         warn("kernel sampling was denied; recording fell back to user-only frames.".to_string());
     }
-    // `fun_<offset>` hint — only emit when we actually have such frames.
     let address_only_count: u64 = stacks
         .iter()
         .filter(|(frames, _)| frames.iter().any(|(n, _)| n.starts_with("fun_")))
@@ -624,7 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     if address_only_count > 0 {
         warn(format!(
-            "{} sample(s) contain {} frames — that's the address-only fallback when ELF/debug info is missing. Install matching -dbg packages or build with the {} feature.",
+            "{} sample(s) contain {} frames. That's the address-only fallback when ELF/debug info is missing. Install matching -dbg packages or build with the {} feature.",
             c.bold(&address_only_count.to_string()),
             c.dim("fun_<offset>"),
             c.dim("debuginfod"),

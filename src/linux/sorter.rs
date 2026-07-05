@@ -95,6 +95,21 @@ impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
     pub fn force_pop(&mut self) -> Option<V> {
         self.heap.pop().map(|x| x.value)
     }
+
+    pub fn push_current_group(&mut self, key: K, value: V) {
+        let group = self
+            .current_group
+            .clone()
+            .expect("begin_group must be called before insertion");
+        let sequence = take_sequence(&mut self.next_sequence);
+        self.heap.push(EventHeapItem {
+            group,
+            round: self.round,
+            key,
+            sequence,
+            value,
+        });
+    }
 }
 
 impl<G: Clone + Ord, K: Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
@@ -106,8 +121,7 @@ impl<G: Clone + Ord, K: Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
         let round = self.round;
         let mut next_sequence = self.next_sequence;
         self.heap.extend(iter.into_iter().map(|(key, value)| {
-            let sequence = next_sequence;
-            next_sequence = next_sequence.saturating_add(1);
+            let sequence = take_sequence(&mut next_sequence);
             EventHeapItem {
                 group: group.clone(),
                 round,
@@ -118,6 +132,14 @@ impl<G: Clone + Ord, K: Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
         }));
         self.next_sequence = next_sequence;
     }
+}
+
+fn take_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence
+        .checked_add(1)
+        .expect("event sorter sequence exhausted");
+    sequence
 }
 
 #[cfg(test)]

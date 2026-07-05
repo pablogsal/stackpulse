@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -116,7 +117,9 @@ impl SuspendedLaunchedProcess {
             }
         }
 
-        Ok(RunningProcess { pid: self.pid })
+        Ok(RunningProcess {
+            pid: Cell::new(Some(self.pid)),
+        })
     }
 
     /// Executed in the forked child process. This function never returns.
@@ -154,9 +157,17 @@ impl SuspendedLaunchedProcess {
     }
 }
 
-/// Reap `pid`, retrying only while interrupted by a signal.
+fn waitpid_retry(pid: Pid, flags: Option<WaitPidFlag>) -> nix::Result<WaitStatus> {
+    loop {
+        match waitpid(pid, flags) {
+            Err(Errno::EINTR) => {}
+            result => return result,
+        }
+    }
+}
+
 fn reap(pid: Pid) {
-    while let Err(Errno::EINTR) = waitpid(pid, None) {}
+    let _ = waitpid_retry(pid, None);
 }
 
 impl Drop for SuspendedLaunchedProcess {
@@ -179,22 +190,41 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 }
 
 /// A launched process that is now running.
+#[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
-    pid: Pid,
+    pid: Cell<Option<Pid>>,
 }
 
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
-    pub fn try_wait(&self) -> Result<Option<WaitStatus>, Errno> {
-        Ok(match waitpid(self.pid, Some(WaitPidFlag::WNOHANG))? {
-            WaitStatus::StillAlive => None,
-            s => Some(s),
-        })
+    pub fn try_wait(&self) -> io::Result<Option<WaitStatus>> {
+        let Some(pid) = self.pid.get() else {
+            return Ok(None);
+        };
+        match waitpid_retry(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => Ok(None),
+            Ok(status) => {
+                self.pid.set(None);
+                Ok(Some(status))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Wait until the process exits.
-    pub fn wait(self) -> Result<WaitStatus, Errno> {
-        waitpid(self.pid, None)
+    pub fn wait(self) -> io::Result<WaitStatus> {
+        let Some(pid) = self.pid.replace(None) else {
+            return Err(io::Error::other("process was already waited"));
+        };
+        waitpid_retry(pid, None).map_err(Into::into)
+    }
+}
+
+impl Drop for RunningProcess {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.get() {
+            let _ = waitpid_retry(pid, Some(WaitPidFlag::WNOHANG));
+        }
     }
 }
 

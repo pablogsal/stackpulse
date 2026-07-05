@@ -40,10 +40,9 @@ fn record(pid: u32) -> stackpulse::Result<()> {
     let reader = PerfSpoolReader::open("profile.spool")?;
     let mut symbolizer = PerfSymbolizer::for_spool(&reader);
 
-    for sample in reader.samples().iter().take(10) {
-        let raw = reader.stack_frame_refs(sample.stack_id)?;
-        println!("pid={} tid={}", sample.process_id, sample.thread_id);
-        symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |f| {
+    for stack in reader.sample_stacks().take(10) {
+        println!("pid={} tid={}", stack.sample.process_id, stack.sample.thread_id);
+        symbolizer.for_each_sample_stack(stack, |f| {
             println!("  {}", f.func_name());
         });
     }
@@ -125,10 +124,9 @@ let reader = PerfSpoolReader::open("profile.spool")?;
 let mut symbolizer = PerfSymbolizer::for_spool(&reader);
 let mut counts = BTreeMap::<String, u64>::new();
 
-for sample in reader.samples() {
-    let raw = reader.stack_frame_refs(sample.stack_id)?;
+for stack in reader.sample_stacks() {
     let mut names = Vec::new();
-    symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |f| {
+    symbolizer.for_each_sample_stack(stack, |f| {
         names.push(f.func_name());
     });
     let key = names.join(";");

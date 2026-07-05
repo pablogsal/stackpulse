@@ -127,9 +127,8 @@ One symbolizer per profile, reused for every sample:
 let reader = stackpulse::PerfSpoolReader::open("profile.spool")?;
 let mut symbolizer = stackpulse::PerfSymbolizer::for_spool(&reader);
 
-for sample in reader.samples() {
-    let raw = reader.stack_frame_refs(sample.stack_id)?;
-    symbolizer.for_each_resolved_frame(sample.process_id, sample.stack_id, raw, |frame| {
+for stack in reader.sample_stacks() {
+    symbolizer.for_each_sample_stack(stack, |frame| {
         // render or aggregate
         let _ = frame.func_name();
     });
@@ -138,7 +137,7 @@ for sample in reader.samples() {
 # }
 ```
 
-`for_each_resolved_frame` streams borrowed frames straight out of the
+`for_each_sample_stack` streams borrowed frames straight out of the
 symbolizer's cache. It only stores compact frame ids per repeated
 `(process_id, stack_id)`, so callers that render or aggregate inline never
 pay for materializing a full resolved-stack `Vec`.
@@ -225,6 +224,10 @@ let mut symbolizer = stackpulse::PerfSymbolizer::with_perf_map_processes(
 );
 # }
 ```
+
+`PerfSymbolizer::for_spool_with_recorded_python_perf_maps(reader)` is a
+broader convenience helper: it allows any PID that was ever marked as a Python
+runtime in the spool.
 
 Or skip perf maps entirely:
 

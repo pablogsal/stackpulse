@@ -134,10 +134,22 @@ pub fn kill_process(pid: i32) -> io::Result<()> {
 }
 
 fn send_signal(pid: i32, signal: libc::c_int) -> io::Result<()> {
+    validate_signal_pid(pid)?;
     let rc = unsafe { libc::kill(pid, signal) };
     if rc == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+fn validate_signal_pid(pid: i32) -> io::Result<()> {
+    if pid > 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid must identify a single process: {pid}"),
+        ))
     }
 }

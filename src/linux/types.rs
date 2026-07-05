@@ -9,7 +9,7 @@ pub enum StackMode {
 impl From<Priv> for StackMode {
     fn from(privilege: Priv) -> Self {
         match privilege {
-            Priv::Kernel | Priv::GuestKernel => Self::Kernel,
+            Priv::Kernel | Priv::Hv | Priv::GuestKernel => Self::Kernel,
             _ => Self::User,
         }
     }

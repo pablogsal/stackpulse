@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -18,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::ElfSectionCache;
 use crate::spool::{
-    self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader,
+    self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader, SampleStack,
     SpoolFrameModuleContexts, StackFrameRefs,
 };
 
@@ -33,9 +34,10 @@ pub struct PerfSymbolizer {
     perf_map_cache: FxHashMap<i32, Option<Vec<PerfMapSymbol>>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
-    frame_cache: FxHashMap<(i32, FrameCacheKey), Box<[usize]>>,
+    frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
     resolved_frames: Vec<ResolvedFrame>,
-    stack_cache: FxHashMap<(i32, u32), Box<[usize]>>,
+    resolved_stack_frame_ids: Vec<usize>,
+    stack_cache: FxHashMap<(i32, u32), Range<usize>>,
     native_factory: NativeSymbolizerFactory,
 }
 
@@ -264,51 +266,68 @@ impl PerfSymbolizer {
             spool_frame_contexts: None,
             frame_cache: FxHashMap::default(),
             resolved_frames: Vec::new(),
+            resolved_stack_frame_ids: Vec::new(),
             stack_cache: FxHashMap::default(),
             native_factory,
         }
     }
 
-    /// Resolve borrowed raw frames and visit each resolved frame without
-    /// materializing a resolved stack.
-    ///
-    /// This is the hot path for profile aggregation: resolved frames are owned
-    /// by the symbolizer's frame cache and borrowed only for the callback.
-    pub fn for_each_resolved_frame(
+    fn for_each_resolved_frame(
         &mut self,
         process_id: i32,
         stack_id: u32,
-        mut frames: StackFrameRefs<'_>,
+        frames: StackFrameRefs<'_>,
         mut visit: impl FnMut(&ResolvedFrame),
     ) -> usize {
         let cache_key = (process_id, stack_id);
         if let Some(frame_ids) = self.stack_cache.get(&cache_key) {
-            for &frame_id in frame_ids.iter() {
+            for &frame_id in &self.resolved_stack_frame_ids[frame_ids.clone()] {
                 visit(&self.resolved_frames[frame_id]);
             }
-            return frame_ids.len();
+            return frame_ids.end - frame_ids.start;
         }
 
-        let mut frame_ids = Vec::with_capacity(frames.len());
-        while let Some((frame_id, frame)) = frames.next_with_id() {
+        let start = self.resolved_stack_frame_ids.len();
+        let mut frames = frames;
+        while let Some(frame_ref) = frames.next_with_id() {
             let resolved_ids = self.resolve_cached_frame_ids(
                 process_id,
-                frame,
-                FrameCacheKey::Spool(frame_id),
-                Some(frame_id),
+                frame_ref.frame,
+                FrameCacheKey::Spool(frame_ref.id),
+                Some(frame_ref.id),
             );
-            for frame_id in resolved_ids.iter().copied() {
+            for frame_id in resolved_ids {
                 visit(&self.resolved_frames[frame_id]);
-                frame_ids.push(frame_id);
+                self.resolved_stack_frame_ids.push(frame_id);
             }
         }
-        let count = frame_ids.len();
-        self.stack_cache
-            .insert(cache_key, frame_ids.into_boxed_slice());
+        let frame_ids = start..self.resolved_stack_frame_ids.len();
+        let count = frame_ids.end - frame_ids.start;
+        self.stack_cache.insert(cache_key, frame_ids);
         count
     }
 
-    #[doc(hidden)]
+    /// Resolve one borrowed [`SampleStack`] and visit each resolved frame.
+    pub fn for_each_sample_stack(
+        &mut self,
+        stack: SampleStack<'_>,
+        visit: impl FnMut(&ResolvedFrame),
+    ) -> usize {
+        self.for_each_resolved_frame(
+            stack.sample.process_id,
+            stack.sample.stack_id,
+            stack.frames,
+            visit,
+        )
+    }
+
+    /// Resolve a raw frame slice and visit each resolved frame without
+    /// materializing a resolved stack.
+    ///
+    /// Use [`Self::for_each_sample_stack`] when frames come from a
+    /// [`PerfSpoolReader`], because spool-backed resolution can use recorded
+    /// module context for moduleless frames. This slice method is useful for
+    /// synthetic stacks, examples, and callers that already own raw frames.
     pub fn for_each_resolved_frame_slice(
         &mut self,
         process_id: i32,
@@ -319,7 +338,7 @@ impl PerfSymbolizer {
         for frame in frames {
             let resolved_ids =
                 self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None);
-            for frame_id in resolved_ids.iter().copied() {
+            for frame_id in resolved_ids {
                 visit(&self.resolved_frames[frame_id]);
                 count += 1;
             }
@@ -329,9 +348,9 @@ impl PerfSymbolizer {
 
     #[cfg(test)]
     fn resolve_cached_frame_ref(&mut self, process_id: i32, frame: &FrameRecord) -> &ResolvedFrame {
-        let frame_id =
-            self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None)[0];
-        &self.resolved_frames[frame_id]
+        let frame_ids =
+            self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None);
+        &self.resolved_frames[frame_ids.start]
     }
 
     fn resolve_cached_frame_ids(
@@ -340,22 +359,15 @@ impl PerfSymbolizer {
         frame: &FrameRecord,
         cache_key: FrameCacheKey,
         spool_frame_id: Option<u32>,
-    ) -> Box<[usize]> {
+    ) -> Range<usize> {
         let cache_key = (process_id, cache_key);
         if let Some(frame_ids) = self.frame_cache.get(&cache_key) {
             return frame_ids.clone();
         }
-        let frame_ids = self
-            .resolve_frames(process_id, frame, spool_frame_id)
-            .into_vec()
-            .into_iter()
-            .map(|resolved| {
-                let frame_id = self.resolved_frames.len();
-                self.resolved_frames.push(resolved);
-                frame_id
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let frames = self.resolve_frames(process_id, frame, spool_frame_id);
+        let start = self.resolved_frames.len();
+        self.resolved_frames.extend(frames);
+        let frame_ids = start..self.resolved_frames.len();
         self.frame_cache.insert(cache_key, frame_ids.clone());
         frame_ids
     }
@@ -363,7 +375,6 @@ impl PerfSymbolizer {
     #[cfg(test)]
     fn resolve_frame(&mut self, process_id: i32, frame: &FrameRecord) -> ResolvedFrame {
         self.resolve_frames(process_id, frame, None)
-            .into_vec()
             .into_iter()
             .next()
             .expect("frame resolution returns at least one frame")
@@ -374,7 +385,7 @@ impl PerfSymbolizer {
         process_id: i32,
         frame: &FrameRecord,
         spool_frame_id: Option<u32>,
-    ) -> Box<[ResolvedFrame]> {
+    ) -> Vec<ResolvedFrame> {
         if let Some(module) = frame
             .module_id
             .and_then(|module_id| self.modules.get(module_id as usize))
@@ -384,8 +395,7 @@ impl PerfSymbolizer {
                 .resolve_native_frames(frame, Some((module.clone(), frame.rel_ip)))
                 .into_iter()
                 .map(ResolvedFrame::Native)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+                .collect();
         }
 
         let perf_map_symbol =
@@ -406,19 +416,16 @@ impl PerfSymbolizer {
                     .resolve_native_frames(frame, Some(module))
                     .into_iter()
                     .map(ResolvedFrame::Native)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                    .collect();
             }
 
-            return vec![perf_map_symbol_to_frame(process_id, frame.abs_ip, symbol)]
-                .into_boxed_slice();
+            return vec![perf_map_symbol_to_frame(process_id, frame.abs_ip, symbol)];
         }
         let module = self.owned_module_for_frame(process_id, frame, spool_frame_id);
         self.resolve_native_frames(frame, module)
             .into_iter()
             .map(ResolvedFrame::Native)
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
+            .collect()
     }
 
     fn owned_module_for_frame(
@@ -839,10 +846,11 @@ fn load_sparse_kernel_symbols(addresses: impl IntoIterator<Item = u64>) -> Kerne
     if addresses.is_empty() {
         return KernelSymbolTable::Sparse(Arc::from([]));
     }
+    let addresses: Arc<[u64]> = Arc::from(addresses.into_boxed_slice());
 
     let cache_key = SparseKernelSymbolCacheKey {
         kernel_id: running_kernel_cache_id(),
-        addresses: Arc::from(addresses.clone().into_boxed_slice()),
+        addresses: Arc::clone(&addresses),
     };
     if let Ok(cache) = sparse_kernel_symbol_cache().lock() {
         if let Some(symbols) = cache.get(&cache_key) {

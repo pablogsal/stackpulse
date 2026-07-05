@@ -99,9 +99,8 @@ record references.
 | `frames()` | Interned raw frame records. Useful for precomputing symbolization caches. |
 | `samples()` | Timestamped samples. |
 | `process_execs()` | Process exec markers, including Python runtime on/off. |
+| `recovered_from_truncated_tail()` | Whether the spool ended mid-record and the reader kept only the intact prefix. |
 | `kernel_frame_addresses()` | Iterator over absolute kernel IPs in interned frames. Used by [`PerfSymbolizer::for_spool`] for sparse `kallsyms` loading. |
-| `module_for_frame(pid, frame)` | Recorded module context for a raw frame, without symbolizing. |
-| `frame_context(pid, frame)` | Raw frame plus optional module context. |
 | `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`]s for an interned stack without copying. |
 | `stack_frame_contexts(pid, stack_id)` | Borrow raw frames with recorded module context for an interned stack. |
 | `sample_stacks()` | Iterate samples with borrowed raw stacks. |
@@ -132,7 +131,11 @@ requires.
 | `module_id` | Matched module, when known. |
 | `rel_ip` | Module-relative address. |
 | `abs_ip` | Absolute IP. |
-| `mode` | [`FrameMode::User`] or [`FrameMode::Kernel`]. |
+| `mode` | [`FrameMode::User`], [`FrameMode::Kernel`], or [`FrameMode::TruncatedStackMarker`]. |
+
+`FrameRecord::truncated_stack_marker()` creates the sentinel written when
+native unwinding stopped before the stack root. Use
+`FrameRecord::is_truncated_stack_marker()` to detect it in raw-frame workflows.
 
 ### [`OwnedSampleRecord`]
 
@@ -162,9 +165,16 @@ Resolves raw frames into displayable ones. One per profile, reused.
 | `new(modules)` | Default: ELF, kernel symbols, plus Python perf maps for any PID. |
 | `for_spool(reader)` | Create a symbolizer for a loaded spool, including sparse kernel-symbol loading. |
 | `for_spool_with_perf_maps(reader, allow)` | Same as `for_spool`, but explicitly enable or disable Python perf maps. |
+| `for_spool_with_recorded_python_perf_maps(reader)` | Allow perf maps for PIDs ever recorded as Python runtimes in the spool. |
 | `with_perf_maps(modules, allow)` | Globally enable or disable perf-map lookup. |
 | `with_perf_map_processes(modules, pids)` | Allow perf maps only for the listed PIDs. |
-| `for_each_resolved_frame(pid, stack_id, frames, visit)` | Resolve borrowed raw frames and stream borrowed resolved frames to `visit`. |
+| `for_each_sample_stack(stack, visit)` | Resolve a [`SampleStack`] from `sample_stacks()` and stream borrowed resolved frames to `visit`. |
+| `for_each_resolved_frame_slice(pid, frames, visit)` | Resolve a caller-supplied raw-frame slice and stream borrowed resolved frames to `visit`. |
+
+`for_spool_with_recorded_python_perf_maps` is intentionally broader than a
+"last observed as Python" filter: a PID remains allowed if it was ever marked
+as a Python runtime in the spool. Use `with_perf_map_processes` for stricter
+PID-reuse handling.
 
 Resolution order, top to bottom:
 
@@ -218,10 +228,20 @@ like `is_eval_frame` and `should_ignore`.
 | --- | --- |
 | [`FrameKind`] | `Python`, `Native`, `Kernel`, `Unknown` |
 | [`SymbolOrigin`] | `Elf`, `PerfMap`, `KernelSymbols`, `AddressOnly` |
-| [`FrameFlags`] | `PYTHON_RUNTIME`, `HIDDEN_DEFAULT`, `JIT` |
+| [`FrameFlags`] | `PYTHON_RUNTIME`, `HIDDEN_DEFAULT`, `JIT`, `TRUNCATED_STACK` |
 
 UIs typically hide `HIDDEN_DEFAULT`, badge `JIT`, group by [`FrameKind`], and
 expose [`SymbolOrigin`] in a details view.
+
+## Feature flags
+
+| Feature | Effect |
+| --- | --- |
+| `debuginfod` | Enables the default native symbolizer to query debuginfod when `DEBUGINFOD_URLS` is set. |
+
+`STACKPULSE_DEBUG_DIRS` overrides local debug-file search roots. With
+`debuginfod`, `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod cache
+directory.
 
 ## Process launch and liveness
 

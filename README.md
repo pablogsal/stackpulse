@@ -29,6 +29,8 @@ In practice the flow is:
 Record briefly, then read back one stack:
 
 ```rust
+use std::time::{Duration, Instant};
+
 use stackpulse::{
     AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
 };
@@ -47,23 +49,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    rec.wait()?;
-    rec.consume_available()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && rec.process_is_active(pid as i32) {
+        rec.wait()?;
+        rec.consume_available()?;
+    }
     rec.finish()?;
 
     let reader = PerfSpoolReader::open("profile.spool")?;
     let mut symbols = PerfSymbolizer::for_spool(&reader);
 
-    if let Some(sample) = reader.samples().first() {
-        let raw_frames = reader.stack_frame_refs(sample.stack_id)?;
-        symbols.for_each_resolved_frame(
-            sample.process_id,
-            sample.stack_id,
-            raw_frames,
-            |frame| {
-                println!("{}", frame.func_name());
-            },
-        );
+    if let Some(stack) = reader.sample_stacks().next() {
+        symbols.for_each_sample_stack(stack, |frame| {
+            println!("{}", frame.func_name());
+        });
     }
 
     Ok(())
@@ -95,6 +94,13 @@ You can pass extra cargo flags through `CARGO_FLAGS`:
 make test CARGO_FLAGS="--features debuginfod"
 make coverage CARGO_FLAGS="--features debuginfod"
 ```
+
+## Feature flags
+
+`debuginfod` enables debuginfod lookup in the default native symbolizer when
+`DEBUGINFOD_URLS` is set. `STACKPULSE_DEBUG_DIRS` overrides local debug-file
+search roots, and `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod
+cache directory.
 
 ## Notes
 

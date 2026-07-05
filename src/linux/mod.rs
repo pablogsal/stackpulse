@@ -1,4 +1,5 @@
 mod convert_regs;
+mod cpu;
 pub(crate) mod elf_loader;
 pub(crate) mod elf_types;
 pub(crate) mod perf_event;
@@ -30,7 +31,8 @@ use crate::native_module::ElfSectionCache;
 use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
 use convert_regs::ConvertRegs;
 use perf_event::{
-    CallChainEntry, CallChainRef, EventRecord, EventRef, EventSource, SampleRecordRef,
+    CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource,
+    SampleRecordRef,
 };
 pub use perf_group::AttachMode;
 use perf_group::PerfGroupOptions;
@@ -336,20 +338,20 @@ impl PerfRecorder {
                         0,
                         pid_i32,
                     ) {
-                        self.perf.resume_stopped_processes();
+                        self.rollback_open_process(pid);
                         return Err(err);
                     }
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    self.perf.resume_stopped_processes();
+                    self.rollback_open_process(pid);
                     return Err(err);
                 }
             }
         }
         if attach_mode == AttachMode::StopAttachEnableResume {
             if let Err(err) = self.perf.enable() {
-                self.perf.resume_stopped_processes();
+                self.rollback_open_process(pid);
                 return Err(err);
             }
         }
@@ -407,6 +409,22 @@ impl PerfRecorder {
         self.active_processes
             .entry(pid)
             .or_insert_with(|| try_new_exit_watcher(pid));
+    }
+
+    fn rollback_open_process(&mut self, pid: u32) {
+        self.perf.resume_stopped_processes();
+        self.perf.remove_process(pid);
+        if let Some(pid) = i32_from_u32(pid) {
+            let _ = cleanup_process(
+                pid,
+                &mut self.modules,
+                &mut self.unwinders,
+                &mut self.writer,
+                &mut self.active_processes,
+                &mut self.python_perf_support_processes,
+                &mut self.python_runtime_processes,
+            );
+        }
     }
 }
 
@@ -576,11 +594,11 @@ fn cleanup_process(
     python_perf_support_processes: &mut FxHashMap<i32, bool>,
     python_runtime_processes: &mut FxHashSet<i32>,
 ) -> io::Result<()> {
-    cleanup_process_modules(pid, modules, unwinders, writer)?;
+    let result = cleanup_process_modules(pid, modules, unwinders, writer);
     active_processes.remove(&pid);
     python_perf_support_processes.remove(&pid);
     python_runtime_processes.remove(&pid);
-    Ok(())
+    result
 }
 
 fn cleanup_process_modules<W: std::io::Write>(
@@ -624,17 +642,23 @@ fn process_has_python_perf_support_env(pid: u32) -> bool {
 }
 
 fn cmdline_has_python_perf_support(cmdline: &[u8]) -> bool {
-    let args: Vec<_> = cmdline
+    let mut args = cmdline
         .split(|byte| *byte == 0)
         .filter(|arg| !arg.is_empty())
-        .collect();
-    args.iter().enumerate().any(|(index, arg)| {
-        *arg == b"-Xperf"
-            || (*arg == b"-X"
-                && args
-                    .get(index + 1)
-                    .is_some_and(|next| *next == b"perf" || next.starts_with(b"perf,")))
-    })
+        .peekable();
+    while let Some(arg) = args.next() {
+        if arg == b"-Xperf" {
+            return true;
+        }
+        if arg == b"-X"
+            && args
+                .peek()
+                .is_some_and(|next| *next == b"perf" || next.starts_with(b"perf,"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn process_has_python_perf_support(
@@ -691,7 +715,7 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     let Some(pid) = i32_from_u32(mmap.task.pid) else {
         return Ok(());
     };
-    if !is_python_runtime_path(&c_string_to_string(&mmap.file)) {
+    if !c_string_is_python_runtime_path(&mmap.file) {
         return Ok(());
     }
     if process_has_python_perf_support(mmap.task.pid, python_perf_support_processes) {
@@ -731,6 +755,59 @@ enum SampleCallChain<'a> {
     None,
     Owned(&'a [CallChain]),
     Borrowed(CallChainRef<'a>),
+}
+
+enum SampleCallChainIter<'a> {
+    None,
+    Owned(std::slice::Iter<'a, CallChain>),
+    Borrowed(CallChainIter<'a>),
+}
+
+impl<'a> SampleCallChain<'a> {
+    fn iter(self) -> SampleCallChainIter<'a> {
+        match self {
+            SampleCallChain::None => SampleCallChainIter::None,
+            SampleCallChain::Owned(chains) => SampleCallChainIter::Owned(chains.iter()),
+            SampleCallChain::Borrowed(chains) => SampleCallChainIter::Borrowed(chains.iter()),
+        }
+    }
+}
+
+impl<'a> Iterator for SampleCallChainIter<'a> {
+    type Item = (StackMode, &'a [u64]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            SampleCallChainIter::None => None,
+            SampleCallChainIter::Owned(chains) => {
+                for chain in chains {
+                    let entry = match chain {
+                        CallChain::Kernel(addresses)
+                        | CallChain::Hv(addresses)
+                        | CallChain::GuestKernel(addresses) => {
+                            (StackMode::Kernel, addresses.as_slice())
+                        }
+                        CallChain::User(addresses)
+                        | CallChain::Guest(addresses)
+                        | CallChain::GuestUser(addresses)
+                        | CallChain::Unknown(addresses) => (StackMode::User, addresses.as_slice()),
+                        CallChain::UserDeferred { .. } => continue,
+                    };
+                    return Some(entry);
+                }
+                None
+            }
+            SampleCallChainIter::Borrowed(chains) => chains.next().map(|chain| match chain {
+                CallChainEntry::Kernel(addresses)
+                | CallChainEntry::Hv(addresses)
+                | CallChainEntry::GuestKernel(addresses) => (StackMode::Kernel, addresses),
+                CallChainEntry::User(addresses)
+                | CallChainEntry::Guest(addresses)
+                | CallChainEntry::GuestUser(addresses)
+                | CallChainEntry::Unknown(addresses) => (StackMode::User, addresses),
+            }),
+        }
+    }
 }
 
 impl<'a> SampleView<'a> {
@@ -947,7 +1024,7 @@ fn mmap_is_executable(mmap: &Mmap) -> bool {
 }
 
 fn add_unwind_module(unwinders: &mut FxHashMap<i32, ProcessUnwinder>, module: &ModuleRecord) {
-    if module.is_kernel || !Path::new(&module.path).is_file() {
+    if module.is_kernel || module.path.is_bracketed_mapping() {
         return;
     }
     let process_unwinder = unwinders.entry(module.process_id).or_default();
@@ -1004,11 +1081,10 @@ fn register_existing_maps<W: std::io::Write>(
 ) -> io::Result<bool> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
     let mut saw_python_runtime = false;
-    for region in crate::proc_maps::parse(&maps)
-        .into_iter()
-        .filter(|r| r.is_executable && !r.path.is_empty())
+    for region in
+        crate::proc_maps::parse_iter(&maps).filter(|r| r.is_executable && !r.path.is_empty())
     {
-        saw_python_runtime |= is_python_runtime_path(&region.path);
+        saw_python_runtime |= is_python_runtime_path(region.path);
         record_module(
             modules,
             unwinders,
@@ -1016,8 +1092,8 @@ fn register_existing_maps<W: std::io::Write>(
             ModuleRecord {
                 id: 0,
                 process_id: pid as i32,
-                start: region.start,
-                end: region.end,
+                start: region.address.start,
+                end: region.address.end,
                 file_offset: region.file_offset,
                 path: region.path.into(),
                 is_kernel: false,
@@ -1029,10 +1105,21 @@ fn register_existing_maps<W: std::io::Write>(
 }
 
 fn is_python_runtime_path(path: &str) -> bool {
-    Path::new(path)
-        .file_name()
+    path_basename_is_python_module(std::path::Path::new(path))
+}
+
+fn path_basename_is_python_module(path: &std::path::Path) -> bool {
+    path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(crate::is_python_module)
+}
+
+fn c_string_is_python_runtime_path(path: &std::ffi::CString) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    path_basename_is_python_module(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        path.as_bytes(),
+    )))
 }
 
 fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
@@ -1066,12 +1153,14 @@ fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::Un
     match (sample.user_regs, user_stack) {
         (Some(raw_regs), Some(user_stack)) => {
             if let Some((pc, sp, regs)) = C::convert_regs(raw_regs) {
+                let (user_stack_words, _) = user_stack.as_chunks::<8>();
                 let mut read_stack = |addr: u64| {
                     let index = addr
                         .checked_sub(sp)
+                        .filter(|offset| offset % 8 == 0)
                         .and_then(|offset| usize::try_from(offset / 8).ok())
                         .ok_or(())?;
-                    read_stack_u64(user_stack, index)
+                    read_stack_u64(user_stack_words, index)
                 };
 
                 let mut frames = process_unwinder.unwinder.iter_frames(
@@ -1188,51 +1277,9 @@ fn stack_frame_address(frame: StackFrame) -> Option<u64> {
 }
 
 fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackFrame>) {
-    match call_chain {
-        SampleCallChain::None => {}
-        SampleCallChain::Owned(chains) => {
-            for chain in chains {
-                let (mode, addresses) = match chain {
-                    CallChain::Kernel(addresses)
-                    | CallChain::Hv(addresses)
-                    | CallChain::GuestKernel(addresses) => {
-                        (StackMode::Kernel, addresses.as_slice())
-                    }
-                    CallChain::User(addresses)
-                    | CallChain::Guest(addresses)
-                    | CallChain::GuestUser(addresses)
-                    | CallChain::Unknown(addresses) => (StackMode::User, addresses.as_slice()),
-                    CallChain::UserDeferred { .. } => continue,
-                };
-                let first_address_is_instruction_pointer = stack.is_empty();
-                push_callchain_addresses(
-                    mode,
-                    addresses,
-                    first_address_is_instruction_pointer,
-                    stack,
-                );
-            }
-        }
-        SampleCallChain::Borrowed(chains) => {
-            for chain in chains.iter() {
-                let (mode, addresses) = match chain {
-                    CallChainEntry::Kernel(addresses)
-                    | CallChainEntry::Hv(addresses)
-                    | CallChainEntry::GuestKernel(addresses) => (StackMode::Kernel, addresses),
-                    CallChainEntry::User(addresses)
-                    | CallChainEntry::Guest(addresses)
-                    | CallChainEntry::GuestUser(addresses)
-                    | CallChainEntry::Unknown(addresses) => (StackMode::User, addresses),
-                };
-                let first_address_is_instruction_pointer = stack.is_empty();
-                push_callchain_addresses(
-                    mode,
-                    addresses,
-                    first_address_is_instruction_pointer,
-                    stack,
-                );
-            }
-        }
+    for (mode, addresses) in call_chain.iter() {
+        let first_address_is_instruction_pointer = stack.is_empty();
+        push_callchain_addresses(mode, addresses, first_address_is_instruction_pointer, stack);
     }
 }
 
@@ -1251,12 +1298,8 @@ fn push_callchain_addresses(
     }
 }
 
-fn read_stack_u64(stack: &[u8], index: usize) -> Result<u64, ()> {
-    let offset = index.checked_mul(std::mem::size_of::<u64>()).ok_or(())?;
-    let bytes = stack
-        .get(offset..offset + std::mem::size_of::<u64>())
-        .ok_or(())?;
-    Ok(u64::from_ne_bytes(bytes.try_into().map_err(|_| ())?))
+fn read_stack_u64(stack: &[[u8; 8]], index: usize) -> Result<u64, ()> {
+    stack.get(index).copied().map(u64::from_ne_bytes).ok_or(())
 }
 
 fn resolve_stack_frame(

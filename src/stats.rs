@@ -132,7 +132,9 @@ impl SampleErrorStats {
     /// repeated failures of the same kind collapse to ~1 log per second.
     pub fn record_with_log(&self, kind: SampleErrorKind, context: impl FnOnce() -> String) {
         self.record(kind);
-        if self.should_log(kind) {
+        if tracing::enabled!(target: "stackpulse::sampler::error", tracing::Level::DEBUG)
+            && self.should_log(kind)
+        {
             tracing::debug!(
                 target: "stackpulse::sampler::error",
                 kind = %kind,
@@ -191,6 +193,10 @@ impl SampleErrorStats {
     pub fn reset(&self) {
         for counter in &self.counts {
             counter.store(0, Ordering::Relaxed);
+        }
+        match self.last_logged.lock() {
+            Ok(mut guard) => guard.fill(None),
+            Err(poisoned) => poisoned.into_inner().fill(None),
         }
     }
 }

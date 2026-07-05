@@ -4,6 +4,7 @@ use bitflags::bitflags;
 
 /// High-level frame category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FrameKind {
     /// Python frame.
     Python,
@@ -17,6 +18,7 @@ pub enum FrameKind {
 
 /// Where a symbol name came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SymbolOrigin {
     /// File-backed symbol information.
     Elf,
@@ -164,7 +166,7 @@ pub struct NativeSymbol {
     /// Byte offset of the instruction within its enclosing function.
     ///
     /// `0` for fallback pseudo-symbols whose [`Self::name`] already embeds an
-    /// address (`module+0x…`, `[kernel]+0x…`). For inline expansions the
+    /// address (`module+0x...`, `[kernel]+0x...`). For inline expansions the
     /// offset is relative to the outermost function's start.
     pub offset: u64,
     /// Nesting depth for inline expansions: `0` is the outermost enclosing

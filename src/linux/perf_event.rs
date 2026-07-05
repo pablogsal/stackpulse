@@ -133,12 +133,11 @@ impl PerfOptions {
         let opts = self.perf_open_opts();
         let counter = self.open_counter(&opts)?;
         let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
-        let fd = counter.file().as_raw_fd();
 
         let perf = Perf {
             counter,
             sampler,
-            fd,
+            target: self.pid,
             inherit: self.inherit,
         };
         Ok(perf)
@@ -240,7 +239,7 @@ fn ring_buffer_page_exp(stack_size: u32) -> io::Result<u8> {
 pub struct Perf {
     counter: Counter,
     sampler: Sampler,
-    fd: RawFd,
+    target: u32,
     inherit: TaskInheritance,
 }
 
@@ -255,7 +254,12 @@ impl Perf {
 
     #[inline]
     pub fn fd(&self) -> RawFd {
-        self.fd
+        self.counter.file().as_raw_fd()
+    }
+
+    #[inline]
+    pub fn target(&self) -> u32 {
+        self.target
     }
 
     #[inline]
@@ -263,12 +267,11 @@ impl Perf {
         self.inherit
     }
 
-    pub fn consume_owned_events(&self, cb: &mut impl FnMut(OwnedEventRecord)) {
+    pub fn owned_events(&self) -> impl Iterator<Item = OwnedEventRecord> + '_ {
         let mut iter = self.sampler.iter().into_cow();
-        while iter
-            .next(|chunk, parser| cb(OwnedEventRecord::new(chunk, parser.as_unsafe())))
-            .is_some()
-        {}
+        std::iter::from_fn(move || {
+            iter.next(|chunk, parser| OwnedEventRecord::new(chunk, parser.as_unsafe()))
+        })
     }
 }
 
@@ -284,13 +287,11 @@ pub enum EventRecord<'a> {
 }
 
 pub enum OwnedEventRecord {
-    // Samples keep the raw bytes and are re-read zero-copy at dispatch.
     Sample {
         record: AlignedPerfRecord,
         parser: UnsafeParser,
         time: Option<u64>,
     },
-    // Everything else is parsed exactly once, at construction.
     Parsed {
         privilege: Priv,
         record: Record,
@@ -300,24 +301,24 @@ pub enum OwnedEventRecord {
 
 impl OwnedEventRecord {
     fn new(chunk: CowChunk<'_>, parser: &UnsafeParser) -> Self {
-        // Build the aligned copy first, then read from it: the raw chunk can
-        // be unaligned after a ring-buffer wrap, but the parser requires
-        // 8-byte alignment.
-        let record = AlignedPerfRecord::from_bytes(chunk.as_bytes());
-        match parse_sample_record(record.as_bytes(), parser).map(|(_, sample)| sample.time) {
-            Some(time) => Self::Sample {
-                record,
+        let bytes = chunk.as_bytes();
+        if PerfRecordHeader::from_bytes(bytes)
+            .is_some_and(|header| header.is_sample() && header.matches_len(bytes))
+        {
+            let time = parse_sample_timestamp(bytes, parser);
+            return Self::Sample {
+                record: AlignedPerfRecord::from_chunk(chunk),
                 parser: parser.clone(),
                 time,
-            },
-            None => {
-                let (privilege, record, _) = unsafe { parser.parse(record.as_bytes()) };
-                Self::Parsed {
-                    privilege,
-                    time: record_timestamp(&record),
-                    record,
-                }
-            }
+            };
+        }
+
+        let (privilege, record) = parse_event_record_from_chunk(chunk, parser)
+            .expect("perf record bytes should be aligned and sized");
+        Self::Parsed {
+            privilege,
+            time: record_timestamp(&record),
+            record,
         }
     }
 
@@ -477,6 +478,27 @@ fn record_timestamp(record: &Record) -> Option<u64> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PerfRecordHeader {
+    record_type: u32,
+    misc: u16,
+    size: usize,
+}
+
+impl PerfRecordHeader {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        ByteCursor::new(bytes).read_record_header()
+    }
+
+    fn is_sample(self) -> bool {
+        self.record_type == sys::PERF_RECORD_SAMPLE
+    }
+
+    fn matches_len(self, bytes: &[u8]) -> bool {
+        self.size == bytes.len()
+    }
+}
+
 fn dispatch_event_bytes(bytes: &[u8], parser: &UnsafeParser, cb: &mut impl FnMut(EventRef<'_>)) {
     if let Some((privilege, sample)) = parse_sample_record(bytes, parser) {
         cb(EventRef {
@@ -487,8 +509,29 @@ fn dispatch_event_bytes(bytes: &[u8], parser: &UnsafeParser, cb: &mut impl FnMut
         return;
     }
 
+    if let Some((privilege, record)) = parse_aligned_event_record(bytes, parser) {
+        cb(EventRef::new(privilege, record));
+    }
+}
+
+fn parse_event_record_from_chunk(
+    chunk: CowChunk<'_>,
+    parser: &UnsafeParser,
+) -> Option<(Priv, Record)> {
+    let bytes = chunk.as_bytes();
+    if let Some(record) = parse_aligned_event_record(bytes, parser) {
+        return Some(record);
+    }
+    let record = AlignedPerfRecord::from_chunk(chunk);
+    parse_aligned_event_record(record.as_bytes(), parser)
+}
+
+fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
+    if !is_u64_aligned(bytes) || !PerfRecordHeader::from_bytes(bytes)?.matches_len(bytes) {
+        return None;
+    }
     let (privilege, record, _) = unsafe { parser.parse(bytes) };
-    cb(EventRef::new(privilege, record));
+    Some((privilege, record))
 }
 
 fn parse_sample_record<'a>(
@@ -499,8 +542,12 @@ fn parse_sample_record<'a>(
         return None;
     }
     let mut cursor = ByteCursor::new(bytes);
-    let misc = read_sample_header(&mut cursor)?;
+    let header = read_sample_header(&mut cursor)?;
+    let misc = header.misc;
     let sample_type = parser.sample_type;
+    if !sample_type_supported(sample_type) {
+        return None;
+    }
     let mut sample = SampleRecordRef {
         task: None,
         time: None,
@@ -513,15 +560,52 @@ fn parse_sample_record<'a>(
     parse_common_sample_fields(sample_type, misc, &mut cursor, &mut sample)?;
     skip_sample_fields(sample_type, &mut cursor)?;
     parse_stack_sample_fields(sample_type, parser, &mut cursor, &mut sample)?;
+    if !cursor.is_finished() {
+        return None;
+    }
 
     Some((priv_from_misc(misc), sample))
 }
 
-fn read_sample_header(cursor: &mut ByteCursor<'_>) -> Option<u16> {
-    let record_type = cursor.read_u32()?;
-    let misc = cursor.read_u16()?;
-    let _size = cursor.read_u16()?;
-    (record_type == sys::PERF_RECORD_SAMPLE).then_some(misc)
+fn parse_sample_timestamp(bytes: &[u8], parser: &UnsafeParser) -> Option<u64> {
+    let mut cursor = ByteCursor::new(bytes);
+    let header = read_sample_header(&mut cursor)?;
+    let sample_type = parser.sample_type;
+    if !sample_type_supported(sample_type) {
+        return None;
+    }
+    let mut sample = SampleRecordRef {
+        task: None,
+        time: None,
+        code_addr: None,
+        user_regs: None,
+        user_stack: None,
+        call_chain: None,
+    };
+    parse_common_sample_fields(sample_type, header.misc, &mut cursor, &mut sample)?;
+    sample.time
+}
+
+fn read_sample_header(cursor: &mut ByteCursor<'_>) -> Option<PerfRecordHeader> {
+    let header = cursor.read_record_header()?;
+    (header.is_sample() && header.matches_len(cursor.bytes)).then_some(header)
+}
+
+fn sample_type_supported(sample_type: u64) -> bool {
+    const SUPPORTED_SAMPLE_TYPE: u64 = sys::PERF_SAMPLE_IP as u64
+        | sys::PERF_SAMPLE_TID as u64
+        | sys::PERF_SAMPLE_TIME as u64
+        | sys::PERF_SAMPLE_ADDR as u64
+        | sys::PERF_SAMPLE_ID as u64
+        | sys::PERF_SAMPLE_STREAM_ID as u64
+        | sys::PERF_SAMPLE_CPU as u64
+        | sys::PERF_SAMPLE_PERIOD as u64
+        | sys::PERF_SAMPLE_CALLCHAIN as u64
+        | sys::PERF_SAMPLE_RAW as u64
+        | sys::PERF_SAMPLE_REGS_USER as u64
+        | sys::PERF_SAMPLE_STACK_USER as u64;
+
+    sample_type & !SUPPORTED_SAMPLE_TYPE == 0
 }
 
 fn parse_common_sample_fields<'a>(
@@ -787,26 +871,63 @@ pub(crate) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) 
     checksum
 }
 
+enum AlignedPerfRecordStorage {
+    Bytes(Vec<u8>),
+    Words(Vec<u64>),
+}
+
 pub(crate) struct AlignedPerfRecord {
-    words: Vec<u64>,
+    storage: AlignedPerfRecordStorage,
     len: usize,
 }
 
 impl AlignedPerfRecord {
+    fn from_chunk(chunk: CowChunk<'_>) -> Self {
+        Self::from_vec(chunk.into_owned())
+    }
+
     fn from_bytes(bytes: &[u8]) -> Self {
+        Self::from_vec(bytes.to_vec())
+    }
+
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        if is_u64_aligned(&bytes) {
+            return Self {
+                len: bytes.len(),
+                storage: AlignedPerfRecordStorage::Bytes(bytes),
+            };
+        }
+        Self::from_unaligned_bytes(&bytes)
+    }
+
+    fn from_unaligned_bytes(bytes: &[u8]) -> Self {
         let mut words = vec![0_u64; bytes.len().div_ceil(size_of::<u64>())];
-        // The parser intentionally consumes u64-aligned perf record bytes.
         let aligned_bytes =
             unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8) };
         aligned_bytes[..bytes.len()].copy_from_slice(bytes);
         Self {
-            words,
             len: bytes.len(),
+            storage: AlignedPerfRecordStorage::Words(words),
         }
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
+        match &self.storage {
+            AlignedPerfRecordStorage::Bytes(bytes) => bytes,
+            AlignedPerfRecordStorage::Words(words) => unsafe {
+                slice::from_raw_parts(words.as_ptr().cast::<u8>(), self.len)
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        match &mut self.storage {
+            AlignedPerfRecordStorage::Bytes(bytes) => bytes,
+            AlignedPerfRecordStorage::Words(words) => unsafe {
+                slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8)
+            },
+        }
     }
 
     fn len(&self) -> usize {
@@ -912,6 +1033,10 @@ impl<'a> ByteCursor<'a> {
         Self { bytes, offset: 0 }
     }
 
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
     fn read_u16(&mut self) -> Option<u16> {
         self.read_array().map(u16::from_ne_bytes)
     }
@@ -922,6 +1047,14 @@ impl<'a> ByteCursor<'a> {
 
     fn read_u64(&mut self) -> Option<u64> {
         self.read_array().map(u64::from_ne_bytes)
+    }
+
+    fn read_record_header(&mut self) -> Option<PerfRecordHeader> {
+        Some(PerfRecordHeader {
+            record_type: self.read_u32()?,
+            misc: self.read_u16()?,
+            size: usize::from(self.read_u16()?),
+        })
     }
 
     fn read_u64_slice(&mut self, len: usize) -> Option<&'a [u64]> {
@@ -994,12 +1127,7 @@ mod tests {
 
     fn set_dynamic_stack_size(record: &mut AlignedPerfRecord, dyn_len: u64) {
         let len = record.len();
-        let bytes = unsafe {
-            slice::from_raw_parts_mut(
-                record.words.as_mut_ptr().cast::<u8>(),
-                record.words.len() * size_of::<u64>(),
-            )
-        };
+        let bytes = record.as_mut_bytes();
         bytes[len - size_of::<u64>()..len].copy_from_slice(&dyn_len.to_ne_bytes());
     }
 

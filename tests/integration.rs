@@ -617,21 +617,13 @@ fn finish_recording(
 fn resolve_stacks(reader: &PerfSpoolReader) -> io::Result<Vec<ResolvedSampleStack>> {
     let mut symbolizer = PerfSymbolizer::for_spool(reader);
     let mut stacks = Vec::new();
-    for sample in reader.samples() {
-        let raw_frames = reader.stack_frame_refs(sample.stack_id)?;
+    for stack in reader.sample_stacks() {
+        let process_id = stack.sample.process_id;
         let mut frames = Vec::new();
-        symbolizer.for_each_resolved_frame(
-            sample.process_id,
-            sample.stack_id,
-            raw_frames,
-            |frame| {
-                frames.push(resolve_test_frame(frame));
-            },
-        );
-        stacks.push(ResolvedSampleStack {
-            process_id: sample.process_id,
-            frames,
+        symbolizer.for_each_sample_stack(stack, |frame| {
+            frames.push(resolve_test_frame(frame));
         });
+        stacks.push(ResolvedSampleStack { process_id, frames });
     }
     Ok(stacks)
 }
@@ -1258,6 +1250,9 @@ impl PidGuard {
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
+        if self.pid <= 0 {
+            return;
+        }
         unsafe {
             libc::kill(self.pid, libc::SIGKILL);
         }

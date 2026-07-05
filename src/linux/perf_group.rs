@@ -8,6 +8,7 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::cpu::{online_cpu_ids, thread_perf_event_capacity};
 use super::perf_event::{
     EventRef, EventSource, OwnedEventRecord, Perf, PerfOptions, TaskInheritance,
 };
@@ -190,7 +191,9 @@ impl PerfGroup {
             inheriting_threads.push(pid);
         }
         for &tid in &threads {
-            if let Some(thread_perfs) = self.open_thread_perfs(tid, per_thread_only, attach_mode)? {
+            if let Some(thread_perfs) =
+                self.open_thread_perfs(tid, &cpu_ids, per_thread_only, attach_mode)?
+            {
                 if thread_perfs.inherits {
                     inheriting_threads.push(tid);
                 }
@@ -240,9 +243,12 @@ impl PerfGroup {
         let mut tracked_threads = Vec::with_capacity(new_threads.len());
         let mut inheriting_threads = Vec::new();
         for tid in new_threads {
-            if let Some(thread_perfs) =
-                self.open_thread_perfs(tid, per_thread_only, AttachMode::StopAttachEnableResume)?
-            {
+            if let Some(thread_perfs) = self.open_thread_perfs(
+                tid,
+                &cpu_ids,
+                per_thread_only,
+                AttachMode::StopAttachEnableResume,
+            )? {
                 if thread_perfs.inherits {
                     inheriting_threads.push(tid);
                 }
@@ -264,7 +270,8 @@ impl PerfGroup {
             return Ok(());
         }
 
-        let cpu_count = online_cpu_ids().len().max(1);
+        let cpu_ids = online_cpu_ids();
+        let cpu_count = cpu_ids.len().max(1);
         let task_count = self
             .tracked_threads
             .len()
@@ -292,9 +299,12 @@ impl PerfGroup {
                 continue;
             }
 
-            if let Some(thread_perfs) =
-                self.open_thread_perfs(tid, per_thread_only, AttachMode::StopAttachEnableResume)?
-            {
+            if let Some(thread_perfs) = self.open_thread_perfs(
+                tid,
+                &cpu_ids,
+                per_thread_only,
+                AttachMode::StopAttachEnableResume,
+            )? {
                 if thread_perfs.inherits {
                     inheriting_threads.insert(tid);
                 }
@@ -328,6 +338,7 @@ impl PerfGroup {
                 Ok(()) => {
                     if let Err(err) = self.enable() {
                         self.resume_stopped_processes();
+                        self.remove_process(pid);
                         return Err(err);
                     }
                 }
@@ -344,13 +355,33 @@ impl PerfGroup {
         self.inheriting_threads.remove(&tid);
     }
 
+    pub fn remove_process(&mut self, pid: u32) {
+        let mut tids: FxHashSet<u32> = self
+            .tracked_threads
+            .iter()
+            .filter_map(|(&tid, &owner)| (owner == pid).then_some(tid))
+            .collect();
+        tids.insert(pid);
+
+        let fds_to_remove: Vec<_> = self
+            .members
+            .iter()
+            .filter_map(|(&fd, member)| tids.contains(&member.perf.target()).then_some(fd))
+            .collect();
+        for fd in fds_to_remove {
+            self.remove_member_fd(fd);
+        }
+        self.tracked_threads.retain(|_, owner| *owner != pid);
+        self.inheriting_threads.retain(|tid| !tids.contains(tid));
+    }
+
     fn open_thread_perfs(
         &self,
         tid: u32,
+        cpu_ids: &[u32],
         per_thread_only: bool,
         attach_mode: AttachMode,
     ) -> io::Result<Option<ThreadPerfEvents>> {
-        let cpu_ids = online_cpu_ids();
         let mut perf_events = ThreadPerfEvents::with_capacity(thread_perf_event_capacity(
             cpu_ids.len(),
             1,
@@ -364,7 +395,7 @@ impl PerfGroup {
             };
             perf_events.push(perf);
         } else {
-            for cpu in cpu_ids {
+            for &cpu in cpu_ids {
                 let Some(perf) = self.try_open_thread_perf(
                     tid,
                     Some(cpu),
@@ -533,12 +564,11 @@ impl PerfGroup {
         for (&fd, member) in &mut self.members {
             self.event_sorter.begin_group(fd);
             let mut consumed_record = false;
-            let mut events = Vec::new();
-            member.perf.consume_owned_events(&mut |event| {
+            for event in member.perf.owned_events() {
                 consumed_record = true;
-                events.push((event.timestamp().unwrap_or(0), event));
-            });
-            self.event_sorter.extend(events);
+                self.event_sorter
+                    .push_current_group(event.timestamp().unwrap_or(0), event);
+            }
             while let Some(event) = self.event_sorter.pop() {
                 event.dispatch(cb);
             }
@@ -568,56 +598,9 @@ fn perf_event_count_is_large(cpu_count: usize, task_count: usize) -> bool {
     cpu_count.saturating_mul(task_count) >= LARGE_PERF_EVENT_COUNT
 }
 
-#[must_use]
-fn online_cpu_ids() -> Vec<u32> {
-    fs::read_to_string("/sys/devices/system/cpu/online")
-        .ok()
-        .and_then(|list| parse_cpu_list(list.trim()))
-        .filter(|ids| !ids.is_empty())
-        .unwrap_or_else(fallback_cpu_ids)
-}
-
-fn parse_cpu_list(list: &str) -> Option<Vec<u32>> {
-    let mut cpus = Vec::new();
-    for part in list
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        if let Some((start, end)) = part.split_once('-') {
-            let start = start.parse::<u32>().ok()?;
-            let end = end.parse::<u32>().ok()?;
-            if start > end {
-                return None;
-            }
-            cpus.extend(start..=end);
-        } else {
-            cpus.push(part.parse::<u32>().ok()?);
-        }
-    }
-    (!cpus.is_empty()).then_some(cpus)
-}
-
-fn fallback_cpu_ids() -> Vec<u32> {
-    let cpu_count = std::thread::available_parallelism().map_or(1, usize::from);
-    (0..cpu_count as u32).collect()
-}
-
-#[must_use]
-fn thread_perf_event_capacity(
-    cpu_count: usize,
-    thread_count: usize,
-    per_thread_only: bool,
-) -> usize {
-    if per_thread_only {
-        thread_count
-    } else {
-        cpu_count.saturating_mul(thread_count)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
 

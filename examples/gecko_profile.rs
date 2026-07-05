@@ -29,7 +29,7 @@ use fxprof_processed_profile::{
 };
 use stackpulse::process::SuspendedLaunchedProcess;
 use stackpulse::{
-    AttachMode, FrameKind, FrameMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
+    AttachMode, FrameFlags, FrameKind, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
     PerfSummary, PerfSymbolizer, ResolvedFrame,
 };
 
@@ -163,7 +163,7 @@ fn record_until_exit(
         }
         recorder.consume_available()?;
         if !main_exited {
-            main_exited = running.try_wait().map_err(io::Error::from)?.is_some();
+            main_exited = running.try_wait()?.is_some();
         }
         if !main_exited {
             continue;
@@ -207,7 +207,8 @@ fn build_profile(
     );
 
     let mut symbolizer = PerfSymbolizer::for_spool(reader);
-    for sample in reader.samples() {
+    for stack in reader.sample_stacks() {
+        let sample = stack.sample;
         let timestamp_ns = sample.timestamp_ns.saturating_sub(first_sample_ns);
         let timestamp = Timestamp::from_nanos_since_reference(timestamp_ns);
         let (thread, cpu_delta) = {
@@ -227,19 +228,17 @@ fn build_profile(
         };
 
         let mut frames = Vec::new();
-        for raw_frame in reader.stack_frame_refs(sample.stack_id)? {
-            if raw_frame.mode == FrameMode::TruncatedStackMarker {
+        symbolizer.for_each_sample_stack(stack, |frame| {
+            if matches!(
+                frame,
+                ResolvedFrame::Native(native)
+                    if native.flags.contains(FrameFlags::TRUNCATED_STACK)
+            ) {
                 frames.push(GeckoFrame::TruncatedStack);
             } else {
-                symbolizer.for_each_resolved_frame_slice(
-                    sample.process_id,
-                    std::slice::from_ref(raw_frame),
-                    |frame| {
-                        frames.push(GeckoFrame::Resolved(frame.clone()));
-                    },
-                );
+                frames.push(GeckoFrame::Resolved(frame.clone()));
             }
-        }
+        });
         let stack = stack_handle_for_frames(
             &mut profile,
             thread,
@@ -382,6 +381,7 @@ fn category_for_frame(frame: &GeckoFrame, categories: Categories) -> CategoryPai
             FrameKind::Native => categories.native,
             FrameKind::Kernel => categories.kernel,
             FrameKind::Unknown => categories.other,
+            _ => categories.other,
         },
         GeckoFrame::Resolved(ResolvedFrame::Python(_)) => categories.python,
     }
