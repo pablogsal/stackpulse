@@ -1204,6 +1204,29 @@ mod tests {
     }
 
     #[test]
+    fn owned_event_from_record_bytes_dispatches_sample() {
+        let spec = stack_sample_spec(16);
+        let batch = BenchSampleBatch::new(spec);
+        let event = batch.owned_event(&batch.records()[0]);
+
+        assert_eq!(event.timestamp(), Some(1_700_000_000_000_000));
+
+        let mut task = None;
+        event.dispatch(&mut |event| {
+            let (privilege, record) = event.into_parts();
+            let EventRecord::Sample(sample) = record else {
+                panic!("expected sample record");
+            };
+            assert!(matches!(privilege, Priv::User));
+            task = sample.task;
+        });
+
+        let task = task.expect("sample task");
+        assert_eq!(task.pid, 1234);
+        assert_eq!(task.tid, 1234);
+    }
+
+    #[test]
     fn sample_parser_rejects_invalid_dynamic_stack_size() {
         let spec = stack_sample_spec(16);
         let parser = stack_sample_parser(spec.user_regs);
