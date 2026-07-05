@@ -1,11 +1,18 @@
-use std::collections::VecDeque;
+//! Resolves stack frames recorded in perf spool files into displayable profile
+//! frames.
+//!
+//! Spool records mostly contain process ids, raw instruction pointers (program
+//! counters), and module mappings, not final symbol names. This module chooses
+//! the symbol source for each frame: Python perf maps for JIT frames, ELF/native
+//! symbolizers for user-space modules, and the kernel submodule for kernel
+//! addresses. The rest of the crate consumes resolved frames without needing to
+//! know which backend produced each symbol.
+
 use std::fs;
-use std::io::{self, BufRead};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
-
-use memchr::memchr;
+#[cfg(test)]
+use std::sync::Arc;
 
 use crate::profile::{
     FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
@@ -22,6 +29,12 @@ use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader, SampleStack,
     SpoolFrameModuleContexts, StackFrameRefs,
 };
+
+mod kernel;
+pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
+#[cfg(test)]
+use kernel::KernelSymbol;
+use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 
 /// Resolves raw profile frames into displayable frames.
 pub struct PerfSymbolizer {
@@ -55,67 +68,6 @@ impl From<bool> for PerfMapProcesses {
             Self::All
         } else {
             Self::Pids(FxHashSet::default())
-        }
-    }
-}
-
-#[derive(Clone)]
-struct KernelSymbol {
-    address: u64,
-    name: String,
-    module: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KernelSymbolName<'a> {
-    name: &'a [u8],
-    module: Option<&'a [u8]>,
-}
-
-struct ResolvedKernelSymbol {
-    name: String,
-    module: String,
-    // Byte offset of the instruction within the resolved kernel function.
-    offset: u64,
-}
-
-#[derive(Clone)]
-enum KernelSymbolTable {
-    Full(Arc<[KernelSymbol]>),
-    Sparse(Arc<[(u64, KernelSymbol)]>),
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SparseKernelSymbolCacheKey {
-    kernel_id: Arc<str>,
-    addresses: Arc<[u64]>,
-}
-
-/// Process-global cache of sparse kernel symbol lookups, bounded FIFO. Hits
-/// only happen for byte-identical kernel address sets (same spool reopened),
-/// so a small capacity covers the useful cases while keeping long-running
-/// services that open many distinct profiles from accumulating dead entries.
-#[derive(Default)]
-struct SparseKernelSymbolCache {
-    entries: FxHashMap<SparseKernelSymbolCacheKey, Arc<[(u64, KernelSymbol)]>>,
-    insertion_order: VecDeque<SparseKernelSymbolCacheKey>,
-}
-
-const SPARSE_KERNEL_SYMBOL_CACHE_CAP: usize = 16;
-
-impl SparseKernelSymbolCache {
-    fn get(&self, key: &SparseKernelSymbolCacheKey) -> Option<Arc<[(u64, KernelSymbol)]>> {
-        self.entries.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: SparseKernelSymbolCacheKey, value: Arc<[(u64, KernelSymbol)]>) {
-        if self.entries.insert(key.clone(), value).is_none() {
-            self.insertion_order.push_back(key);
-            if self.insertion_order.len() > SPARSE_KERNEL_SYMBOL_CACHE_CAP {
-                if let Some(oldest) = self.insertion_order.pop_front() {
-                    self.entries.remove(&oldest);
-                }
-            }
         }
     }
 }
@@ -243,8 +195,10 @@ impl PerfSymbolizer {
             perf_map_processes,
             native_factory,
         );
-        symbolizer.kernel_symbols =
-            Some(load_sparse_kernel_symbols(reader.kernel_frame_addresses()));
+        symbolizer.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
+            reader.kernel_frame_addresses(),
+            reader.modules(),
+        ));
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
         symbolizer
     }
@@ -657,17 +611,8 @@ impl PerfSymbolizer {
     fn resolve_kernel(&mut self, abs_ip: u64) -> Option<ResolvedKernelSymbol> {
         let symbols = self
             .kernel_symbols
-            .get_or_insert_with(load_shared_kernel_symbols);
-        let symbol = find_kernel_symbol_in_table(symbols, abs_ip)?;
-        let offset = abs_ip.saturating_sub(symbol.address);
-        Some(ResolvedKernelSymbol {
-            name: format_symbol(&symbol.name, offset),
-            module: symbol
-                .module
-                .clone()
-                .unwrap_or_else(|| "[kernel]".to_owned()),
-            offset,
-        })
+            .get_or_insert_with(kernel::load_shared_kernel_symbols);
+        kernel::resolve_kernel_symbol(symbols, abs_ip)
     }
 
     fn perf_maps_allowed_for(&self, process_id: i32) -> bool {
@@ -703,28 +648,6 @@ impl NativeSymbolizerGroup {
 
 fn ranges_overlap(left: &std::ops::Range<u64>, right: &std::ops::Range<u64>) -> bool {
     left.start < right.end && right.start < left.end
-}
-
-fn format_symbol(name: &str, offset: u64) -> String {
-    if offset == 0 {
-        name.to_owned()
-    } else {
-        format!("{name}+0x{offset:x}")
-    }
-}
-
-fn find_kernel_symbol(symbols: &[KernelSymbol], address: u64) -> Option<&KernelSymbol> {
-    symbols[..symbols.partition_point(|s| s.address <= address)].last()
-}
-
-fn find_kernel_symbol_in_table(symbols: &KernelSymbolTable, address: u64) -> Option<&KernelSymbol> {
-    match symbols {
-        KernelSymbolTable::Full(symbols) => find_kernel_symbol(symbols, address),
-        KernelSymbolTable::Sparse(symbols) => symbols
-            .binary_search_by_key(&address, |(address, _)| *address)
-            .ok()
-            .map(|idx| &symbols[idx].1),
-    }
 }
 
 fn find_perf_map_symbol(symbols: &[PerfMapSymbol], address: u64) -> Option<&PerfMapSymbol> {
@@ -804,402 +727,6 @@ fn module_display_name(path: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
-}
-
-fn load_kernel_symbols() -> io::Result<Vec<KernelSymbol>> {
-    let data = fs::read("/proc/kallsyms")?;
-    Ok(parse_kernel_symbols(&data))
-}
-
-/// Warn once, process-wide, when kernel symbolization is unavailable, from
-/// whichever kallsyms load path (full or sparse) hits the problem first.
-fn warn_kallsyms_unusable(err: Option<&io::Error>) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| match err {
-        Some(err) => tracing::warn!(
-            "Failed to read /proc/kallsyms: {err}; kernel frames will not be symbolized"
-        ),
-        None => tracing::warn!(
-            "No usable kernel symbols in /proc/kallsyms (kptr_restrict or perf_event_paranoid may hide addresses); kernel frames will not be symbolized"
-        ),
-    });
-}
-
-fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
-    let mut symbols = Vec::new();
-    let mut text_addr = None;
-
-    for (address, name) in KallSymIter::new(data) {
-        if should_include_kernel_symbol(&mut text_addr, address, name) {
-            symbols.push(kernel_symbol_from_name(address, name));
-        }
-    }
-    symbols.sort_by_key(|s| s.address);
-    symbols.dedup_by_key(|s| s.address);
-    symbols
-}
-
-fn load_sparse_kernel_symbols(addresses: impl IntoIterator<Item = u64>) -> KernelSymbolTable {
-    let mut addresses: Vec<_> = addresses.into_iter().collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    if addresses.is_empty() {
-        return KernelSymbolTable::Sparse(Arc::from([]));
-    }
-    let addresses: Arc<[u64]> = Arc::from(addresses.into_boxed_slice());
-
-    let cache_key = SparseKernelSymbolCacheKey {
-        kernel_id: running_kernel_cache_id(),
-        addresses: Arc::clone(&addresses),
-    };
-    if let Ok(cache) = sparse_kernel_symbol_cache().lock() {
-        if let Some(symbols) = cache.get(&cache_key) {
-            return KernelSymbolTable::Sparse(symbols);
-        }
-    }
-
-    let symbols = match load_sparse_kernel_symbols_from_file(&addresses) {
-        Ok(symbols) => symbols,
-        Err(err) => {
-            warn_kallsyms_unusable(Some(&err));
-            return KernelSymbolTable::Sparse(Arc::from([]));
-        }
-    };
-    if symbols.is_empty() {
-        warn_kallsyms_unusable(None);
-    }
-    let symbols = Arc::from(symbols.into_boxed_slice());
-    if let Ok(mut cache) = sparse_kernel_symbol_cache().lock() {
-        cache.insert(cache_key, Arc::clone(&symbols));
-    }
-    KernelSymbolTable::Sparse(symbols)
-}
-
-fn sparse_kernel_symbol_cache() -> &'static Mutex<SparseKernelSymbolCache> {
-    static CACHE: OnceLock<Mutex<SparseKernelSymbolCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(SparseKernelSymbolCache::default()))
-}
-
-fn running_kernel_cache_id() -> Arc<str> {
-    static CACHE_ID: OnceLock<Arc<str>> = OnceLock::new();
-    Arc::clone(CACHE_ID.get_or_init(|| {
-        fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| "unknown".to_owned())
-            .into()
-    }))
-}
-
-fn load_sparse_kernel_symbols_from_file(
-    requested_addresses: &[u64],
-) -> io::Result<Vec<(u64, KernelSymbol)>> {
-    let file = fs::File::open("/proc/kallsyms")?;
-    let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
-    match parse_sparse_kernel_symbols_sorted_streaming(&mut reader, requested_addresses)? {
-        Some(symbols) => Ok(symbols),
-        None => fs::read("/proc/kallsyms")
-            .map(|data| parse_sparse_kernel_symbols_unsorted(&data, requested_addresses)),
-    }
-}
-
-/// In-memory entry point for benches and tests. Drives the same streaming
-/// sorted scanner the production load path uses, falling back to the unsorted
-/// parser when the data is detected to be out of order.
-fn parse_sparse_kernel_symbols(
-    data: &[u8],
-    requested_addresses: &[u64],
-) -> Vec<(u64, KernelSymbol)> {
-    match parse_sparse_kernel_symbols_sorted_streaming(
-        &mut io::Cursor::new(data),
-        requested_addresses,
-    ) {
-        Ok(Some(symbols)) => symbols,
-        _ => parse_sparse_kernel_symbols_unsorted(data, requested_addresses),
-    }
-}
-
-pub(crate) fn bench_parse_sparse_kernel_symbols(
-    data: &[u8],
-    requested_addresses: &[u64],
-    rounds: u64,
-) -> usize {
-    let mut checksum = 0usize;
-    for _ in 0..rounds {
-        let symbols = parse_sparse_kernel_symbols(data, requested_addresses);
-        for (requested, symbol) in symbols {
-            checksum = checksum
-                .wrapping_add(requested as usize)
-                .wrapping_add(symbol.address as usize)
-                .wrapping_add(symbol.name.len());
-        }
-    }
-    checksum
-}
-
-fn parse_sparse_kernel_symbols_unsorted(
-    data: &[u8],
-    requested_addresses: &[u64],
-) -> Vec<(u64, KernelSymbol)> {
-    let symbols = parse_kernel_symbols(data);
-    requested_addresses
-        .iter()
-        .filter_map(|&address| {
-            find_kernel_symbol(&symbols, address)
-                .cloned()
-                .map(|symbol| (address, symbol))
-        })
-        .collect()
-}
-
-fn parse_sparse_kernel_symbols_sorted_streaming(
-    reader: &mut impl BufRead,
-    requested_addresses: &[u64],
-) -> io::Result<Option<Vec<(u64, KernelSymbol)>>> {
-    let mut scan = SparseKernelSymbolScan::new(requested_addresses);
-    let mut carry = Vec::new();
-
-    loop {
-        let mut consumed = 0;
-        let mut unsorted = false;
-        {
-            let buffer = reader.fill_buf()?;
-            if buffer.is_empty() {
-                if !carry.is_empty() {
-                    match scan.process_line(&carry) {
-                        SparseScanState::Continue => {}
-                        SparseScanState::Unsorted => return Ok(None),
-                    }
-                }
-                return Ok(Some(scan.finish()));
-            }
-
-            while consumed < buffer.len() {
-                let tail = &buffer[consumed..];
-                let Some(newline) = memchr(b'\n', tail) else {
-                    carry.extend_from_slice(tail);
-                    consumed = buffer.len();
-                    break;
-                };
-                let line_end = consumed + newline + 1;
-                let state = if carry.is_empty() {
-                    scan.process_line(&buffer[consumed..line_end])
-                } else {
-                    carry.extend_from_slice(&buffer[consumed..line_end]);
-                    let state = scan.process_line(&carry);
-                    carry.clear();
-                    state
-                };
-                consumed = line_end;
-                if let SparseScanState::Unsorted = state {
-                    unsorted = true;
-                    break;
-                }
-            }
-        }
-        reader.consume(consumed);
-        if unsorted {
-            return Ok(None);
-        }
-    }
-}
-
-struct SparseKernelSymbolScan<'a> {
-    requested_addresses: &'a [u64],
-    result: Vec<(u64, KernelSymbol)>,
-    request_idx: usize,
-    text_addr: Option<u64>,
-    last_address: Option<u64>,
-    last_symbol: Option<KernelSymbol>,
-}
-
-enum SparseScanState {
-    Continue,
-    Unsorted,
-}
-
-impl<'a> SparseKernelSymbolScan<'a> {
-    fn new(requested_addresses: &'a [u64]) -> Self {
-        Self {
-            requested_addresses,
-            result: Vec::with_capacity(requested_addresses.len()),
-            request_idx: 0,
-            text_addr: None,
-            last_address: None,
-            last_symbol: None,
-        }
-    }
-
-    fn process_line(&mut self, line: &[u8]) -> SparseScanState {
-        let Some((address, name)) = parse_kernel_symbol_line_bytes(line) else {
-            return SparseScanState::Continue;
-        };
-        if !should_include_kernel_symbol(&mut self.text_addr, address, name) {
-            return SparseScanState::Continue;
-        }
-        if self.last_address.is_some_and(|last| address < last) {
-            return SparseScanState::Unsorted;
-        }
-        self.last_address = Some(address);
-
-        while self.request_idx < self.requested_addresses.len()
-            && self.requested_addresses[self.request_idx] < address
-        {
-            if let Some(symbol) = &self.last_symbol {
-                self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
-            }
-            self.request_idx += 1;
-        }
-        if self.request_idx >= self.requested_addresses.len() {
-            return SparseScanState::Continue;
-        }
-        if self
-            .last_symbol
-            .as_ref()
-            .is_none_or(|symbol| symbol.address != address)
-        {
-            self.last_symbol = Some(kernel_symbol_from_name(address, name));
-        }
-        SparseScanState::Continue
-    }
-
-    fn finish(mut self) -> Vec<(u64, KernelSymbol)> {
-        while self.request_idx < self.requested_addresses.len() {
-            if let Some(symbol) = &self.last_symbol {
-                self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
-            }
-            self.request_idx += 1;
-        }
-        self.result
-    }
-}
-
-fn parse_kernel_symbol_line_bytes(line: &[u8]) -> Option<(u64, KernelSymbolName<'_>)> {
-    let (address, address_len) = parse_hex_u64(line)?;
-    let name_start = address_len.checked_add(3)?;
-    let name_and_rest = line.get(name_start..)?;
-    let line_len = memchr(b'\n', name_and_rest).unwrap_or(name_and_rest.len());
-    let line = &name_and_rest[..line_len];
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    Some((address, parse_kernel_symbol_name(line)))
-}
-
-struct KallSymIter<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> KallSymIter<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { remaining: data }
-    }
-}
-
-impl<'a> Iterator for KallSymIter<'a> {
-    type Item = (u64, KernelSymbolName<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Skip unparsable lines rather than ending iteration: one malformed
-        // line must not drop every symbol after it.
-        while !self.remaining.is_empty() {
-            let line_len = memchr(b'\n', self.remaining)
-                .map(|idx| idx + 1)
-                .unwrap_or(self.remaining.len());
-            let line = &self.remaining[..line_len];
-            self.remaining = self.remaining.get(line_len..).unwrap_or_default();
-            if let Some((address, name)) = parse_kernel_symbol_line_bytes(line) {
-                return Some((address, name));
-            }
-        }
-        None
-    }
-}
-
-fn parse_hex_u64(input: &[u8]) -> Option<(u64, usize)> {
-    let mut value = 0_u64;
-    let mut len = 0;
-    for &byte in input.iter().take(16) {
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => break,
-        };
-        value = (value << 4) | u64::from(digit);
-        len += 1;
-    }
-    (len != 0).then_some((value, len))
-}
-
-fn should_include_kernel_symbol(
-    text_addr: &mut Option<u64>,
-    address: u64,
-    name: KernelSymbolName<'_>,
-) -> bool {
-    if address == 0 {
-        return false;
-    }
-    if text_addr.is_none() && name.name == b"_text" {
-        *text_addr = Some(address);
-    }
-    name.module.is_some() || text_addr.is_some_and(|anchor| address >= anchor)
-}
-
-fn parse_kernel_symbol_name(name: &[u8]) -> KernelSymbolName<'_> {
-    if name.last() == Some(&b']') {
-        if let Some(bracket_start) = name.iter().rposition(|&byte| byte == b'[') {
-            let module = &name[bracket_start + 1..name.len() - 1];
-            if !module.is_empty() {
-                return KernelSymbolName {
-                    name: trim_ascii_end(&name[..bracket_start]),
-                    module: Some(module),
-                };
-            }
-        }
-    }
-    KernelSymbolName { name, module: None }
-}
-
-fn trim_ascii_end(mut data: &[u8]) -> &[u8] {
-    while data.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
-        data = &data[..data.len() - 1];
-    }
-    data
-}
-
-fn kernel_symbol_from_name(address: u64, name: KernelSymbolName<'_>) -> KernelSymbol {
-    KernelSymbol {
-        address,
-        name: kernel_symbol_name_to_string(name.name),
-        module: name.module.map(kernel_symbol_module_to_string),
-    }
-}
-
-fn kernel_symbol_name_to_string(name: &[u8]) -> String {
-    String::from_utf8_lossy(name).into_owned()
-}
-
-fn kernel_symbol_module_to_string(module: &[u8]) -> String {
-    format!("[{}]", String::from_utf8_lossy(module))
-}
-
-fn load_shared_kernel_symbols() -> KernelSymbolTable {
-    static KERNEL_SYMBOLS: OnceLock<Arc<[KernelSymbol]>> = OnceLock::new();
-    KernelSymbolTable::Full(Arc::clone(KERNEL_SYMBOLS.get_or_init(|| {
-        let symbols = match load_kernel_symbols() {
-            Ok(symbols) => symbols,
-            Err(err) => {
-                warn_kallsyms_unusable(Some(&err));
-                Vec::new()
-            }
-        };
-        if symbols.is_empty() {
-            warn_kallsyms_unusable(None);
-        }
-        Arc::from(symbols.into_boxed_slice())
-    })))
 }
 
 fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
@@ -1705,45 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_kernel_symbol_cache_is_bounded_and_evicts_fifo() {
-        let mut cache = SparseKernelSymbolCache::default();
-        let value: Arc<[(u64, KernelSymbol)]> = Arc::from([]);
-        let key = |i: u64| SparseKernelSymbolCacheKey {
-            kernel_id: Arc::from("boot"),
-            addresses: Arc::from(vec![i].into_boxed_slice()),
-        };
-
-        for i in 0..=SPARSE_KERNEL_SYMBOL_CACHE_CAP as u64 {
-            cache.insert(key(i), Arc::clone(&value));
-        }
-
-        assert_eq!(cache.entries.len(), SPARSE_KERNEL_SYMBOL_CACHE_CAP);
-        assert!(cache.get(&key(0)).is_none(), "oldest entry must be evicted");
-        assert!(cache.get(&key(1)).is_some());
-
-        // Re-inserting an existing key must not duplicate its queue slot.
-        cache.insert(key(1), value);
-        assert_eq!(cache.insertion_order.len(), SPARSE_KERNEL_SYMBOL_CACHE_CAP);
-    }
-
-    #[test]
-    fn sparse_kernel_symbol_loads_are_cached_per_address_set() {
-        let addresses = [0xffff_ffff_9990_0000_u64, 0xffff_ffff_9990_1234];
-
-        let first = load_sparse_kernel_symbols(addresses);
-        let second = load_sparse_kernel_symbols(addresses);
-
-        let (KernelSymbolTable::Sparse(first), KernelSymbolTable::Sparse(second)) = (first, second)
-        else {
-            panic!("sparse loads must produce sparse tables");
-        };
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "identical address sets must hit the cache"
-        );
-    }
-
-    #[test]
     fn truncated_stack_markers_resolve_to_flagged_sentinels() {
         let mut symbolizer = PerfSymbolizer::new(&[]);
 
@@ -1763,69 +1251,6 @@ mod tests {
         assert_eq!(null_pc.func_name(), "<0x0>");
         assert!(null_pc.flags.is_empty());
         assert_ne!(marker, null_pc);
-    }
-
-    #[test]
-    fn parses_kernel_symbol_lines() {
-        let mut iter = KallSymIter::new(
-            b"ffffffff89800000 T _text\nffffffff89800137 t syscall_return [kernel]\n",
-        );
-
-        let (address, name) = iter.next().expect("_text symbol");
-        assert_eq!(address, 0xffff_ffff_8980_0000);
-        assert_eq!(name.name, b"_text");
-        assert_eq!(name.module, None);
-
-        let (address, name) = iter.next().expect("module symbol");
-        assert_eq!(address, 0xffff_ffff_8980_0137);
-        assert_eq!(name.name, b"syscall_return");
-        assert_eq!(name.module, Some(b"kernel".as_slice()));
-        assert_eq!(KallSymIter::new(b"not-an-address T broken\n").next(), None);
-    }
-
-    #[test]
-    fn kernel_symbol_iterator_skips_unparsable_lines() {
-        let mut iter = KallSymIter::new(
-            b"ffffffff89800000 T _text\nnot-an-address T broken\nffffffff89800137 t syscall_return\n",
-        );
-
-        assert_eq!(iter.next().expect("_text symbol").0, 0xffff_ffff_8980_0000);
-        assert_eq!(
-            iter.next().expect("symbol after bad line").0,
-            0xffff_ffff_8980_0137
-        );
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn zeroed_kernel_symbols_are_ignored() {
-        let kallsyms = b"0000000000000000 T _text\n\
-                         0000000000000000 t schedule\n\
-                         0000000000000000 t module_symbol [module]\n";
-
-        assert!(parse_kernel_symbols(kallsyms).is_empty());
-        assert!(parse_sparse_kernel_symbols(kallsyms, &[0xffff_ffff_8000_1234]).is_empty());
-
-        let mut reader = io::Cursor::new(kallsyms);
-        let sparse =
-            parse_sparse_kernel_symbols_sorted_streaming(&mut reader, &[0xffff_ffff_8000_1234])
-                .unwrap()
-                .unwrap();
-        assert!(sparse.is_empty());
-    }
-
-    #[test]
-    fn kernel_symbols_keep_module_symbols_before_text() {
-        let kallsyms = b"ffff800001717020 t tls_update  [tls]\n\
-                         ffff8000081e0000 T _text\n\
-                         ffff8000081f0000 t core_symbol\n";
-        let symbols = parse_kernel_symbols(kallsyms);
-
-        assert_eq!(symbols.len(), 3);
-        assert_eq!(symbols[0].name, "tls_update");
-        assert_eq!(symbols[0].module.as_deref(), Some("[tls]"));
-        assert_eq!(symbols[1].name, "_text");
-        assert_eq!(symbols[1].module, None);
     }
 
     #[test]
@@ -1989,46 +1414,6 @@ mod tests {
         assert_eq!(symbol.module.as_ref(), "[wireguard]");
     }
 
-    #[test]
-    fn sparse_kernel_symbols_keep_only_requested_addresses() {
-        let kallsyms = b"ffffffff89800000 T _text\n\
-                         ffffffff89800100 T first\n\
-                         ffffffff89800100 t duplicate\n\
-                         ffffffff89800200 t second [kernel]\n";
-        let symbols = parse_sparse_kernel_symbols(
-            kallsyms,
-            &[
-                0xffff_ffff_8980_0000,
-                0xffff_ffff_8980_0101,
-                0xffff_ffff_8980_01ff,
-                0xffff_ffff_8980_0204,
-            ],
-        );
-
-        assert_eq!(symbols.len(), 4);
-        assert_eq!(symbols[0].1.name, "_text");
-        assert_eq!(symbols[1].1.name, "first");
-        assert_eq!(symbols[2].1.name, "first");
-        assert_eq!(symbols[3].1.name, "second");
-        assert_eq!(symbols[3].1.module.as_deref(), Some("[kernel]"));
-        assert_eq!(symbols[1].1.address, 0xffff_ffff_8980_0100);
-    }
-
-    #[test]
-    fn sparse_kernel_symbols_keep_module_symbols_before_text() {
-        let kallsyms = b"ffff800001717020 t tls_update [tls]\n\
-                         ffff8000081e0000 T _text\n\
-                         ffff8000081f0000 t core_symbol\n";
-        let symbols =
-            parse_sparse_kernel_symbols(kallsyms, &[0xffff_8000_0171_7024, 0xffff_8000_081e_0004]);
-
-        assert_eq!(symbols.len(), 2);
-        assert_eq!(symbols[0].1.name, "tls_update");
-        assert_eq!(symbols[0].1.module.as_deref(), Some("[tls]"));
-        assert_eq!(symbols[1].1.name, "_text");
-        assert_eq!(symbols[1].1.module, None);
-    }
-
     fn temp_symbolize_spool_path(name: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -2037,30 +1422,5 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
-    }
-
-    #[test]
-    fn streaming_sparse_kernel_symbols_detects_late_unsorted_lines() {
-        let kallsyms = b"ffffffff89800000 T _text\n\
-                         ffffffff89803000 T late\n\
-                         ffffffff89802000 T middle\n";
-        let mut reader = io::Cursor::new(kallsyms);
-        let symbols =
-            parse_sparse_kernel_symbols_sorted_streaming(&mut reader, &[0xffff_ffff_8980_2500])
-                .unwrap();
-
-        assert!(symbols.is_none());
-        assert_eq!(reader.position() as usize, kallsyms.len());
-    }
-
-    #[test]
-    fn sparse_kernel_symbols_handle_unsorted_kallsyms() {
-        let kallsyms = b"ffffffff89800000 T _text\n\
-                         ffffffff89803000 T late\n\
-                         ffffffff89802000 T middle\n";
-        let symbols = parse_sparse_kernel_symbols(kallsyms, &[0xffff_ffff_8980_2500]);
-
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].1.name, "middle");
     }
 }
