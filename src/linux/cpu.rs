@@ -47,3 +47,32 @@ pub(super) fn thread_perf_event_capacity(
         cpu_count.saturating_mul(thread_count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cpu_list_rejects_empty_and_invalid_lists() {
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list(" , "), None);
+        assert_eq!(parse_cpu_list("0,nope"), None);
+        assert_eq!(parse_cpu_list("4-3"), None);
+    }
+
+    #[test]
+    fn fallback_cpu_ids_are_zero_based_and_non_empty() {
+        let ids = fallback_cpu_ids();
+
+        assert!(!ids.is_empty());
+        assert_eq!(ids[0], 0);
+        assert_eq!(ids, (0..ids.len() as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn thread_perf_event_capacity_matches_event_layout() {
+        assert_eq!(thread_perf_event_capacity(4, 3, false), 12);
+        assert_eq!(thread_perf_event_capacity(4, 3, true), 3);
+        assert_eq!(thread_perf_event_capacity(usize::MAX, 2, false), usize::MAX);
+    }
+}

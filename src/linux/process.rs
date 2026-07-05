@@ -260,6 +260,26 @@ fn build_env(env_vars: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const ENV_HELPER: &str = "linux::process::tests::stackpulse_process_helper_env_probe";
+    const EXIT_HELPER: &str = "linux::process::tests::stackpulse_process_helper_exit_7";
+
+    fn current_test_binary() -> OsString {
+        std::env::current_exe()
+            .expect("current test binary")
+            .into_os_string()
+    }
+
+    fn ignored_test_args(test_name: &str) -> [OsString; 3] {
+        [
+            OsString::from("--ignored"),
+            OsString::from("--exact"),
+            OsString::from(test_name),
+        ]
+    }
 
     #[test]
     fn dropping_suspended_launch_reaps_child() {
@@ -293,5 +313,91 @@ mod tests {
             waitpid(pid, Some(WaitPidFlag::WNOHANG)),
             Err(Errno::ECHILD)
         ));
+    }
+
+    #[test]
+    fn suspended_launch_runs_command_with_environment_overrides() {
+        let command = current_test_binary();
+        let args = ignored_test_args(ENV_HELPER);
+        let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
+            command.as_os_str(),
+            &args,
+            &[(OsString::from("STACKPULSE_TEST_ENV"), OsString::from("ok"))],
+        )
+        .expect("launch suspended child");
+
+        let running = launched.unsuspend_and_run().expect("resume child");
+        let status = running.wait().expect("wait child");
+
+        assert!(matches!(status, WaitStatus::Exited(_, 0)));
+    }
+
+    #[test]
+    fn running_process_reports_none_after_it_has_been_waited() {
+        let process = RunningProcess {
+            pid: Cell::new(None),
+        };
+
+        assert!(process.try_wait().expect("try wait without pid").is_none());
+        assert_eq!(
+            process.wait().unwrap_err().to_string(),
+            "process was already waited"
+        );
+    }
+
+    #[test]
+    fn try_wait_records_exited_process_once() {
+        let command = current_test_binary();
+        let args = ignored_test_args(EXIT_HELPER);
+        let launched =
+            SuspendedLaunchedProcess::launch_in_suspended_state(command.as_os_str(), &args, &[])
+                .expect("launch suspended child");
+        let running = launched.unsuspend_and_run().expect("resume child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            if let Some(status) = running.try_wait().expect("try wait child") {
+                assert!(matches!(status, WaitStatus::Exited(_, 7)));
+                assert!(running.try_wait().expect("try wait reaped child").is_none());
+                return;
+            }
+            if Instant::now() >= deadline {
+                if let Some(pid) = running.pid.get() {
+                    unsafe {
+                        libc::kill(pid.as_raw(), libc::SIGKILL);
+                    }
+                }
+                let _ = running.wait();
+                panic!("child did not exit");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cstring_conversions_reject_nul_bytes() {
+        assert!(cstring_from_os_str(OsStr::from_bytes(b"abc\0def")).is_err());
+        assert!(build_env(&[(
+            OsString::from_vec(b"BAD\0NAME".to_vec()),
+            OsString::from("x")
+        )])
+        .is_err());
+        assert!(build_env(&[(
+            OsString::from("BAD_VALUE"),
+            OsString::from_vec(b"x\0y".to_vec())
+        )])
+        .is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn stackpulse_process_helper_env_probe() {
+        assert_eq!(std::env::var("STACKPULSE_TEST_ENV").as_deref(), Ok("ok"));
+    }
+
+    #[test]
+    #[ignore]
+    fn stackpulse_process_helper_exit_7() {
+        std::process::exit(7);
     }
 }

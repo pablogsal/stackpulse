@@ -136,3 +136,23 @@ pub struct ElfSectionInfo {
     /// PT_LOAD segments sorted by file offset.
     pub load_segments: Box<[LoadSegment]>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::mmap_from_bytes;
+
+    #[test]
+    fn mmap_section_data_validates_and_slices_ranges() {
+        let mmap = mmap_from_bytes(&[10, 20, 30, 40, 50]);
+
+        let section = ElfSectionData::mmap(mmap.clone(), 1..4).expect("valid mmap range");
+
+        assert_eq!(&*section, &[20, 30, 40]);
+        assert_eq!(section, ElfSectionData::owned(vec![20_u8, 30, 40]));
+        let start = 4;
+        let end = 1;
+        assert!(ElfSectionData::mmap(mmap.clone(), start..end).is_none());
+        assert!(ElfSectionData::mmap(mmap, 0..6).is_none());
+    }
+}

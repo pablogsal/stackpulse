@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 
 use crate::linux;
 use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, ProcessExecRecord};
@@ -18,11 +18,22 @@ pub fn write_spool_samples_to_memory(
     samples: &[BenchSpoolSample],
     capacity: usize,
 ) -> io::Result<usize> {
-    let mut writer = PerfSpoolWriter::from_writer(
+    let bytes = write_spool_samples_to_writer(
         Vec::with_capacity(capacity.max(1024)),
-        1_700_000_000_000_000,
-        1_000,
+        modules,
+        process_execs,
+        samples,
     )?;
+    Ok(bytes.len())
+}
+
+fn write_spool_samples_to_writer<W: Write>(
+    writer: W,
+    modules: &[ModuleRecord],
+    process_execs: &[ProcessExecRecord],
+    samples: &[BenchSpoolSample],
+) -> io::Result<W> {
+    let mut writer = PerfSpoolWriter::from_writer(writer, 1_700_000_000_000_000, 1_000)?;
     for module in modules {
         writer.write_module(module)?;
     }
@@ -38,7 +49,7 @@ pub fn write_spool_samples_to_memory(
         )?;
     }
     writer.flush()?;
-    Ok(writer.into_inner().len())
+    Ok(writer.into_inner())
 }
 
 #[doc(hidden)]
@@ -147,4 +158,119 @@ pub fn parse_sparse_kernel_symbols(fixture: &SparseKernelSymbolsFixture, rounds:
         &fixture.requested_addresses,
         rounds,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spool::{FrameMode, PerfSpoolReader};
+    use crate::test_support::TempDir;
+    use std::fs;
+
+    #[test]
+    fn writes_synthetic_spool_samples_to_memory() {
+        let temp = TempDir::new("bench-spool");
+        let path = temp.path().join("samples.spool");
+        let module = ModuleRecord {
+            id: 0,
+            process_id: 42,
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0x100,
+            inode: 7,
+            path: "/tmp/libstackpulse.so".into(),
+            is_kernel: false,
+        };
+        let exec = ProcessExecRecord {
+            timestamp_ns: 1_700_000_000_000_001,
+            process_id: 42,
+            is_python_runtime: true,
+        };
+        let frame = FrameRecord {
+            module_id: Some(0),
+            rel_ip: 0x120,
+            abs_ip: 0x1020,
+            mode: FrameMode::User,
+        };
+        let marker = FrameRecord::truncated_stack_marker();
+        let samples = [BenchSpoolSample {
+            timestamp_ns: 1_700_000_000_000_002,
+            process_id: 42,
+            thread_id: 43,
+            frames: vec![frame, marker],
+        }];
+
+        let bytes = write_spool_samples_to_writer(
+            Vec::new(),
+            std::slice::from_ref(&module),
+            std::slice::from_ref(&exec),
+            &samples,
+        )
+        .expect("write spool samples");
+        let reported_len = write_spool_samples_to_memory(
+            std::slice::from_ref(&module),
+            std::slice::from_ref(&exec),
+            &samples,
+            bytes.len() * 2,
+        )
+        .expect("write sized spool samples");
+        fs::write(&path, &bytes).expect("persist spool bytes");
+
+        let reader = PerfSpoolReader::open(&path).expect("read generated spool");
+
+        assert_eq!(reported_len, bytes.len());
+        assert_eq!(reader.start_timestamp_us(), 1_700_000_000_000_000);
+        assert_eq!(reader.sample_interval_us(), 1_000);
+        assert_eq!(reader.modules().len(), 1);
+        assert_eq!(reader.modules()[0].path.as_str(), "/tmp/libstackpulse.so");
+        assert_eq!(reader.modules()[0].file_offset, 0x100);
+        assert_eq!(reader.process_execs().len(), 1);
+        assert_eq!(reader.process_execs()[0].timestamp_ns, exec.timestamp_ns);
+        assert_eq!(reader.process_execs()[0].process_id, 42);
+        assert!(reader.process_execs()[0].is_python_runtime);
+        assert_eq!(reader.samples().len(), 1);
+        assert_eq!(reader.samples()[0].timestamp_ns, samples[0].timestamp_ns);
+        assert_eq!(reader.samples()[0].process_id, 42);
+        assert_eq!(reader.samples()[0].thread_id, 43);
+
+        let mut frames = Vec::new();
+        reader
+            .stack_frames(reader.samples()[0].stack_id, &mut frames)
+            .expect("read sample stack");
+        assert_eq!(frames, vec![frame, marker]);
+    }
+
+    #[test]
+    fn sparse_kernel_symbols_fixture_builds_requested_addresses() {
+        let fixture = SparseKernelSymbolsFixture::new(4, 4);
+        let base = 0xffff_ffff_8100_0000_u64;
+        let expected_data = concat!(
+            "ffffffff81000000 T _text\n",
+            "ffffffff81000020 T bench_kernel_symbol_1\n",
+            "ffffffff81000040 T bench_kernel_symbol_2\n",
+            "ffffffff81000060 T bench_kernel_symbol_3\n",
+        );
+
+        assert_eq!(fixture.bytes(), expected_data.len() as u64);
+        assert_eq!(std::str::from_utf8(&fixture.data), Ok(expected_data));
+        assert_eq!(fixture.requested_addresses, vec![base + 0x30, base + 0x50]);
+        assert_eq!(
+            parse_sparse_kernel_symbols(&fixture, 1),
+            sparse_symbol_checksum(&[
+                (base + 0x30, base + 0x20, "bench_kernel_symbol_1"),
+                (base + 0x50, base + 0x40, "bench_kernel_symbol_2"),
+            ])
+        );
+    }
+
+    fn sparse_symbol_checksum(symbols: &[(u64, u64, &str)]) -> usize {
+        symbols
+            .iter()
+            .fold(0usize, |checksum, (request, address, name)| {
+                checksum
+                    .wrapping_add(*request as usize)
+                    .wrapping_add(*address as usize)
+                    .wrapping_add(name.len())
+            })
+    }
 }
