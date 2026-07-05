@@ -121,9 +121,9 @@ criterion_group! {
         bench_spool_open,
         bench_spool_iteration,
         bench_spool_write,
-        bench_live_perf_events,
         bench_symbolization,
-        bench_helpers
+        bench_helpers,
+        bench_live_perf_events
 }
 criterion_main!(benches);
 
