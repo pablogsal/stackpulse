@@ -87,6 +87,12 @@ pub struct PerfGroup {
     stopped_processes: Vec<StoppedProcess>,
 }
 
+#[derive(Clone, Copy)]
+enum FrequencyMode {
+    Requested,
+    ClampToKernelMax,
+}
+
 pub(crate) trait EventConsumer {
     type Prepared;
 
@@ -170,7 +176,17 @@ impl PerfGroup {
     }
 
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
+        self.open_process_with_frequency_mode(pid, attach_mode, FrequencyMode::Requested)
+    }
+
+    fn open_process_with_frequency_mode(
+        &mut self,
+        pid: u32,
+        attach_mode: AttachMode,
+        frequency_mode: FrequencyMode,
+    ) -> io::Result<()> {
         validate_target_pid(pid)?;
+        let frequency = frequency_for_mode(self.frequency, frequency_mode);
         let stopped_process = if attach_mode == AttachMode::StopAttachEnableResume {
             Some(StoppedProcess::new(pid)?)
         } else {
@@ -194,7 +210,8 @@ impl PerfGroup {
         let mut inheriting_threads = Vec::new();
         let mut leader_inherits = false;
         for &cpu in &cpu_ids {
-            let perf = self.open_perf(pid, Some(cpu), attach_mode, leader_inheritance)?;
+            let perf =
+                self.open_perf(pid, Some(cpu), attach_mode, leader_inheritance, frequency)?;
             leader_inherits |= perf.inherit().is_enabled();
             perf_events.push(perf);
         }
@@ -203,7 +220,7 @@ impl PerfGroup {
         }
         for &tid in &threads {
             if let Some(thread_perfs) =
-                self.open_thread_perfs(tid, &cpu_ids, per_thread_only, attach_mode)?
+                self.open_thread_perfs(tid, &cpu_ids, per_thread_only, attach_mode, frequency)?
             {
                 if thread_perfs.inherits {
                     inheriting_threads.push(tid);
@@ -246,6 +263,7 @@ impl PerfGroup {
         let cpu_ids = online_cpu_ids();
         let cpu_count = cpu_ids.len();
         let per_thread_only = self.use_per_thread_only_events(cpu_count, task_count);
+        let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut perf_events = Vec::with_capacity(thread_perf_event_capacity(
             cpu_count,
             new_threads.len(),
@@ -259,6 +277,7 @@ impl PerfGroup {
                 &cpu_ids,
                 per_thread_only,
                 AttachMode::StopAttachEnableResume,
+                frequency,
             )? {
                 if thread_perfs.inherits {
                     inheriting_threads.push(tid);
@@ -288,6 +307,7 @@ impl PerfGroup {
             .len()
             .saturating_add(thread_forks.len());
         let per_thread_only = self.use_per_thread_only_events(cpu_count, task_count);
+        let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut perf_events = Vec::with_capacity(thread_perf_event_capacity(
             cpu_count,
             thread_forks.len(),
@@ -315,6 +335,7 @@ impl PerfGroup {
                 &cpu_ids,
                 per_thread_only,
                 AttachMode::StopAttachEnableResume,
+                frequency,
             )? {
                 if thread_perfs.inherits {
                     inheriting_threads.insert(tid);
@@ -345,7 +366,11 @@ impl PerfGroup {
                 }
                 continue;
             }
-            match self.open_process(pid, AttachMode::StopAttachEnableResume) {
+            match self.open_process_with_frequency_mode(
+                pid,
+                AttachMode::StopAttachEnableResume,
+                FrequencyMode::ClampToKernelMax,
+            ) {
                 Ok(()) => {
                     if let Err(err) = self.enable() {
                         self.resume_stopped_processes();
@@ -392,6 +417,7 @@ impl PerfGroup {
         cpu_ids: &[u32],
         per_thread_only: bool,
         attach_mode: AttachMode,
+        frequency: u64,
     ) -> io::Result<Option<ThreadPerfEvents>> {
         let mut perf_events = ThreadPerfEvents::with_capacity(thread_perf_event_capacity(
             cpu_ids.len(),
@@ -399,8 +425,13 @@ impl PerfGroup {
             per_thread_only,
         ));
         if per_thread_only {
-            let Some(perf) =
-                self.try_open_thread_perf(tid, None, attach_mode, TaskInheritance::None)?
+            let Some(perf) = self.try_open_thread_perf(
+                tid,
+                None,
+                attach_mode,
+                TaskInheritance::None,
+                frequency,
+            )?
             else {
                 return Ok(None);
             };
@@ -412,6 +443,7 @@ impl PerfGroup {
                     Some(cpu),
                     attach_mode,
                     self.task_inheritance(),
+                    frequency,
                 )?
                 else {
                     return Ok(None);
@@ -428,8 +460,9 @@ impl PerfGroup {
         cpu: Option<u32>,
         attach_mode: AttachMode,
         inherit: TaskInheritance,
+        frequency: u64,
     ) -> io::Result<Option<Perf>> {
-        match self.open_perf(tid, cpu, attach_mode, inherit) {
+        match self.open_perf(tid, cpu, attach_mode, inherit, frequency) {
             Ok(perf) => Ok(Some(perf)),
             Err(err) if process_gone_error(&err) => Ok(None),
             Err(err) => Err(err),
@@ -487,11 +520,12 @@ impl PerfGroup {
         cpu: Option<u32>,
         attach_mode: AttachMode,
         inherit: TaskInheritance,
+        frequency: u64,
     ) -> io::Result<Perf> {
         PerfOptions {
             pid,
             cpu,
-            frequency: self.frequency as u64,
+            frequency,
             stack_size: self.stack_size,
             reg_mask: self.regs_mask,
             event_source: self.event_source,
@@ -610,6 +644,20 @@ fn perf_event_count_is_large(cpu_count: usize, task_count: usize) -> bool {
     cpu_count.saturating_mul(task_count) >= LARGE_PERF_EVENT_COUNT
 }
 
+fn frequency_for_mode(frequency: u32, mode: FrequencyMode) -> u64 {
+    frequency_for_kernel_max(frequency, mode, crate::max_sample_rate())
+}
+
+fn frequency_for_kernel_max(frequency: u32, mode: FrequencyMode, max_rate: Option<u64>) -> u64 {
+    let requested = u64::from(frequency);
+    match mode {
+        FrequencyMode::Requested => requested,
+        FrequencyMode::ClampToKernelMax => max_rate
+            .filter(|&max_rate| max_rate > 0 && requested > max_rate)
+            .unwrap_or(requested),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cpu::parse_cpu_list;
@@ -653,6 +701,30 @@ mod tests {
         assert!(group.tracked_threads.contains_key(&200));
         assert!(group.inheriting_threads.contains(&200));
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn requested_frequency_mode_preserves_requested_rate() {
+        assert_eq!(
+            frequency_for_kernel_max(123, FrequencyMode::Requested, Some(50)),
+            123
+        );
+    }
+
+    #[test]
+    fn clamp_frequency_mode_uses_lower_live_kernel_cap() {
+        assert_eq!(
+            frequency_for_kernel_max(123, FrequencyMode::ClampToKernelMax, Some(50)),
+            50
+        );
+        assert_eq!(
+            frequency_for_kernel_max(123, FrequencyMode::ClampToKernelMax, Some(0)),
+            123
+        );
+        assert_eq!(
+            frequency_for_kernel_max(123, FrequencyMode::ClampToKernelMax, None),
+            123
+        );
     }
 
     #[test]
