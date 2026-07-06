@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 - 2026-07-06
+
+### Fixed
+
+- Perf-mode native unwinding now resolves ELF image bases correctly for large executable mappings that span multiple load segments.
+- Perf-mode module tracking now reconciles executable mappings from `/proc/<pid>/maps` when a sampled user address is not covered by the current module table.
+
 ## 0.1.3 - 2026-07-06
 
 ### Fixed
