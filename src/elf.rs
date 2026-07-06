@@ -6,6 +6,7 @@
 
 use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::Elf;
+use std::sync::OnceLock;
 
 /// A PT_LOAD segment from an ELF binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,12 +44,62 @@ pub fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for a mapping.
 ///
-/// This deliberately does not use simple overlap. A mapping can be larger than
-/// the file-backed part of the segment due to alignment or BSS, and some real
-/// systems expose partial mappings of a segment. We therefore accept either:
-/// - the segment fully containing the mapping's file range, or
-/// - the mapping's file range fully containing the segment's file range.
 pub fn find_load_contribution_for_file_range(
+    segments: &[LoadSegment],
+    file_off: u64,
+    mapping_span: u64,
+) -> Option<&LoadSegment> {
+    precise_file_range_contribution(segments, file_off, mapping_span)
+        .or_else(|| broad_file_range_contribution(segments, file_off, mapping_span))
+}
+
+fn precise_file_range_contribution(
+    segments: &[LoadSegment],
+    file_off: u64,
+    mapping_span: u64,
+) -> Option<&LoadSegment> {
+    segments
+        .iter()
+        .find(|seg| seg.p_offset == file_off)
+        .or_else(|| find_page_aligned_load_contribution(segments, file_off, mapping_span))
+        .or_else(|| {
+            segments
+                .iter()
+                .find(|seg| file_offset_in_segment(seg, file_off))
+        })
+}
+
+fn find_page_aligned_load_contribution(
+    segments: &[LoadSegment],
+    file_off: u64,
+    mapping_span: u64,
+) -> Option<&LoadSegment> {
+    find_page_aligned_load_contribution_with_page_size(
+        segments,
+        file_off,
+        mapping_span,
+        system_page_size(),
+    )
+}
+
+fn find_page_aligned_load_contribution_with_page_size(
+    segments: &[LoadSegment],
+    file_off: u64,
+    mapping_span: u64,
+    page_size: u64,
+) -> Option<&LoadSegment> {
+    if page_size == 0 {
+        return None;
+    }
+    let file_end = file_off.saturating_add(mapping_span);
+    segments.iter().rev().find(|seg| {
+        let seg_page_start = page_floor(seg.p_offset, page_size);
+        let seg_page_end = page_ceil(seg.p_offset.saturating_add(seg.p_memsz), page_size);
+        file_off >= seg_page_start && file_off < seg_page_end && seg.p_offset < file_end
+    })
+}
+
+fn broad_file_range_contribution(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -57,6 +108,37 @@ pub fn find_load_contribution_for_file_range(
         .iter()
         .rev()
         .find(|seg| file_ranges_correlate(seg.p_offset, seg.p_filesz, file_off, mapping_span))
+}
+
+fn file_offset_in_segment(seg: &LoadSegment, file_off: u64) -> bool {
+    seg.p_offset <= file_off && file_off < seg.p_offset.saturating_add(seg.p_filesz)
+}
+
+fn page_floor(value: u64, page_size: u64) -> u64 {
+    value - value % page_size
+}
+
+fn page_ceil(value: u64, page_size: u64) -> u64 {
+    let remainder = value % page_size;
+    if remainder == 0 {
+        value
+    } else {
+        value.saturating_add(page_size - remainder)
+    }
+}
+
+const DEFAULT_PAGE_SIZE: u64 = 0x1000;
+
+pub(crate) fn system_page_size() -> u64 {
+    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size > 0 {
+            page_size as u64
+        } else {
+            DEFAULT_PAGE_SIZE
+        }
+    })
 }
 
 /// Check whether two file ranges mutually contain each other (either A
@@ -120,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_load_contribution_for_file_range_prefers_later_contained_segment() {
+    fn test_find_load_contribution_for_file_range_prefers_exact_mapping_start() {
         let segs = vec![
             LoadSegment {
                 p_offset: 0x0,
@@ -139,12 +221,98 @@ mod tests {
         ];
 
         let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1000).unwrap();
-        assert_eq!(matched.p_offset, 0x900);
+        assert_eq!(matched.p_offset, 0x0);
 
-        // The bias derived from the matched contribution must map SVMA 0 to the
-        // expected image-base AVMA.
         let bias = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, 0x5555_5555_5000);
-        assert_eq!(0_u64.wrapping_add(bias), 0x5555_5555_4000);
+        assert_eq!(0_u64.wrapping_add(bias), 0x5555_5555_5000);
+    }
+
+    #[test]
+    fn test_find_load_contribution_uses_broad_correlation_as_fallback() {
+        let segs = vec![LoadSegment {
+            p_offset: 0x900,
+            p_filesz: 0x3b0,
+            p_memsz: 0x3b0,
+            p_vaddr: 0x1900,
+            p_flags: 0x5,
+        }];
+
+        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1000).unwrap();
+        assert_eq!(matched.p_offset, 0x900);
+    }
+
+    #[test]
+    fn test_find_load_contribution_for_large_zero_offset_mapping() {
+        let segs = vec![
+            seg(0x0, 0x1661_3000, 0x1661_3000, 0x0),
+            seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
+        ];
+
+        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1661_3000).unwrap();
+        assert_eq!(matched.p_offset, 0x0);
+
+        let mapping_start = 0x7f61_4879_9000;
+        let bias = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, mapping_start);
+        assert_eq!(0_u64.wrapping_add(bias), mapping_start);
+    }
+
+    #[test]
+    fn test_image_relative_address_matches_mapping_relative_address() {
+        let segs = vec![
+            seg(0x0, 0x1661_3000, 0x1661_3000, 0x0),
+            seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
+        ];
+        let mapping_start = 0x7f61_4879_9000;
+        let sampled_ip = mapping_start + 0x8ce_4ea0;
+
+        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1661_3000).unwrap();
+        let image_base = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, mapping_start);
+        let image_rel = sampled_ip - image_base;
+        let mapping_rel = sampled_ip - mapping_start;
+
+        assert_eq!(image_rel, mapping_rel);
+    }
+
+    #[test]
+    fn test_find_load_contribution_uses_page_aligned_segment_start() {
+        let segs = rust_pie_segments();
+
+        let matched =
+            find_page_aligned_load_contribution_with_page_size(&segs, 0x13000, 0x41000, 0x1000)
+                .unwrap();
+
+        assert_eq!(matched.p_offset, 0x13c10);
+    }
+
+    #[test]
+    fn test_find_load_contribution_uses_16k_page_alignment() {
+        let segs = rust_pie_segments();
+
+        let matched =
+            find_page_aligned_load_contribution_with_page_size(&segs, 0x10000, 0x44000, 0x4000)
+                .unwrap();
+
+        assert_eq!(matched.p_offset, 0x13c10);
+    }
+
+    #[test]
+    fn test_find_load_contribution_keeps_first_segment_on_64k_zero_mapping() {
+        let segs = rust_pie_segments();
+
+        let matched =
+            find_page_aligned_load_contribution_with_page_size(&segs, 0x0, 0x10000, 0x10000)
+                .unwrap();
+
+        assert_eq!(matched.p_offset, 0x0);
+    }
+
+    #[test]
+    fn test_find_load_contribution_rejects_zero_page_size() {
+        let segs = rust_pie_segments();
+
+        assert!(
+            find_page_aligned_load_contribution_with_page_size(&segs, 0x0, 0x1000, 0).is_none()
+        );
     }
 
     #[test]
