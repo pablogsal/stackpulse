@@ -65,21 +65,74 @@ enum DrainMode {
 struct ProcessUnwinder {
     unwinder: NativeUnwinder,
     cache: NativeCache,
-    loaded_module_starts: FxHashSet<u64>,
+    known_user_modules: FxHashMap<u64, ModuleRecord>,
+    loaded_unwind_modules: FxHashSet<u64>,
+    refreshed_uncovered_pages: FxHashSet<u64>,
     elf_sections: ElfSectionCache,
 }
 
 impl Clone for ProcessUnwinder {
-    /// Forks: clone the unwinder state and module set, but start with a fresh
-    /// per-thread cache (cloning the cache would defeat its locality).
     fn clone(&self) -> Self {
         Self {
             unwinder: self.unwinder.clone(),
             cache: NativeCache::default(),
-            loaded_module_starts: self.loaded_module_starts.clone(),
+            known_user_modules: self.known_user_modules.clone(),
+            loaded_unwind_modules: self.loaded_unwind_modules.clone(),
+            refreshed_uncovered_pages: FxHashSet::default(),
             elf_sections: self.elf_sections.clone(),
         }
     }
+}
+
+impl ProcessUnwinder {
+    fn covers_user_pc(&self, pc: u64) -> bool {
+        self.known_user_modules
+            .values()
+            .any(|module| (module.start..module.end).contains(&pc))
+    }
+
+    fn should_refresh_for_uncovered_pc(&mut self, pc: u64) -> bool {
+        self.refreshed_uncovered_pages.insert(refresh_page(pc))
+    }
+
+    fn track_known_user_module(&mut self, module: &ModuleRecord) -> bool {
+        if self
+            .known_user_modules
+            .get(&module.start)
+            .is_some_and(|known| same_module_mapping(known, module))
+        {
+            return false;
+        }
+        self.known_user_modules.insert(module.start, module.clone());
+        true
+    }
+
+    fn track_loaded_unwind_module(&mut self, module: &ModuleRecord) {
+        self.loaded_unwind_modules.insert(module.start);
+    }
+
+    fn has_loaded_unwind_module_at(&self, start: u64) -> bool {
+        self.loaded_unwind_modules.contains(&start)
+    }
+
+    fn untrack_loaded_unwind_module_at(&mut self, start: u64) {
+        self.loaded_unwind_modules.remove(&start);
+    }
+}
+
+fn refresh_page(pc: u64) -> u64 {
+    let page_size = crate::elf::system_page_size();
+    pc - pc % page_size
+}
+
+fn same_module_mapping(left: &ModuleRecord, right: &ModuleRecord) -> bool {
+    left.process_id == right.process_id
+        && left.start == right.start
+        && left.end == right.end
+        && left.file_offset == right.file_offset
+        && left.inode == right.inode
+        && left.path == right.path
+        && left.is_kernel == right.is_kernel
 }
 
 /// Options used when attaching a [`PerfRecorder`] to a process.
@@ -1081,6 +1134,7 @@ fn record_prepared_sample<W: std::io::Write>(
     sample: PreparedSample,
 ) -> io::Result<()> {
     let pid = sample.pid;
+    refresh_maps_for_uncovered_user_pc(ctx, &sample)?;
     let input = StackInput {
         code_addr: sample.code_addr,
         user_regs: sample.user_regs.as_deref(),
@@ -1117,6 +1171,51 @@ fn record_prepared_sample<W: std::io::Write>(
             bump(&mut ctx.summary.samples);
             Ok(())
         }
+        Err(err) => Err(err),
+    }
+}
+
+fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
+    ctx: &mut EventContext<'_, W>,
+    sample: &PreparedSample,
+) -> io::Result<()> {
+    let Some(pid) = u32::try_from(sample.pid).ok() else {
+        return Ok(());
+    };
+    let Some(pc) = sample
+        .user_regs
+        .as_deref()
+        .and_then(ConvertRegsNative::convert_regs)
+        .map(|(pc, _, _)| pc)
+    else {
+        return Ok(());
+    };
+    if ctx
+        .unwinders
+        .get(&sample.pid)
+        .is_some_and(|unwinder| unwinder.covers_user_pc(pc))
+    {
+        return Ok(());
+    }
+    if !ctx
+        .unwinders
+        .entry(sample.pid)
+        .or_default()
+        .should_refresh_for_uncovered_pc(pc)
+    {
+        return Ok(());
+    }
+    match register_existing_maps(pid, ctx.modules, ctx.unwinders, ctx.writer) {
+        Ok(true) if process_has_python_perf_support(pid, ctx.python_perf_support_processes) => {
+            mark_python_runtime_process(
+                ctx.python_runtime_processes,
+                ctx.writer,
+                sample.timestamp_ns,
+                sample.pid,
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(err) if process_gone_error(&err) => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -1159,9 +1258,26 @@ fn record_module<W: std::io::Write>(
     if module.path.is_empty() {
         return Ok(());
     }
-    add_unwind_module(unwinders, &module);
-    modules.intern_module(module, writer)?;
+    if modules.intern_module(module.clone(), writer)? == u32::MAX {
+        return Ok(());
+    }
+    if track_known_user_module(unwinders, &module) {
+        add_unwind_module(unwinders, &module);
+    }
     Ok(())
+}
+
+fn track_known_user_module(
+    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    module: &ModuleRecord,
+) -> bool {
+    if module.is_kernel {
+        return true;
+    }
+    unwinders
+        .entry(module.process_id)
+        .or_default()
+        .track_known_user_module(module)
 }
 
 struct MmapEvent<'a> {
@@ -1249,17 +1365,15 @@ fn add_unwind_module(unwinders: &mut FxHashMap<i32, ProcessUnwinder>, module: &M
         return;
     }
     let process_unwinder = unwinders.entry(module.process_id).or_default();
-    if process_unwinder
-        .loaded_module_starts
-        .contains(&module.start)
-    {
+    if process_unwinder.has_loaded_unwind_module_at(module.start) {
         process_unwinder.unwinder.remove_module(module.start);
+        process_unwinder.untrack_loaded_unwind_module_at(module.start);
     }
     let Some(framehop_module) = module_to_framehop(&mut process_unwinder.elf_sections, module)
     else {
         return;
     };
-    process_unwinder.loaded_module_starts.insert(module.start);
+    process_unwinder.track_loaded_unwind_module(module);
     process_unwinder.unwinder.add_module(framehop_module);
 }
 
@@ -1828,6 +1942,72 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<PerfRecorder>();
+    }
+
+    #[test]
+    fn process_unwinder_tracks_known_module_ranges() {
+        let mut unwinder = ProcessUnwinder::default();
+
+        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
+
+        assert!(!unwinder.covers_user_pc(0x0fff));
+        assert!(unwinder.covers_user_pc(0x1000));
+        assert!(unwinder.covers_user_pc(0x1fff));
+        assert!(!unwinder.covers_user_pc(0x2000));
+    }
+
+    #[test]
+    fn process_unwinder_replaces_known_module_for_same_start() {
+        let mut unwinder = ProcessUnwinder::default();
+
+        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x1800)));
+        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2800)));
+
+        assert!(unwinder.covers_user_pc(0x2000));
+        assert_eq!(unwinder.known_user_modules.len(), 1);
+    }
+
+    #[test]
+    fn process_unwinder_skips_duplicate_known_module() {
+        let mut unwinder = ProcessUnwinder::default();
+
+        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
+        assert!(!unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
+    }
+
+    #[test]
+    fn uncovered_pc_refresh_is_once_per_page() {
+        let mut unwinder = ProcessUnwinder::default();
+        let page_size = crate::elf::system_page_size();
+
+        assert!(unwinder.should_refresh_for_uncovered_pc(page_size + 1));
+        assert!(!unwinder.should_refresh_for_uncovered_pc(page_size + 2));
+        assert!(unwinder.should_refresh_for_uncovered_pc(page_size * 2));
+    }
+
+    #[test]
+    fn cloned_unwinder_keeps_ranges_but_resets_refresh_cache() {
+        let mut unwinder = ProcessUnwinder::default();
+        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
+        assert!(unwinder.should_refresh_for_uncovered_pc(0x3000));
+
+        let mut cloned = unwinder.clone();
+
+        assert!(cloned.covers_user_pc(0x1000));
+        assert!(cloned.should_refresh_for_uncovered_pc(0x3000));
+    }
+
+    fn test_module(start: u64, end: u64) -> ModuleRecord {
+        ModuleRecord {
+            id: 0,
+            process_id: 7,
+            start,
+            end,
+            file_offset: 0,
+            inode: 0,
+            path: "/tmp/libtest.so".into(),
+            is_kernel: false,
+        }
     }
 
     #[test]
