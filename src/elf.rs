@@ -230,15 +230,15 @@ mod tests {
     #[test]
     fn test_find_load_contribution_uses_broad_correlation_as_fallback() {
         let segs = vec![LoadSegment {
-            p_offset: 0x900,
-            p_filesz: 0x3b0,
-            p_memsz: 0x3b0,
-            p_vaddr: 0x1900,
+            p_offset: 0x20_000,
+            p_filesz: 0x1000,
+            p_memsz: 0x1000,
+            p_vaddr: 0x30_000,
             p_flags: 0x5,
         }];
 
-        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1000).unwrap();
-        assert_eq!(matched.p_offset, 0x900);
+        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x30_000).unwrap();
+        assert_eq!(matched.p_offset, 0x20_000);
     }
 
     #[test]
