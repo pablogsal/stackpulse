@@ -451,6 +451,43 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_mapping_uses_zero_offset_load_for_large_mapping() {
+        let section_info = ElfSectionInfo {
+            base_svma: 0,
+            text_svma: Some(0x0..0x1661_3000),
+            text_file_range: Some(0x0..0x1661_3000),
+            text: None,
+            eh_frame_svma: None,
+            eh_frame: None,
+            eh_frame_hdr_svma: None,
+            eh_frame_hdr: None,
+            got_svma: None,
+            load_segments: vec![
+                crate::elf::LoadSegment {
+                    p_offset: 0,
+                    p_filesz: 0x1661_3000,
+                    p_memsz: 0x1661_3000,
+                    p_vaddr: 0,
+                    p_flags: 0x5,
+                },
+                crate::elf::LoadSegment {
+                    p_offset: 0x15e3_d000,
+                    p_filesz: 0x1000,
+                    p_memsz: 0x1000,
+                    p_vaddr: 0x15e3_e000,
+                    p_flags: 0x6,
+                },
+            ]
+            .into_boxed_slice(),
+        };
+
+        let mapping_start = 0x7f61_4879_9000;
+        let resolved =
+            ElfImageLayout::new(&section_info).resolve_mapping(0, mapping_start, 0x1661_3000);
+        assert_eq!(resolved, Some(ModuleImageBase::new(mapping_start, 0)));
+    }
+
+    #[test]
     fn test_resolve_mapping_falls_back_to_text_section() {
         let section_info = ElfSectionInfo {
             base_svma: 0,
