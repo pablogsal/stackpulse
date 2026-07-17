@@ -707,10 +707,12 @@ fn parse_user_regs_sample<'a>(
                 _ => return None,
             };
             let regs = cursor.read_u64_slice(parser.user_regs)?;
-            debug_assert!(
-                abi == sys::PERF_SAMPLE_REGS_ABI_32 || abi == sys::PERF_SAMPLE_REGS_ABI_64
-            );
-            sample.user_regs = Some(regs);
+            // Framehop's native unwinder and our stack reader use the host's
+            // 64-bit register/word ABI. Keep parsing ABI_32 records so the
+            // cursor remains valid, but do not feed them into a 64-bit unwind.
+            if abi == sys::PERF_SAMPLE_REGS_ABI_64 {
+                sample.user_regs = Some(regs);
+            }
         }
     }
     Some(())
@@ -945,6 +947,14 @@ impl AlignedPerfRecord {
 }
 
 fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> AlignedPerfRecord {
+    build_bench_sample_record_with_abi(spec, sample_idx, sys::PERF_SAMPLE_REGS_ABI_64)
+}
+
+fn build_bench_sample_record_with_abi(
+    spec: &BenchSampleBatchSpec,
+    sample_idx: usize,
+    user_regs_abi: u32,
+) -> AlignedPerfRecord {
     let mut bytes = Vec::with_capacity(
         64 + (spec.user_frames + spec.kernel_frames) * size_of::<u64>()
             + spec.user_regs * size_of::<u64>()
@@ -986,7 +996,7 @@ fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> 
         );
     }
 
-    push_u64(&mut bytes, u64::from(sys::PERF_SAMPLE_REGS_ABI_64));
+    push_u64(&mut bytes, u64::from(user_regs_abi));
     for reg_idx in 0..spec.user_regs {
         push_u64(
             &mut bytes,
@@ -1179,6 +1189,18 @@ mod tests {
         let (_, sample) =
             parse_sample_record(record.as_bytes(), &parser).expect("sample should parse");
         assert_eq!(sample.time, Some(1_700_000_000_000_000 + 7_000));
+    }
+
+    #[test]
+    fn sample_parser_does_not_expose_32_bit_regs_to_native_unwinder() {
+        let spec = stack_sample_spec(32);
+        let parser = stack_sample_parser(spec.user_regs);
+        let record = build_bench_sample_record_with_abi(&spec, 0, sys::PERF_SAMPLE_REGS_ABI_32);
+
+        let (_, sample) =
+            parse_sample_record(record.as_bytes(), &parser).expect("sample should parse");
+        assert_eq!(sample.user_regs, None);
+        assert_eq!(sample.user_stack.map(<[u8]>::len), Some(32));
     }
 
     #[test]
