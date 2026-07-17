@@ -32,6 +32,13 @@ impl ElfSectionData {
         }
     }
 
+    pub(crate) fn owned_range(data: Arc<[u8]>, range: Range<usize>) -> Option<Self> {
+        (range.start <= range.end && range.end <= data.len()).then_some(Self {
+            storage: ElfSectionStorage::Owned(data),
+            range,
+        })
+    }
+
     pub(crate) fn mmap(mmap: Arc<Mmap>, range: Range<usize>) -> Option<Self> {
         (range.start <= range.end && range.end <= mmap.len()).then_some(Self {
             storage: ElfSectionStorage::Mmap(mmap),

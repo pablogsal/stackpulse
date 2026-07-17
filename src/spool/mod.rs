@@ -9,12 +9,40 @@ use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
 mod model;
+mod modules;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, OwnedSampleRecord, ProcessExecRecord,
 };
+pub(crate) use modules::ModuleTable;
+pub(crate) use modules::ModuleUpdate;
+
+#[cfg(test)]
+pub(crate) trait ModuleTableTestExt {
+    fn intern_module<W: Write>(
+        &mut self,
+        module: ModuleRecord,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> io::Result<u32>;
+}
+
+#[cfg(test)]
+impl ModuleTableTestExt for ModuleTable {
+    fn intern_module<W: Write>(
+        &mut self,
+        module: ModuleRecord,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> io::Result<u32> {
+        Ok(self
+            .apply_module(module, writer)?
+            .active
+            .last()
+            .map_or(u32::MAX, |activation| activation.module.id))
+    }
+}
 
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
+const MAGIC_V3: &[u8; 8] = b"SPULSE3\0";
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -77,7 +105,7 @@ impl<W: Write> PerfSpoolWriter<W> {
             thread_cache: FxHashMap::default(),
             last_timestamp_ns: 0,
         };
-        writer.writer.write_all(MAGIC_V2)?;
+        writer.writer.write_all(MAGIC_V3)?;
         writer.writer.write_varint(start_timestamp_us)?;
         writer.writer.write_varint(sample_interval_us)?;
         Ok(writer)
@@ -95,6 +123,9 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(module.end)?;
         self.writer.write_varint(module.file_offset)?;
         self.writer.write_varint(module.inode)?;
+        self.writer.write_varint(u64::from(module.device_major))?;
+        self.writer.write_varint(u64::from(module.device_minor))?;
+        self.writer.write_varint(module.inode_generation)?;
         self.writer.write_all(&[u8::from(module.is_kernel)])?;
         write_bytes(&mut self.writer, module.path.as_bytes())?;
         self.unpinned_frame_cache.clear();
@@ -468,7 +499,7 @@ impl PerfSpoolReader {
             let parsed = (|| -> io::Result<()> {
                 match tag {
                     REC_MODULE => {
-                        modules.push(read_module_mmap(&mut reader, modules.len())?);
+                        modules.push(read_module_mmap(&mut reader, modules.len(), spool_version)?);
                         module_deactivated_at.push(None);
                     }
                     REC_FRAME => {
@@ -691,6 +722,7 @@ impl MmapSpoolCursor {
         match &magic {
             magic if magic == MAGIC_V1 => Ok(1),
             magic if magic == MAGIC_V2 => Ok(2),
+            magic if magic == MAGIC_V3 => Ok(3),
             _ => Err(invalid_data("invalid stackpulse spool magic")),
         }
     }
@@ -774,309 +806,11 @@ impl SpoolRead for &[u8] {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ModuleIdentity {
-    process_id: i32,
-    start: u64,
-    end: u64,
-    file_offset: u64,
-    inode: u64,
-    path: ModulePath,
-}
-
-impl From<&ModuleRecord> for ModuleIdentity {
-    fn from(module: &ModuleRecord) -> Self {
-        Self {
-            process_id: module.process_id,
-            start: module.start,
-            end: module.end,
-            file_offset: module.file_offset,
-            inode: module.inode,
-            path: module.path.clone(),
-        }
-    }
-}
-
-struct ModuleSlot {
-    module: ModuleRecord,
-    active: bool,
-}
-
-#[derive(Default)]
-pub struct ModuleTable {
-    slots: Vec<ModuleSlot>,
-    active_by_key: FxHashMap<ModuleIdentity, u32>,
-    index: ModuleIndex,
-    index_dirty: bool,
-}
-
-impl ModuleTable {
-    pub fn intern_module<W: Write>(
-        &mut self,
-        module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<u32> {
-        if module.end <= module.start {
-            return Ok(u32::MAX);
-        }
-        let key = ModuleIdentity::from(&module);
-        if let Some(&id) = self.active_by_key.get(&key) {
-            return Ok(id);
-        }
-
-        // Module records are generations, not a permanent address-to-path
-        // dictionary.  dlclose/dlopen commonly reuses the exact same range;
-        // keeping both old mappings active makes the last distinct path win
-        // forever and suppresses a later return to an earlier identity.
-        //
-        // Mapping identities are generations. dlclose/dlopen commonly reuses
-        // the exact same address, and MAP_FIXED may replace only part of a
-        // VMA. Retire just the overlapping generations and preserve their
-        // unaffected fragments; unrelated modules stay interned and stable.
-        if !module.is_kernel {
-            let overlapping: Vec<_> = self
-                .slots
-                .iter()
-                .filter(|slot| {
-                    slot.active
-                        && !slot.module.is_kernel
-                        && slot.module.process_id == module.process_id
-                        && module_ranges_overlap(&slot.module, &module)
-                })
-                .map(|slot| (slot.module.id, slot.module.clone()))
-                .collect();
-            if !overlapping.is_empty() {
-                let mut survivors = Vec::new();
-                for (_, known) in &overlapping {
-                    survivors.extend(split_module_around(known, &module));
-                }
-                for (id, known) in overlapping {
-                    let slot = &mut self.slots[id as usize];
-                    debug_assert!(slot.active);
-                    slot.active = false;
-                    self.active_by_key.remove(&ModuleIdentity::from(&known));
-                    writer.write_module_deactivation_one(id)?;
-                }
-                self.index_dirty = true;
-                for survivor in survivors {
-                    self.intern_module_without_overlap_reconciliation(survivor, writer)?;
-                }
-            }
-        }
-
-        self.intern_module_without_overlap_reconciliation(module, writer)
-    }
-
-    fn intern_module_without_overlap_reconciliation<W: Write>(
-        &mut self,
-        mut module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<u32> {
-        let key = ModuleIdentity::from(&module);
-        if let Some(&id) = self.active_by_key.get(&key) {
-            return Ok(id);
-        }
-        let id = next_spool_id(self.slots.len(), "module")?;
-        module.id = id;
-        writer.write_module(&module)?;
-        self.active_by_key.insert(key, id);
-        self.slots.push(ModuleSlot {
-            module,
-            active: true,
-        });
-        self.index_dirty = true;
-        Ok(id)
-    }
-
-    pub fn deactivate_process_modules<W: Write>(
-        &mut self,
-        process_id: i32,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<()> {
-        let mut changed = false;
-        for slot in &mut self.slots {
-            if slot.module.process_id == process_id && !slot.module.is_kernel && slot.active {
-                changed = true;
-                slot.active = false;
-                self.active_by_key
-                    .remove(&ModuleIdentity::from(&slot.module));
-            }
-        }
-        self.index_dirty |= changed;
-        if changed {
-            writer.write_module_deactivation(process_id)?;
-        }
-        Ok(())
-    }
-
-    pub fn clone_process_modules<W: Write>(
-        &mut self,
-        parent_process_id: i32,
-        child_process_id: i32,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<()> {
-        let inherited: Vec<_> = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                slot.active && slot.module.process_id == parent_process_id && !slot.module.is_kernel
-            })
-            .map(|slot| ModuleRecord {
-                id: 0,
-                process_id: child_process_id,
-                ..slot.module.clone()
-            })
-            .collect();
-        for inherited in inherited {
-            self.intern_module(inherited, writer)?;
-        }
-        Ok(())
-    }
-
-    pub fn resolve_frame(&mut self, process_id: i32, abs_ip: u64, mode: FrameMode) -> FrameRecord {
-        self.rebuild_index_if_needed();
-        let module = self
-            .index
-            .find(process_id, abs_ip, mode)
-            .and_then(|id| self.slots.get(id as usize).map(|slot| (id, &slot.module)));
-        let (module_id, rel_ip) = match module {
-            Some((id, m)) => (Some(id), abs_ip.saturating_sub(m.start) + m.file_offset),
-            None => (None, abs_ip),
-        };
-        FrameRecord {
-            module_id,
-            rel_ip,
-            abs_ip,
-            mode,
-        }
-    }
-
-    fn rebuild_index_if_needed(&mut self) {
-        if !self.index_dirty {
-            return;
-        }
-        self.index = ModuleIndex::build(&self.slots);
-        self.index_dirty = false;
-    }
-}
-
-fn module_ranges_overlap(left: &ModuleRecord, right: &ModuleRecord) -> bool {
-    left.start < right.end && right.start < left.end
-}
-
-fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
-    let mut fragments = Vec::with_capacity(2);
-    if old.start < replacement.start {
-        fragments.push(ModuleRecord {
-            id: 0,
-            end: replacement.start.min(old.end),
-            ..old.clone()
-        });
-    }
-    if replacement.end < old.end {
-        let start = replacement.end.max(old.start);
-        fragments.push(ModuleRecord {
-            id: 0,
-            start,
-            file_offset: old.file_offset.saturating_add(start - old.start),
-            ..old.clone()
-        });
-    }
-    fragments
-}
-
-#[derive(Default)]
-struct ModuleIndex {
-    by_process: FxHashMap<i32, ModuleIndexGroup>,
-    kernel: ModuleIndexGroup,
-}
-
-impl ModuleIndex {
-    fn build(slots: &[ModuleSlot]) -> Self {
-        let mut index = Self::default();
-        for slot in slots {
-            if !slot.active {
-                continue;
-            }
-            let module = &slot.module;
-            let entry = ModuleIndexEntry {
-                start: module.start,
-                end: module.end,
-                id: module.id,
-            };
-            if module.is_kernel {
-                index.kernel.push(entry);
-            } else {
-                index
-                    .by_process
-                    .entry(module.process_id)
-                    .or_default()
-                    .push(entry);
-            }
-        }
-        index.kernel.finish();
-        for group in index.by_process.values_mut() {
-            group.finish();
-        }
-        index
-    }
-
-    fn find(&self, process_id: i32, address: u64, mode: FrameMode) -> Option<u32> {
-        match mode {
-            FrameMode::User => self
-                .by_process
-                .get(&process_id)
-                .and_then(|group| group.find(address)),
-            FrameMode::Kernel => self.kernel.find(address),
-            FrameMode::TruncatedStackMarker => None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct ModuleIndexGroup {
-    entries: Vec<ModuleIndexEntry>,
-    has_overlaps: bool,
-}
-
-impl ModuleIndexGroup {
-    fn push(&mut self, entry: ModuleIndexEntry) {
-        self.entries.push(entry);
-    }
-
-    fn finish(&mut self) {
-        let mut sorted = self.entries.clone();
-        sorted.sort_by_key(|entry| (entry.start, entry.id));
-        self.has_overlaps = sorted
-            .windows(2)
-            .any(|window| window[0].end > window[1].start);
-        if !self.has_overlaps {
-            self.entries = sorted;
-        }
-    }
-
-    fn find(&self, address: u64) -> Option<u32> {
-        if self.has_overlaps {
-            return self
-                .entries
-                .iter()
-                .rfind(|entry| entry.start <= address && address < entry.end)
-                .map(|entry| entry.id);
-        }
-        let idx = self.entries.partition_point(|entry| entry.start <= address);
-        let entry = self.entries.get(idx.checked_sub(1)?)?;
-        (address < entry.end).then_some(entry.id)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ModuleIndexEntry {
-    start: u64,
-    end: u64,
-    id: u32,
-}
-
-fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Result<ModuleRecord> {
+fn read_module_mmap(
+    reader: &mut MmapSpoolCursor,
+    expected_id: usize,
+    spool_version: u8,
+) -> io::Result<ModuleRecord> {
     check_id(reader, expected_id, "module")?;
     let id = u32::try_from(expected_id).map_err(|_| invalid_data("module id too large"))?;
     let process_id = read_process_id(reader)?;
@@ -1084,6 +818,17 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
     let end = reader.read_varint::<u64>()?;
     let file_offset = reader.read_varint::<u64>()?;
     let inode = reader.read_varint::<u64>()?;
+    let (device_major, device_minor, inode_generation) = if spool_version >= 3 {
+        (
+            u32::try_from(reader.read_varint::<u64>()?)
+                .map_err(|_| invalid_data("module device major too large"))?,
+            u32::try_from(reader.read_varint::<u64>()?)
+                .map_err(|_| invalid_data("module device minor too large"))?,
+            reader.read_varint::<u64>()?,
+        )
+    } else {
+        (0, 0, 0)
+    };
     let mut flag = [0_u8; 1];
     reader.read_exact_spool(&mut flag)?;
     let len = usize::try_from(reader.read_varint::<u64>()?)
@@ -1099,6 +844,9 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
         path,
         is_kernel: flag[0] != 0,
         inode,
+        device_major,
+        device_minor,
+        inode_generation,
     })
 }
 
@@ -1445,6 +1193,9 @@ mod tests {
             end,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: path.into(),
             is_kernel,
         }
@@ -1648,6 +1399,9 @@ mod tests {
                 end: 0x2000,
                 file_offset: 0x100,
                 inode: 1,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "/first".into(),
                 is_kernel: false,
             })
@@ -1660,6 +1414,9 @@ mod tests {
                 end: 0x4000,
                 file_offset: 0x200,
                 inode: 2,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "/second".into(),
                 is_kernel: false,
             })
@@ -1672,6 +1429,9 @@ mod tests {
                 end: 0xffff_ffff_8101_0000,
                 file_offset: 0,
                 inode: 0,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "[kernel]".into(),
                 is_kernel: true,
             })
@@ -1764,6 +1524,9 @@ mod tests {
                 end: 0x2000,
                 file_offset: 0,
                 inode: 1,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "/future".into(),
                 is_kernel: false,
             })
@@ -1964,6 +1727,9 @@ mod tests {
                 end: 0x2000,
                 file_offset: 0,
                 inode: 1,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "/bad".into(),
                 is_kernel: false,
             })
@@ -1994,6 +1760,9 @@ mod tests {
                 end: 0x2000,
                 file_offset: 0x100,
                 inode: 1,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: "/module".into(),
                 is_kernel: false,
             }],
@@ -2103,7 +1872,7 @@ mod tests {
         let mut reader = MmapSpoolCursor::new(mmap);
 
         assert_invalid_data_contains(
-            read_module_mmap(&mut reader, 0),
+            read_module_mmap(&mut reader, 0, 3),
             "process id",
             "reader accepted an out-of-range module process id",
         );
@@ -2191,6 +1960,115 @@ mod tests {
             table.resolve_frame(7, 0x1008, FrameMode::User).module_id,
             Some(second_id)
         );
+    }
+
+    #[test]
+    fn module_updates_return_canonical_assigned_records() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let first = table
+            .apply_module(module(7, 0x1000, 0x2000, "/first", false), &mut writer)
+            .unwrap();
+        let second_module = module(7, 0x3000, 0x4000, "/second", false);
+        let second = table
+            .apply_module(second_module.clone(), &mut writer)
+            .unwrap();
+        let duplicate = table.apply_module(second_module, &mut writer).unwrap();
+
+        assert_eq!(first.active[0].module.id, 0);
+        assert_eq!(second.active[0].module.id, 1);
+        assert_eq!(duplicate.active[0].module.id, 1);
+        assert!(!duplicate.mapping_changed);
+    }
+
+    #[test]
+    fn module_identity_includes_device_and_inode_generation() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let mut first = module(7, 0x1000, 0x2000, "/same", false);
+        first.inode = 9;
+        first.device_major = 8;
+        first.device_minor = 1;
+        first.inode_generation = 4;
+        let mut second = first.clone();
+        second.device_minor = 2;
+        second.inode_generation = 5;
+
+        let first = table.apply_module(first, &mut writer).unwrap();
+        let second = table.apply_module(second, &mut writer).unwrap();
+
+        assert_eq!(first.active[0].module.id, 0);
+        assert_eq!(second.retired[0].id, 0);
+        assert_eq!(second.active[0].module.id, 1);
+        assert_eq!(second.active[0].module.device_minor, 2);
+        assert_eq!(second.active[0].module.inode_generation, 5);
+    }
+
+    #[test]
+    fn unknown_snapshot_generation_preserves_canonical_identity() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let mut mmap2 = module(7, 0x1000, 0x2000, "/same", false);
+        mmap2.inode = 9;
+        mmap2.device_major = 8;
+        mmap2.device_minor = 1;
+        mmap2.inode_generation = 4;
+        let mut snapshot = mmap2.clone();
+        snapshot.inode_generation = 0;
+
+        let first = table.apply_module(mmap2, &mut writer).unwrap();
+        let snapshot = table.apply_module(snapshot, &mut writer).unwrap();
+
+        assert_eq!(snapshot.active[0].module.id, first.active[0].module.id);
+        assert_eq!(snapshot.active[0].module.inode_generation, 4);
+        assert!(!snapshot.mapping_changed);
+        assert!(snapshot.retired.is_empty());
+    }
+
+    #[test]
+    fn spool_v3_round_trips_full_module_identity() {
+        let path = temp_spool_path("module-identity-v3");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 0).unwrap();
+        let mut module = module(7, 0x1000, 0x2000, "/module", false);
+        module.id = 0;
+        module.inode = 99;
+        module.device_major = 8;
+        module.device_minor = 2;
+        module.inode_generation = 17;
+        writer.write_module(&module).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(reader.modules()[0].device_major, 8);
+        assert_eq!(reader.modules()[0].device_minor, 2);
+        assert_eq!(reader.modules()[0].inode_generation, 17);
+    }
+
+    #[test]
+    fn spool_v2_defaults_extended_module_identity() {
+        let path = temp_spool_path("module-identity-v2");
+        let mut bytes = MAGIC_V2.to_vec();
+        bytes.write_varint(0_u64).unwrap();
+        bytes.write_varint(0_u64).unwrap();
+        bytes.push(REC_MODULE);
+        bytes.write_varint(0_u64).unwrap();
+        bytes.write_varint(7_i64).unwrap();
+        bytes.write_varint(0x1000_u64).unwrap();
+        bytes.write_varint(0x2000_u64).unwrap();
+        bytes.write_varint(0_u64).unwrap();
+        bytes.write_varint(99_u64).unwrap();
+        bytes.push(0);
+        write_bytes(&mut bytes, b"/module").unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(reader.modules()[0].inode, 99);
+        assert_eq!(reader.modules()[0].device_major, 0);
+        assert_eq!(reader.modules()[0].device_minor, 0);
+        assert_eq!(reader.modules()[0].inode_generation, 0);
     }
 
     #[test]

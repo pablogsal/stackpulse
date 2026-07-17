@@ -15,6 +15,7 @@ mod sorter;
 #[cfg(test)]
 mod test_fixtures;
 mod types;
+mod unwind;
 
 use std::io;
 use std::os::fd::RawFd;
@@ -30,7 +31,6 @@ use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::native_module::ElfSectionCache;
 use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
 use convert_regs::ConvertRegs;
 use perf_event::{
@@ -41,16 +41,13 @@ pub use perf_group::AttachMode;
 use perf_group::{EventConsumer, PerfGroupOptions};
 use sorter::EventSorter;
 use types::{StackFrame, StackMode};
+use unwind::{NativeUnwinder, ProcessUnwinder};
 
 #[cfg(target_arch = "x86_64")]
 type ConvertRegsNative = convert_regs::ConvertRegsX86_64;
 
 #[cfg(target_arch = "aarch64")]
 type ConvertRegsNative = convert_regs::ConvertRegsAarch64;
-
-type UnwindPolicy = framehop::MayAllocateDuringUnwind;
-type NativeUnwinder = framehop::UnwinderNative<elf_types::ElfSectionData, UnwindPolicy>;
-type NativeCache = framehop::CacheNative<UnwindPolicy>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum LifecycleAction {
@@ -77,138 +74,6 @@ enum LifecycleAction {
 enum DrainMode {
     Consume,
     Flush,
-}
-
-#[derive(Default)]
-struct ProcessUnwinder {
-    unwinder: NativeUnwinder,
-    cache: NativeCache,
-    known_user_modules: FxHashMap<u64, ModuleRecord>,
-    loaded_unwind_modules: FxHashSet<u64>,
-    refreshed_uncovered_pages: FxHashSet<u64>,
-    elf_sections: ElfSectionCache,
-}
-
-impl Clone for ProcessUnwinder {
-    fn clone(&self) -> Self {
-        Self {
-            unwinder: self.unwinder.clone(),
-            cache: NativeCache::default(),
-            known_user_modules: self.known_user_modules.clone(),
-            loaded_unwind_modules: self.loaded_unwind_modules.clone(),
-            refreshed_uncovered_pages: FxHashSet::default(),
-            elf_sections: self.elf_sections.clone(),
-        }
-    }
-}
-
-impl ProcessUnwinder {
-    fn covers_user_pc(&self, pc: u64) -> bool {
-        self.known_user_modules
-            .values()
-            .any(|module| (module.start..module.end).contains(&pc))
-    }
-
-    fn should_refresh_for_uncovered_pc(&mut self, pc: u64) -> bool {
-        self.refreshed_uncovered_pages.insert(refresh_page(pc))
-    }
-
-    fn track_known_user_module(&mut self, module: &ModuleRecord) -> bool {
-        if self
-            .known_user_modules
-            .get(&module.start)
-            .is_some_and(|known| same_module_mapping(known, module))
-        {
-            return false;
-        }
-
-        // A new executable mapping can partially replace an older VMA with a
-        // different start (for example via MAP_FIXED). Framehop sorts by start
-        // and assumes non-overlap, so leaving the older range installed can
-        // make it win even though the newer mapping is the current one.
-        let overlapping: Vec<_> = self
-            .known_user_modules
-            .values()
-            .filter(|known| module_ranges_overlap(known, module))
-            .cloned()
-            .collect();
-        for known in overlapping {
-            self.known_user_modules.remove(&known.start);
-            let was_loaded = self.loaded_unwind_modules.remove(&known.start);
-            if was_loaded {
-                self.unwinder.remove_module(known.start);
-            }
-            for fragment in split_module_around(&known, module) {
-                if was_loaded {
-                    if let Some(framehop_module) =
-                        module_to_framehop(&mut self.elf_sections, &fragment)
-                    {
-                        self.loaded_unwind_modules.insert(fragment.start);
-                        self.unwinder.add_module(framehop_module);
-                    }
-                }
-                self.known_user_modules.insert(fragment.start, fragment);
-            }
-        }
-
-        // A mapping change is a new generation: pages that previously missed
-        // may now be backed by executable code and must be eligible to retry.
-        self.refreshed_uncovered_pages.clear();
-        self.known_user_modules.insert(module.start, module.clone());
-        true
-    }
-
-    fn track_loaded_unwind_module(&mut self, module: &ModuleRecord) {
-        self.loaded_unwind_modules.insert(module.start);
-    }
-
-    fn has_loaded_unwind_module_at(&self, start: u64) -> bool {
-        self.loaded_unwind_modules.contains(&start)
-    }
-
-    fn untrack_loaded_unwind_module_at(&mut self, start: u64) {
-        self.loaded_unwind_modules.remove(&start);
-    }
-}
-
-fn refresh_page(pc: u64) -> u64 {
-    let page_size = crate::elf::system_page_size();
-    pc - pc % page_size
-}
-
-fn same_module_mapping(left: &ModuleRecord, right: &ModuleRecord) -> bool {
-    left.process_id == right.process_id
-        && left.start == right.start
-        && left.end == right.end
-        && left.file_offset == right.file_offset
-        && left.inode == right.inode
-        && left.path == right.path
-        && left.is_kernel == right.is_kernel
-}
-
-fn module_ranges_overlap(left: &ModuleRecord, right: &ModuleRecord) -> bool {
-    left.start < right.end && right.start < left.end
-}
-
-fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
-    let mut fragments = Vec::with_capacity(2);
-    if old.start < replacement.start {
-        fragments.push(ModuleRecord {
-            id: 0,
-            end: replacement.start.min(old.end),
-            ..old.clone()
-        });
-    }
-    if replacement.end < old.end {
-        let start = replacement.end.max(old.start);
-        fragments.push(ModuleRecord {
-            id: 0,
-            start,
-            file_offset: old.file_offset.saturating_add(start - old.start),
-            ..old.clone()
-        });
-    }
-    fragments
 }
 
 /// Options used when attaching a [`PerfRecorder`] to a process.
@@ -1026,14 +891,17 @@ fn handle_non_sample_record<W: std::io::Write>(
                 ppid,
                 pid,
             )?;
-            if let Some(parent) = ctx.unwinders.get(&ppid).cloned() {
-                ctx.unwinders.insert(pid, parent);
+            let updates = ctx.modules.clone_process_modules(ppid, pid, ctx.writer)?;
+            let mut child_unwinder = ctx.unwinders.get(&ppid).cloned().unwrap_or_default();
+            for update in &updates {
+                child_unwinder.apply_module_update(update);
             }
+            ctx.unwinders.insert(pid, child_unwinder);
             ctx.lifecycle_actions.push(LifecycleAction::ProcessFork {
                 pid: fork.task.pid,
                 parent_tid: fork.parent_task.tid,
             });
-            ctx.modules.clone_process_modules(ppid, pid, ctx.writer)
+            Ok(())
         }
         Record::Fork(fork) if fork.task.pid == fork.parent_task.pid => {
             if fork.task.tid != fork.parent_task.tid {
@@ -1615,11 +1483,7 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     else {
         return Ok(());
     };
-    if ctx
-        .unwinders
-        .get(&sample.pid)
-        .is_some_and(|unwinder| unwinder.covers_user_pc(pc))
-    {
+    if ctx.modules.covers_user_pc(sample.pid, pc) {
         return Ok(());
     }
     if !ctx
@@ -1683,26 +1547,21 @@ fn record_module<W: std::io::Write>(
     if module.path.is_empty() {
         return Ok(());
     }
-    if modules.intern_module(module.clone(), writer)? == u32::MAX {
+    let update = modules.apply_module(module, writer)?;
+    if update.active.is_empty() {
         return Ok(());
     }
-    if track_known_user_module(unwinders, &module) {
-        add_unwind_module(unwinders, &module);
+    for activation in &update.active {
+        let module = &activation.module;
+        if !module.is_kernel {
+            unwinders
+                .entry(module.process_id)
+                .or_default()
+                .apply_module_update(&update);
+            break;
+        }
     }
     Ok(())
-}
-
-fn track_known_user_module(
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
-    module: &ModuleRecord,
-) -> bool {
-    if module.is_kernel {
-        return true;
-    }
-    unwinders
-        .entry(module.process_id)
-        .or_default()
-        .track_known_user_module(module)
 }
 
 struct MmapEvent<'a> {
@@ -1714,6 +1573,9 @@ struct MmapEvent<'a> {
     page_offset: u64,
     path: &'a std::ffi::CString,
     inode: u64,
+    device_major: u32,
+    device_minor: u32,
+    inode_generation: u64,
 }
 
 fn record_mmap_event<W: std::io::Write>(
@@ -1739,6 +1601,9 @@ fn record_mmap_event<W: std::io::Write>(
             path: c_string_to_string(event.path).into(),
             is_kernel,
             inode: event.inode,
+            device_major: event.device_major,
+            device_minor: event.device_minor,
+            inode_generation: event.inode_generation,
         },
     )
 }
@@ -1750,12 +1615,17 @@ fn record_mmap<W: std::io::Write>(
     mmap: &Mmap,
     privilege: Priv,
 ) -> io::Result<()> {
-    let inode = match &mmap.ext {
+    let (inode, device_major, device_minor, inode_generation) = match &mmap.ext {
         Some(ext) => match &ext.info {
-            MmapInfo::Device { inode, .. } => *inode,
-            MmapInfo::BuildId(_) => 0,
+            MmapInfo::Device {
+                major,
+                minor,
+                inode,
+                inode_gen,
+            } => (*inode, *major, *minor, *inode_gen),
+            MmapInfo::BuildId(_) => (0, 0, 0, 0),
         },
-        None => 0,
+        None => (0, 0, 0, 0),
     };
     let Some(pid) = i32_from_u32(mmap.task.pid) else {
         return Ok(());
@@ -1773,6 +1643,9 @@ fn record_mmap<W: std::io::Write>(
             page_offset: mmap.page_offset,
             path: &mmap.file,
             inode,
+            device_major,
+            device_minor,
+            inode_generation,
         },
     )
 }
@@ -1783,31 +1656,6 @@ fn mmap_is_executable(mmap: &Mmap) -> bool {
         Some(ext) => ext.prot & PROT_EXEC != 0,
         None => mmap.executable,
     }
-}
-
-fn add_unwind_module(unwinders: &mut FxHashMap<i32, ProcessUnwinder>, module: &ModuleRecord) {
-    if module.is_kernel || module.path.is_bracketed_mapping() {
-        return;
-    }
-    let process_unwinder = unwinders.entry(module.process_id).or_default();
-    if process_unwinder.has_loaded_unwind_module_at(module.start) {
-        process_unwinder.unwinder.remove_module(module.start);
-        process_unwinder.untrack_loaded_unwind_module_at(module.start);
-    }
-    let Some(framehop_module) = module_to_framehop(&mut process_unwinder.elf_sections, module)
-    else {
-        return;
-    };
-    process_unwinder.track_loaded_unwind_module(module);
-    process_unwinder.unwinder.add_module(framehop_module);
-}
-
-fn module_to_framehop(
-    elf_sections: &mut ElfSectionCache,
-    module: &ModuleRecord,
-) -> Option<framehop::Module<elf_types::ElfSectionData>> {
-    let (module_info, section_info) = elf_sections.module_info(module)?;
-    elf_loader::module_to_framehop_with_section_info(&module_info, &section_info)
 }
 
 fn open_perf_group(
@@ -1868,6 +1716,9 @@ fn register_existing_maps_snapshot<W: std::io::Write>(
                 path: region.path.into(),
                 is_kernel: false,
                 inode: region.inode,
+                device_major: region.device_major,
+                device_minor: region.device_minor,
+                inode_generation: 0,
             },
         )?;
     }
@@ -2354,6 +2205,9 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             end: LIVE_BENCH_USER_BASE + 0x0008_0000,
             file_offset: 0,
             inode: 1_000_001,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "/opt/stackpulse/live-bench/libworkload.so".into(),
             is_kernel: false,
         },
@@ -2364,6 +2218,9 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             end: LIVE_BENCH_USER_BASE + 0x0018_0000,
             file_offset: 0,
             inode: 1_000_002,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "/opt/stackpulse/live-bench/python3.12".into(),
             is_kernel: false,
         },
@@ -2374,6 +2231,9 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             end: LIVE_BENCH_KERNEL_BASE + 0x0010_0000,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "[kernel.kallsyms]".into(),
             is_kernel: true,
         },
@@ -2383,6 +2243,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spool::ModuleTableTestExt;
     use perf_event_open::sample::record::comm::Comm;
     use perf_event_open::sample::record::lost::LostRecords;
     use perf_event_open::sample::record::task::{Exit, Fork};
@@ -2393,78 +2254,6 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<PerfRecorder>();
-    }
-
-    #[test]
-    fn process_unwinder_tracks_known_module_ranges() {
-        let mut unwinder = ProcessUnwinder::default();
-
-        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
-
-        assert!(!unwinder.covers_user_pc(0x0fff));
-        assert!(unwinder.covers_user_pc(0x1000));
-        assert!(unwinder.covers_user_pc(0x1fff));
-        assert!(!unwinder.covers_user_pc(0x2000));
-    }
-
-    #[test]
-    fn process_unwinder_replaces_known_module_for_same_start() {
-        let mut unwinder = ProcessUnwinder::default();
-
-        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x1800)));
-        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2800)));
-
-        assert!(unwinder.covers_user_pc(0x2000));
-        assert_eq!(unwinder.known_user_modules.len(), 1);
-    }
-
-    #[test]
-    fn process_unwinder_splits_partially_overlapped_module() {
-        let mut unwinder = ProcessUnwinder::default();
-        let old = test_module(0x2000, 0x4000);
-        let replacement = test_module(0x1000, 0x3000);
-
-        assert!(unwinder.track_known_user_module(&old));
-        unwinder.loaded_unwind_modules.insert(old.start);
-        assert!(unwinder.should_refresh_for_uncovered_pc(0x5000));
-
-        assert!(unwinder.track_known_user_module(&replacement));
-
-        assert_eq!(unwinder.known_user_modules.len(), 2);
-        assert!(unwinder.known_user_modules.contains_key(&replacement.start));
-        let suffix = unwinder.known_user_modules.get(&0x3000).unwrap();
-        assert_eq!(suffix.end, 0x4000);
-        assert_eq!(suffix.file_offset, old.file_offset + 0x1000);
-        assert!(unwinder.covers_user_pc(0x3800));
-        assert!(!unwinder.loaded_unwind_modules.contains(&old.start));
-        assert!(unwinder.should_refresh_for_uncovered_pc(0x5000));
-    }
-
-    #[test]
-    fn process_unwinder_preserves_both_sides_of_inner_replacement() {
-        let mut unwinder = ProcessUnwinder::default();
-        let mut old = test_module(0x1000, 0x5000);
-        old.file_offset = 0x8000;
-        let replacement = test_module(0x2000, 0x3000);
-
-        assert!(unwinder.track_known_user_module(&old));
-        assert!(unwinder.track_known_user_module(&replacement));
-
-        assert_eq!(unwinder.known_user_modules.len(), 3);
-        assert_eq!(unwinder.known_user_modules[&0x1000].end, 0x2000);
-        assert_eq!(unwinder.known_user_modules[&0x3000].end, 0x5000);
-        assert_eq!(unwinder.known_user_modules[&0x3000].file_offset, 0xa000);
-        assert!(unwinder.covers_user_pc(0x1800));
-        assert!(unwinder.covers_user_pc(0x2800));
-        assert!(unwinder.covers_user_pc(0x4800));
-    }
-
-    #[test]
-    fn process_unwinder_skips_duplicate_known_module() {
-        let mut unwinder = ProcessUnwinder::default();
-
-        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
-        assert!(!unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
     }
 
     #[test]
@@ -2818,14 +2607,12 @@ mod tests {
     }
 
     #[test]
-    fn cloned_unwinder_keeps_ranges_but_resets_refresh_cache() {
+    fn cloned_unwinder_resets_refresh_cache() {
         let mut unwinder = ProcessUnwinder::default();
-        assert!(unwinder.track_known_user_module(&test_module(0x1000, 0x2000)));
         assert!(unwinder.should_refresh_for_uncovered_pc(0x3000));
 
         let mut cloned = unwinder.clone();
 
-        assert!(cloned.covers_user_pc(0x1000));
         assert!(cloned.should_refresh_for_uncovered_pc(0x3000));
     }
 
@@ -2837,6 +2624,9 @@ mod tests {
             end,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "/tmp/libtest.so".into(),
             is_kernel: false,
         }

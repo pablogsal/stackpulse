@@ -8,6 +8,8 @@ pub struct Region<'a> {
     pub is_executable: bool,
     pub file_offset: u64,
     pub inode: u64,
+    pub device_major: u32,
+    pub device_minor: u32,
     pub path: &'a str,
 }
 
@@ -29,7 +31,7 @@ pub fn parse_line(line: &str) -> Option<Region<'_>> {
     let range = next_field(&mut rest)?;
     let perms = next_field(&mut rest)?;
     let offset = next_field(&mut rest)?;
-    let _dev = next_field(&mut rest)?;
+    let device = next_field(&mut rest)?;
     let inode = next_field(&mut rest)?;
     let path = normalize_path(rest.trim_start());
 
@@ -38,12 +40,17 @@ pub fn parse_line(line: &str) -> Option<Region<'_>> {
     let end = u64::from_str_radix(end, 16).ok()?;
     let file_offset = u64::from_str_radix(offset, 16).ok()?;
     let inode = inode.parse().ok()?;
+    let (device_major, device_minor) = device.split_once(':')?;
+    let device_major = u32::from_str_radix(device_major, 16).ok()?;
+    let device_minor = u32::from_str_radix(device_minor, 16).ok()?;
 
     Some(Region {
         address: start..end,
         is_executable: perms.as_bytes().get(2).copied() == Some(b'x'),
         file_offset,
         inode,
+        device_major,
+        device_minor,
         path,
     })
 }
@@ -93,6 +100,8 @@ mod tests {
                     is_executable: true,
                     file_offset: 0,
                     inode: 1321238,
+                    device_major: 0x08,
+                    device_minor: 0x02,
                     path: "/usr/bin/cat",
                 },
                 Region {
@@ -100,6 +109,8 @@ mod tests {
                     is_executable: false,
                     file_offset: 0,
                     inode: 0,
+                    device_major: 0,
+                    device_minor: 0,
                     path: "[heap]",
                 },
                 Region {
@@ -107,6 +118,8 @@ mod tests {
                     is_executable: false,
                     file_offset: 0x1ac2,
                     inode: 1335289,
+                    device_major: 0x1f,
+                    device_minor: 0x33,
                     path: "/usr/lib/locale/locale-archive",
                 },
                 Region {
@@ -114,6 +127,8 @@ mod tests {
                     is_executable: false,
                     file_offset: 0,
                     inode: 0,
+                    device_major: 0,
+                    device_minor: 0,
                     path: "",
                 },
             ]

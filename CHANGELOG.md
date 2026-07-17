@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 - 2026-07-17
+## 0.2.0 - 2026-07-18
 
 ### Fixed
 
@@ -13,6 +13,9 @@
 - 32-bit perf register samples no longer enter the native 64-bit unwinder.
 - Transient and deleted mapped ELF files can be retried and opened through `/proc/<pid>/map_files` while the target is alive.
 - Unresolved or invalid image bases no longer poison symbol caches or produce wrapped AVMA/SVMA translations.
+- Live native unwinding now consumes canonical assigned module IDs instead of aliasing unrelated ELF files through ID zero.
+- Device and inode-generation identity are retained across MMAP2 events, profile files, and symbolizer reuse.
+- vDSO mappings now provide ELF unwind information when the target mapping is readable.
 
 ### Performance
 
@@ -21,7 +24,8 @@
 
 ### Changed
 
-- New profiles use spool format `SPULSE2` for targeted module-generation deactivation; the reader remains compatible with `SPULSE1` profiles.
+- `ModuleRecord` now exposes device and inode-generation identity for mapped files.
+- New profiles use spool format `SPULSE3`; the reader remains compatible with `SPULSE1` and `SPULSE2` profiles.
 
 ## 0.1.4 - 2026-07-06
 

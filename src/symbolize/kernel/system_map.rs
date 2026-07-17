@@ -336,6 +336,9 @@ mod tests {
             end: 0xffff_ffff_8d00_0000,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "[kernel.kallsyms]_text".into(),
             is_kernel: true,
         };
