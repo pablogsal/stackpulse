@@ -1925,6 +1925,8 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     callchain_stack: &[StackFrame],
     summary: &mut PerfSummary,
 ) {
+    const MAX_NATIVE_UNWIND_FRAMES: usize = 1_024;
+
     stack.clear();
 
     let kernel_frame_count = callchain_stack
@@ -1969,6 +1971,10 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
                     &mut read_stack,
                 );
                 loop {
+                    if stack.len().saturating_sub(dwarf_start) >= MAX_NATIVE_UNWIND_FRAMES {
+                        dwarf_truncated = true;
+                        break;
+                    }
                     match frames.next() {
                         Ok(None) => break,
                         Ok(Some(FrameAddress::InstructionPointer(a))) => {
