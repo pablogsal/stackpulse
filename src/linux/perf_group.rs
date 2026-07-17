@@ -241,9 +241,6 @@ impl PerfGroup {
     }
 
     pub fn refresh_threads(&mut self, pid: u32) -> io::Result<()> {
-        if !self.inheriting_threads.is_empty() {
-            return Ok(());
-        }
         let mut threads = match get_threads(pid) {
             Ok(threads) => threads,
             Err(err) if process_gone_error(&err) => return Ok(()),
@@ -256,10 +253,24 @@ impl PerfGroup {
         self.tracked_threads.retain(|&tid, &mut owner| {
             owner != pid || tid == pid || threads.binary_search(&tid).is_ok()
         });
+        self.inheriting_threads
+            .retain(|tid| self.tracked_threads.contains_key(tid));
         let new_threads: Vec<_> = threads
             .into_iter()
             .filter(|tid| !self.tracked_threads.contains_key(tid))
             .collect();
+        let process_inherits = self.inheriting_threads.iter().any(|tid| {
+            self.tracked_threads
+                .get(tid)
+                .is_some_and(|owner| *owner == pid)
+        });
+        if process_inherits {
+            for tid in new_threads {
+                self.tracked_threads.insert(tid, pid);
+                self.inheriting_threads.insert(tid);
+            }
+            return Ok(());
+        }
         let cpu_ids = online_cpu_ids();
         let cpu_count = cpu_ids.len();
         let per_thread_only = self.use_per_thread_only_events(cpu_count, task_count);
@@ -384,6 +395,26 @@ impl PerfGroup {
         }
 
         Ok(())
+    }
+
+    /// Repair process bookkeeping after LOST when only the owning parent
+    /// process (not the exact forking TID) can be recovered from /proc.
+    pub fn recover_forked_processes(&mut self, process_forks: &[(u32, u32)]) -> io::Result<()> {
+        let mut need_explicit_open = Vec::new();
+        for &(pid, parent_pid) in process_forks {
+            let parent_process_inherits = self.inheriting_threads.iter().any(|tid| {
+                self.tracked_threads
+                    .get(tid)
+                    .is_some_and(|owner| *owner == parent_pid)
+            });
+            if parent_process_inherits {
+                self.tracked_threads.insert(pid, pid);
+                self.inheriting_threads.insert(pid);
+            } else {
+                need_explicit_open.push((pid, parent_pid));
+            }
+        }
+        self.open_forked_processes(&need_explicit_open)
     }
 
     pub fn remove_thread(&mut self, tid: u32) {
@@ -755,6 +786,42 @@ mod tests {
         assert!(group.tracked_threads.contains_key(&200));
         assert!(group.inheriting_threads.contains(&200));
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn lost_fork_recovery_uses_any_inheriting_thread_owned_by_parent_process() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
+            .expect("create perf group");
+        group.tracked_threads.insert(100, 100);
+        group.tracked_threads.insert(101, 100);
+        group.inheriting_threads.insert(101);
+
+        group
+            .recover_forked_processes(&[(200, 100)])
+            .expect("recover inherited child process");
+
+        assert_eq!(group.tracked_threads.get(&200), Some(&200));
+        assert!(group.inheriting_threads.contains(&200));
+        assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn refresh_threads_drops_stale_inheriting_tids() {
+        let pid = std::process::id();
+        let stale_tid = u32::MAX;
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        group.tracked_threads.insert(pid, pid);
+        group.tracked_threads.insert(stale_tid, pid);
+        group.inheriting_threads.extend([pid, stale_tid]);
+
+        group
+            .refresh_threads(pid)
+            .expect("refresh live test process");
+
+        assert!(!group.tracked_threads.contains_key(&stale_tid));
+        assert!(!group.inheriting_threads.contains(&stale_tid));
+        assert!(group.inheriting_threads.contains(&pid));
     }
 
     #[test]
