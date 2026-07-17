@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- ELF image-base correlation accepts legitimate page-rounded load-segment tails while rejecting ambiguous shared boundary pages.
+- Process-image changes, overlapping executable remaps, and lost perf lifecycle records now rebuild stale module and Framehop state.
+- Exact-address DSO reuse and partial `MAP_FIXED` replacements now retain correct module generations and surviving VMA fragments.
+- LOST recovery now runs at a forward event boundary, rescans every tracked image, and repairs missed child/thread bookkeeping.
+- Thread-group leader exit no longer tears down profiling state while sibling threads are still running.
+- Exited process perf and pidfd state is released promptly, preventing descriptor exhaustion under process churn.
+- 32-bit perf register samples no longer enter the native 64-bit unwinder.
+- Transient and deleted mapped ELF files can be retried and opened through `/proc/<pid>/map_files` while the target is alive.
+- Unresolved or invalid image bases no longer poison symbol caches or produce wrapped AVMA/SVMA translations.
+
+### Performance
+
+- Perf recording no longer requests non-executable MMAP traffic that Stackpulse does not consume.
+- Repeated mappings of the same ELF reuse symbolizer state, keeping high-churn `dlopen` workloads bounded.
+
+### Changed
+
+- New profiles use spool format `SPULSE2` for targeted module-generation deactivation; the reader remains compatible with `SPULSE1` profiles.
+
 ## 0.1.4 - 2026-07-06
 
 ### Fixed
