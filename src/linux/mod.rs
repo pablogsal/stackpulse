@@ -237,6 +237,8 @@ pub struct PerfSummary {
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
+    /// LOST lifecycle records observed; one drain may recover several at once.
+    pub lifecycle_gaps: u64,
     /// Whether kernel frame capture remained enabled after attach.
     pub kernel_enabled: bool,
     /// Samples skipped because the process id was missing.
@@ -356,6 +358,7 @@ struct DrainSink<'a, W: std::io::Write> {
     ctx: EventContext<'a, W>,
     sorter: &'a mut EventSorter<RawFd, u64, PreparedEvent>,
     result: io::Result<()>,
+    last_finished_timestamp_ns: u64,
 }
 
 impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
@@ -416,8 +419,14 @@ impl<W: std::io::Write> DrainSink<'_, W> {
         if self.result.is_err() {
             return;
         }
+        let timestamp_ns = match &prepared {
+            PreparedEvent::Sample(sample) => sample.timestamp_ns,
+            PreparedEvent::Record { timestamp_ns, .. } => *timestamp_ns,
+        };
         if let Err(err) = finish_prepared_event(prepared, &mut self.ctx) {
             self.result = Err(err);
+        } else {
+            self.last_finished_timestamp_ns = self.last_finished_timestamp_ns.max(timestamp_ns);
         }
     }
 }
@@ -526,8 +535,10 @@ impl PerfRecorder {
             summary,
         } = self;
         let mut lifecycle_actions = Vec::new();
+        let mut recovered_process_forks = Vec::new();
         let inherit_child_processes = perf.inherit_child_processes;
-        let mut result = {
+        let lifecycle_gaps_before = summary.lifecycle_gaps;
+        let (mut result, recovery_timestamp_ns) = {
             let ctx = EventContext {
                 modules,
                 unwinders,
@@ -546,13 +557,21 @@ impl PerfRecorder {
                 ctx,
                 sorter: event_sorter,
                 result: Ok(()),
+                last_finished_timestamp_ns: 0,
             };
             match mode {
                 DrainMode::Consume => perf.consume_events(&mut sink),
                 DrainMode::Flush => perf.flush_events(&mut sink),
             }
-            sink.result
+            if sink.result.is_ok() && sink.ctx.summary.lifecycle_gaps != lifecycle_gaps_before {
+                // A /proc snapshot is current state, not state at the LOST
+                // record timestamp. Drain every event already collected before
+                // installing that snapshot so it cannot resolve older samples.
+                sink.drain_sorter(true);
+            }
+            (sink.result, sink.last_finished_timestamp_ns)
         };
+        let recovered_lifecycle_gap = summary.lifecycle_gaps != lifecycle_gaps_before;
         // Replay lifecycle mutations in event order. Batching forks and exits
         // by kind breaks when the kernel reuses a PID or TID in one drain.
         if result.is_ok() {
@@ -589,7 +608,15 @@ impl PerfRecorder {
         if result.is_ok() {
             let dead_processes: Vec<_> = active_processes
                 .iter_mut()
-                .filter_map(|(&pid, watcher)| (!process_is_alive(watcher, pid)).then_some(pid))
+                .filter_map(|(&pid, watcher)| {
+                    let dead = !process_is_alive(watcher, pid);
+                    let generation_changed = u32::try_from(pid)
+                        .ok()
+                        .and_then(|pid_u32| read_process_start_time(pid_u32).ok())
+                        .zip(process_start_times.get(&pid).copied())
+                        .is_some_and(|(current, previous)| current != previous);
+                    (dead || generation_changed).then_some(pid)
+                })
                 .collect();
             for pid in dead_processes {
                 if let Ok(pid_u32) = u32::try_from(pid) {
@@ -607,7 +634,7 @@ impl PerfRecorder {
                             _ => None,
                         })
                         .max()
-                        .unwrap_or(0);
+                        .unwrap_or(recovery_timestamp_ns);
                     if let Err(err) = writer.write_process_exec(timestamp_ns, pid, false) {
                         result = Err(err);
                         break;
@@ -627,6 +654,116 @@ impl PerfRecorder {
                 ) {
                     result = Err(err);
                     break;
+                }
+            }
+        }
+        if result.is_ok() && recovered_lifecycle_gap {
+            let tracked_pids: Vec<_> = active_processes.keys().copied().collect();
+            for pid in tracked_pids {
+                let Ok(pid_u32) = u32::try_from(pid) else {
+                    continue;
+                };
+                match reconcile_process_image(
+                    pid_u32,
+                    recovery_timestamp_ns,
+                    modules,
+                    unwinders,
+                    writer,
+                    process_images,
+                    process_start_times,
+                    python_perf_support_processes,
+                    python_runtime_processes,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        perf.remove_process(pid_u32);
+                        if let Err(err) = cleanup_process(
+                            pid,
+                            modules,
+                            unwinders,
+                            writer,
+                            active_processes,
+                            process_images,
+                            process_start_times,
+                            python_perf_support_processes,
+                            python_runtime_processes,
+                        ) {
+                            result = Err(err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_ok()
+            && open_new_perf_events
+            && recovered_lifecycle_gap
+            && inherit_child_processes
+        {
+            let roots: Vec<_> = active_processes.keys().copied().collect();
+            let mut discovered = FxHashSet::default();
+            for root in roots {
+                for (child, parent) in crate::children::discover_descendant_edges(root) {
+                    if !discovered.insert(child) || active_processes.contains_key(&child) {
+                        continue;
+                    }
+                    let Ok(child_u32) = u32::try_from(child) else {
+                        continue;
+                    };
+                    let python_perf_support =
+                        process_has_python_perf_support(child_u32, python_perf_support_processes);
+                    match register_existing_maps(child_u32, modules, unwinders, writer) {
+                        Ok(true) if python_perf_support => {
+                            if let Err(err) = mark_python_runtime_process(
+                                python_runtime_processes,
+                                writer,
+                                recovery_timestamp_ns,
+                                child,
+                            ) {
+                                result = Err(err);
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) if process_gone_error(&err) => continue,
+                        Err(err) => {
+                            result = Err(err);
+                            break;
+                        }
+                    }
+                    active_processes.insert(child, try_new_exit_watcher(child));
+                    if let Ok((identity, _)) = read_process_image_identity(child_u32) {
+                        process_images.insert(child, identity);
+                    }
+                    if let Ok(start_time) = read_process_start_time(child_u32) {
+                        process_start_times.insert(child, start_time);
+                    }
+                    if let Ok(parent_u32) = u32::try_from(parent) {
+                        recovered_process_forks.push((child_u32, parent_u32));
+                    }
+                }
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+        if result.is_ok() && open_new_perf_events {
+            result = perf.recover_forked_processes(&recovered_process_forks);
+        }
+        if result.is_ok() && open_new_perf_events && recovered_lifecycle_gap {
+            for pid in active_processes
+                .keys()
+                .filter_map(|pid| u32::try_from(*pid).ok())
+            {
+                if let Err(err) = perf.refresh_threads(pid) {
+                    if !process_gone_error(&err) {
+                        result = Err(err);
+                        break;
+                    }
                 }
             }
         }
@@ -951,6 +1088,7 @@ fn handle_non_sample_record<W: std::io::Write>(
         }
         Record::LostRecords(lost) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_records);
+            ctx.summary.lifecycle_gaps = ctx.summary.lifecycle_gaps.saturating_add(1);
             Ok(())
         }
         Record::LostSamples(lost) => {
@@ -995,6 +1133,87 @@ fn cleanup_process_modules<W: std::io::Write>(
     modules.deactivate_process_modules(pid, writer)?;
     unwinders.remove(&pid);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_process_image<W: std::io::Write>(
+    pid: u32,
+    timestamp_ns: u64,
+    modules: &mut ModuleTable,
+    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    writer: &mut PerfSpoolWriter<W>,
+    process_images: &mut FxHashMap<i32, ProcessImageIdentity>,
+    process_start_times: &mut FxHashMap<i32, u64>,
+    python_perf_support_processes: &mut FxHashMap<i32, bool>,
+    python_runtime_processes: &mut FxHashSet<i32>,
+) -> io::Result<bool> {
+    let Some(pid_i32) = i32_from_u32(pid) else {
+        return Ok(false);
+    };
+
+    let current_start_time = match read_process_start_time(pid) {
+        Ok(start_time) => start_time,
+        Err(err) if process_gone_error(&err) => {
+            process_images.remove(&pid_i32);
+            process_start_times.remove(&pid_i32);
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
+    // /proc/<tgid>/exe can disappear after the thread-group leader exits even
+    // while sibling threads remain alive. Start time and the maps snapshot,
+    // not the exe symlink alone, determine whether this generation survives.
+    let current_identity = read_process_image_identity(pid)
+        .ok()
+        .map(|(identity, _)| identity);
+
+    let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        Ok(maps) => maps,
+        Err(err) if process_gone_error(&err) => {
+            process_images.remove(&pid_i32);
+            process_start_times.remove(&pid_i32);
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
+    let has_executable_maps = maps_snapshot_has_executable_files(&maps);
+    if !has_executable_maps {
+        // A live group whose leader has exited can expose an empty maps file.
+        // Without a usable replacement snapshot, preserve the last known
+        // modules and unwinder instead of destructively reconciling to empty.
+        return Ok(true);
+    }
+
+    cleanup_process_modules(pid_i32, modules, unwinders, writer)?;
+    python_perf_support_processes.remove(&pid_i32);
+    if python_runtime_processes.remove(&pid_i32) {
+        writer.write_process_exec(timestamp_ns, pid_i32, false)?;
+    }
+
+    let registered = register_existing_maps_snapshot(pid, &maps, modules, unwinders, writer);
+    match registered {
+        Ok(true) if process_has_python_perf_support(pid, python_perf_support_processes) => {
+            if let Some(identity) = current_identity {
+                process_images.insert(pid_i32, identity);
+            }
+            process_start_times.insert(pid_i32, current_start_time);
+            mark_python_runtime_process(python_runtime_processes, writer, timestamp_ns, pid_i32)?;
+            Ok(true)
+        }
+        Ok(_) => {
+            if let Some(identity) = current_identity {
+                process_images.insert(pid_i32, identity);
+            }
+            process_start_times.insert(pid_i32, current_start_time);
+            Ok(true)
+        }
+        Err(err) if process_gone_error(&err) => {
+            process_images.remove(&pid_i32);
+            process_start_times.remove(&pid_i32);
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn process_gone_error(err: &io::Error) -> bool {
@@ -1621,9 +1840,19 @@ fn register_existing_maps<W: std::io::Write>(
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    register_existing_maps_snapshot(pid, &maps, modules, unwinders, writer)
+}
+
+fn register_existing_maps_snapshot<W: std::io::Write>(
+    pid: u32,
+    maps: &str,
+    modules: &mut ModuleTable,
+    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    writer: &mut PerfSpoolWriter<W>,
+) -> io::Result<bool> {
     let mut saw_python_runtime = false;
     for region in
-        crate::proc_maps::parse_iter(&maps).filter(|r| r.is_executable && !r.path.is_empty())
+        crate::proc_maps::parse_iter(maps).filter(|r| r.is_executable && !r.path.is_empty())
     {
         saw_python_runtime |= is_python_runtime_path(region.path);
         record_module(
@@ -1643,6 +1872,10 @@ fn register_existing_maps<W: std::io::Write>(
         )?;
     }
     Ok(saw_python_runtime)
+}
+
+fn maps_snapshot_has_executable_files(maps: &str) -> bool {
+    crate::proc_maps::parse_iter(maps).any(|region| region.is_executable && !region.path.is_empty())
 }
 
 fn is_python_runtime_path(path: &str) -> bool {
@@ -2145,6 +2378,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
 mod tests {
     use super::*;
     use perf_event_open::sample::record::comm::Comm;
+    use perf_event_open::sample::record::lost::LostRecords;
     use perf_event_open::sample::record::task::{Exit, Fork};
     use perf_event_open::sample::record::Task;
 
@@ -2355,6 +2589,69 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn lost_record_defers_recovery_and_does_not_trust_record_id_task() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let mut modules = ModuleTable::default();
+        let mut unwinders = FxHashMap::default();
+        let mut active_processes = FxHashMap::default();
+        let mut process_images = FxHashMap::default();
+        let mut process_start_times = FxHashMap::default();
+        let mut python_perf_support_processes = FxHashMap::default();
+        let mut python_runtime_processes = FxHashSet::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut module = test_module(0x1000, 0x2000);
+        module.process_id = pid;
+        modules.intern_module(module, &mut writer).unwrap();
+
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            unwinders: &mut unwinders,
+            active_processes: &mut active_processes,
+            process_images: &mut process_images,
+            process_start_times: &mut process_start_times,
+            python_perf_support_processes: &mut python_perf_support_processes,
+            python_runtime_processes: &mut python_runtime_processes,
+            writer: &mut writer,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            lifecycle_actions: &mut lifecycle_actions,
+            inherit_child_processes: false,
+        };
+        handle_non_sample_record(
+            123,
+            Priv::User,
+            Record::LostRecords(Box::new(LostRecords {
+                record_id: None,
+                id: 99,
+                lost_records: 7,
+            })),
+            &mut ctx,
+        )
+        .unwrap();
+
+        assert_eq!(summary.lost_events, 7);
+        assert_eq!(summary.lifecycle_gaps, 1);
+        assert!(modules
+            .resolve_frame(pid, 0x1800, FrameMode::User)
+            .module_id
+            .is_some());
+    }
+
+    #[test]
+    fn empty_maps_snapshot_cannot_replace_live_process_modules() {
+        assert!(!maps_snapshot_has_executable_files(""));
+        assert!(!maps_snapshot_has_executable_files(
+            "1000-2000 r-xp 00000000 00:00 0\n"
+        ));
+        assert!(maps_snapshot_has_executable_files(
+            "1000-2000 r-xp 00000000 08:01 42 /tmp/lib.so\n"
+        ));
     }
 
     #[test]
