@@ -104,6 +104,39 @@ impl ProcessUnwinder {
         {
             return false;
         }
+
+        // A new executable mapping can partially replace an older VMA with a
+        // different start (for example via MAP_FIXED). Framehop sorts by start
+        // and assumes non-overlap, so leaving the older range installed can
+        // make it win even though the newer mapping is the current one.
+        let overlapping: Vec<_> = self
+            .known_user_modules
+            .values()
+            .filter(|known| module_ranges_overlap(known, module))
+            .cloned()
+            .collect();
+        for known in overlapping {
+            self.known_user_modules.remove(&known.start);
+            let was_loaded = self.loaded_unwind_modules.remove(&known.start);
+            if was_loaded {
+                self.unwinder.remove_module(known.start);
+            }
+            for fragment in split_module_around(&known, module) {
+                if was_loaded {
+                    if let Some(framehop_module) =
+                        module_to_framehop(&mut self.elf_sections, &fragment)
+                    {
+                        self.loaded_unwind_modules.insert(fragment.start);
+                        self.unwinder.add_module(framehop_module);
+                    }
+                }
+                self.known_user_modules.insert(fragment.start, fragment);
+            }
+        }
+
+        // A mapping change is a new generation: pages that previously missed
+        // may now be backed by executable code and must be eligible to retry.
+        self.refreshed_uncovered_pages.clear();
         self.known_user_modules.insert(module.start, module.clone());
         true
     }
@@ -134,6 +167,31 @@ fn same_module_mapping(left: &ModuleRecord, right: &ModuleRecord) -> bool {
         && left.inode == right.inode
         && left.path == right.path
         && left.is_kernel == right.is_kernel
+}
+
+fn module_ranges_overlap(left: &ModuleRecord, right: &ModuleRecord) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
+    let mut fragments = Vec::with_capacity(2);
+    if old.start < replacement.start {
+        fragments.push(ModuleRecord {
+            id: 0,
+            end: replacement.start.min(old.end),
+            ..old.clone()
+        });
+    }
+    if replacement.end < old.end {
+        let start = replacement.end.max(old.start);
+        fragments.push(ModuleRecord {
+            id: 0,
+            start,
+            file_offset: old.file_offset.saturating_add(start - old.start),
+            ..old.clone()
+        });
+    }
+    fragments
 }
 
 /// Options used when attaching a [`PerfRecorder`] to a process.
@@ -1966,6 +2024,47 @@ mod tests {
 
         assert!(unwinder.covers_user_pc(0x2000));
         assert_eq!(unwinder.known_user_modules.len(), 1);
+    }
+
+    #[test]
+    fn process_unwinder_splits_partially_overlapped_module() {
+        let mut unwinder = ProcessUnwinder::default();
+        let old = test_module(0x2000, 0x4000);
+        let replacement = test_module(0x1000, 0x3000);
+
+        assert!(unwinder.track_known_user_module(&old));
+        unwinder.loaded_unwind_modules.insert(old.start);
+        assert!(unwinder.should_refresh_for_uncovered_pc(0x5000));
+
+        assert!(unwinder.track_known_user_module(&replacement));
+
+        assert_eq!(unwinder.known_user_modules.len(), 2);
+        assert!(unwinder.known_user_modules.contains_key(&replacement.start));
+        let suffix = unwinder.known_user_modules.get(&0x3000).unwrap();
+        assert_eq!(suffix.end, 0x4000);
+        assert_eq!(suffix.file_offset, old.file_offset + 0x1000);
+        assert!(unwinder.covers_user_pc(0x3800));
+        assert!(!unwinder.loaded_unwind_modules.contains(&old.start));
+        assert!(unwinder.should_refresh_for_uncovered_pc(0x5000));
+    }
+
+    #[test]
+    fn process_unwinder_preserves_both_sides_of_inner_replacement() {
+        let mut unwinder = ProcessUnwinder::default();
+        let mut old = test_module(0x1000, 0x5000);
+        old.file_offset = 0x8000;
+        let replacement = test_module(0x2000, 0x3000);
+
+        assert!(unwinder.track_known_user_module(&old));
+        assert!(unwinder.track_known_user_module(&replacement));
+
+        assert_eq!(unwinder.known_user_modules.len(), 3);
+        assert_eq!(unwinder.known_user_modules[&0x1000].end, 0x2000);
+        assert_eq!(unwinder.known_user_modules[&0x3000].end, 0x5000);
+        assert_eq!(unwinder.known_user_modules[&0x3000].file_offset, 0xa000);
+        assert!(unwinder.covers_user_pc(0x1800));
+        assert!(unwinder.covers_user_pc(0x2800));
+        assert!(unwinder.covers_user_pc(0x4800));
     }
 
     #[test]
