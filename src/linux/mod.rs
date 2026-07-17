@@ -24,6 +24,7 @@ use crate::state::{process_is_alive, try_new_exit_watcher, ProcessExitWatcher};
 use crate::{SampleErrorKind, SampleErrorStats};
 use framehop::{Error as FramehopError, FrameAddress, Unwinder};
 use perf_event_open::sample::record::mmap::{Info as MmapInfo, Mmap};
+use perf_event_open::sample::record::sample::Abi as SampleRegsAbi;
 use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -918,7 +919,7 @@ fn prepare_sample<W: std::io::Write>(
         tid: meta.tid,
         privilege: meta.privilege,
         code_addr: meta.code_addr,
-        user_regs: user_regs.map(|(regs, _)| regs),
+        user_regs: user_regs.and_then(|(regs, abi)| (abi == SampleRegsAbi::_64).then_some(regs)),
         user_stack,
         callchain_stack: call_chain
             .as_deref()
