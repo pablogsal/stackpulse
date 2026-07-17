@@ -194,7 +194,6 @@ impl PerfOptions {
             opts.sample_format.user_stack = Some(Size(self.stack_size));
         }
         opts.extra_record.mmap.code = true;
-        opts.extra_record.mmap.data = true;
         opts.extra_record.mmap.ext = Some(UseBuildId(false));
         opts.extra_record.comm = true;
         opts.extra_record.task = true;
@@ -1148,6 +1147,13 @@ mod tests {
     #[test]
     fn ring_buffer_exp_keeps_space_for_queued_stack_samples() {
         assert_eq!(ring_buffer_page_exp(0).expect("page exp"), 5);
+    }
+
+    #[test]
+    fn perf_options_request_only_executable_mmaps() {
+        let opts = PerfOptions::default().perf_open_opts();
+        assert!(opts.extra_record.mmap.code);
+        assert!(!opts.extra_record.mmap.data);
     }
 
     #[test]
