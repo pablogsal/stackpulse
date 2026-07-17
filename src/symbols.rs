@@ -740,12 +740,15 @@ impl SymbolizerWrapper {
         let image_base_opt = module.image_base;
         let is_python_runtime = module.is_python_runtime;
         let Some(image_base) = image_base_opt else {
-            self.cache_insert(addr, &path, Rc::clone(&empty));
             return empty;
         };
 
-        let svma = image_base.svma_for_avma(addr);
-        let module_offset = image_base.relative_address(addr);
+        let Some(svma) = image_base.checked_svma_for_avma(addr) else {
+            return empty;
+        };
+        let Some(module_offset) = image_base.checked_relative_address(addr) else {
+            return empty;
+        };
         let module_rc = module_name_rc(&path);
 
         let symbols = self
@@ -1006,6 +1009,25 @@ mod tests {
         assert!(!symbolizer.symbol_maps.contains_key(&added));
         assert!(symbolizer.redirect_cache.contains_key(&keep));
         assert!(!symbolizer.redirect_cache.contains_key(&removed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_missing_image_base_does_not_poison_symbol_cache() {
+        let path = PathBuf::from("/tmp/libpending.so");
+        let mut symbolizer = SymbolizerWrapper::new(0);
+        symbolizer.local_debug_dirs = Box::default();
+        symbolizer.set_modules(vec![SymModule {
+            path: path.clone(),
+            avma_range: 0x1000..0x2000,
+            image_base: None,
+            is_executable: true,
+            is_python_runtime: false,
+        }]);
+
+        assert!(symbolizer.symbolize_one(0x1234).is_empty());
+        assert!(!symbolizer.cache.contains_key(&0x1234));
+        assert!(!symbolizer.cache_keys_by_path.contains_key(&path));
     }
 
     #[cfg(target_os = "linux")]
