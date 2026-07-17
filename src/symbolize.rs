@@ -89,6 +89,7 @@ enum FrameCacheKey {
 struct NativeSymbolizerGroup {
     process_id: i32,
     modules: Vec<SymModule>,
+    module_inodes: Vec<u64>,
     symbolizer: Box<dyn NativeSymbolizer>,
 }
 
@@ -553,16 +554,28 @@ impl PerfSymbolizer {
         if let Some(idx) = self
             .native_symbolizers
             .iter()
+            .position(|group| group.has_equivalent(module, &requested_module))
+        {
+            // Mapping generations get distinct spool module ids, but an
+            // unchanged ELF at the same layout can share its symbol manager.
+            // This keeps rapid dlclose/dlopen reuse bounded.
+            self.native_symbolizer_by_module.insert(module.id, idx);
+            return Some(());
+        }
+        if let Some(idx) = self
+            .native_symbolizers
+            .iter()
             .position(|group| group.can_add(module.process_id, &requested_module))
         {
             let group = &mut self.native_symbolizers[idx];
             group.modules.push(requested_module);
+            group.module_inodes.push(module.inode);
             group.symbolizer.set_modules(group.modules.clone());
             self.native_symbolizer_by_module.insert(module.id, idx);
             return Some(());
         }
 
-        let mut grouped_modules = vec![(module.id, requested_module)];
+        let mut grouped_modules = vec![(module.id, module.inode, requested_module)];
         let candidates: Vec<_> = self
             .modules
             .iter()
@@ -582,27 +595,28 @@ impl PerfSymbolizer {
                 continue;
             };
             let sym_module = SymModule::from(&module_info);
-            if grouped_modules
-                .iter()
-                .all(|(_, existing)| !ranges_overlap(&existing.avma_range, &sym_module.avma_range))
-            {
-                grouped_modules.push((candidate.id, sym_module));
+            if grouped_modules.iter().all(|(_, _, existing)| {
+                !ranges_overlap(&existing.avma_range, &sym_module.avma_range)
+            }) {
+                grouped_modules.push((candidate.id, candidate.inode, sym_module));
             }
         }
 
         let modules: Vec<_> = grouped_modules
             .iter()
-            .map(|(_, module)| module.clone())
+            .map(|(_, _, module)| module.clone())
             .collect();
+        let module_inodes = grouped_modules.iter().map(|(_, inode, _)| *inode).collect();
         let mut symbolizer = (self.native_factory)(module.process_id);
         symbolizer.set_modules(modules.clone());
         let idx = self.native_symbolizers.len();
         self.native_symbolizers.push(NativeSymbolizerGroup {
             process_id: module.process_id,
             modules,
+            module_inodes,
             symbolizer,
         });
-        for (module_id, _) in grouped_modules {
+        for (module_id, _, _) in grouped_modules {
             self.native_symbolizer_by_module.insert(module_id, idx);
         }
         Some(())
@@ -637,6 +651,23 @@ fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
 }
 
 impl NativeSymbolizerGroup {
+    fn has_equivalent(&self, record: &ModuleRecord, module: &SymModule) -> bool {
+        self.process_id == record.process_id
+            && record.inode != 0
+            && self
+                .modules
+                .iter()
+                .zip(&self.module_inodes)
+                .any(|(existing, inode)| {
+                    *inode == record.inode
+                        && existing.path == module.path
+                        && existing.avma_range == module.avma_range
+                        && existing.image_base == module.image_base
+                        && existing.is_executable == module.is_executable
+                        && existing.is_python_runtime == module.is_python_runtime
+                })
+    }
+
     fn can_add(&self, process_id: i32, module: &SymModule) -> bool {
         self.process_id == process_id
             && self
@@ -798,6 +829,7 @@ fn python_trampoline_slot_size(symbols: &[PerfMapSymbol], index: usize) -> Optio
 mod tests {
     use super::*;
     use crate::spool::PerfSpoolWriter;
+    use std::os::unix::fs::MetadataExt;
 
     fn temp_perf_map_path(process_id: i32) -> String {
         format!("/tmp/perf-{process_id}.map")
@@ -868,6 +900,37 @@ mod tests {
             .ensure_native_symbolizer_for_module(&other_process)
             .is_some());
         assert_eq!(symbolizer.native_symbolizers.len(), 3);
+    }
+
+    #[test]
+    fn native_symbolizer_reuses_only_same_inode_mapping_generations() {
+        let mut symbolizer = PerfSymbolizer::new(&[]);
+        let mut first = executable_module(1, 42, 0x1000);
+        first.inode = std::fs::metadata(first.path.as_path()).unwrap().ino();
+        let mut same_file_generation = first.clone();
+        same_file_generation.id = 2;
+        let mut replaced_file = first.clone();
+        replaced_file.id = 3;
+        replaced_file.inode = first.inode.saturating_add(1);
+
+        let requested_module = {
+            let (module_info, _) = symbolizer.elf_sections.module_info(&first).unwrap();
+            SymModule::from(&module_info)
+        };
+
+        assert!(symbolizer
+            .ensure_native_symbolizer_for_module(&first)
+            .is_some());
+        assert!(symbolizer
+            .ensure_native_symbolizer_for_module(&same_file_generation)
+            .is_some());
+        assert_eq!(symbolizer.native_symbolizers.len(), 1);
+        assert_eq!(
+            symbolizer.native_symbolizer_by_module[&same_file_generation.id],
+            0
+        );
+
+        assert!(!symbolizer.native_symbolizers[0].has_equivalent(&replaced_file, &requested_module));
     }
 
     #[test]

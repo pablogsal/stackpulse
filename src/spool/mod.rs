@@ -13,7 +13,8 @@ pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, OwnedSampleRecord, ProcessExecRecord,
 };
 
-const MAGIC: &[u8; 8] = b"SPULSE1\0";
+const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
+const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -21,6 +22,7 @@ const REC_THREAD: u8 = 4;
 const REC_SAMPLE: u8 = 5;
 const REC_PROCESS_EXEC: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
+const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
 const TRUNCATED_STACK_MARKER_TAG: u64 = 5;
 const NONE_U32: u32 = u32::MAX;
 
@@ -75,7 +77,7 @@ impl<W: Write> PerfSpoolWriter<W> {
             thread_cache: FxHashMap::default(),
             last_timestamp_ns: 0,
         };
-        writer.writer.write_all(MAGIC)?;
+        writer.writer.write_all(MAGIC_V2)?;
         writer.writer.write_varint(start_timestamp_us)?;
         writer.writer.write_varint(sample_interval_us)?;
         Ok(writer)
@@ -145,6 +147,13 @@ impl<W: Write> PerfSpoolWriter<W> {
     pub(crate) fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE])?;
         self.writer.write_varint(i64::from(process_id))?;
+        self.unpinned_frame_cache.clear();
+        Ok(())
+    }
+
+    pub(crate) fn write_module_deactivation_one(&mut self, module_id: u32) -> io::Result<()> {
+        self.writer.write_all(&[REC_MODULE_DEACTIVATE_ONE])?;
+        self.writer.write_varint(u64::from(module_id))?;
         self.unpinned_frame_cache.clear();
         Ok(())
     }
@@ -427,7 +436,7 @@ impl PerfSpoolReader {
         let file = File::open(path)?;
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
-        reader.check_magic()?;
+        let spool_version = reader.check_magic()?;
         let start_timestamp_us = reader.read_varint::<u64>()?;
         let sample_interval_us = reader.read_varint::<u64>()?;
         let (
@@ -487,6 +496,16 @@ impl PerfSpoolReader {
                                 deactivated.get_or_insert(deactivated_at);
                             }
                         }
+                    }
+                    REC_MODULE_DEACTIVATE_ONE => {
+                        if spool_version < 2 {
+                            return Err(invalid_data(
+                                "targeted module deactivation requires spool version 2",
+                            ));
+                        }
+                        let module_id =
+                            read_index_within(&mut reader, modules.len(), "module deactivation")?;
+                        module_deactivated_at[module_id].get_or_insert(frames.len());
                     }
                     other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
                 }
@@ -666,13 +685,14 @@ impl MmapSpoolCursor {
         Self { mmap, position: 0 }
     }
 
-    fn check_magic(&mut self) -> io::Result<()> {
+    fn check_magic(&mut self) -> io::Result<u8> {
         let mut magic = [0_u8; 8];
         self.read_exact_spool(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(invalid_data("invalid stackpulse spool magic"));
+        match &magic {
+            magic if magic == MAGIC_V1 => Ok(1),
+            magic if magic == MAGIC_V2 => Ok(2),
+            _ => Err(invalid_data("invalid stackpulse spool magic")),
         }
-        Ok(())
     }
 
     fn read_tag(&mut self) -> io::Result<Option<u8>> {
@@ -793,12 +813,65 @@ pub struct ModuleTable {
 impl ModuleTable {
     pub fn intern_module<W: Write>(
         &mut self,
-        mut module: ModuleRecord,
+        module: ModuleRecord,
         writer: &mut PerfSpoolWriter<W>,
     ) -> io::Result<u32> {
         if module.end <= module.start {
             return Ok(u32::MAX);
         }
+        let key = ModuleIdentity::from(&module);
+        if let Some(&id) = self.active_by_key.get(&key) {
+            return Ok(id);
+        }
+
+        // Module records are generations, not a permanent address-to-path
+        // dictionary.  dlclose/dlopen commonly reuses the exact same range;
+        // keeping both old mappings active makes the last distinct path win
+        // forever and suppresses a later return to an earlier identity.
+        //
+        // Mapping identities are generations. dlclose/dlopen commonly reuses
+        // the exact same address, and MAP_FIXED may replace only part of a
+        // VMA. Retire just the overlapping generations and preserve their
+        // unaffected fragments; unrelated modules stay interned and stable.
+        if !module.is_kernel {
+            let overlapping: Vec<_> = self
+                .slots
+                .iter()
+                .filter(|slot| {
+                    slot.active
+                        && !slot.module.is_kernel
+                        && slot.module.process_id == module.process_id
+                        && module_ranges_overlap(&slot.module, &module)
+                })
+                .map(|slot| (slot.module.id, slot.module.clone()))
+                .collect();
+            if !overlapping.is_empty() {
+                let mut survivors = Vec::new();
+                for (_, known) in &overlapping {
+                    survivors.extend(split_module_around(known, &module));
+                }
+                for (id, known) in overlapping {
+                    let slot = &mut self.slots[id as usize];
+                    debug_assert!(slot.active);
+                    slot.active = false;
+                    self.active_by_key.remove(&ModuleIdentity::from(&known));
+                    writer.write_module_deactivation_one(id)?;
+                }
+                self.index_dirty = true;
+                for survivor in survivors {
+                    self.intern_module_without_overlap_reconciliation(survivor, writer)?;
+                }
+            }
+        }
+
+        self.intern_module_without_overlap_reconciliation(module, writer)
+    }
+
+    fn intern_module_without_overlap_reconciliation<W: Write>(
+        &mut self,
+        mut module: ModuleRecord,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> io::Result<u32> {
         let key = ModuleIdentity::from(&module);
         if let Some(&id) = self.active_by_key.get(&key) {
             return Ok(id);
@@ -885,6 +958,31 @@ impl ModuleTable {
         self.index = ModuleIndex::build(&self.slots);
         self.index_dirty = false;
     }
+}
+
+fn module_ranges_overlap(left: &ModuleRecord, right: &ModuleRecord) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
+    let mut fragments = Vec::with_capacity(2);
+    if old.start < replacement.start {
+        fragments.push(ModuleRecord {
+            id: 0,
+            end: replacement.start.min(old.end),
+            ..old.clone()
+        });
+    }
+    if replacement.end < old.end {
+        let start = replacement.end.max(old.start);
+        fragments.push(ModuleRecord {
+            id: 0,
+            start,
+            file_offset: old.file_offset.saturating_add(start - old.start),
+            ..old.clone()
+        });
+    }
+    fragments
 }
 
 #[derive(Default)]
@@ -2093,6 +2191,93 @@ mod tests {
             table.resolve_frame(7, 0x1008, FrameMode::User).module_id,
             Some(second_id)
         );
+    }
+
+    #[test]
+    fn module_table_records_exact_address_mapping_generations() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+
+        let alpha1 = table
+            .intern_module(module(7, 0x1000, 0x2000, "/alpha.so", false), &mut writer)
+            .unwrap();
+        let beta = table
+            .intern_module(module(7, 0x1000, 0x2000, "/beta.so", false), &mut writer)
+            .unwrap();
+        let alpha2 = table
+            .intern_module(module(7, 0x1000, 0x2000, "/alpha.so", false), &mut writer)
+            .unwrap();
+
+        assert_ne!(alpha1, alpha2);
+        assert_ne!(beta, alpha2);
+        assert_eq!(
+            table.resolve_frame(7, 0x1100, FrameMode::User).module_id,
+            Some(alpha2)
+        );
+    }
+
+    #[test]
+    fn targeted_module_deactivation_round_trips_generation_contexts() {
+        let path = temp_spool_path("targeted-module-generations");
+        let mut spool = PerfSpoolWriter::create(&path, 0, 0).unwrap();
+        let mut table = ModuleTable::default();
+        let raw = frame(0x1100);
+
+        table
+            .intern_module(module(7, 0x1000, 0x2000, "/alpha.so", false), &mut spool)
+            .unwrap();
+        spool.write_sample_frames(1, 7, 7, [raw]).unwrap();
+        table
+            .intern_module(module(7, 0x1000, 0x2000, "/beta.so", false), &mut spool)
+            .unwrap();
+        spool.write_sample_frames(2, 7, 7, [raw]).unwrap();
+        table
+            .intern_module(module(7, 0x1000, 0x2000, "/alpha.so", false), &mut spool)
+            .unwrap();
+        spool.write_sample_frames(3, 7, 7, [raw]).unwrap();
+        spool.flush().unwrap();
+        drop(spool);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let paths: Vec<_> = reader
+            .samples()
+            .iter()
+            .map(|sample| {
+                reader
+                    .stack_frame_contexts(sample.process_id, sample.stack_id)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .module
+                    .unwrap()
+                    .module
+                    .path
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(paths, ["/alpha.so", "/beta.so", "/alpha.so"]);
+    }
+
+    #[test]
+    fn module_table_preserves_partial_overlap_fragments_and_offsets() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let mut old = module(7, 0x1000, 0x5000, "/old.so", false);
+        old.file_offset = 0x8000;
+        table.intern_module(old, &mut writer).unwrap();
+        let replacement = table
+            .intern_module(module(7, 0x2000, 0x3000, "/new.so", false), &mut writer)
+            .unwrap();
+
+        let left = table.resolve_frame(7, 0x1800, FrameMode::User);
+        let middle = table.resolve_frame(7, 0x2800, FrameMode::User);
+        let right = table.resolve_frame(7, 0x3800, FrameMode::User);
+        assert_ne!(left.module_id, Some(replacement));
+        assert_eq!(middle.module_id, Some(replacement));
+        assert_ne!(right.module_id, Some(replacement));
+        assert_eq!(left.rel_ip, 0x8800);
+        assert_eq!(right.rel_ip, 0xa800);
     }
 
     #[test]
