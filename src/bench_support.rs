@@ -178,6 +178,9 @@ mod tests {
             end: 0x2000,
             file_offset: 0x100,
             inode: 7,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "/tmp/libstackpulse.so".into(),
             is_kernel: false,
         };

@@ -1,7 +1,8 @@
 use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::linux::elf_loader;
 use crate::linux::elf_types::{ElfSectionInfo, ModuleInfo};
@@ -23,17 +24,23 @@ impl ElfSectionCache {
         &mut self,
         module: &ModuleRecord,
     ) -> Option<(ModuleInfo, Arc<ElfSectionInfo>)> {
-        if module.is_kernel || module.path.is_empty() || module.path.is_bracketed_mapping() {
+        if module.is_kernel
+            || module.path.is_empty()
+            || (module.path.is_bracketed_mapping() && module.path.as_str() != "[vdso]")
+        {
             return None;
         }
 
         let section_info = match self.by_module.entry(module.id) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let file = open_module_file(module)?;
-                let section_info = Arc::new(
-                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?,
-                );
+                let section_info = Arc::new(if module.path.as_str() == "[vdso]" {
+                    let bytes = local_vdso_bytes()?;
+                    elf_loader::load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
+                } else {
+                    let file = open_module_file(module)?;
+                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?
+                });
                 Arc::clone(entry.insert(section_info))
             }
         };
@@ -43,6 +50,51 @@ impl ElfSectionCache {
             section_info,
         ))
     }
+
+    pub(crate) fn remove(&mut self, module_id: u32) {
+        self.by_module.remove(&module_id);
+    }
+
+    pub(crate) fn contains(&self, module_id: u32) -> bool {
+        self.by_module.contains_key(&module_id)
+    }
+
+    pub(crate) fn reuse(&mut self, source_id: u32, module_id: u32) {
+        if let Some(sections) = self.by_module.get(&source_id).cloned() {
+            self.by_module.insert(module_id, sections);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_module.len()
+    }
+}
+
+fn local_vdso_bytes() -> Option<Arc<[u8]>> {
+    const MAX_MAPPED_ELF_SIZE: u64 = 16 * 1024 * 1024;
+    static VDSO: OnceLock<Arc<[u8]>> = OnceLock::new();
+
+    // Stackpulse only sends native-register samples to Framehop. The native
+    // vDSO is kernel-wide, so a local copy avoids ptrace/Yama restrictions on
+    // /proc/<target>/mem while retaining the target mapping's AVMA.
+    if let Some(bytes) = VDSO.get() {
+        return Some(Arc::clone(bytes));
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    let region = crate::proc_maps::parse_iter(&maps).find(|region| region.path == "[vdso]")?;
+    let length = region.address.end.checked_sub(region.address.start)?;
+    if length == 0 || length > MAX_MAPPED_ELF_SIZE {
+        return None;
+    }
+    let mut bytes = vec![0; usize::try_from(length).ok()?];
+    let memory = File::open("/proc/self/mem").ok()?;
+    memory
+        .read_exact_at(&mut bytes, region.address.start)
+        .ok()?;
+    let bytes: Arc<[u8]> = bytes.into();
+    let _ = VDSO.set(Arc::clone(&bytes));
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -78,6 +130,13 @@ fn validated_module_file(path: &std::path::Path, module: &ModuleRecord) -> Optio
     }
     if module.inode != 0 && metadata.ino() != module.inode {
         return None;
+    }
+    if module.device_major != 0 || module.device_minor != 0 {
+        let device = metadata.dev();
+        if libc::major(device) != module.device_major || libc::minor(device) != module.device_minor
+        {
+            return None;
+        }
     }
     Some(file)
 }
@@ -141,6 +200,9 @@ mod tests {
             end: 0x7000_1000,
             file_offset: 0x9000,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: "/tmp/libexample.so".into(),
             is_kernel: false,
         };
@@ -163,12 +225,21 @@ mod tests {
             end: 0x2000,
             file_offset: 0,
             inode: inode.saturating_add(1),
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: path.to_string_lossy().into_owned().into(),
             is_kernel: false,
         };
 
         assert!(!module_path_matches_inode(&module));
         module.inode = inode;
+        assert!(module_path_matches_inode(&module));
+        let device = std::fs::metadata(&path).unwrap().dev();
+        module.device_major = libc::major(device);
+        module.device_minor = libc::minor(device).saturating_add(1);
+        assert!(!module_path_matches_inode(&module));
+        module.device_minor = libc::minor(device);
         assert!(module_path_matches_inode(&module));
 
         let _ = std::fs::remove_file(path);
@@ -188,6 +259,9 @@ mod tests {
             end: 0x2000,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: path.to_string_lossy().into_owned().into(),
             is_kernel: false,
         };
@@ -198,6 +272,33 @@ mod tests {
         assert!(cache.module_info(&module).is_some());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cached_sections_can_be_reused_and_retired_by_module_id() {
+        let path = std::env::current_exe().unwrap();
+        let mut module = ModuleRecord {
+            id: 1,
+            process_id: i32::try_from(std::process::id()).unwrap(),
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: path.to_string_lossy().into_owned().into(),
+            is_kernel: false,
+        };
+        let mut cache = ElfSectionCache::default();
+        assert!(cache.module_info(&module).is_some());
+
+        cache.reuse(1, 2);
+        module.id = 2;
+        cache.remove(1);
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.module_info(&module).is_some());
     }
 
     #[test]
@@ -216,6 +317,9 @@ mod tests {
             end: 0x2000,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: textual_path.to_string_lossy().into_owned().into(),
             is_kernel: false,
         };
@@ -225,5 +329,33 @@ mod tests {
 
         let _ = std::fs::remove_file(map_path);
         let _ = std::fs::remove_file(textual_path);
+    }
+
+    #[test]
+    fn loads_vdso_sections_from_the_target_mapping() {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let region = crate::proc_maps::parse_iter(&maps)
+            .find(|region| region.path == "[vdso]")
+            .expect("current process has a vDSO mapping");
+        let module = ModuleRecord {
+            id: 1,
+            process_id: i32::try_from(std::process::id()).unwrap(),
+            start: region.address.start,
+            end: region.address.end,
+            file_offset: region.file_offset,
+            inode: region.inode,
+            device_major: region.device_major,
+            device_minor: region.device_minor,
+            inode_generation: 0,
+            path: "[vdso]".into(),
+            is_kernel: false,
+        };
+
+        let (info, sections) = ElfSectionCache::default()
+            .module_info(&module)
+            .expect("vDSO is a readable ELF mapping");
+
+        assert!(info.image_base.is_some());
+        assert!(sections.eh_frame.is_some() || sections.eh_frame_hdr.is_some());
     }
 }

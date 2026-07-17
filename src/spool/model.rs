@@ -151,6 +151,12 @@ pub struct ModuleRecord {
     pub file_offset: u64,
     /// File inode, when available.
     pub inode: u64,
+    /// Device major number, when available.
+    pub device_major: u32,
+    /// Device minor number, when available.
+    pub device_minor: u32,
+    /// Inode generation reported by `PERF_RECORD_MMAP2`, when available.
+    pub inode_generation: u64,
     /// File path or display name.
     pub path: ModulePath,
     /// Whether this record is kernel code.

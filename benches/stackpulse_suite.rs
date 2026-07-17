@@ -701,6 +701,9 @@ fn synthetic_modules(spec: ScenarioSpec) -> Vec<ModuleRecord> {
                 end: start + 0x000c_0000,
                 file_offset: (index as u64 % 4) * 0x1000,
                 inode: 100_000 + id as u64,
+                device_major: 0,
+                device_minor: 0,
+                inode_generation: 0,
                 path: module_path(spec, process, index),
                 is_kernel: false,
             });
@@ -716,6 +719,9 @@ fn synthetic_modules(spec: ScenarioSpec) -> Vec<ModuleRecord> {
             end: 0xffff_ffff_9000_0000,
             file_offset: 0,
             inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
             path: ModulePath::from("[kernel.kallsyms]"),
             is_kernel: true,
         });
@@ -914,6 +920,9 @@ fn current_exe_symbolization_fixture() -> Option<(Vec<ModuleRecord>, Vec<FrameRe
         end,
         file_offset,
         inode,
+        device_major: 0,
+        device_minor: 0,
+        inode_generation: 0,
         path: exe.to_string_lossy().into_owned().into(),
         is_kernel: false,
     };

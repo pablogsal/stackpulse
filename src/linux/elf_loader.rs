@@ -122,7 +122,37 @@ pub fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
 
 pub fn load_elf_sections_from_file(file: &std::fs::File, path: &Path) -> Result<ElfSectionInfo> {
     let mmap = Arc::new(unsafe { Mmap::map(file) }?);
-    let bytes = &mmap[..];
+    load_elf_sections(ElfFileData::Mmap(mmap), path)
+}
+
+pub fn load_elf_sections_from_bytes(bytes: Arc<[u8]>, path: &Path) -> Result<ElfSectionInfo> {
+    load_elf_sections(ElfFileData::Owned(bytes), path)
+}
+
+#[derive(Clone)]
+enum ElfFileData {
+    Mmap(Arc<Mmap>),
+    Owned(Arc<[u8]>),
+}
+
+impl ElfFileData {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn section(&self, range: Range<usize>) -> Option<ElfSectionData> {
+        match self {
+            Self::Mmap(mmap) => ElfSectionData::mmap(Arc::clone(mmap), range),
+            Self::Owned(bytes) => ElfSectionData::owned_range(Arc::clone(bytes), range),
+        }
+    }
+}
+
+fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
+    let bytes = data.bytes();
 
     // Use lazy parsing rather than Elf::parse to avoid reading symbol tables
     // and relocation sections; on a cold page cache those can be several MB per
@@ -171,9 +201,9 @@ pub fn load_elf_sections_from_file(file: &std::fs::File, path: &Path) -> Result<
     let object_file = unwind_sections_have_compressed_data(&elf)
         .then(|| object::File::parse(bytes).ok())
         .flatten();
-    let text = find_unwind_section_data(".text", &elf, object_file.as_ref(), &mmap);
-    let eh_frame = find_unwind_section_data(".eh_frame", &elf, object_file.as_ref(), &mmap);
-    let eh_frame_hdr = find_unwind_section_data(".eh_frame_hdr", &elf, object_file.as_ref(), &mmap);
+    let text = find_unwind_section_data(".text", &elf, object_file.as_ref(), &data);
+    let eh_frame = find_unwind_section_data(".eh_frame", &elf, object_file.as_ref(), &data);
+    let eh_frame_hdr = find_unwind_section_data(".eh_frame_hdr", &elf, object_file.as_ref(), &data);
 
     Ok(ElfSectionInfo {
         base_svma: calculate_base_svma(&elf),
@@ -225,15 +255,15 @@ fn find_unwind_section_data(
     name: &str,
     elf: &Elf,
     object_file: Option<&object::File<'_>>,
-    mmap: &Arc<Mmap>,
+    data: &ElfFileData,
 ) -> Option<(u64, ElfSectionData)> {
     let section = find_section_header(name, elf)?;
     if section_has_compressed_data(section) {
-        return object_file.and_then(|file| find_section_data_with_object(name, file, mmap));
+        return object_file.and_then(|file| find_section_data_with_object(name, file, data));
     }
 
     let (addr, range) = section_range_in_file(section)?;
-    ElfSectionData::mmap(Arc::clone(mmap), range).map(|data| (addr, data))
+    data.section(range).map(|data| (addr, data))
 }
 
 fn unwind_sections_have_compressed_data(elf: &Elf) -> bool {
@@ -250,17 +280,17 @@ fn section_has_compressed_data(section: &goblin::elf::SectionHeader) -> bool {
 fn find_section_data_with_object(
     name: &str,
     file: &object::File<'_>,
-    mmap: &Arc<Mmap>,
+    storage: &ElfFileData,
 ) -> Option<(u64, ElfSectionData)> {
     let section = file.section_by_name(name)?;
     let file_range = section.compressed_file_range().ok()?;
     let data = match file_range.format {
         CompressionFormat::None => {
             let range = checked_usize_range(file_range.offset, file_range.uncompressed_size)?;
-            ElfSectionData::mmap(Arc::clone(mmap), range)
+            storage.section(range)
         }
         _ => {
-            let compressed = file_range.data(&mmap[..]).ok()?;
+            let compressed = file_range.data(storage.bytes()).ok()?;
             let decompressed = compressed.decompress().ok()?;
             Some(ElfSectionData::owned(decompressed.into_owned()))
         }
@@ -652,8 +682,12 @@ mod tests {
             .unwrap();
         assert_ne!(compressed_range.format, CompressionFormat::None);
 
-        let (_addr, data) =
-            find_section_data_with_object(".debug_stackpulse", &object_file, &mmap).unwrap();
+        let (_addr, data) = find_section_data_with_object(
+            ".debug_stackpulse",
+            &object_file,
+            &ElfFileData::Mmap(Arc::clone(&mmap)),
+        )
+        .unwrap();
         assert_eq!(&data[..], expected.as_slice());
 
         fs::remove_dir_all(root).unwrap();
