@@ -8,26 +8,14 @@ use crate::linux::elf_types::{ElfSectionInfo, ModuleInfo};
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
-use crate::spool::{ModulePath, ModuleRecord};
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ModuleFileKey {
-    path: ModulePath,
-    inode: u64,
-}
-
-impl From<&ModuleRecord> for ModuleFileKey {
-    fn from(module: &ModuleRecord) -> Self {
-        Self {
-            path: module.path.clone(),
-            inode: module.inode,
-        }
-    }
-}
+use crate::spool::ModuleRecord;
 
 #[derive(Clone, Default)]
 pub(crate) struct ElfSectionCache {
-    by_path: FxHashMap<ModuleFileKey, Option<Arc<ElfSectionInfo>>>,
+    // Module ids are unique within a spool. Keying by id avoids reusing ELF
+    // data across processes or mapping generations that happen to report the
+    // same pathname and inode number in different mount namespaces.
+    by_module: FxHashMap<u32, Arc<ElfSectionInfo>>,
 }
 
 impl ElfSectionCache {
@@ -39,18 +27,16 @@ impl ElfSectionCache {
             return None;
         }
 
-        let section_info = self
-            .by_path
-            .entry(ModuleFileKey::from(module))
-            .or_insert_with(|| {
-                open_module_file(module).and_then(|file| {
-                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path())
-                        .ok()
-                        .map(Arc::new)
-                })
-            })
-            .as_ref()
-            .cloned()?;
+        let section_info = match self.by_module.entry(module.id) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let file = open_module_file(module)?;
+                let section_info = Arc::new(
+                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?,
+                );
+                Arc::clone(entry.insert(section_info))
+            }
+        };
 
         Some((
             module_info_with_sections(module, &section_info),
@@ -65,7 +51,27 @@ fn module_path_matches_inode(module: &ModuleRecord) -> bool {
 }
 
 fn open_module_file(module: &ModuleRecord) -> Option<File> {
-    let file = File::open(module.path.as_path()).ok()?;
+    let map_file = PathBuf::from(format!(
+        "/proc/{}/map_files/{:x}-{:x}",
+        module.process_id, module.start, module.end
+    ));
+    open_module_file_with_mapping_path(module, &map_file)
+}
+
+fn open_module_file_with_mapping_path(
+    module: &ModuleRecord,
+    map_file: &std::path::Path,
+) -> Option<File> {
+    // The proc mapping names the exact object mapped by this process and must
+    // win over a textual pathname that may now refer to a replacement file or
+    // resolve in a different mount namespace. The pathname remains a useful
+    // fallback after the process exits and map_files disappears.
+    validated_module_file(map_file, module)
+        .or_else(|| validated_module_file(module.path.as_path(), module))
+}
+
+fn validated_module_file(path: &std::path::Path, module: &ModuleRecord) -> Option<File> {
+    let file = File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -166,5 +172,58 @@ mod tests {
         assert!(module_path_matches_inode(&module));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_elf_load_is_retried_when_file_appears() {
+        let path = std::env::temp_dir().join(format!(
+            "stackpulse-native-module-retry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let module = ModuleRecord {
+            id: 1,
+            process_id: 42,
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            path: path.to_string_lossy().into_owned().into(),
+            is_kernel: false,
+        };
+        let mut cache = ElfSectionCache::default();
+
+        assert!(cache.module_info(&module).is_none());
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        assert!(cache.module_info(&module).is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exact_mapping_file_wins_over_existing_textual_path() {
+        let suffix = std::process::id();
+        let map_path = std::env::temp_dir().join(format!("stackpulse-native-module-map-{suffix}"));
+        let textual_path =
+            std::env::temp_dir().join(format!("stackpulse-native-module-path-{suffix}"));
+        std::fs::write(&map_path, b"mapped object").unwrap();
+        std::fs::write(&textual_path, b"replacement").unwrap();
+        let mapped_inode = std::fs::metadata(&map_path).unwrap().ino();
+        let module = ModuleRecord {
+            id: 1,
+            process_id: i32::try_from(std::process::id()).unwrap(),
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            path: textual_path.to_string_lossy().into_owned().into(),
+            is_kernel: false,
+        };
+
+        let opened = open_module_file_with_mapping_path(&module, &map_path).unwrap();
+        assert_eq!(opened.metadata().unwrap().ino(), mapped_inode);
+
+        let _ = std::fs::remove_file(map_path);
+        let _ = std::fs::remove_file(textual_path);
     }
 }
