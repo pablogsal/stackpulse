@@ -9,7 +9,7 @@ use mio::{Events, Interest, Poll, Token};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::attach::StoppedProcess;
-use super::cpu::{online_cpu_ids, thread_perf_event_capacity};
+use super::cpu::online_cpu_ids;
 use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
 use super::process_gone_error;
 
@@ -34,23 +34,18 @@ struct Member {
 
 struct OutputMember {
     ring: OutputRing,
-    poll_registered: bool,
+    poll_fd: Option<RawFd>,
 }
 
 #[derive(Default)]
 struct PendingEvents {
-    perfs: Vec<PendingMember>,
+    perfs: Vec<Member>,
     outputs: Vec<OutputRing>,
     cpu_outputs: BTreeMap<u32, RawFd>,
 }
 
-struct PendingMember {
-    perf: Perf,
-    output_fd: RawFd,
-}
-
 struct OpenedEvent {
-    member: Option<PendingMember>,
+    member: Option<Member>,
     inherit: TaskInheritance,
 }
 
@@ -62,7 +57,7 @@ pub(super) struct OpenTransaction {
 }
 
 struct ThreadPerfEvents {
-    events: Vec<PendingMember>,
+    events: Vec<Member>,
     inherits: bool,
 }
 
@@ -87,6 +82,7 @@ pub struct PerfGroup {
     outputs: BTreeMap<RawFd, OutputMember>,
     cpu_outputs: BTreeMap<u32, RawFd>,
     ready_fds: BTreeSet<RawFd>,
+    retired_poll_fds: BTreeSet<RawFd>,
     poll: Poll,
     poll_events: Events,
     frequency: u32,
@@ -165,6 +161,7 @@ impl PerfGroup {
             outputs: Default::default(),
             cpu_outputs: Default::default(),
             ready_fds: BTreeSet::new(),
+            retired_poll_fds: BTreeSet::new(),
             poll: Poll::new()?,
             poll_events: Events::with_capacity(16),
             frequency,
@@ -221,11 +218,7 @@ impl PerfGroup {
         let mut pending = PendingEvents::default();
         pending
             .perfs
-            .reserve(cpu_count.saturating_add(thread_perf_event_capacity(
-                cpu_count,
-                threads.len(),
-                false,
-            )));
+            .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
         let mut inheriting_threads = Vec::new();
         let leader_perfs =
             self.open_task_perfs(pid, &cpu_ids, attach_mode, frequency, &mut pending)?;
@@ -304,11 +297,9 @@ impl PerfGroup {
         let cpu_count = cpu_ids.len();
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut pending = PendingEvents::default();
-        pending.perfs.reserve(thread_perf_event_capacity(
-            cpu_count,
-            new_threads.len(),
-            false,
-        ));
+        pending
+            .perfs
+            .reserve(cpu_count.saturating_mul(new_threads.len()));
         let mut tracked_threads = Vec::with_capacity(new_threads.len());
         let mut inheriting_threads = Vec::new();
         for tid in new_threads {
@@ -344,11 +335,9 @@ impl PerfGroup {
         let cpu_count = cpu_ids.len().max(1);
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut pending = PendingEvents::default();
-        pending.perfs.reserve(thread_perf_event_capacity(
-            cpu_count,
-            thread_forks.len(),
-            false,
-        ));
+        pending
+            .perfs
+            .reserve(cpu_count.saturating_mul(thread_forks.len()));
         let mut tracked_threads =
             FxHashMap::with_capacity_and_hasher(thread_forks.len(), Default::default());
         let mut inheriting_threads =
@@ -483,8 +472,7 @@ impl PerfGroup {
         frequency: u64,
         pending: &mut PendingEvents,
     ) -> io::Result<ThreadPerfEvents> {
-        let mut perf_events =
-            ThreadPerfEvents::with_capacity(thread_perf_event_capacity(cpu_ids.len(), 1, false));
+        let mut perf_events = ThreadPerfEvents::with_capacity(cpu_ids.len());
         for &cpu in cpu_ids {
             let perf = self.open_perf(
                 tid,
@@ -534,26 +522,21 @@ impl PerfGroup {
                 }
                 return Err(err);
             }
-            if let Some(cpu) = ring.cpu() {
-                self.cpu_outputs.insert(cpu, fd);
-            }
+            self.cpu_outputs.insert(ring.cpu(), fd);
             self.outputs.insert(
                 fd,
                 OutputMember {
                     ring,
-                    poll_registered: true,
+                    poll_fd: Some(fd),
                 },
             );
+            self.retired_poll_fds.remove(&fd);
             registered_outputs.push(fd);
         }
-        for pending_member in pending.perfs {
-            self.members.insert(
-                pending_member.perf.fd(),
-                Member {
-                    perf: pending_member.perf,
-                    output_fd: pending_member.output_fd,
-                },
-            );
+        for member in pending.perfs {
+            let fd = member.perf.fd();
+            self.retired_poll_fds.remove(&fd);
+            self.members.insert(fd, member);
         }
         Ok(OpenTransaction {
             member_fds,
@@ -596,17 +579,82 @@ impl PerfGroup {
     }
 
     fn remove_member_fd(&mut self, fd: RawFd) {
+        let output_fd = self.members.get(&fd).map(|member| member.output_fd);
+        if output_fd.is_some_and(|output_fd| {
+            self.outputs
+                .get(&output_fd)
+                .is_some_and(|output| output.poll_fd == Some(fd))
+        }) {
+            let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
+            if let Some(output) = output_fd.and_then(|fd| self.outputs.get_mut(&fd)) {
+                output.poll_fd = None;
+            }
+        }
         self.members.remove(&fd);
+        self.retired_poll_fds.remove(&fd);
     }
 
     fn remove_output_fd(&mut self, fd: RawFd) {
-        let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
         if let Some(member) = self.outputs.remove(&fd) {
-            if let Some(cpu) = member.ring.cpu() {
-                self.cpu_outputs.remove(&cpu);
+            if let Some(poll_fd) = member.poll_fd {
+                let _ = self.poll.registry().deregister(&mut SourceFd(&poll_fd));
             }
+            self.cpu_outputs.remove(&member.ring.cpu());
         }
         self.ready_fds.remove(&fd);
+        self.retired_poll_fds.remove(&fd);
+    }
+
+    fn ensure_poll_anchor(&mut self, output_fd: RawFd) -> io::Result<()> {
+        let Some(output) = self.outputs.get(&output_fd) else {
+            return Ok(());
+        };
+        if output.poll_fd.is_some() {
+            return Ok(());
+        }
+        let poll_fd = std::iter::once(output_fd)
+            .chain(
+                self.members
+                    .iter()
+                    .filter_map(|(&fd, member)| (member.output_fd == output_fd).then_some(fd)),
+            )
+            .find(|fd| !self.retired_poll_fds.contains(fd));
+        let Some(poll_fd) = poll_fd else {
+            return Ok(());
+        };
+        self.poll.registry().register(
+            &mut SourceFd(&poll_fd),
+            Token(output_fd as usize),
+            Interest::READABLE,
+        )?;
+        if let Some(output) = self.outputs.get_mut(&output_fd) {
+            output.poll_fd = Some(poll_fd);
+        }
+        Ok(())
+    }
+
+    fn replace_closed_poll_anchor(&mut self, output_fd: RawFd) -> io::Result<()> {
+        let poll_fd = self
+            .outputs
+            .get_mut(&output_fd)
+            .and_then(|output| output.poll_fd.take());
+        if let Some(poll_fd) = poll_fd {
+            let _ = self.poll.registry().deregister(&mut SourceFd(&poll_fd));
+            self.retired_poll_fds.insert(poll_fd);
+        }
+        self.ensure_poll_anchor(output_fd)
+    }
+
+    fn ensure_poll_anchors(&mut self) -> io::Result<()> {
+        let missing: Vec<_> = self
+            .outputs
+            .iter()
+            .filter_map(|(&fd, output)| output.poll_fd.is_none().then_some(fd))
+            .collect();
+        for fd in missing {
+            self.ensure_poll_anchor(fd)?;
+        }
+        Ok(())
     }
 
     fn open_perf(
@@ -620,7 +668,7 @@ impl PerfGroup {
     ) -> io::Result<OpenedEvent> {
         let options = PerfOptions {
             pid,
-            cpu: Some(cpu),
+            cpu,
             frequency,
             stack_size: self.stack_size,
             reg_mask: self.regs_mask,
@@ -648,7 +696,7 @@ impl PerfGroup {
             perf.set_output(output)?;
             Ok(OpenedEvent {
                 inherit: perf.inherit(),
-                member: Some(PendingMember {
+                member: Some(Member {
                     perf,
                     output_fd: fd,
                 }),
@@ -706,6 +754,7 @@ impl PerfGroup {
         if !self.ready_fds.is_empty() {
             return Ok(());
         }
+        self.ensure_poll_anchors()?;
         // EINTR is normal (signals: e.g. parent's Ctrl-C handler).
         if let Err(err) = self
             .poll
@@ -728,16 +777,7 @@ impl PerfGroup {
             }
         }
         for fd in closed {
-            if self
-                .outputs
-                .get(&fd)
-                .is_some_and(|member| member.poll_registered)
-            {
-                let _ = self.poll.registry().deregister(&mut SourceFd(&fd));
-                if let Some(member) = self.outputs.get_mut(&fd) {
-                    member.poll_registered = false;
-                }
-            }
+            self.replace_closed_poll_anchor(fd)?;
         }
         Ok(())
     }
@@ -1004,8 +1044,56 @@ mod tests {
         };
         let group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
+        let Some(pending) = open_fixed_cpu_events(&group, cpu, 2) else {
+            return;
+        };
+
+        assert_eq!(pending.perfs.len(), 1);
+        assert_eq!(pending.outputs.len(), 1);
+    }
+
+    #[test]
+    fn closed_output_poll_anchor_promotes_a_redirected_member() {
+        let Some(cpu) = online_cpu_ids().into_iter().next() else {
+            return;
+        };
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        let Some(pending) = open_fixed_cpu_events(&group, cpu, 3) else {
+            return;
+        };
+        let output_fd = pending.outputs[0].fd();
+        let mut member_fds: Vec<_> = pending
+            .perfs
+            .iter()
+            .map(|member| member.perf.fd())
+            .collect();
+        member_fds.sort_unstable();
+        let [first_member_fd, second_member_fd] = member_fds[..] else {
+            unreachable!("three events create one owner and two members");
+        };
+        group.register_pending(pending).expect("register events");
+
+        group
+            .replace_closed_poll_anchor(output_fd)
+            .expect("promote redirected member");
+        assert_eq!(group.outputs[&output_fd].poll_fd, Some(first_member_fd));
+
+        group
+            .replace_closed_poll_anchor(output_fd)
+            .expect("promote another redirected member");
+        assert!(group.members.contains_key(&first_member_fd));
+        assert_eq!(group.outputs[&output_fd].poll_fd, Some(second_member_fd));
+
+        group.remove_member_fd(second_member_fd);
+        group.ensure_poll_anchor(output_fd).expect("no live anchor");
+
+        assert_eq!(group.outputs[&output_fd].poll_fd, None);
+    }
+
+    fn open_fixed_cpu_events(group: &PerfGroup, cpu: u32, count: usize) -> Option<PendingEvents> {
         let mut pending = PendingEvents::default();
-        for _ in 0..2 {
+        for _ in 0..count {
             let opened = match group.open_perf(
                 std::process::id(),
                 cpu,
@@ -1015,16 +1103,14 @@ mod tests {
                 &mut pending,
             ) {
                 Ok(opened) => opened,
-                Err(err) if perf_open_can_be_skipped(&err) => return,
+                Err(err) if perf_open_can_be_skipped(&err) => return None,
                 Err(err) => panic!("open redirected perf event: {err}"),
             };
             if let Some(member) = opened.member {
                 pending.perfs.push(member);
             }
         }
-
-        assert_eq!(pending.perfs.len(), 1);
-        assert_eq!(pending.outputs.len(), 1);
+        Some(pending)
     }
 
     #[test]
