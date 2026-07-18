@@ -16,10 +16,12 @@
 - Live native unwinding now consumes canonical assigned module IDs instead of aliasing unrelated ELF files through ID zero.
 - Device and inode-generation identity are retained across MMAP2 events, profile files, and symbolizer reuse.
 - vDSO mappings now provide ELF unwind information when the target mapping is readable.
+- Attaching waits for the complete thread group to stop and resumes only processes Stackpulse stopped itself.
 
 ### Performance
 
 - Perf recording no longer requests non-executable MMAP traffic that Stackpulse does not consume.
+- Sampling counters share bounded output rings instead of allocating a full mmap ring for every CPU/task pair.
 - Repeated mappings of the same ELF reuse symbolizer state, keeping high-churn `dlopen` workloads bounded.
 
 ### Changed

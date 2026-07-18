@@ -112,6 +112,46 @@ impl PerfOptions {
     }
 
     fn open_once(&self) -> io::Result<Perf> {
+        self.validate()?;
+        let opts = self.perf_open_opts();
+        let counter = self.open_counter(&opts)?;
+
+        Ok(Perf {
+            counter,
+            target: self.pid,
+            cpu: self.cpu,
+            inherit: self.inherit,
+        })
+    }
+
+    pub fn open_ring(mut self) -> io::Result<OutputRing> {
+        match self.open_ring_once() {
+            Ok(ring) => Ok(ring),
+            Err(err)
+                if self.inherit == TaskInheritance::Threads && is_inherit_thread_error(&err) =>
+            {
+                self.inherit = TaskInheritance::None;
+                self.open_ring_once()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn open_ring_once(&self) -> io::Result<OutputRing> {
+        self.validate()?;
+        let opts = self.perf_open_opts();
+        let counter = self.open_counter(&opts)?;
+        let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
+        Ok(OutputRing {
+            counter,
+            sampler,
+            target: self.pid,
+            cpu: self.cpu,
+            inherit: self.inherit,
+        })
+    }
+
+    fn validate(&self) -> io::Result<()> {
         if let Some(max_rate) = crate::max_sample_rate().filter(|&r| self.frequency > r) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -126,22 +166,7 @@ impl PerfOptions {
                 "sample_user_stack can be at most {MAX_SAMPLE_USER_STACK} bytes"
             )));
         }
-        // See `perf_mmap` in the Linux kernel.
-        if self.cpu.is_none() && self.inherit.is_enabled() {
-            return Err(invalid_input("inherit and any-cpu are mutually exclusive"));
-        }
-
-        let opts = self.perf_open_opts();
-        let counter = self.open_counter(&opts)?;
-        let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
-
-        let perf = Perf {
-            counter,
-            sampler,
-            target: self.pid,
-            inherit: self.inherit,
-        };
-        Ok(perf)
+        ring_buffer_page_exp(self.stack_size).map(drop)
     }
 
     fn open_counter(&self, opts: &Opts) -> io::Result<Counter> {
@@ -201,6 +226,45 @@ impl PerfOptions {
     }
 }
 
+pub struct OutputRing {
+    counter: Counter,
+    sampler: Sampler,
+    target: u32,
+    cpu: Option<u32>,
+    inherit: TaskInheritance,
+}
+
+impl OutputRing {
+    pub fn enable(&self) -> io::Result<()> {
+        self.counter.enable()
+    }
+
+    pub fn disable(&self) -> io::Result<()> {
+        self.counter.disable()
+    }
+
+    #[inline]
+    pub fn fd(&self) -> RawFd {
+        self.counter.file().as_raw_fd()
+    }
+
+    #[inline]
+    pub fn cpu(&self) -> Option<u32> {
+        self.cpu
+    }
+
+    #[inline]
+    pub fn inherit(&self) -> TaskInheritance {
+        self.inherit
+    }
+
+    pub fn event_drain(&self) -> EventDrain<'_> {
+        EventDrain {
+            iter: self.sampler.iter().into_cow(),
+        }
+    }
+}
+
 fn sample_type_bits(
     include_callchain: bool,
     include_user_regs: bool,
@@ -228,12 +292,30 @@ fn open_counter_for_event<E>(
     opts: &Opts,
 ) -> io::Result<Counter>
 where
-    E: TryInto<PerfOpenEvent, Error = io::Error>,
+    E: Clone + TryInto<PerfOpenEvent, Error = io::Error>,
 {
-    match cpu {
-        Some(cpu) => Counter::new(event, (Proc(pid), Cpu(cpu)), opts),
-        None => Counter::new(event, (Proc(pid), Cpu::ALL), opts),
+    let open = || match cpu {
+        Some(cpu) => Counter::new(event.clone(), (Proc(pid), Cpu(cpu)), opts),
+        None => Counter::new(event.clone(), (Proc(pid), Cpu::ALL), opts),
+    };
+    match open() {
+        Err(err) if err.raw_os_error() == Some(libc::EMFILE) && raise_nofile_soft_limit() => open(),
+        result => result,
     }
+}
+
+fn raise_nofile_soft_limit() -> bool {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0
+        || limit.rlim_cur >= limit.rlim_max
+    {
+        return false;
+    }
+    limit.rlim_cur = limit.rlim_max;
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 }
 }
 
 fn is_inherit_thread_error(err: &io::Error) -> bool {
@@ -258,8 +340,8 @@ fn ring_buffer_page_exp(stack_size: u32) -> io::Result<u8> {
 
 pub struct Perf {
     counter: Counter,
-    sampler: Sampler,
     target: u32,
+    cpu: Option<u32>,
     inherit: TaskInheritance,
 }
 
@@ -287,10 +369,15 @@ impl Perf {
         self.inherit
     }
 
-    pub fn event_drain(&self) -> EventDrain<'_> {
-        EventDrain {
-            iter: self.sampler.iter().into_cow(),
+    pub fn set_output(&self, output: &OutputRing) -> io::Result<()> {
+        if self.cpu != output.cpu || (self.cpu.is_none() && self.target != output.target) {
+            return Err(invalid_input("incompatible perf output ring"));
         }
+        let result = unsafe { perf_event_open_sys::ioctls::SET_OUTPUT(self.fd(), output.fd()) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

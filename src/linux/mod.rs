@@ -1,3 +1,4 @@
+mod attach;
 mod convert_regs;
 mod cpu;
 pub(crate) mod elf_loader;
@@ -32,6 +33,7 @@ use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
+use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
 use perf_event::{
     CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource,
@@ -162,17 +164,6 @@ struct EventContext<'a, W: std::io::Write> {
 struct ProcessImageIdentity {
     device: u64,
     inode: u64,
-}
-
-fn read_process_start_time(pid: u32) -> io::Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let after_comm = stat
-        .rfind(')')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))?;
-    stat.get(after_comm + 2..)
-        .and_then(|fields| fields.split_whitespace().nth(19))
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc start time"))
 }
 
 fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
@@ -671,7 +662,7 @@ impl PerfRecorder {
                 )?;
             }
         }
-        self.perf.open_process(pid, attach_mode)?;
+        let opened = self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
             self.track_process(pid_i32);
             if let Ok((identity, _)) = read_process_image_identity(pid) {
@@ -695,20 +686,20 @@ impl PerfRecorder {
                         0,
                         pid_i32,
                     ) {
-                        self.rollback_open_process(pid);
+                        self.rollback_open_process(pid, opened);
                         return Err(err);
                     }
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    self.rollback_open_process(pid);
+                    self.rollback_open_process(pid, opened);
                     return Err(err);
                 }
             }
         }
         if attach_mode == AttachMode::StopAttachEnableResume {
             if let Err(err) = self.perf.enable() {
-                self.rollback_open_process(pid);
+                self.rollback_open_process(pid, opened);
                 return Err(err);
             }
         }
@@ -781,9 +772,9 @@ impl PerfRecorder {
         }
     }
 
-    fn rollback_open_process(&mut self, pid: u32) {
+    fn rollback_open_process(&mut self, pid: u32, opened: perf_group::OpenTransaction) {
         self.perf.resume_stopped_processes();
-        self.perf.remove_process(pid);
+        self.perf.rollback_open(opened);
         if let Some(pid) = i32_from_u32(pid) {
             let _ = cleanup_process(
                 pid,
