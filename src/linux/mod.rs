@@ -299,27 +299,14 @@ impl PerfRecorder {
         attach_mode: AttachMode,
         options: PerfRecorderOptions,
     ) -> io::Result<Self> {
-        let mut kernel_enabled = options.include_kernel;
-        let perf = open_perf_group(pid, attach_mode, &options).or_else(|err| {
-            if options.include_kernel && err.kind() == io::ErrorKind::PermissionDenied {
-                kernel_enabled = false;
-                open_perf_group(
-                    pid,
-                    attach_mode,
-                    &PerfRecorderOptions {
-                        include_kernel: false,
-                        ..options.clone()
-                    },
-                )
-            } else {
-                Err(err)
-            }
-        })?;
+        let mut perf = open_perf_group(pid, attach_mode, &options)?;
+        let kernel_enabled = perf.kernel_enabled();
         let mut writer = PerfSpoolWriter::create(
             output,
             options.start_timestamp_us,
             options.sample_interval_us,
-        )?;
+        )
+        .map_err(|err| perf.resume_error_or(err))?;
         let mut modules = ModuleTable::default();
         let mut unwinders = FxHashMap::default();
         let mut active_processes = FxHashMap::default();
@@ -338,13 +325,22 @@ impl PerfRecorder {
         }
         let python_perf_support =
             process_has_python_perf_support(pid, &mut python_perf_support_processes);
-        let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
-            && register_existing_maps(pid, &mut modules, &mut unwinders, &mut writer)?;
-        if let Some(pid_i32) =
-            i32_from_u32(pid).filter(|_| registered_existing_maps && python_perf_support)
-        {
-            mark_python_runtime_process(&mut python_runtime_processes, &mut writer, 0, pid_i32)?;
-        }
+        (|| {
+            let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
+                && register_existing_maps(pid, &mut modules, &mut unwinders, &mut writer)?;
+            if let Some(pid_i32) =
+                i32_from_u32(pid).filter(|_| registered_existing_maps && python_perf_support)
+            {
+                mark_python_runtime_process(
+                    &mut python_runtime_processes,
+                    &mut writer,
+                    0,
+                    pid_i32,
+                )?;
+            }
+            Ok::<_, io::Error>(())
+        })()
+        .map_err(|err| perf.resume_error_or(err))?;
 
         let mut recorder = Self {
             perf,
@@ -623,6 +619,7 @@ impl PerfRecorder {
                 }
             }
         }
+        summary.kernel_enabled &= perf.kernel_enabled();
         result
     }
 
@@ -637,17 +634,17 @@ impl PerfRecorder {
     /// Add another process to this recording.
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
         if let Some(pid_i32) = i32_from_u32(pid) {
-            let current_start_time = read_process_start_time(pid).ok();
-            let stale = self
-                .active_processes
-                .get_mut(&pid_i32)
-                .is_some_and(|watcher| {
-                    !process_is_alive(watcher, pid_i32)
-                        || current_start_time
-                            .zip(self.process_start_times.get(&pid_i32).copied())
-                            .is_some_and(|(current, previous)| current != previous)
-                });
-            if stale {
+            let previous_start_time = self.process_start_times.get(&pid_i32).copied();
+            if let Some(watcher) = self.active_processes.get_mut(&pid_i32) {
+                // Reopen only after proving that the old process is gone or
+                // that this numeric PID now identifies a new generation.
+                let stale = !process_is_alive(watcher, pid_i32)
+                    || previous_start_time.is_some_and(|previous| {
+                        read_process_start_time(pid).is_ok_and(|current| current != previous)
+                    });
+                if !stale {
+                    return Ok(());
+                }
                 self.perf.remove_process(pid);
                 cleanup_process(
                     pid_i32,
@@ -686,23 +683,21 @@ impl PerfRecorder {
                         0,
                         pid_i32,
                     ) {
-                        self.rollback_open_process(pid, opened);
-                        return Err(err);
+                        return Err(self.rollback_open_process(pid, opened, err));
                     }
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    self.rollback_open_process(pid, opened);
-                    return Err(err);
+                    return Err(self.rollback_open_process(pid, opened, err));
                 }
             }
         }
         if attach_mode == AttachMode::StopAttachEnableResume {
             if let Err(err) = self.perf.enable() {
-                self.rollback_open_process(pid, opened);
-                return Err(err);
+                return Err(self.rollback_open_process(pid, opened, err));
             }
         }
+        self.summary.kernel_enabled &= self.perf.kernel_enabled();
         Ok(())
     }
 
@@ -773,8 +768,13 @@ impl PerfRecorder {
         }
     }
 
-    fn rollback_open_process(&mut self, pid: u32, opened: perf_group::OpenTransaction) {
-        self.perf.resume_stopped_processes();
+    fn rollback_open_process(
+        &mut self,
+        pid: u32,
+        opened: perf_group::OpenTransaction,
+        original_error: io::Error,
+    ) -> io::Error {
+        let error = self.perf.resume_error_or(original_error);
         self.perf.rollback_open(opened);
         if let Some(pid) = i32_from_u32(pid) {
             let _ = cleanup_process(
@@ -789,6 +789,7 @@ impl PerfRecorder {
                 &mut self.python_runtime_processes,
             );
         }
+        error
     }
 }
 
@@ -1170,7 +1171,10 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     let Some(pid) = i32_from_u32(mmap.task.pid) else {
         return Ok(());
     };
-    if !c_string_is_python_runtime_path(&mmap.file) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(mmap.file.as_bytes()));
+    if !crate::is_python_runtime_module_path(path) {
         return Ok(());
     }
     if process_has_python_perf_support(mmap.task.pid, python_perf_support_processes) {
@@ -1656,21 +1660,18 @@ fn open_perf_group(
     options: &PerfRecorderOptions,
 ) -> io::Result<perf_group::PerfGroup> {
     let regs_mask = ConvertRegsNative::regs_mask();
-    let open = |source| {
-        perf_group::PerfGroup::open(
-            pid,
-            attach_mode,
-            PerfGroupOptions {
-                frequency: options.frequency,
-                stack_size: options.stack_size,
-                event_source: source,
-                regs_mask,
-                include_kernel: options.include_kernel,
-                inherit_child_processes: options.inherit_child_processes,
-            },
-        )
-    };
-    open(EventSource::HwCpuCycles).or_else(|_| open(EventSource::SwCpuClock))
+    perf_group::PerfGroup::open(
+        pid,
+        attach_mode,
+        PerfGroupOptions {
+            frequency: options.frequency,
+            stack_size: options.stack_size,
+            event_source: EventSource::HwCpuCycles,
+            regs_mask,
+            include_kernel: options.include_kernel,
+            inherit_child_processes: options.inherit_child_processes,
+        },
+    )
 }
 
 fn register_existing_maps<W: std::io::Write>(
@@ -1694,7 +1695,7 @@ fn register_existing_maps_snapshot<W: std::io::Write>(
     for region in
         crate::proc_maps::parse_iter(maps).filter(|r| r.is_executable && !r.path.is_empty())
     {
-        saw_python_runtime |= is_python_runtime_path(region.path);
+        saw_python_runtime |= crate::is_python_runtime_module_path(region.path);
         record_module(
             modules,
             unwinders,
@@ -1719,24 +1720,6 @@ fn register_existing_maps_snapshot<W: std::io::Write>(
 
 fn maps_snapshot_has_executable_files(maps: &str) -> bool {
     crate::proc_maps::parse_iter(maps).any(|region| region.is_executable && !region.path.is_empty())
-}
-
-fn is_python_runtime_path(path: &str) -> bool {
-    path_basename_is_python_module(std::path::Path::new(path))
-}
-
-fn path_basename_is_python_module(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(crate::is_python_module)
-}
-
-fn c_string_is_python_runtime_path(path: &std::ffi::CString) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    path_basename_is_python_module(std::path::Path::new(std::ffi::OsStr::from_bytes(
-        path.as_bytes(),
-    )))
 }
 
 #[cfg(test)]
@@ -1997,10 +1980,6 @@ impl LivePerfSampleBenchFixture {
     pub(crate) fn sample_count(&self) -> usize {
         self.samples.sample_count()
     }
-
-    pub(crate) fn frame_count(&self) -> usize {
-        self.samples.frame_count()
-    }
 }
 
 pub(crate) fn live_perf_sample_bench_fixture() -> LivePerfSampleBenchFixture {
@@ -2029,69 +2008,6 @@ pub(crate) fn bench_parse_live_perf_samples(
     rounds: u64,
 ) -> usize {
     perf_event::bench_parse_sample_records(&fixture.samples, rounds)
-}
-
-pub(crate) fn bench_record_live_perf_samples(
-    fixture: &LivePerfSampleBenchFixture,
-    rounds: u64,
-) -> io::Result<usize> {
-    let mut checksum = 0usize;
-    for round in 0..rounds {
-        let mut writer = PerfSpoolWriter::from_writer(
-            Vec::with_capacity(fixture.spool_capacity),
-            1_700_000_000_000_000 + round,
-            1_000,
-        )?;
-        let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        for module in &fixture.modules {
-            record_module(&mut modules, &mut unwinders, &mut writer, module.clone())?;
-        }
-
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
-        let mut summary = PerfSummary::default();
-        let mut stack_scratch = Vec::with_capacity(128);
-        let mut lifecycle_actions = Vec::new();
-        {
-            let mut ctx = EventContext {
-                modules: &mut modules,
-                unwinders: &mut unwinders,
-                active_processes: &mut active_processes,
-                process_images: &mut process_images,
-                process_start_times: &mut process_start_times,
-                python_perf_support_processes: &mut python_perf_support_processes,
-                python_runtime_processes: &mut python_runtime_processes,
-                writer: &mut writer,
-                summary: &mut summary,
-                stack_scratch: &mut stack_scratch,
-                lifecycle_actions: &mut lifecycle_actions,
-                inherit_child_processes: false,
-            };
-            for record in fixture.samples.records() {
-                let (privilege, sample) = fixture
-                    .samples
-                    .parse(record)
-                    .expect("parse synthetic live sample");
-                if let Some(prepared) = prepare_sample_ref(&mut ctx, sample, privilege)? {
-                    finish_prepared_event(prepared, &mut ctx)?;
-                }
-            }
-        }
-
-        writer.flush()?;
-        let bytes = writer.into_inner();
-        checksum = checksum
-            .wrapping_add(bytes.len())
-            .wrapping_add(summary.samples as usize)
-            .wrapping_add(summary.sample_events as usize)
-            .wrapping_add(summary.ignored_user_callchain_frames as usize)
-            .wrapping_add(lifecycle_actions.len());
-    }
-    Ok(checksum)
 }
 
 pub(crate) fn bench_replay_live_perf_ring_records(
@@ -2236,6 +2152,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
 mod tests {
     use super::*;
     use crate::spool::ModuleTableTestExt;
+    use crate::test_support::{SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
     use perf_event_open::sample::record::lost::LostRecords;
     use perf_event_open::sample::record::task::{Exit, Fork};
@@ -2246,6 +2163,39 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<PerfRecorder>();
+    }
+
+    #[test]
+    fn reopening_the_same_process_is_idempotent() {
+        let child = SleepChild::spawn();
+        let temp = TempDir::new("duplicate-open");
+        let mut recorder = match PerfRecorder::attach(
+            child.pid_u32(),
+            temp.path().join("profile.stackpulse"),
+            AttachMode::StopAttachEnableResume,
+            PerfRecorderOptions {
+                frequency: 1,
+                ..PerfRecorderOptions::default()
+            },
+        ) {
+            Ok(recorder) => recorder,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) || matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) =>
+            {
+                return;
+            }
+            Err(err) => panic!("attach recorder: {err}"),
+        };
+        let before = recorder.perf.resource_counts();
+
+        recorder
+            .open_process(child.pid_u32(), AttachMode::StopAttachEnableResume)
+            .expect("repeat process attachment");
+
+        assert_eq!(recorder.perf.resource_counts(), before);
     }
 
     #[test]

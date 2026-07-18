@@ -42,6 +42,7 @@ struct PendingEvents {
     perfs: Vec<Member>,
     outputs: Vec<OutputRing>,
     cpu_outputs: BTreeMap<u32, RawFd>,
+    kernel_excluded: bool,
 }
 
 struct OpenedEvent {
@@ -54,6 +55,7 @@ pub(super) struct OpenTransaction {
     member_fds: Vec<RawFd>,
     output_fds: Vec<RawFd>,
     bookkeeping: Vec<(u32, Option<u32>, bool)>,
+    previous_include_kernel: bool,
 }
 
 struct ThreadPerfEvents {
@@ -121,11 +123,21 @@ pub(crate) trait EventConsumer {
 }
 
 fn get_threads(pid: u32) -> io::Result<Vec<u32>> {
-    Ok(fs::read_dir(format!("/proc/{pid}/task"))?
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&tid| tid != pid)
-        .collect())
+    let mut tids = Vec::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/task"))? {
+        let entry = entry?;
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if tid != pid {
+            tids.push(tid);
+        }
+    }
+    Ok(tids)
 }
 
 /// How recording should attach to a process.
@@ -211,51 +223,64 @@ impl PerfGroup {
         } else {
             (None, get_threads(pid)?)
         };
-        let cpu_ids = online_cpu_ids();
-        let cpu_count = cpu_ids.len();
-        // Match perf's mmap topology: the first sampling counter on each CPU
-        // owns the ring and every other same-CPU counter redirects into it.
-        let mut pending = PendingEvents::default();
-        pending
-            .perfs
-            .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
-        let mut inheriting_threads = Vec::new();
-        let leader_perfs =
-            self.open_task_perfs(pid, &cpu_ids, attach_mode, frequency, &mut pending)?;
-        if leader_perfs.inherits {
-            inheriting_threads.push(pid);
-        }
-        pending.perfs.extend(leader_perfs.events);
-        for &tid in &threads {
-            if let Some(thread_perfs) =
-                self.try_open_thread_perfs(tid, &cpu_ids, attach_mode, frequency, &mut pending)?
-            {
-                if thread_perfs.inherits {
-                    inheriting_threads.push(tid);
+        let result = (|| {
+            let cpu_ids = online_cpu_ids();
+            let cpu_count = cpu_ids.len();
+            // Match perf's mmap topology: the first sampling counter on each CPU
+            // owns the ring and every other same-CPU counter redirects into it.
+            let mut pending = PendingEvents::default();
+            pending
+                .perfs
+                .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
+            let mut inheriting_threads = Vec::new();
+            let leader_perfs =
+                self.open_task_perfs(pid, &cpu_ids, attach_mode, frequency, &mut pending)?;
+            if leader_perfs.inherits {
+                inheriting_threads.push(pid);
+            }
+            pending.perfs.extend(leader_perfs.events);
+            for &tid in &threads {
+                if let Some(thread_perfs) =
+                    self.try_open_thread_perfs(tid, &cpu_ids, attach_mode, frequency, &mut pending)?
+                {
+                    if thread_perfs.inherits {
+                        inheriting_threads.push(tid);
+                    }
+                    pending.perfs.extend(thread_perfs.events);
                 }
-                pending.perfs.extend(thread_perfs.events);
+            }
+
+            let mut opened = self.register_pending(pending)?;
+            opened.bookkeeping = std::iter::once(pid)
+                .chain(threads.iter().copied())
+                .map(|tid| {
+                    (
+                        tid,
+                        self.tracked_threads.get(&tid).copied(),
+                        self.inheriting_threads.contains(&tid),
+                    )
+                })
+                .collect();
+            self.tracked_threads.insert(pid, pid);
+            self.tracked_threads
+                .extend(threads.into_iter().map(|tid| (tid, pid)));
+            self.inheriting_threads.extend(inheriting_threads);
+            Ok(opened)
+        })();
+        match result {
+            Ok(opened) => {
+                if let Some(stopped_process) = stopped_process {
+                    self.stopped_processes.push(stopped_process);
+                }
+                Ok(opened)
+            }
+            Err(err) => {
+                if let Some(mut stopped_process) = stopped_process {
+                    stopped_process.resume()?;
+                }
+                Err(err)
             }
         }
-
-        let mut opened = self.register_pending(pending)?;
-        opened.bookkeeping = std::iter::once(pid)
-            .chain(threads.iter().copied())
-            .map(|tid| {
-                (
-                    tid,
-                    self.tracked_threads.get(&tid).copied(),
-                    self.inheriting_threads.contains(&tid),
-                )
-            })
-            .collect();
-        self.tracked_threads.insert(pid, pid);
-        self.tracked_threads
-            .extend(threads.into_iter().map(|tid| (tid, pid)));
-        self.inheriting_threads.extend(inheriting_threads);
-        if let Some(stopped_process) = stopped_process {
-            self.stopped_processes.push(stopped_process);
-        }
-        Ok(opened)
     }
 
     pub fn refresh_threads(&mut self, pid: u32) -> io::Result<()> {
@@ -398,7 +423,6 @@ impl PerfGroup {
             ) {
                 Ok(opened) => {
                     if let Err(err) = self.enable() {
-                        self.resume_stopped_processes();
                         self.rollback_open(opened);
                         return Err(err);
                     }
@@ -503,6 +527,8 @@ impl PerfGroup {
     }
 
     fn register_pending(&mut self, pending: PendingEvents) -> io::Result<OpenTransaction> {
+        let kernel_excluded = pending.kernel_excluded;
+        let previous_include_kernel = self.include_kernel;
         let member_fds = pending
             .perfs
             .iter()
@@ -538,10 +564,12 @@ impl PerfGroup {
             self.retired_poll_fds.remove(&fd);
             self.members.insert(fd, member);
         }
+        self.include_kernel &= !kernel_excluded;
         Ok(OpenTransaction {
             member_fds,
             output_fds,
             bookkeeping: Vec::new(),
+            previous_include_kernel,
         })
     }
 
@@ -556,6 +584,7 @@ impl PerfGroup {
     }
 
     pub(super) fn rollback_open(&mut self, opened: OpenTransaction) {
+        self.include_kernel = opened.previous_include_kernel;
         for fd in opened.member_fds {
             self.remove_member_fd(fd);
         }
@@ -675,10 +704,10 @@ impl PerfGroup {
             event_source: self.event_source,
             inherit,
             enable_on_exec: attach_mode == AttachMode::AttachWithEnableOnExec,
-            include_kernel: self.include_kernel,
+            include_kernel: self.include_kernel && !pending.kernel_excluded,
             sample_callchain: true,
             exclude_user_callchain: false,
-            exclude_kernel_callchain: !self.include_kernel,
+            exclude_kernel_callchain: !self.include_kernel || pending.kernel_excluded,
         };
         if let Some(fd) = self
             .cpu_outputs
@@ -687,6 +716,9 @@ impl PerfGroup {
             .or_else(|| pending.cpu_outputs.get(&cpu).copied())
         {
             let perf = options.clone().open()?;
+            if !perf.includes_kernel() {
+                pending.kernel_excluded = true;
+            }
             let output = self
                 .outputs
                 .get(&fd)
@@ -703,6 +735,9 @@ impl PerfGroup {
             })
         } else {
             let output = options.open_ring()?;
+            if !output.includes_kernel() {
+                pending.kernel_excluded = true;
+            }
             let fd = output.fd();
             let inherit = output.inherit();
             pending.cpu_outputs.insert(cpu, fd);
@@ -726,19 +761,38 @@ impl PerfGroup {
         !self.ready_fds.is_empty()
     }
 
-    pub fn enable(&mut self) -> io::Result<()> {
-        for member in self.outputs.values() {
-            member.ring.enable()?;
-        }
-        for member in self.members.values_mut() {
-            member.perf.enable()?;
-        }
-        self.stopped_processes.clear();
-        Ok(())
+    pub fn kernel_enabled(&self) -> bool {
+        self.include_kernel
     }
 
-    pub fn resume_stopped_processes(&mut self) {
-        self.stopped_processes.clear();
+    pub fn enable(&mut self) -> io::Result<()> {
+        let enable_result = (|| {
+            for member in self.outputs.values() {
+                member.ring.enable()?;
+            }
+            for member in self.members.values_mut() {
+                member.perf.enable()?;
+            }
+            Ok(())
+        })();
+        let resume_result = self.resume_stopped_processes();
+        resume_result.and(enable_result)
+    }
+
+    pub fn resume_stopped_processes(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        for mut process in std::mem::take(&mut self.stopped_processes) {
+            if let Err(err) = process.resume() {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn resume_error_or(&mut self, original_error: io::Error) -> io::Error {
+        self.resume_stopped_processes()
+            .err()
+            .unwrap_or(original_error)
     }
 
     pub fn disable(&mut self) {
@@ -806,6 +860,15 @@ impl PerfGroup {
     pub fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) {
         self.consume_events(consumer);
         consumer.flush_ready_events();
+    }
+
+    #[cfg(test)]
+    pub(super) fn resource_counts(&self) -> (usize, usize, usize) {
+        (
+            self.outputs.len(),
+            self.members.len(),
+            self.tracked_threads.len(),
+        )
     }
 }
 
@@ -1028,7 +1091,14 @@ mod tests {
         assert!(!group.has_pending_events());
         group.enable().expect("enable empty group");
         group.disable();
-        group.resume_stopped_processes();
+        group
+            .resume_stopped_processes()
+            .expect("resume empty group");
+        let original = io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(
+            group.resume_error_or(original).raw_os_error(),
+            Some(libc::ENOSPC)
+        );
         group.flush_events(&mut consumer);
 
         assert_eq!(
@@ -1131,6 +1201,23 @@ mod tests {
         assert!(group.outputs.is_empty());
         assert!(group.tracked_threads.is_empty());
         assert!(group.inheriting_threads.is_empty());
+    }
+
+    #[test]
+    fn rollback_restores_kernel_sampling_state() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, true, false)
+            .expect("create perf group");
+        let pending = PendingEvents {
+            kernel_excluded: true,
+            ..PendingEvents::default()
+        };
+
+        let opened = group.register_pending(pending).expect("register events");
+        assert!(!group.kernel_enabled());
+
+        group.rollback_open(opened);
+
+        assert!(group.kernel_enabled());
     }
 
     fn perf_open_can_be_skipped(err: &io::Error) -> bool {

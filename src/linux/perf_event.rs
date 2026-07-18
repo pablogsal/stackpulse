@@ -94,49 +94,44 @@ impl TaskInheritance {
 }
 
 impl PerfOptions {
-    pub fn open(mut self) -> io::Result<Perf> {
-        match self.open_once() {
-            Ok(perf) => Ok(perf),
-            Err(err)
-                if self.inherit == TaskInheritance::Threads && is_inherit_thread_error(&err) =>
-            {
-                self.inherit = TaskInheritance::None;
-                self.open_once()
-            }
-            Err(err) => Err(err),
-        }
+    pub fn open(self) -> io::Result<Perf> {
+        let (counter, inherit, include_kernel) = self.open_counter()?;
+
+        Ok(Perf::new(
+            counter,
+            self.pid,
+            self.cpu,
+            inherit,
+            include_kernel,
+        ))
     }
 
-    fn open_once(&self) -> io::Result<Perf> {
-        self.validate()?;
-        let opts = self.perf_open_opts();
-        let counter = self.open_counter(&opts)?;
-
-        Ok(Perf::new(counter, self.pid, self.cpu, self.inherit))
-    }
-
-    pub fn open_ring(mut self) -> io::Result<OutputRing> {
-        match self.open_ring_once() {
-            Ok(ring) => Ok(ring),
-            Err(err)
-                if self.inherit == TaskInheritance::Threads && is_inherit_thread_error(&err) =>
-            {
-                self.inherit = TaskInheritance::None;
-                self.open_ring_once()
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn open_ring_once(&self) -> io::Result<OutputRing> {
-        self.validate()?;
-        let opts = self.perf_open_opts();
-        let counter = self.open_counter(&opts)?;
+    pub fn open_ring(self) -> io::Result<OutputRing> {
+        let (counter, inherit, include_kernel) = self.open_counter()?;
         let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
         Ok(OutputRing {
-            perf: Perf::new(counter, self.pid, self.cpu, self.inherit),
+            perf: Perf::new(counter, self.pid, self.cpu, inherit, include_kernel),
             sampler,
         })
+    }
+
+    fn open_counter(&self) -> io::Result<(Counter, TaskInheritance, bool)> {
+        self.validate()?;
+        let opts = self.perf_open_opts();
+        match self.open_counter_once(&opts) {
+            Ok((counter, include_kernel)) => Ok((counter, self.inherit, include_kernel)),
+            Err(err)
+                if self.inherit == TaskInheritance::Threads && is_inherit_thread_error(&err) =>
+            {
+                let mut no_inherit_opts = opts.clone();
+                no_inherit_opts.inherit = None;
+                self.open_counter_once(&no_inherit_opts)
+                    .map(|(counter, include_kernel)| {
+                        (counter, TaskInheritance::None, include_kernel)
+                    })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -157,11 +152,24 @@ impl PerfOptions {
         ring_buffer_page_exp(self.stack_size).map(drop)
     }
 
-    fn open_counter(&self, opts: &Opts) -> io::Result<Counter> {
+    fn open_counter_once(&self, opts: &Opts) -> io::Result<(Counter, bool)> {
+        with_kernel_exclusion_fallback(
+            self.include_kernel,
+            || self.open_event_counter(opts),
+            || {
+                let mut user_opts = opts.clone();
+                user_opts.exclude.kernel = true;
+                self.open_event_counter(&user_opts)
+            },
+        )
+    }
+
+    fn open_event_counter(&self, opts: &Opts) -> io::Result<Counter> {
         match self.event_source {
-            EventSource::HwCpuCycles => {
-                open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts)
-            }
+            EventSource::HwCpuCycles => with_software_event_fallback(
+                || open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts),
+                || open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts),
+            ),
             EventSource::SwCpuClock => {
                 open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts)
             }
@@ -243,6 +251,11 @@ impl OutputRing {
         self.perf.inherit()
     }
 
+    #[inline]
+    pub fn includes_kernel(&self) -> bool {
+        self.perf.includes_kernel()
+    }
+
     pub fn event_drain(&self) -> EventDrain<'_> {
         EventDrain {
             iter: self.sampler.iter().into_cow(),
@@ -296,12 +309,42 @@ fn raise_nofile_soft_limit() -> bool {
 }
 
 fn is_inherit_thread_error(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::InvalidInput
-        || err.kind() == io::ErrorKind::Unsupported
-        || matches!(
-            err.raw_os_error(),
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-        )
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
+fn with_software_event_fallback<T>(
+    hardware: impl FnOnce() -> io::Result<T>,
+    software: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    match hardware() {
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO)
+            ) =>
+        {
+            software()
+        }
+        result => result,
+    }
+}
+
+fn with_kernel_exclusion_fallback<T>(
+    include_kernel: bool,
+    preferred: impl FnOnce() -> io::Result<T>,
+    user_only: impl FnOnce() -> io::Result<T>,
+) -> io::Result<(T, bool)> {
+    match preferred() {
+        Err(err)
+            if include_kernel && matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) =>
+        {
+            user_only().map(|value| (value, false))
+        }
+        result => result.map(|value| (value, include_kernel)),
+    }
 }
 
 fn ring_buffer_page_exp(stack_size: u32) -> io::Result<u8> {
@@ -335,15 +378,23 @@ pub struct Perf {
     target: u32,
     cpu: u32,
     inherit: TaskInheritance,
+    include_kernel: bool,
 }
 
 impl Perf {
-    fn new(counter: Counter, target: u32, cpu: u32, inherit: TaskInheritance) -> Self {
+    fn new(
+        counter: Counter,
+        target: u32,
+        cpu: u32,
+        inherit: TaskInheritance,
+        include_kernel: bool,
+    ) -> Self {
         Self {
             counter,
             target,
             cpu,
             inherit,
+            include_kernel,
         }
     }
 
@@ -368,6 +419,11 @@ impl Perf {
     #[inline]
     pub fn inherit(&self) -> TaskInheritance {
         self.inherit
+    }
+
+    #[inline]
+    pub fn includes_kernel(&self) -> bool {
+        self.include_kernel
     }
 
     pub fn set_output(&self, output: &OutputRing) -> io::Result<()> {
@@ -1255,6 +1311,58 @@ mod tests {
         );
         assert!(ring_buffer_page_exp_for_page_size(0, 0).is_err());
         assert!(ring_buffer_page_exp_for_page_size(0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn software_fallback_is_limited_to_unavailable_hardware_events() {
+        for errno in [libc::ENOENT, libc::ENODEV, libc::ENXIO] {
+            let value = with_software_event_fallback(
+                || Err(io::Error::from_raw_os_error(errno)),
+                || Ok(42),
+            )
+            .expect("fallback to software event");
+            assert_eq!(value, 42);
+        }
+
+        let err = with_software_event_fallback::<()>(
+            || Err(io::Error::from_raw_os_error(libc::EPERM)),
+            || panic!("permission errors must not trigger fallback"),
+        )
+        .expect_err("preserve hardware error");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn software_fallback_preserves_the_software_errno() {
+        let err = with_software_event_fallback::<()>(
+            || Err(io::Error::from_raw_os_error(libc::ENODEV)),
+            || Err(io::Error::from_raw_os_error(libc::EMFILE)),
+        )
+        .expect_err("return software event error");
+
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+    }
+
+    #[test]
+    fn kernel_exclusion_fallback_is_limited_to_permission_errors() {
+        for errno in [libc::EACCES, libc::EPERM] {
+            let (value, kernel_enabled) = with_kernel_exclusion_fallback(
+                true,
+                || Err(io::Error::from_raw_os_error(errno)),
+                || Ok(42),
+            )
+            .expect("retry without kernel samples");
+            assert_eq!(value, 42);
+            assert!(!kernel_enabled);
+        }
+
+        let err = with_kernel_exclusion_fallback::<()>(
+            true,
+            || Err(io::Error::from_raw_os_error(libc::EMFILE)),
+            || panic!("resource errors must not trigger fallback"),
+        )
+        .expect_err("preserve preferred event error");
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
     }
 
     #[test]

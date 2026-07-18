@@ -27,12 +27,7 @@ impl ProcessExitWatcher {
     /// Open a pidfd for `pid`. Fails if `pid` is non-positive or if
     /// `pidfd_open` is unavailable or denied (e.g. older kernels, sandbox).
     pub fn try_new(pid: i32) -> io::Result<Self> {
-        if pid <= 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("pid {pid}"),
-            ));
-        }
+        validate_signal_pid(pid)?;
         let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid, 0) };
         if raw_fd < 0 {
             return Err(io::Error::last_os_error());
@@ -168,7 +163,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(try_new_exit_watcher(0).is_none());
         assert!(ProcessExitWatcher::try_new(i32::MAX).is_err());
         assert_eq!(

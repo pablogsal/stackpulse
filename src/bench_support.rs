@@ -74,11 +74,6 @@ impl LivePerfSampleFixture {
     pub fn sample_count(&self) -> u64 {
         self.inner.sample_count() as u64
     }
-
-    #[doc(hidden)]
-    pub fn frame_count(&self) -> u64 {
-        self.inner.frame_count() as u64
-    }
 }
 
 impl Default for LivePerfSampleFixture {
@@ -90,14 +85,6 @@ impl Default for LivePerfSampleFixture {
 #[doc(hidden)]
 pub fn parse_live_perf_samples(fixture: &LivePerfSampleFixture, rounds: u64) -> usize {
     linux::bench_parse_live_perf_samples(&fixture.inner, rounds)
-}
-
-#[doc(hidden)]
-pub fn record_live_perf_samples_to_spool(
-    fixture: &LivePerfSampleFixture,
-    rounds: u64,
-) -> io::Result<usize> {
-    linux::bench_record_live_perf_samples(&fixture.inner, rounds)
 }
 
 #[doc(hidden)]

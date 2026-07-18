@@ -9,7 +9,7 @@ use crate::elf::{
     collect_load_segments, file_ranges_correlate, find_load_contribution_for_file_range,
     LoadSegment,
 };
-use crate::error::{Error, Result};
+use crate::error::{ElfParseError, Error};
 use crate::ModuleImageBase;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
@@ -21,6 +21,8 @@ use object::{CompressionFormat, Object, ObjectSection};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SvmaFileRange {
@@ -157,9 +159,7 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
     // Use lazy parsing rather than Elf::parse to avoid reading symbol tables
     // and relocation sections; on a cold page cache those can be several MB per
     // library and block the sample loop for seconds in CI containers.
-    let parse_err = |e: goblin::error::Error| {
-        Error::RuntimeError(format!("Failed to parse ELF {}: {}", path.display(), e))
-    };
+    let parse_err = |source| Error::from(ElfParseError::new(path, source));
     let header = Elf::parse_header(bytes).map_err(&parse_err)?;
     let mut elf = Elf::lazy_parse(header).map_err(&parse_err)?;
 
@@ -713,8 +713,13 @@ mod tests {
         // /etc/passwd is definitely not an ELF file
         #[cfg(unix)]
         {
-            let result = load_elf_sections_from_path(Path::new("/etc/passwd"));
-            assert!(result.is_err(), "non-ELF file should return error");
+            let err = load_elf_sections_from_path(Path::new("/etc/passwd"))
+                .expect_err("non-ELF file should return error");
+            let Error::ElfParse(parse) = err else {
+                panic!("non-ELF file should return structured parse error");
+            };
+            assert_eq!(parse.path(), Path::new("/etc/passwd"));
+            assert!(std::error::Error::source(&parse).is_some());
         }
     }
 }
