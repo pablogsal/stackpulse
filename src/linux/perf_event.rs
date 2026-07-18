@@ -1,4 +1,3 @@
-use std::cmp::max;
 use std::fmt;
 use std::io;
 use std::mem::{align_of, size_of};
@@ -23,8 +22,6 @@ use perf_event_open_sys::bindings as sys;
 /// `perf_event_open` will copy per sample. Acts as a ceiling for
 /// `PerfRecorderOptions::stack_size`; anything larger is rejected.
 pub const MAX_SAMPLE_USER_STACK: u32 = 65_528;
-/// Size of the perf metadata page that precedes the ring buffer in the mmap.
-const META_PAGE: u32 = 4096;
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -67,8 +64,7 @@ pub enum EventSource {
 #[derive(Clone, Debug, Default)]
 pub struct PerfOptions {
     pub pid: u32,
-    /// `None` => any cpu.
-    pub cpu: Option<u32>,
+    pub cpu: u32,
     pub frequency: u64,
     pub stack_size: u32,
     pub reg_mask: u64,
@@ -116,12 +112,7 @@ impl PerfOptions {
         let opts = self.perf_open_opts();
         let counter = self.open_counter(&opts)?;
 
-        Ok(Perf {
-            counter,
-            target: self.pid,
-            cpu: self.cpu,
-            inherit: self.inherit,
-        })
+        Ok(Perf::new(counter, self.pid, self.cpu, self.inherit))
     }
 
     pub fn open_ring(mut self) -> io::Result<OutputRing> {
@@ -143,11 +134,8 @@ impl PerfOptions {
         let counter = self.open_counter(&opts)?;
         let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
         Ok(OutputRing {
-            counter,
+            perf: Perf::new(counter, self.pid, self.cpu, self.inherit),
             sampler,
-            target: self.pid,
-            cpu: self.cpu,
-            inherit: self.inherit,
         })
     }
 
@@ -227,35 +215,32 @@ impl PerfOptions {
 }
 
 pub struct OutputRing {
-    counter: Counter,
+    perf: Perf,
     sampler: Sampler,
-    target: u32,
-    cpu: Option<u32>,
-    inherit: TaskInheritance,
 }
 
 impl OutputRing {
     pub fn enable(&self) -> io::Result<()> {
-        self.counter.enable()
+        self.perf.enable()
     }
 
     pub fn disable(&self) -> io::Result<()> {
-        self.counter.disable()
+        self.perf.disable()
     }
 
     #[inline]
     pub fn fd(&self) -> RawFd {
-        self.counter.file().as_raw_fd()
+        self.perf.fd()
     }
 
     #[inline]
-    pub fn cpu(&self) -> Option<u32> {
-        self.cpu
+    pub fn cpu(&self) -> u32 {
+        self.perf.cpu
     }
 
     #[inline]
     pub fn inherit(&self) -> TaskInheritance {
-        self.inherit
+        self.perf.inherit()
     }
 
     pub fn event_drain(&self) -> EventDrain<'_> {
@@ -285,19 +270,11 @@ fn sample_type_bits(
     sample_type
 }
 
-fn open_counter_for_event<E>(
-    event: E,
-    pid: u32,
-    cpu: Option<u32>,
-    opts: &Opts,
-) -> io::Result<Counter>
+fn open_counter_for_event<E>(event: E, pid: u32, cpu: u32, opts: &Opts) -> io::Result<Counter>
 where
     E: Clone + TryInto<PerfOpenEvent, Error = io::Error>,
 {
-    let open = || match cpu {
-        Some(cpu) => Counter::new(event.clone(), (Proc(pid), Cpu(cpu)), opts),
-        None => Counter::new(event.clone(), (Proc(pid), Cpu::ALL), opts),
-    };
+    let open = || Counter::new(event.clone(), (Proc(pid), Cpu(cpu)), opts);
     match open() {
         Err(err) if err.raw_os_error() == Some(libc::EMFILE) && raise_nofile_soft_limit() => open(),
         result => result,
@@ -328,24 +305,48 @@ fn is_inherit_thread_error(err: &io::Error) -> bool {
 }
 
 fn ring_buffer_page_exp(stack_size: u32) -> io::Result<u8> {
+    ring_buffer_page_exp_for_page_size(stack_size, crate::elf::system_page_size())
+}
+
+fn ring_buffer_page_exp_for_page_size(stack_size: u32, page_size: u64) -> io::Result<u8> {
     const STACK_COUNT_PER_BUFFER: u32 = 32;
-    let required_space = max(stack_size, META_PAGE) * STACK_COUNT_PER_BUFFER;
-    let Some(n) = (1..26).find(|n| (1_u32 << n) * META_PAGE >= required_space) else {
+    if page_size == 0 {
+        return Err(invalid_input("system page size cannot be zero"));
+    }
+    let required_space = u64::from(stack_size)
+        .max(page_size)
+        .checked_mul(u64::from(STACK_COUNT_PER_BUFFER))
+        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
+    let pages = required_space
+        .div_ceil(page_size)
+        .checked_next_power_of_two()
+        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
+    let page_exp = pages.trailing_zeros();
+    if page_exp >= 26 {
         return Err(invalid_input(format!(
             "stack_size {stack_size} too large for the ring buffer"
         )));
-    };
-    Ok(max(1 << n, 16_u32).trailing_zeros() as u8)
+    }
+    Ok(page_exp as u8)
 }
 
 pub struct Perf {
     counter: Counter,
     target: u32,
-    cpu: Option<u32>,
+    cpu: u32,
     inherit: TaskInheritance,
 }
 
 impl Perf {
+    fn new(counter: Counter, target: u32, cpu: u32, inherit: TaskInheritance) -> Self {
+        Self {
+            counter,
+            target,
+            cpu,
+            inherit,
+        }
+    }
+
     pub fn enable(&self) -> io::Result<()> {
         self.counter.enable()
     }
@@ -370,7 +371,7 @@ impl Perf {
     }
 
     pub fn set_output(&self, output: &OutputRing) -> io::Result<()> {
-        if self.cpu != output.cpu || (self.cpu.is_none() && self.target != output.target) {
+        if self.cpu != output.cpu() {
             return Err(invalid_input("incompatible perf output ring"));
         }
         let result = unsafe { perf_event_open_sys::ioctls::SET_OUTPUT(self.fd(), output.fd()) };
@@ -1234,6 +1235,26 @@ mod tests {
     #[test]
     fn ring_buffer_exp_keeps_space_for_queued_stack_samples() {
         assert_eq!(ring_buffer_page_exp(0).expect("page exp"), 5);
+    }
+
+    #[test]
+    fn ring_buffer_exp_uses_the_runtime_page_size() {
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 4_096).expect("4K page exp"),
+            9
+        );
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 16_384)
+                .expect("16K page exp"),
+            7
+        );
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 65_536)
+                .expect("64K page exp"),
+            5
+        );
+        assert!(ring_buffer_page_exp_for_page_size(0, 0).is_err());
+        assert!(ring_buffer_page_exp_for_page_size(0, u64::MAX).is_err());
     }
 
     #[test]

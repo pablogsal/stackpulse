@@ -35,19 +35,6 @@ fn fallback_cpu_ids() -> Vec<u32> {
     (0..cpu_count as u32).collect()
 }
 
-#[must_use]
-pub(super) fn thread_perf_event_capacity(
-    cpu_count: usize,
-    thread_count: usize,
-    per_thread_only: bool,
-) -> usize {
-    if per_thread_only {
-        thread_count
-    } else {
-        cpu_count.saturating_mul(thread_count)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,12 +54,5 @@ mod tests {
         assert!(!ids.is_empty());
         assert_eq!(ids[0], 0);
         assert_eq!(ids, (0..ids.len() as u32).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn thread_perf_event_capacity_matches_event_layout() {
-        assert_eq!(thread_perf_event_capacity(4, 3, false), 12);
-        assert_eq!(thread_perf_event_capacity(4, 3, true), 3);
-        assert_eq!(thread_perf_event_capacity(usize::MAX, 2, false), usize::MAX);
     }
 }

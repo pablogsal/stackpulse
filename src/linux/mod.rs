@@ -716,7 +716,8 @@ impl PerfRecorder {
         self.perf.disable();
     }
 
-    /// Return whether unread profiling events are already queued.
+    /// Return whether userspace has queued events or [`Self::wait`] observed a
+    /// readable perf buffer.
     pub fn has_pending_events(&self) -> bool {
         self.event_sorter.has_more() || self.perf.has_pending_events()
     }
