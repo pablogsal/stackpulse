@@ -47,22 +47,27 @@ impl StoppedProcess {
         let deadline = Instant::now() + STOP_TIMEOUT;
         let mut previous = None;
         loop {
-            let snapshot = process_snapshot(pid)?;
+            let snapshot = match process_snapshot(pid) {
+                Ok(snapshot) => snapshot,
+                Err(err) => return Err(stopped.resume_error_or(err)),
+            };
             if snapshot.start_time != stopped.start_time {
-                return Err(io::Error::new(
+                let err = io::Error::new(
                     io::ErrorKind::NotFound,
                     "target process identity changed while stopping",
-                ));
+                );
+                return Err(stopped.resume_error_or(err));
             }
             if snapshot.all_stopped && previous.as_ref() == Some(&snapshot) {
                 return Ok((stopped, without_leader(snapshot.tids, pid)));
             }
             previous = snapshot.all_stopped.then_some(snapshot);
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
+                let err = io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for process {pid} to stop"),
-                ));
+                );
+                return Err(stopped.resume_error_or(err));
             }
             std::thread::sleep(STOP_POLL_INTERVAL);
         }
@@ -87,34 +92,62 @@ impl StoppedProcess {
         }
         Ok(())
     }
+
+    pub(super) fn resume(&mut self) -> io::Result<()> {
+        if !self.resume_on_drop {
+            return Ok(());
+        }
+
+        // A pidfd pins the exact process. The kill fallback must prove that
+        // the numeric PID still names the process we stopped.
+        if self.pidfd.is_none() {
+            match read_process_start_time(self.pid) {
+                Ok(start_time) if start_time == self.start_time => {}
+                Ok(_) => {
+                    self.resume_on_drop = false;
+                    return Ok(());
+                }
+                Err(err) if super::process_gone_error(&err) => {
+                    self.resume_on_drop = false;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.send_signal(libc::SIGCONT)?;
+        // Once SIGCONT succeeds, ownership of the stopped state ends. A
+        // subsequent stop may belong to another actor and must not be undone
+        // by Drop, even if confirmation below fails.
+        self.resume_on_drop = false;
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            match process_snapshot(self.pid) {
+                Ok(snapshot) if snapshot.start_time != self.start_time || !snapshot.all_stopped => {
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(err) if super::process_gone_error(&err) => return Ok(()),
+                Err(err) => return Err(err),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for process {} to resume", self.pid),
+                ));
+            }
+            std::thread::sleep(STOP_POLL_INTERVAL);
+        }
+    }
+
+    fn resume_error_or(&mut self, original_error: io::Error) -> io::Error {
+        self.resume().err().unwrap_or(original_error)
+    }
 }
 
 impl Drop for StoppedProcess {
     fn drop(&mut self) {
-        if !self.resume_on_drop {
-            return;
-        }
-        // A pidfd pins the exact process, so it remains safe even if procfs is
-        // temporarily unreadable. The kill fallback needs the start-time check
-        // to avoid resuming a reused PID.
-        if self.pidfd.is_some()
-            || read_process_start_time(self.pid)
-                .is_ok_and(|start_time| start_time == self.start_time)
-        {
-            if self.send_signal(libc::SIGCONT).is_err() {
-                return;
-            }
-            let deadline = Instant::now() + STOP_TIMEOUT;
-            while Instant::now() < deadline {
-                let Ok(snapshot) = process_snapshot(self.pid) else {
-                    return;
-                };
-                if snapshot.start_time != self.start_time || !snapshot.all_stopped {
-                    return;
-                }
-                std::thread::sleep(STOP_POLL_INTERVAL);
-            }
-        }
+        let _ = self.resume();
     }
 }
 
@@ -136,7 +169,15 @@ fn without_leader(mut tids: Vec<u32>, pid: u32) -> Vec<u32> {
 }
 
 fn process_snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
-    let leader = read_proc_stat(&format!("/proc/{pid}/stat"))?;
+    process_snapshot_with(pid, read_proc_stat)
+}
+
+fn process_snapshot_with(
+    pid: u32,
+    mut read_stat: impl FnMut(&str) -> io::Result<ProcStat>,
+) -> io::Result<ProcessSnapshot> {
+    let leader_path = format!("/proc/{pid}/stat");
+    let initial_leader = read_stat(&leader_path)?;
     let mut tids = Vec::new();
     let mut all_stopped = true;
     for entry in fs::read_dir(format!("/proc/{pid}/task"))? {
@@ -148,7 +189,7 @@ fn process_snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
         let Some(tid) = entry.file_name().to_str().and_then(|tid| tid.parse().ok()) else {
             continue;
         };
-        match read_proc_stat(&format!("/proc/{pid}/task/{tid}/stat")) {
+        match read_stat(&format!("/proc/{pid}/task/{tid}/stat")) {
             Ok(stat) => {
                 tids.push(tid);
                 all_stopped &= matches!(stat.state, 'T' | 't');
@@ -165,8 +206,15 @@ fn process_snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
             "target process disappeared while enumerating threads",
         ));
     }
+    let confirmed_leader = read_stat(&leader_path)?;
+    if confirmed_leader.start_time != initial_leader.start_time {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target process identity changed while enumerating threads",
+        ));
+    }
     Ok(ProcessSnapshot {
-        start_time: leader.start_time,
+        start_time: confirmed_leader.start_time,
         tids,
         all_stopped,
     })
@@ -231,11 +279,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rejects_identity_change_during_thread_enumeration() {
+        let pid = std::process::id();
+        let leader_path = format!("/proc/{pid}/stat");
+        let mut leader_reads = 0;
+
+        let err = process_snapshot_with(pid, |path| {
+            let mut stat = read_proc_stat(path)?;
+            if path == leader_path {
+                leader_reads += 1;
+                if leader_reads == 2 {
+                    stat.start_time = stat.start_time.saturating_add(1);
+                }
+            }
+            Ok(stat)
+        })
+        .expect_err("reject changed process identity");
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn running_process_is_stopped_then_resumed() {
         let child = SleepChild::spawn();
         let pid = child.pid_u32();
-        let (stopped, _) = StoppedProcess::new(pid).expect("stop child");
+        let (mut stopped, _) = StoppedProcess::new(pid).expect("stop child");
         assert!(process_snapshot(pid).expect("stopped snapshot").all_stopped);
+        stopped.resume().expect("resume child");
         drop(stopped);
         assert!(!process_snapshot(pid).expect("resumed snapshot").all_stopped);
     }
@@ -272,6 +342,27 @@ mod tests {
         });
 
         wait_until(pid, |snapshot| !snapshot.all_stopped);
+    }
+
+    #[test]
+    fn explicit_resume_preserves_the_signal_errno() {
+        let file = std::fs::File::open("/dev/null").expect("open non-pidfd");
+        let mut stopped = StoppedProcess {
+            pid: std::process::id(),
+            start_time: u64::MAX,
+            pidfd: Some(file.into()),
+            resume_on_drop: true,
+        };
+
+        let err = stopped
+            .resume()
+            .expect_err("reject non-pidfd signal target");
+
+        assert!(matches!(
+            err.raw_os_error(),
+            Some(libc::EBADF | libc::EINVAL)
+        ));
+        assert!(stopped.resume_on_drop);
     }
 
     fn wait_until(pid: u32, predicate: impl Fn(&ProcessSnapshot) -> bool) {

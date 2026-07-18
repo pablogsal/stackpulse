@@ -45,7 +45,7 @@ mod symbols;
 #[cfg(test)]
 mod test_support;
 
-pub use error::{Error, Result};
+pub use error::{ElfParseError, Error};
 pub use linux::perf_event::PerfFrequencyLimit;
 pub use linux::perf_event::MAX_SAMPLE_USER_STACK;
 pub use linux::{process, AttachMode, PerfRecorder, PerfRecorderOptions, PerfSummary};

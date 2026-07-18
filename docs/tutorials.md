@@ -22,7 +22,7 @@ Attach to that PID, drain for ten seconds, then read the spool file back:
 use std::time::{Duration, Instant};
 use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer};
 
-fn record(pid: u32) -> stackpulse::Result<()> {
+fn record(pid: u32) -> std::io::Result<()> {
     let mut recorder = PerfRecorder::attach(
         pid,
         "profile.spool",

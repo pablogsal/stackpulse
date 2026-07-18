@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - 2026-07-18
+
+### Fixed
+
+- Perf output rings retain a live poll anchor after their owning task exits, preventing high-frequency samples from waiting on the periodic drain timeout.
+- Ring-buffer sizing uses the runtime page size instead of assuming 4 KiB pages.
+- Attach success now reports resume failures instead of silently leaving a target stopped.
+- Hardware-to-software event fallback is limited to unavailable hardware counters and preserves unrelated OS errors.
+- Repeated attachment to the same process generation is idempotent instead of opening duplicate counters.
+- Process snapshots verify the leader identity after thread enumeration, closing a PID-reuse race.
+- Thread enumeration propagates directory-entry errors instead of returning a partial snapshot.
+
+### Changed
+
+- `Error` is non-exhaustive and replaces the stringly `RuntimeError` variant with `ElfParse(ElfParseError)`, which exposes the affected path and preserves the parser source chain; the unused public `Result` alias was removed.
+- Perf events now use one fixed-CPU member representation and one bounded output ring per CPU.
+- Removed unused hidden live-recording benchmark helpers.
+
 ## 0.2.0 - 2026-07-18
 
 ### Fixed
