@@ -94,7 +94,8 @@ impl TaskInheritance {
 }
 
 impl PerfOptions {
-    pub fn open(self) -> io::Result<Perf> {
+    pub fn open(mut self) -> io::Result<Perf> {
+        self.align_stack_size()?;
         let (counter, inherit, include_kernel) = self.open_counter()?;
 
         Ok(Perf::new(
@@ -106,13 +107,29 @@ impl PerfOptions {
         ))
     }
 
-    pub fn open_ring(self) -> io::Result<OutputRing> {
+    pub fn open_ring(mut self) -> io::Result<OutputRing> {
+        self.align_stack_size()?;
         let (counter, inherit, include_kernel) = self.open_counter()?;
         let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
         Ok(OutputRing {
             perf: Perf::new(counter, self.pid, self.cpu, inherit, include_kernel),
             sampler,
         })
+    }
+
+    fn align_stack_size(&mut self) -> io::Result<()> {
+        const ALIGNMENT: u32 = size_of::<u64>() as u32;
+        if self.stack_size > MAX_SAMPLE_USER_STACK {
+            return Err(invalid_input(format!(
+                "sample_user_stack can be at most {MAX_SAMPLE_USER_STACK} bytes"
+            )));
+        }
+        self.stack_size = self
+            .stack_size
+            .checked_add(ALIGNMENT - 1)
+            .map(|size| size & !(ALIGNMENT - 1))
+            .ok_or_else(|| invalid_input("sample_user_stack size overflow"))?;
+        Ok(())
     }
 
     fn open_counter(&self) -> io::Result<(Counter, TaskInheritance, bool)> {
@@ -143,11 +160,6 @@ impl PerfOptions {
                     max_frequency: max_rate,
                 },
             ));
-        }
-        if self.stack_size > MAX_SAMPLE_USER_STACK {
-            return Err(invalid_input(format!(
-                "sample_user_stack can be at most {MAX_SAMPLE_USER_STACK} bytes"
-            )));
         }
         ring_buffer_page_exp(self.stack_size).map(drop)
     }
@@ -1370,6 +1382,53 @@ mod tests {
         let opts = PerfOptions::default().perf_open_opts();
         assert!(opts.extra_record.mmap.code);
         assert!(!opts.extra_record.mmap.data);
+    }
+
+    #[test]
+    fn perf_options_align_user_stack_to_u64() {
+        let mut options = PerfOptions {
+            stack_size: 12_345,
+            ..PerfOptions::default()
+        };
+
+        options.align_stack_size().expect("align stack size");
+
+        assert_eq!(options.stack_size, 12_352);
+        assert_eq!(
+            options.perf_open_opts().sample_format.user_stack,
+            Some(Size(12_352))
+        );
+    }
+
+    #[test]
+    fn perf_options_align_and_validate_stack_size_boundaries() {
+        for (requested, expected) in [
+            (0, 0),
+            (MAX_SAMPLE_USER_STACK - 1, MAX_SAMPLE_USER_STACK),
+            (MAX_SAMPLE_USER_STACK, MAX_SAMPLE_USER_STACK),
+        ] {
+            let mut options = PerfOptions {
+                stack_size: requested,
+                ..PerfOptions::default()
+            };
+            options.align_stack_size().expect("align valid stack size");
+            assert_eq!(options.stack_size, expected);
+        }
+
+        for requested in [MAX_SAMPLE_USER_STACK + 1, u32::MAX] {
+            let mut options = PerfOptions {
+                stack_size: requested,
+                ..PerfOptions::default()
+            };
+            let err = options
+                .align_stack_size()
+                .expect_err("reject oversized stack");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                format!("sample_user_stack can be at most {MAX_SAMPLE_USER_STACK} bytes")
+            );
+        }
     }
 
     #[test]
