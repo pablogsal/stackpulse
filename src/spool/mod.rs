@@ -2026,6 +2026,28 @@ mod tests {
     }
 
     #[test]
+    fn process_module_snapshot_matching_is_one_to_one() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let mut first = module(7, 0x1000, 0x2000, "/first", false);
+        first.inode_generation = 4;
+        let second = module(7, 0x3000, 0x4000, "/second", false);
+        table.apply_module(first.clone(), &mut writer).unwrap();
+        table.apply_module(second.clone(), &mut writer).unwrap();
+
+        first.inode_generation = 0;
+        let snapshot = vec![first.clone(), second];
+        assert!(table.process_modules_match(7, &snapshot));
+
+        assert!(!table.process_modules_match(7, std::slice::from_ref(&first)));
+        assert!(!table.process_modules_match(7, &[first.clone(), first.clone()]));
+
+        let mut changed = snapshot;
+        changed[0].end += 1;
+        assert!(!table.process_modules_match(7, &changed));
+    }
+
+    #[test]
     fn spool_v3_round_trips_full_module_identity() {
         let path = temp_spool_path("module-identity-v3");
         let mut writer = PerfSpoolWriter::create(&path, 0, 0).unwrap();
