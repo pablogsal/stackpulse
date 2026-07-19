@@ -165,15 +165,17 @@ impl PerfOptions {
     }
 
     fn open_counter_once(&self, opts: &Opts) -> io::Result<(Counter, bool)> {
-        with_kernel_exclusion_fallback(
-            self.include_kernel,
-            || self.open_event_counter(opts),
-            || {
-                let mut user_opts = opts.clone();
-                user_opts.exclude.kernel = true;
-                self.open_event_counter(&user_opts)
-            },
-        )
+        with_guest_exclusion_fallback(opts, |opts| {
+            with_kernel_exclusion_fallback(
+                self.include_kernel,
+                || self.open_event_counter(opts),
+                || {
+                    let mut user_opts = opts.clone();
+                    user_opts.exclude.kernel = true;
+                    self.open_event_counter(&user_opts)
+                },
+            )
+        })
     }
 
     fn open_event_counter(&self, opts: &Opts) -> io::Result<Counter> {
@@ -356,6 +358,20 @@ fn with_kernel_exclusion_fallback<T>(
             user_only().map(|value| (value, false))
         }
         result => result.map(|value| (value, include_kernel)),
+    }
+}
+
+fn with_guest_exclusion_fallback<T>(
+    opts: &Opts,
+    mut open: impl FnMut(&Opts) -> io::Result<T>,
+) -> io::Result<T> {
+    match open(opts) {
+        Err(err) if !opts.exclude.guest && err.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+            let mut host_only = opts.clone();
+            host_only.exclude.guest = true;
+            open(&host_only)
+        }
+        result => result,
     }
 }
 
@@ -1375,6 +1391,63 @@ mod tests {
         )
         .expect_err("preserve preferred event error");
         assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+    }
+
+    #[test]
+    fn guest_exclusion_fallback_retries_only_unsupported_guest_events() {
+        let opts = Opts::default();
+        let mut seen = Vec::new();
+        let value = with_guest_exclusion_fallback(&opts, |opts| {
+            seen.push(opts.exclude.guest);
+            if opts.exclude.guest {
+                Ok(42)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+        })
+        .expect("retry with guest events excluded");
+
+        assert_eq!(value, 42);
+        assert_eq!(seen, [false, true]);
+
+        for errno in [libc::EINVAL, libc::EPERM] {
+            let mut calls = 0;
+            let err = with_guest_exclusion_fallback::<()>(&opts, |_| {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            })
+            .expect_err("preserve unrelated open error");
+            assert_eq!(err.raw_os_error(), Some(errno));
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn guest_exclusion_fallback_is_bounded_and_preserves_retry_error() {
+        let mut opts = Opts::default();
+        opts.exclude.guest = true;
+        let mut calls = 0;
+        let err = with_guest_exclusion_fallback::<()>(&opts, |_| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        })
+        .expect_err("do not retry an already host-only event");
+        assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(calls, 1);
+
+        opts.exclude.guest = false;
+        calls = 0;
+        let err = with_guest_exclusion_fallback::<()>(&opts, |opts| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(if opts.exclude.guest {
+                libc::EMFILE
+            } else {
+                libc::EOPNOTSUPP
+            }))
+        })
+        .expect_err("preserve retry error");
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(calls, 2);
     }
 
     #[test]
