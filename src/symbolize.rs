@@ -76,7 +76,6 @@ impl From<bool> for PerfMapProcesses {
 struct PerfMapSymbol {
     start: u64,
     end: u64,
-    lookup_end: u64,
     name: String,
 }
 
@@ -726,7 +725,7 @@ fn ranges_overlap(left: &std::ops::Range<u64>, right: &std::ops::Range<u64>) -> 
 fn find_perf_map_symbol(symbols: &[PerfMapSymbol], address: u64) -> Option<&PerfMapSymbol> {
     symbols[..symbols.partition_point(|s| s.start <= address)]
         .iter()
-        .rfind(|s| address < s.lookup_end)
+        .rfind(|s| address < s.end)
 }
 
 fn perf_map_symbol_to_frame(process_id: i32, abs_ip: u64, symbol: &PerfMapSymbol) -> ResolvedFrame {
@@ -809,7 +808,6 @@ fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
         .filter_map(parse_perf_map_line)
         .collect();
     symbols.sort_by_key(|s| s.start);
-    infer_python_trampoline_slot_ranges(&mut symbols);
     Some(symbols)
 }
 
@@ -828,43 +826,8 @@ fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
     Some(PerfMapSymbol {
         start,
         end,
-        lookup_end: end,
         name: name.to_string(),
     })
-}
-
-fn infer_python_trampoline_slot_ranges(symbols: &mut [PerfMapSymbol]) {
-    for i in 0..symbols.len() {
-        if !symbols[i].name.starts_with("py::") {
-            continue;
-        }
-
-        if let Some(slot_size) = python_trampoline_slot_size(symbols, i) {
-            if let Some(slot_end) = symbols[i].start.checked_add(slot_size) {
-                symbols[i].lookup_end = symbols[i].lookup_end.max(slot_end);
-            }
-        }
-    }
-}
-
-fn python_trampoline_slot_size(symbols: &[PerfMapSymbol], index: usize) -> Option<u64> {
-    let symbol = symbols.get(index)?;
-    let code_size = symbol.end.checked_sub(symbol.start)?;
-    let next_delta = symbols.get(index + 1).and_then(|next| {
-        next.name
-            .starts_with("py::")
-            .then(|| next.start.checked_sub(symbol.start))?
-    });
-    let previous_delta = index.checked_sub(1).and_then(|previous_index| {
-        let previous = &symbols[previous_index];
-        previous
-            .name
-            .starts_with("py::")
-            .then(|| symbol.start.checked_sub(previous.start))?
-    });
-    let slot_size = next_delta.or(previous_delta)?;
-    (code_size < slot_size && slot_size <= 0x100 && slot_size.is_power_of_two())
-        .then_some(slot_size)
 }
 
 #[cfg(test)]
@@ -1045,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn python_perf_map_symbols_cover_trampoline_return_slot() {
+    fn python_perf_map_symbols_respect_declared_ranges() {
         let process_id = -(std::process::id() as i32) - 9;
         let path = temp_perf_map_path(process_id);
         fs::write(
@@ -1055,16 +1018,23 @@ mod tests {
         .expect("write perf map");
 
         let mut symbolizer = PerfSymbolizer::new(&[]);
-        let resolved = symbolizer.resolve_frame(process_id, &frame(0x100e));
+        let first = symbolizer.resolve_frame(process_id, &frame(0x1008));
+        let gap = symbolizer.resolve_frame(process_id, &frame(0x100e));
+        let second = symbolizer.resolve_frame(process_id, &frame(0x1024));
         let _ = fs::remove_file(&path);
 
-        match resolved {
-            ResolvedFrame::Python(frame) => {
-                assert_eq!(frame.func_name.as_ref(), "first");
-                assert_eq!(frame.file_name.as_ref(), "/tmp/app.py");
-            }
-            ResolvedFrame::Native(_) => panic!("expected Python trampoline slot frame"),
-        }
+        assert!(matches!(
+            first,
+            ResolvedFrame::Python(frame) if frame.func_name.as_ref() == "first"
+        ));
+        assert!(matches!(
+            gap,
+            ResolvedFrame::Native(frame) if frame.symbol.is_none()
+        ));
+        assert!(matches!(
+            second,
+            ResolvedFrame::Python(frame) if frame.func_name.as_ref() == "second"
+        ));
     }
 
     #[test]
