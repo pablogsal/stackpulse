@@ -81,7 +81,7 @@ Counter snapshot for quality checks.
 | `missing_timestamp_samples` | Samples without a perf timestamp. |
 | `empty_stack_samples` | Samples that produced no usable frames. |
 | `truncated_frame_markers` | Unwind truncation markers observed. |
-| `ignored_user_callchain_frames` | User frame-pointer callchain frames dropped because DWARF unwinding supplied those frames. |
+| `ignored_user_callchain_frames` | Unexpected user callchain frames discarded because user stacks are unwound from DWARF. |
 | `error_stats` | Per-kind sample error counters. |
 
 ## Reading spool files

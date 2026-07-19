@@ -81,8 +81,8 @@ For each target, `stackpulse` configures the event to emit:
   re-reading `/proc`;
 - lost-event records, so the kernel can tell us when it had to drop
   samples because we were too slow;
-- frame-pointer callchains for user fallback frames, with kernel callchains
-  included only when `include_kernel` is on.
+- kernel callchains when `include_kernel` is on; user callchains are excluded
+  because user frames come from DWARF unwinding.
 
 Each event has its own mmap'd ring buffer. The kernel is the producer, we
 are the consumer, and the two sides coordinate through head/tail pointers
@@ -128,9 +128,9 @@ descendants need explicit attachment.
 ## Native stack capture
 
 For user frames, perf hands us the interrupted thread's user registers plus
-a bounded byte copy of the user stack. `framehop` unwinds from there. Perf
-also supplies user frame-pointer callchains, which are used only as a fallback
-when DWARF unwinding cannot produce the deeper frames.
+a bounded byte copy of the user stack. `framehop` unwinds from there. As with
+`perf record --call-graph=dwarf`, the perf event excludes user callchains so
+there is only one authoritative user unwind.
 
 Stack-copy size is a trade-off. Too small and unwinding stops short, and
 `PerfSummary.error_stats` shows truncation. Too large and every sample
@@ -144,11 +144,11 @@ site, not the next instruction after.
 
 ## Kernel frames
 
-The recorder asks perf for frame-pointer callchains and uses them for kernel
-frames when `include_kernel` is enabled. User frames still prefer the native
-DWARF unwinder; perf's user frame-pointer frames are kept as a fallback when
-DWARF unwinding stops early or produces no frames. Any user frame-pointer
-frames left unused are counted in `ignored_user_callchain_frames`.
+The recorder asks perf for callchains and uses them for kernel frames when
+`include_kernel` is enabled. User frames come only from the native DWARF
+unwinder. If the kernel unexpectedly supplies user callchain frames despite
+their exclusion, they are discarded and counted in
+`ignored_user_callchain_frames`.
 
 Kernel sampling is usually permission-gated. If `perf_event_open` fails only
 because kernel sampling was denied, attach retries without kernel frames and
