@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -469,15 +469,15 @@ fn is_addressish_symbol_name(name: &str, module: &str) -> bool {
 
 fn write_profile(profile: &Profile, output: &Path) -> io::Result<()> {
     let file = File::create(output)?;
-    let writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(file);
     if output.extension() == Some(OsStr::new("gz")) {
-        let mut gz = GzEncoder::new(writer, Compression::new(2));
+        let mut gz = GzEncoder::new(&mut writer, Compression::new(2));
         serde_json::to_writer(&mut gz, profile).map_err(io::Error::other)?;
-        gz.finish()?;
+        gz.try_finish()?;
     } else {
-        serde_json::to_writer(writer, profile).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut writer, profile).map_err(io::Error::other)?;
     }
-    Ok(())
+    writer.flush()
 }
 
 fn parse_options() -> Result<Option<Options>, String> {
@@ -594,5 +594,29 @@ mod tests {
         );
 
         assert_eq!(frame_info.flags, FxFrameFlags::empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn profile_writes_report_buffered_output_errors() {
+        let profile = Profile::new(
+            "test",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_hz(1.0),
+        );
+        let plain_error = write_profile(&profile, Path::new("/dev/full"))
+            .expect_err("plain buffered write must report ENOSPC");
+        assert_eq!(plain_error.raw_os_error(), Some(libc::ENOSPC));
+
+        let gzip_path = env::temp_dir().join(format!(
+            "stackpulse-gecko-full-{}.json.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&gzip_path);
+        std::os::unix::fs::symlink("/dev/full", &gzip_path).expect("create /dev/full symlink");
+        let gzip_result = write_profile(&profile, &gzip_path);
+        std::fs::remove_file(&gzip_path).expect("remove /dev/full symlink");
+        let gzip_error = gzip_result.expect_err("gzip buffered write must report ENOSPC");
+        assert_eq!(gzip_error.raw_os_error(), Some(libc::ENOSPC));
     }
 }
