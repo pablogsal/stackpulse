@@ -2023,6 +2023,7 @@ dependencies = [
  "flate2",
  "framehop",
  "fxprof-processed-profile",
+ "gimli 0.33.0",
  "goblin",
  "integer-encoding",
  "libc",
