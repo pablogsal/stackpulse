@@ -1,12 +1,20 @@
-use std::fs;
+use std::{fs, io};
 
-#[must_use]
-pub(super) fn online_cpu_ids() -> Vec<u32> {
-    fs::read_to_string("/sys/devices/system/cpu/online")
+pub(super) fn online_cpu_ids() -> io::Result<Vec<u32>> {
+    if let Some(ids) = fs::read_to_string("/sys/devices/system/cpu/online")
         .ok()
         .and_then(|list| parse_cpu_list(list.trim()))
-        .filter(|ids| !ids.is_empty())
-        .unwrap_or_else(fallback_cpu_ids)
+    {
+        return Ok(ids);
+    }
+
+    let stat = fs::read_to_string("/proc/stat")?;
+    parse_proc_stat_cpu_ids(&stat).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no online CPU IDs found in sysfs or /proc/stat",
+        )
+    })
 }
 
 pub(super) fn parse_cpu_list(list: &str) -> Option<Vec<u32>> {
@@ -30,9 +38,17 @@ pub(super) fn parse_cpu_list(list: &str) -> Option<Vec<u32>> {
     (!cpus.is_empty()).then_some(cpus)
 }
 
-fn fallback_cpu_ids() -> Vec<u32> {
-    let cpu_count = std::thread::available_parallelism().map_or(1, usize::from);
-    (0..cpu_count as u32).collect()
+fn parse_proc_stat_cpu_ids(stat: &str) -> Option<Vec<u32>> {
+    let mut ids: Vec<_> = stat
+        .lines()
+        .filter_map(|line| line.split_ascii_whitespace().next())
+        .filter_map(|label| label.strip_prefix("cpu"))
+        .filter(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter_map(|suffix| suffix.parse().ok())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    (!ids.is_empty()).then_some(ids)
 }
 
 #[cfg(test)]
@@ -48,11 +64,11 @@ mod tests {
     }
 
     #[test]
-    fn fallback_cpu_ids_are_zero_based_and_non_empty() {
-        let ids = fallback_cpu_ids();
+    fn proc_stat_cpu_ids_preserve_sparse_kernel_labels() {
+        let stat = "cpu  10 20 30 40\ncpu2 1 2 3 4\ncpu17 5 6 7 8\ncpu2 9 9 9 9\n\
+                    cpufreq 0 0 0 0\nintr 123\n";
 
-        assert!(!ids.is_empty());
-        assert_eq!(ids[0], 0);
-        assert_eq!(ids, (0..ids.len() as u32).collect::<Vec<_>>());
+        assert_eq!(parse_proc_stat_cpu_ids(stat), Some(vec![2, 17]));
+        assert_eq!(parse_proc_stat_cpu_ids("cpu 1 2 3 4\nintr 5\n"), None);
     }
 }

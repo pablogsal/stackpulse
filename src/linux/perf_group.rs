@@ -224,7 +224,7 @@ impl PerfGroup {
             (None, get_threads(pid)?)
         };
         let result = (|| {
-            let cpu_ids = online_cpu_ids();
+            let cpu_ids = online_cpu_ids()?;
             let cpu_count = cpu_ids.len();
             // Match perf's mmap topology: the first sampling counter on each CPU
             // owns the ring and every other same-CPU counter redirects into it.
@@ -318,7 +318,7 @@ impl PerfGroup {
             }
             return Ok(());
         }
-        let cpu_ids = online_cpu_ids();
+        let cpu_ids = online_cpu_ids()?;
         let cpu_count = cpu_ids.len();
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut pending = PendingEvents::default();
@@ -356,8 +356,8 @@ impl PerfGroup {
             return Ok(());
         }
 
-        let cpu_ids = online_cpu_ids();
-        let cpu_count = cpu_ids.len().max(1);
+        let cpu_ids = online_cpu_ids()?;
+        let cpu_count = cpu_ids.len();
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
         let mut pending = PendingEvents::default();
         pending
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn fixed_cpu_events_share_one_output_ring() {
-        let Some(cpu) = online_cpu_ids().into_iter().next() else {
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
             return;
         };
         let group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn closed_output_poll_anchor_promotes_a_redirected_member() {
-        let Some(cpu) = online_cpu_ids().into_iter().next() else {
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
             return;
         };
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
