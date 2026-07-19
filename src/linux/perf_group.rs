@@ -30,6 +30,13 @@ fn validate_target_pid(pid: u32) -> io::Result<()> {
 struct Member {
     perf: Perf,
     output_fd: RawFd,
+    owner_pid: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TaskTarget {
+    tid: u32,
+    owner_pid: u32,
 }
 
 struct OutputMember {
@@ -237,16 +244,31 @@ impl PerfGroup {
                 .perfs
                 .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
             let mut inheriting_threads = Vec::new();
-            let leader_perfs =
-                self.open_task_perfs(pid, &cpu_ids, attach_mode, frequency, &mut pending)?;
+            let leader_perfs = self.open_task_perfs(
+                TaskTarget {
+                    tid: pid,
+                    owner_pid: pid,
+                },
+                &cpu_ids,
+                attach_mode,
+                frequency,
+                &mut pending,
+            )?;
             if leader_perfs.inherits {
                 inheriting_threads.push(pid);
             }
             pending.perfs.extend(leader_perfs.events);
             for &tid in &threads {
-                if let Some(thread_perfs) =
-                    self.try_open_thread_perfs(tid, &cpu_ids, attach_mode, frequency, &mut pending)?
-                {
+                if let Some(thread_perfs) = self.try_open_thread_perfs(
+                    TaskTarget {
+                        tid,
+                        owner_pid: pid,
+                    },
+                    &cpu_ids,
+                    attach_mode,
+                    frequency,
+                    &mut pending,
+                )? {
                     if thread_perfs.inherits {
                         inheriting_threads.push(tid);
                     }
@@ -333,7 +355,10 @@ impl PerfGroup {
         let mut inheriting_threads = Vec::new();
         for tid in new_threads {
             if let Some(thread_perfs) = self.try_open_thread_perfs(
-                tid,
+                TaskTarget {
+                    tid,
+                    owner_pid: pid,
+                },
                 &cpu_ids,
                 AttachMode::StopAttachEnableResume,
                 frequency,
@@ -385,7 +410,10 @@ impl PerfGroup {
             }
 
             if let Some(thread_perfs) = self.try_open_thread_perfs(
-                tid,
+                TaskTarget {
+                    tid,
+                    owner_pid: owner,
+                },
                 &cpu_ids,
                 AttachMode::StopAttachEnableResume,
                 frequency,
@@ -460,7 +488,9 @@ impl PerfGroup {
     }
 
     pub fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
-        self.remove_noninheriting_members(&FxHashSet::from_iter([tid]))?;
+        self.remove_members(|member| {
+            member.perf.target() == tid && !member.perf.inherit().is_enabled()
+        })?;
         self.tracked_threads.remove(&tid);
         self.inheriting_threads.remove(&tid);
         Ok(())
@@ -474,20 +504,19 @@ impl PerfGroup {
             .collect();
         tids.insert(pid);
 
-        self.remove_noninheriting_members(&tids)?;
+        self.remove_members(|member| {
+            member.owner_pid == pid && member.perf.inherit() != TaskInheritance::Children
+        })?;
         self.tracked_threads.retain(|_, owner| *owner != pid);
         self.inheriting_threads.retain(|tid| !tids.contains(tid));
         Ok(())
     }
 
-    fn remove_noninheriting_members(&mut self, tids: &FxHashSet<u32>) -> io::Result<()> {
+    fn remove_members(&mut self, should_remove: impl Fn(&Member) -> bool) -> io::Result<()> {
         let fds_to_remove: Vec<_> = self
             .members
             .iter()
-            .filter_map(|(&fd, member)| {
-                (tids.contains(&member.perf.target()) && !member.perf.inherit().is_enabled())
-                    .then_some(fd)
-            })
+            .filter_map(|(&fd, member)| should_remove(member).then_some(fd))
             .collect();
         for fd in fds_to_remove {
             self.retire_member_fd(fd)?;
@@ -497,7 +526,7 @@ impl PerfGroup {
 
     fn open_task_perfs(
         &self,
-        tid: u32,
+        target: TaskTarget,
         cpu_ids: &[u32],
         attach_mode: AttachMode,
         frequency: u64,
@@ -506,7 +535,7 @@ impl PerfGroup {
         let mut perf_events = ThreadPerfEvents::with_capacity(cpu_ids.len());
         for &cpu in cpu_ids {
             let perf = self.open_perf(
-                tid,
+                target,
                 cpu,
                 attach_mode,
                 self.task_inheritance(),
@@ -520,13 +549,13 @@ impl PerfGroup {
 
     fn try_open_thread_perfs(
         &self,
-        tid: u32,
+        target: TaskTarget,
         cpu_ids: &[u32],
         attach_mode: AttachMode,
         frequency: u64,
         pending: &mut PendingEvents,
     ) -> io::Result<Option<ThreadPerfEvents>> {
-        match self.open_task_perfs(tid, cpu_ids, attach_mode, frequency, pending) {
+        match self.open_task_perfs(target, cpu_ids, attach_mode, frequency, pending) {
             Ok(perfs) => Ok(Some(perfs)),
             Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(None),
             Err(err) => Err(err),
@@ -706,7 +735,7 @@ impl PerfGroup {
 
     fn open_perf(
         &self,
-        pid: u32,
+        target: TaskTarget,
         cpu: u32,
         attach_mode: AttachMode,
         inherit: TaskInheritance,
@@ -714,7 +743,7 @@ impl PerfGroup {
         pending: &mut PendingEvents,
     ) -> io::Result<OpenedEvent> {
         let options = PerfOptions {
-            pid,
+            pid: target.tid,
             cpu,
             frequency,
             stack_size: self.stack_size,
@@ -749,6 +778,7 @@ impl PerfGroup {
                 member: Some(Member {
                     perf,
                     output_fd: fd,
+                    owner_pid: target.owner_pid,
                 }),
             })
         } else {
@@ -1192,7 +1222,9 @@ mod tests {
         };
         let group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        let Some(pending) = open_fixed_cpu_events(&group, cpu, 2) else {
+        let pid = std::process::id();
+        let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 2, TaskInheritance::None)
+        else {
             return;
         };
 
@@ -1207,7 +1239,9 @@ mod tests {
         };
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        let Some(pending) = open_fixed_cpu_events(&group, cpu, 3) else {
+        let pid = std::process::id();
+        let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 3, TaskInheritance::None)
+        else {
             return;
         };
         let output_fd = pending.outputs[0].fd();
@@ -1239,14 +1273,76 @@ mod tests {
         assert_eq!(group.outputs[&output_fd].poll_fd, None);
     }
 
-    fn open_fixed_cpu_events(group: &PerfGroup, cpu: u32, count: usize) -> Option<PendingEvents> {
+    #[test]
+    fn process_removal_retires_thread_inheritance_but_preserves_child_inheritance() {
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
+            return;
+        };
+        for (inherit, expected_members) in [
+            (TaskInheritance::Threads, 0),
+            (TaskInheritance::Children, 1),
+        ] {
+            let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+                .expect("create perf group");
+            let pid = std::process::id();
+            let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 2, inherit) else {
+                return;
+            };
+            group.register_pending(pending).expect("register events");
+            group
+                .remove_process(std::process::id())
+                .expect("remove process events");
+
+            assert_eq!(group.members.len(), expected_members);
+        }
+    }
+
+    #[test]
+    fn process_removal_finds_members_after_their_thread_was_removed() {
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
+            return;
+        };
+        let target_tid = std::process::id();
+        let owner_pid = u32::MAX - 1;
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        let Some(pending) = open_fixed_cpu_events(
+            &group,
+            target_tid,
+            owner_pid,
+            cpu,
+            2,
+            TaskInheritance::Threads,
+        ) else {
+            return;
+        };
+        group.register_pending(pending).expect("register events");
+        group.tracked_threads.insert(target_tid, owner_pid);
+
+        group.remove_thread(target_tid).expect("remove thread");
+        assert_eq!(group.members.len(), 1);
+        group.remove_process(owner_pid).expect("remove process");
+        assert!(group.members.is_empty());
+    }
+
+    fn open_fixed_cpu_events(
+        group: &PerfGroup,
+        target_tid: u32,
+        owner_pid: u32,
+        cpu: u32,
+        count: usize,
+        inherit: TaskInheritance,
+    ) -> Option<PendingEvents> {
         let mut pending = PendingEvents::default();
         for _ in 0..count {
             let opened = match group.open_perf(
-                std::process::id(),
+                TaskTarget {
+                    tid: target_tid,
+                    owner_pid,
+                },
                 cpu,
                 AttachMode::AttachWithEnableOnExec,
-                TaskInheritance::None,
+                inherit,
                 1,
                 &mut pending,
             ) {
