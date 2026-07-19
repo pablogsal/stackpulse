@@ -55,7 +55,7 @@ bitflags! {
 ///
 /// A value of `-1` for any field means "unknown"; this matches the CPython
 /// convention for missing position attributes on code objects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocationInfo {
     /// 1-based starting line number (`-1` if unknown).
     pub lineno: i32,
@@ -65,6 +65,18 @@ pub struct LocationInfo {
     pub column: i32,
     /// 0-based ending column offset in bytes (`-1` if unknown).
     pub end_column: i32,
+}
+
+impl Default for LocationInfo {
+    fn default() -> Self {
+        const UNKNOWN: i32 = -1;
+        Self {
+            lineno: UNKNOWN,
+            end_lineno: UNKNOWN,
+            column: UNKNOWN,
+            end_column: UNKNOWN,
+        }
+    }
 }
 
 /// A resolved Python frame.
@@ -320,6 +332,19 @@ pub fn basename_start(path: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_python_location_uses_documented_sentinel() {
+        assert_eq!(
+            LocationInfo::default(),
+            LocationInfo {
+                lineno: -1,
+                end_lineno: -1,
+                column: -1,
+                end_column: -1,
+            }
+        );
+    }
 
     #[test]
     fn python_frame_basename_handles_long_ascii_path() {
