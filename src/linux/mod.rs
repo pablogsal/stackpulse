@@ -2122,13 +2122,19 @@ pub(crate) fn bench_replay_live_perf_ring_records(
                 }
             }
             sorter.advance_round();
-            while let Some(prepared) = sorter.pop() {
+            while let Some(prepared) = sorter.force_pop() {
                 if result.is_ok() {
                     result = finish_prepared_event(prepared, &mut ctx);
                 }
             }
         }
         result?;
+
+        let expected_samples = fixture.samples.sample_count() as u64;
+        assert_eq!(
+            summary.samples, expected_samples,
+            "synthetic ring replay did not write every generated sample"
+        );
 
         writer.flush()?;
         let bytes = writer.into_inner();
