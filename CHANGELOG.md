@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 - 2026-07-19
+
+### Fixed
+
+- Launched commands honor their configured `PATH`, stop recording promptly when they exit, and preserve their real exit status.
+- Valid user-stack sizes are aligned for perf, unsupported guest sampling is retried without guest events, and sparse CPU identifiers are preserved when sysfs is unavailable.
+- Events from multiple rings retain previous-round ordering; lost-event totals include every event, unchanged mappings survive loss recovery, and exited-process event descriptors are retired.
+- Mixed kernel/user callchains preserve each context's activation address, and DWARF recording no longer splices in an incompatible perf user callchain.
+- Invalid or unusable `.eh_frame_hdr` indexes fall back to Framehop's existing `.eh_frame` index construction instead of losing valid unwind data.
+- Perf-map symbols keep their declared ranges, accept perf's ASCII field separators, cover perf's anonymous/no-DSO mapping classes, and no longer override known file-backed modules.
+- Kernel symbols use perf's type, ignored-label, and equal-address selection rules in both full and sparse loading.
+- Proc-map pathnames remain verbatim, including literal ` (deleted)` suffixes, and pinned frames resolve modules by stable ID rather than vector position.
+- Final profile-write failures are reported, unknown Python positions retain their documented sentinel, and Gecko output no longer labels Python frames as JavaScript.
+
+### Changed
+
+- The minimum supported kernel is Linux 6.0; no compatibility path is provided for older kernels.
+
 ## 0.3.0 - 2026-07-18
 
 ### Fixed
