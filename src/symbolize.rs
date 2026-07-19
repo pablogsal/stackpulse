@@ -39,6 +39,7 @@ use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 /// Resolves raw profile frames into displayable frames.
 pub struct PerfSymbolizer {
     modules: Vec<ModuleRecord>,
+    module_index_by_id: FxHashMap<u32, usize>,
     perf_map_processes: PerfMapProcesses,
     elf_sections: ElfSectionCache,
     native_symbolizers: Vec<NativeSymbolizerGroup>,
@@ -232,8 +233,19 @@ impl PerfSymbolizer {
         perf_map_processes: PerfMapProcesses,
         native_factory: NativeSymbolizerFactory,
     ) -> Self {
+        let mut module_index_by_id = FxHashMap::default();
+        let mut duplicate_ids = FxHashSet::default();
+        for (index, module) in modules.iter().enumerate() {
+            if module_index_by_id.insert(module.id, index).is_some() {
+                duplicate_ids.insert(module.id);
+            }
+        }
+        for id in duplicate_ids {
+            module_index_by_id.remove(&id);
+        }
         Self {
             modules: modules.to_vec(),
+            module_index_by_id,
             perf_map_processes,
             elf_sections: ElfSectionCache::default(),
             native_symbolizers: Vec::new(),
@@ -366,7 +378,7 @@ impl PerfSymbolizer {
     ) -> Vec<ResolvedFrame> {
         if let Some(module) = frame
             .module_id
-            .and_then(|module_id| self.modules.get(module_id as usize))
+            .and_then(|module_id| self.module_by_id(module_id))
             .filter(|module| !perf_map_module_allowed(module))
         {
             return self
@@ -422,6 +434,12 @@ impl PerfSymbolizer {
         frame: &FrameRecord,
         spool_frame_id: Option<u32>,
     ) -> Option<FrameModuleRef<'_>> {
+        if let Some(module_id) = frame.module_id {
+            return Some(FrameModuleRef {
+                module: self.module_by_id(module_id)?,
+                rel_ip: frame.rel_ip,
+            });
+        }
         match (self.spool_frame_contexts.as_ref(), spool_frame_id) {
             (Some(contexts), Some(frame_id)) => {
                 let context = contexts.for_frame_id(frame_id)?;
@@ -435,6 +453,12 @@ impl PerfSymbolizer {
             }
             _ => spool::module_for_frame_unbounded(&self.modules, process_id, frame),
         }
+    }
+
+    fn module_by_id(&self, module_id: u32) -> Option<&ModuleRecord> {
+        self.module_index_by_id
+            .get(&module_id)
+            .and_then(|&index| self.modules.get(index))
     }
 
     #[cfg(test)]
@@ -855,6 +879,15 @@ mod tests {
         }
     }
 
+    fn pinned_frame(module_id: u32, abs_ip: u64) -> FrameRecord {
+        FrameRecord {
+            module_id: Some(module_id),
+            rel_ip: 8,
+            abs_ip,
+            mode: FrameMode::User,
+        }
+    }
+
     fn executable_module(id: u32, process_id: i32, start: u64) -> ModuleRecord {
         ModuleRecord {
             id,
@@ -917,6 +950,66 @@ mod tests {
             .ensure_native_symbolizer_for_module(&other_process)
             .is_some());
         assert_eq!(symbolizer.native_symbolizers.len(), 3);
+    }
+
+    #[test]
+    fn module_ids_are_not_treated_as_slice_indexes() {
+        let process_id = 42;
+        let module = module_with_path(7, process_id, 0x1000, "/stable-seven.so");
+        let mut symbolizer = PerfSymbolizer::with_perf_maps(&[module], false);
+        let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x1008));
+        let invalid = symbolizer.resolve_frame(process_id, &pinned_frame(0, 0x1008));
+
+        assert_eq!(resolved.func_name(), "stable-seven.so+0x8");
+        assert!(matches!(
+            invalid,
+            ResolvedFrame::Native(frame) if frame.symbol.is_none()
+        ));
+    }
+
+    #[test]
+    fn reordered_dense_module_ids_select_the_matching_record() {
+        let process_id = 42;
+        let modules = [
+            module_with_path(1, process_id, 0x1000, "/module-one.so"),
+            module_with_path(0, process_id, 0x2000, "/module-zero.so"),
+        ];
+        let mut symbolizer = PerfSymbolizer::with_perf_maps(&modules, false);
+        let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(0, 0x2008));
+
+        assert_eq!(resolved.func_name(), "module-zero.so+0x8");
+    }
+
+    #[test]
+    fn duplicate_module_ids_are_ambiguous() {
+        let process_id = 42;
+        let mut modules = vec![module_with_path(7, process_id, 0x1000, "/first-seven.so")];
+        for id in 1..7 {
+            modules.push(module_with_path(
+                id,
+                process_id,
+                0x2000 + u64::from(id) * 0x1000,
+                "/filler.so",
+            ));
+        }
+        modules.push(module_with_path(7, process_id, 0x9000, "/index-seven.so"));
+        let mut symbolizer = PerfSymbolizer::with_perf_maps(&modules, false);
+        let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x9008));
+
+        assert!(matches!(
+            resolved,
+            ResolvedFrame::Native(frame) if frame.symbol.is_none()
+        ));
+    }
+
+    #[test]
+    fn sparse_ids_use_the_module_fallback_path() {
+        let process_id = 42;
+        let module = module_with_path(7, process_id, 0x1000, "[anon:sparse-seven]");
+        let mut symbolizer = PerfSymbolizer::with_perf_maps(&[module], false);
+        let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x1008));
+
+        assert_eq!(resolved.func_name(), "[anon:sparse-seven]+0x8");
     }
 
     #[test]
