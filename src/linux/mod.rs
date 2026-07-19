@@ -120,7 +120,7 @@ pub struct PerfSummary {
     pub empty_stack_samples: u64,
     /// Markers written when a stack had to be truncated.
     pub truncated_frame_markers: u64,
-    /// User frame-pointer callchain frames not needed after DWARF unwinding.
+    /// User callchain frames ignored because user stacks are unwound from DWARF.
     pub ignored_user_callchain_frames: u64,
     /// Per-kind sample error counts.
     pub error_stats: SampleErrorStats,
@@ -1797,24 +1797,18 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
         .iter()
         .take_while(|&&frame| stack_frame_is_kernel(frame))
         .count();
-    let (kernel_callchain_frames, fp_user_frames) = callchain_stack.split_at(kernel_frame_count);
+    let (kernel_callchain_frames, user_callchain_frames) =
+        callchain_stack.split_at(kernel_frame_count);
     stack.extend_from_slice(kernel_callchain_frames);
     let dwarf_start = stack.len();
     let mut dwarf_truncated = false;
     let user_stack = sample.user_stack.filter(|stack| !stack.is_empty());
-    let missing_user_regs_for_user_tail = sample.user_regs.is_none() && !fp_user_frames.is_empty();
 
     if sample.user_stack.is_some() && user_stack.is_none() {
         record_unwind_error(summary, SampleErrorKind::NativeStackRead, || {
             "perf sample reported zero user stack bytes".to_string()
         });
     }
-    if missing_user_regs_for_user_tail && is_kernel_mode(privilege) {
-        record_unwind_error(summary, SampleErrorKind::NativeUserRegistersMissing, || {
-            "perf sample did not include user register state for user callchain tail".to_string()
-        });
-    }
-
     match (sample.user_regs, user_stack) {
         (Some(raw_regs), Some(user_stack)) => {
             if let Some((pc, sp, regs)) = C::convert_regs(raw_regs) {
@@ -1877,12 +1871,10 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
         _ => {}
     }
 
-    let used_fp_user_frames =
-        append_fp_user_callchain(stack, dwarf_start, fp_user_frames, dwarf_truncated);
     summary.ignored_user_callchain_frames = summary
         .ignored_user_callchain_frames
-        .saturating_add(fp_user_frames.len().saturating_sub(used_fp_user_frames) as u64);
-    if dwarf_truncated || missing_user_regs_for_user_tail {
+        .saturating_add(user_callchain_frames.len() as u64);
+    if dwarf_truncated {
         stack.push(StackFrame::TruncatedStackMarker);
     }
 
@@ -1893,56 +1885,12 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     }
 }
 
-fn append_fp_user_callchain(
-    stack: &mut Vec<StackFrame>,
-    dwarf_start: usize,
-    fp_user_frames: &[StackFrame],
-    dwarf_truncated: bool,
-) -> usize {
-    if fp_user_frames.is_empty() {
-        return 0;
-    }
-    if stack.len() == dwarf_start {
-        stack.extend_from_slice(fp_user_frames);
-        return fp_user_frames.len();
-    }
-    if !dwarf_truncated {
-        return 0;
-    }
-
-    let Some(last_dwarf_address) = stack[dwarf_start..]
-        .iter()
-        .rev()
-        .find_map(|&frame| stack_frame_address(frame))
-    else {
-        return 0;
-    };
-    let Some(splice_index) = fp_user_frames
-        .iter()
-        .position(|&frame| stack_frame_address(frame) == Some(last_dwarf_address))
-    else {
-        return 0;
-    };
-    let tail = &fp_user_frames[splice_index + 1..];
-    stack.extend_from_slice(tail);
-    tail.len()
-}
-
 fn stack_frame_is_kernel(frame: StackFrame) -> bool {
     matches!(
         frame,
         StackFrame::InstructionPointer(_, StackMode::Kernel)
             | StackFrame::ReturnAddress(_, StackMode::Kernel)
     )
-}
-
-fn stack_frame_address(frame: StackFrame) -> Option<u64> {
-    match frame {
-        StackFrame::InstructionPointer(address, _) | StackFrame::ReturnAddress(address, _) => {
-            Some(address)
-        }
-        StackFrame::TruncatedStackMarker => None,
-    }
 }
 
 fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackFrame>) {
@@ -2017,7 +1965,7 @@ impl LivePerfSampleBenchFixture {
 pub(crate) fn live_perf_sample_bench_fixture() -> LivePerfSampleBenchFixture {
     let samples = perf_event::BenchSampleBatch::new(perf_event::BenchSampleBatchSpec {
         samples: 4_096,
-        user_frames: 24,
+        user_frames: 0,
         kernel_frames: 8,
         user_regs: ConvertRegsNative::regs_mask().count_ones() as usize,
         user_stack_bytes: 512,
@@ -2801,57 +2749,6 @@ mod tests {
         assert!(checksum > 0);
     }
 
-    #[test]
-    fn fp_user_callchain_fills_missing_dwarf_stack() {
-        let mut stack = vec![StackFrame::InstructionPointer(
-            0xffff_1000,
-            StackMode::Kernel,
-        )];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
-
-        let used = append_fp_user_callchain(&mut stack, 1, &fp_user_frames, false);
-
-        assert_eq!(used, 2);
-        assert_eq!(
-            stack,
-            vec![
-                StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-            ]
-        );
-    }
-
-    #[test]
-    fn fp_user_callchain_splices_after_truncated_dwarf_overlap() {
-        let mut stack = vec![
-            StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-            StackFrame::ReturnAddress(0x3000, StackMode::User),
-        ];
-
-        let used = append_fp_user_callchain(&mut stack, 1, &fp_user_frames, true);
-
-        assert_eq!(used, 1);
-        assert_eq!(
-            stack,
-            vec![
-                StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-                StackFrame::ReturnAddress(0x3000, StackMode::User),
-            ]
-        );
-    }
-
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     struct TestConvertRegs;
 
@@ -2889,7 +2786,7 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn truncated_dwarf_stack_keeps_marker_after_spliced_user_callchain() {
+    fn truncated_dwarf_stack_ignores_user_callchain() {
         let user_regs = [0x1000, 0, 8];
         let user_stack: Vec<_> = [0, 40, 0x2000]
             .into_iter()
@@ -2923,33 +2820,15 @@ mod tests {
             vec![
                 StackFrame::InstructionPointer(0x1000, StackMode::User),
                 StackFrame::ReturnAddress(0x2000, StackMode::User),
-                StackFrame::ReturnAddress(0x3000, StackMode::User),
                 StackFrame::TruncatedStackMarker,
             ]
         );
-        assert_eq!(summary.ignored_user_callchain_frames, 2);
+        assert_eq!(summary.ignored_user_callchain_frames, 3);
         assert_eq!(
             summary
                 .error_stats
                 .get(SampleErrorKind::NativeStackTruncated),
             1
-        );
-    }
-
-    #[test]
-    fn fp_user_callchain_is_ignored_when_dwarf_stack_is_complete() {
-        let mut stack = vec![StackFrame::InstructionPointer(0x1000, StackMode::User)];
-        let fp_user_frames = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
-
-        let used = append_fp_user_callchain(&mut stack, 0, &fp_user_frames, false);
-
-        assert_eq!(used, 0);
-        assert_eq!(
-            stack,
-            vec![StackFrame::InstructionPointer(0x1000, StackMode::User)]
         );
     }
 
@@ -2991,12 +2870,12 @@ mod tests {
     }
 
     #[test]
-    fn get_sample_stack_marks_user_callchain_truncated_when_unwind_inputs_are_missing() {
+    fn get_sample_stack_ignores_unexpected_user_callchain() {
         let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
         let sample = SampleView {
             task: None,
             timestamp_ns: None,
-            code_addr: None,
+            code_addr: Some((0x3000, false)),
             user_regs: None,
             user_stack: None,
             call_chain: SampleCallChain::Owned(&chains),
@@ -3017,13 +2896,9 @@ mod tests {
 
         assert_eq!(
             stack,
-            vec![
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-                StackFrame::TruncatedStackMarker,
-            ]
+            vec![StackFrame::InstructionPointer(0x3000, StackMode::User)]
         );
-        assert_eq!(summary.ignored_user_callchain_frames, 0);
+        assert_eq!(summary.ignored_user_callchain_frames, 2);
         assert_eq!(
             summary
                 .error_stats
@@ -3034,102 +2909,43 @@ mod tests {
     }
 
     #[test]
-    fn get_sample_stack_marks_kernel_sample_user_tail_truncated_when_regs_are_missing() {
-        let chains = vec![
-            CallChain::Kernel(vec![0xffff_1000]),
-            CallChain::User(vec![0x1000]),
+    fn build_sample_stack_keeps_kernel_callchain_and_ignores_user_tail() {
+        let callchain_stack = [
+            StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
+            StackFrame::ReturnAddress(0xffff_2000, StackMode::Kernel),
+            StackFrame::InstructionPointer(0x1000, StackMode::User),
+            StackFrame::ReturnAddress(0x2000, StackMode::User),
         ];
-        let sample = SampleView {
-            task: None,
-            timestamp_ns: None,
-            code_addr: None,
-            user_regs: None,
-            user_stack: None,
-            call_chain: SampleCallChain::Owned(&chains),
-        };
         let mut process_unwinder = ProcessUnwinder::default();
         let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
         let mut summary = PerfSummary::default();
 
-        get_sample_stack::<ConvertRegsNative>(
-            sample,
+        build_sample_stack::<ConvertRegsNative>(
+            StackInput {
+                code_addr: None,
+                user_regs: None,
+                user_stack: None,
+            },
             Priv::Kernel,
             &mut process_unwinder,
             &mut stack,
-            &mut callchain_stack,
+            &callchain_stack,
             &mut summary,
         );
 
-        assert_eq!(
-            stack,
-            vec![
-                StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
-                StackFrame::ReturnAddress(0x1000, StackMode::User),
-                StackFrame::TruncatedStackMarker,
-            ]
-        );
-        assert_eq!(summary.ignored_user_callchain_frames, 0);
-        assert_eq!(
-            summary
-                .error_stats
-                .get(SampleErrorKind::NativeUserRegistersMissing),
-            1
-        );
-    }
-
-    #[test]
-    fn get_sample_stack_uses_user_callchain_when_register_conversion_fails() {
-        let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
-        let user_stack = [0_u8; 8];
-        let sample = SampleView {
-            task: None,
-            timestamp_ns: None,
-            code_addr: None,
-            user_regs: Some(&[]),
-            user_stack: Some(&user_stack),
-            call_chain: SampleCallChain::Owned(&chains),
-        };
-        let mut process_unwinder = ProcessUnwinder::default();
-        let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
-        let mut summary = PerfSummary::default();
-
-        get_sample_stack::<ConvertRegsNative>(
-            sample,
-            Priv::User,
-            &mut process_unwinder,
-            &mut stack,
-            &mut callchain_stack,
-            &mut summary,
-        );
-
-        assert_eq!(
-            stack,
-            vec![
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-            ]
-        );
-        assert_eq!(summary.ignored_user_callchain_frames, 0);
-        assert_eq!(
-            summary
-                .error_stats
-                .get(SampleErrorKind::NativeRegisterCapture),
-            1
-        );
+        assert_eq!(stack, &callchain_stack[..2]);
+        assert_eq!(summary.ignored_user_callchain_frames, 2);
     }
 
     #[test]
     fn get_sample_stack_treats_zero_user_stack_as_bad_sample() {
-        let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
         let sample = SampleView {
             task: None,
             timestamp_ns: None,
-            code_addr: None,
+            code_addr: Some((0x1000, false)),
             user_regs: Some(&[]),
             user_stack: Some(&[]),
-            call_chain: SampleCallChain::Owned(&chains),
+            call_chain: SampleCallChain::Owned(&[]),
         };
         let mut process_unwinder = ProcessUnwinder::default();
         let mut stack = Vec::new();
@@ -3147,10 +2963,7 @@ mod tests {
 
         assert_eq!(
             stack,
-            vec![
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-            ]
+            vec![StackFrame::InstructionPointer(0x1000, StackMode::User)]
         );
         assert_eq!(summary.error_stats.get(SampleErrorKind::NativeStackRead), 1);
         assert_eq!(

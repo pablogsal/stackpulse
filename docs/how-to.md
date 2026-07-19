@@ -248,11 +248,10 @@ let options = stackpulse::PerfRecorderOptions {
 };
 ```
 
-Kernel frames come from perf callchains. User frames still go through the
-native DWARF unwinder; the user side of the perf callchain is only consulted
-when DWARF unwinding stops early or returns nothing. Anything from the user
-callchain that the DWARF result already covered is counted as
-`ignored_user_callchain_frames` in the summary.
+Kernel frames come from perf callchains. User frames go through the native
+DWARF unwinder, and the event excludes user callchains. If the kernel
+unexpectedly supplies user callchain frames anyway, the recorder discards
+and counts them in `ignored_user_callchain_frames`.
 
 After attach, check whether kernel sampling actually stuck:
 

@@ -1162,23 +1162,28 @@ fn build_bench_sample_record_with_abi(
     );
     push_u64(&mut bytes, 1_700_000_000_000_000 + sample_variant * 1_000);
 
+    let context_count = usize::from(spec.kernel_frames != 0) + usize::from(spec.user_frames != 0);
     push_u64(
         &mut bytes,
-        (2 + spec.kernel_frames + spec.user_frames) as u64,
+        (context_count + spec.kernel_frames + spec.user_frames) as u64,
     );
-    push_u64(&mut bytes, sys::PERF_CONTEXT_KERNEL);
-    for frame_idx in 0..spec.kernel_frames {
-        push_u64(
-            &mut bytes,
-            spec.kernel_base + ((sample_variant + frame_idx as u64 * 13) % 4096) * 0x20,
-        );
+    if spec.kernel_frames != 0 {
+        push_u64(&mut bytes, sys::PERF_CONTEXT_KERNEL);
+        for frame_idx in 0..spec.kernel_frames {
+            push_u64(
+                &mut bytes,
+                spec.kernel_base + ((sample_variant + frame_idx as u64 * 13) % 4096) * 0x20,
+            );
+        }
     }
-    push_u64(&mut bytes, sys::PERF_CONTEXT_USER);
-    for frame_idx in 0..spec.user_frames {
-        push_u64(
-            &mut bytes,
-            spec.user_base + ((sample_variant + frame_idx as u64 * 17) % 4096) * 0x20,
-        );
+    if spec.user_frames != 0 {
+        push_u64(&mut bytes, sys::PERF_CONTEXT_USER);
+        for frame_idx in 0..spec.user_frames {
+            push_u64(
+                &mut bytes,
+                spec.user_base + ((sample_variant + frame_idx as u64 * 17) % 4096) * 0x20,
+            );
+        }
     }
 
     push_u64(&mut bytes, u64::from(user_regs_abi));
@@ -1558,6 +1563,24 @@ mod tests {
         let (_, sample) =
             parse_sample_record(record.as_bytes(), &parser).expect("sample should parse");
         assert_eq!(sample.time, Some(1_700_000_000_000_000 + 7_000));
+    }
+
+    #[test]
+    fn bench_record_omits_empty_callchain_contexts() {
+        let mut spec = stack_sample_spec(32);
+        spec.user_frames = 0;
+        let parser = stack_sample_parser(spec.user_regs);
+        let record = build_bench_sample_record(&spec, 0);
+
+        let (_, sample) =
+            parse_sample_record(record.as_bytes(), &parser).expect("sample should parse");
+        let mut callchain = sample.call_chain.expect("kernel callchain").iter();
+        let Some(CallChainEntry::Kernel(addresses)) = callchain.next() else {
+            panic!("first callchain context should be kernel");
+        };
+
+        assert_eq!(addresses.len(), 1);
+        assert!(callchain.next().is_none());
     }
 
     #[test]

@@ -753,7 +753,7 @@ impl PerfGroup {
             enable_on_exec: attach_mode == AttachMode::AttachWithEnableOnExec,
             include_kernel: self.include_kernel && !pending.kernel_excluded,
             sample_callchain: true,
-            exclude_user_callchain: false,
+            exclude_user_callchain: true,
             exclude_kernel_callchain: !self.include_kernel || pending.kernel_excluded,
         };
         if let Some(fd) = self
