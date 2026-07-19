@@ -1037,11 +1037,22 @@ fn reconcile_process_image<W: std::io::Write>(
         }
         Err(err) => return Err(err),
     };
-    let has_executable_maps = maps_snapshot_has_executable_files(&maps);
-    if !has_executable_maps {
+    let snapshot = executable_modules_from_maps(pid, &maps);
+    if snapshot.is_empty() {
         // A live group whose leader has exited can expose an empty maps file.
         // Without a usable replacement snapshot, preserve the last known
         // modules and unwinder instead of destructively reconciling to empty.
+        return Ok(true);
+    }
+
+    let image_matches = current_identity
+        .as_ref()
+        .is_none_or(|identity| process_images.get(&pid_i32) == Some(identity));
+    let start_time_matches = process_start_times.get(&pid_i32) == Some(&current_start_time);
+    if image_matches && start_time_matches && modules.process_modules_match(pid_i32, &snapshot) {
+        if let Some(identity) = current_identity {
+            process_images.insert(pid_i32, identity);
+        }
         return Ok(true);
     }
 
@@ -1051,7 +1062,7 @@ fn reconcile_process_image<W: std::io::Write>(
         writer.write_process_exec(timestamp_ns, pid_i32, false)?;
     }
 
-    let registered = register_existing_maps_snapshot(pid, &maps, modules, unwinders, writer);
+    let registered = register_existing_modules(snapshot, modules, unwinders, writer);
     match registered {
         Ok(true) if process_has_python_perf_support(pid, python_perf_support_processes) => {
             if let Some(identity) = current_identity {
@@ -1691,35 +1702,45 @@ fn register_existing_maps_snapshot<W: std::io::Write>(
     unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
-    let mut saw_python_runtime = false;
-    for region in
-        crate::proc_maps::parse_iter(maps).filter(|r| r.is_executable && !r.path.is_empty())
-    {
-        saw_python_runtime |= crate::is_python_runtime_module_path(region.path);
-        record_module(
-            modules,
-            unwinders,
-            writer,
-            ModuleRecord {
-                id: 0,
-                process_id: pid as i32,
-                start: region.address.start,
-                end: region.address.end,
-                file_offset: region.file_offset,
-                path: region.path.into(),
-                is_kernel: false,
-                inode: region.inode,
-                device_major: region.device_major,
-                device_minor: region.device_minor,
-                inode_generation: 0,
-            },
-        )?;
-    }
-    Ok(saw_python_runtime)
+    register_existing_modules(
+        executable_modules_from_maps(pid, maps),
+        modules,
+        unwinders,
+        writer,
+    )
 }
 
-fn maps_snapshot_has_executable_files(maps: &str) -> bool {
-    crate::proc_maps::parse_iter(maps).any(|region| region.is_executable && !region.path.is_empty())
+fn executable_modules_from_maps(pid: u32, maps: &str) -> Vec<ModuleRecord> {
+    crate::proc_maps::parse_iter(maps)
+        .filter(|region| region.is_executable && !region.path.is_empty())
+        .map(|region| ModuleRecord {
+            id: 0,
+            process_id: pid as i32,
+            start: region.address.start,
+            end: region.address.end,
+            file_offset: region.file_offset,
+            path: region.path.into(),
+            is_kernel: false,
+            inode: region.inode,
+            device_major: region.device_major,
+            device_minor: region.device_minor,
+            inode_generation: 0,
+        })
+        .collect()
+}
+
+fn register_existing_modules<W: std::io::Write>(
+    snapshot: Vec<ModuleRecord>,
+    modules: &mut ModuleTable,
+    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    writer: &mut PerfSpoolWriter<W>,
+) -> io::Result<bool> {
+    let mut saw_python_runtime = false;
+    for module in snapshot {
+        saw_python_runtime |= crate::is_python_runtime_module_path(&module.path);
+        record_module(modules, unwinders, writer, module)?;
+    }
+    Ok(saw_python_runtime)
 }
 
 #[cfg(test)]
@@ -2382,13 +2403,55 @@ mod tests {
 
     #[test]
     fn empty_maps_snapshot_cannot_replace_live_process_modules() {
-        assert!(!maps_snapshot_has_executable_files(""));
-        assert!(!maps_snapshot_has_executable_files(
-            "1000-2000 r-xp 00000000 00:00 0\n"
-        ));
-        assert!(maps_snapshot_has_executable_files(
-            "1000-2000 r-xp 00000000 08:01 42 /tmp/lib.so\n"
-        ));
+        assert!(executable_modules_from_maps(42, "").is_empty());
+        assert!(executable_modules_from_maps(42, "1000-2000 r-xp 00000000 00:00 0\n").is_empty());
+        assert_eq!(
+            executable_modules_from_maps(42, "1000-2000 r-xp 00000000 08:01 42 /tmp/lib.so\n")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unchanged_process_reconciliation_preserves_module_generation() {
+        let pid = std::process::id();
+        let pid_i32 = i32::try_from(pid).unwrap();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        let snapshot = executable_modules_from_maps(pid, &maps);
+        let probe_address = snapshot.first().expect("executable mapping").start;
+        let mut modules = ModuleTable::default();
+        let mut unwinders = FxHashMap::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        register_existing_modules(snapshot, &mut modules, &mut unwinders, &mut writer).unwrap();
+        let module_id = modules
+            .resolve_frame(pid_i32, probe_address, FrameMode::User)
+            .module_id
+            .expect("registered mapping");
+        let mut process_images =
+            FxHashMap::from_iter([(pid_i32, read_process_image_identity(pid).unwrap().0)]);
+        let mut process_start_times =
+            FxHashMap::from_iter([(pid_i32, read_process_start_time(pid).unwrap())]);
+        let mut python_perf_support_processes = FxHashMap::default();
+        let mut python_runtime_processes = FxHashSet::default();
+
+        assert!(reconcile_process_image(
+            pid,
+            123,
+            &mut modules,
+            &mut unwinders,
+            &mut writer,
+            &mut process_images,
+            &mut process_start_times,
+            &mut python_perf_support_processes,
+            &mut python_runtime_processes,
+        )
+        .unwrap());
+        assert_eq!(
+            modules
+                .resolve_frame(pid_i32, probe_address, FrameMode::User)
+                .module_id,
+            Some(module_id)
+        );
     }
 
     #[test]

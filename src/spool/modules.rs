@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{next_spool_id, FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfSpoolWriter};
 
@@ -61,6 +61,21 @@ pub(crate) struct ModuleActivation {
 }
 
 impl ModuleTable {
+    pub(crate) fn process_modules_match(&self, process_id: i32, snapshot: &[ModuleRecord]) -> bool {
+        let active_count = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.active && !slot.module.is_kernel && slot.module.process_id == process_id
+            })
+            .count();
+        let matched: FxHashSet<_> = snapshot
+            .iter()
+            .filter_map(|module| self.find_compatible_active(module))
+            .collect();
+        active_count == snapshot.len() && matched.len() == snapshot.len()
+    }
+
     pub(crate) fn apply_module<W: Write>(
         &mut self,
         module: ModuleRecord,
