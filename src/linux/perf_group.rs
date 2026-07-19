@@ -98,6 +98,8 @@ pub struct PerfGroup {
     tracked_threads: BTreeMap<u32, u32>,
     inheriting_threads: BTreeSet<u32>,
     stopped_processes: Vec<StoppedProcess>,
+    retired_lost_records: u64,
+    reported_lost_records: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +187,8 @@ impl PerfGroup {
             tracked_threads: BTreeMap::new(),
             inheriting_threads: BTreeSet::new(),
             stopped_processes: Vec::new(),
+            retired_lost_records: 0,
+            reported_lost_records: 0,
         })
     }
 
@@ -300,7 +304,7 @@ impl PerfGroup {
             })
             .collect();
         for tid in stale_threads {
-            self.remove_thread(tid);
+            self.remove_thread(tid)?;
         }
         let new_threads: Vec<_> = threads
             .into_iter()
@@ -455,13 +459,14 @@ impl PerfGroup {
         self.open_forked_processes(&need_explicit_open)
     }
 
-    pub fn remove_thread(&mut self, tid: u32) {
-        self.remove_noninheriting_members(&FxHashSet::from_iter([tid]));
+    pub fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
+        self.remove_noninheriting_members(&FxHashSet::from_iter([tid]))?;
         self.tracked_threads.remove(&tid);
         self.inheriting_threads.remove(&tid);
+        Ok(())
     }
 
-    pub fn remove_process(&mut self, pid: u32) {
+    pub fn remove_process(&mut self, pid: u32) -> io::Result<()> {
         let mut tids: FxHashSet<u32> = self
             .tracked_threads
             .iter()
@@ -469,12 +474,13 @@ impl PerfGroup {
             .collect();
         tids.insert(pid);
 
-        self.remove_noninheriting_members(&tids);
+        self.remove_noninheriting_members(&tids)?;
         self.tracked_threads.retain(|_, owner| *owner != pid);
         self.inheriting_threads.retain(|tid| !tids.contains(tid));
+        Ok(())
     }
 
-    fn remove_noninheriting_members(&mut self, tids: &FxHashSet<u32>) {
+    fn remove_noninheriting_members(&mut self, tids: &FxHashSet<u32>) -> io::Result<()> {
         let fds_to_remove: Vec<_> = self
             .members
             .iter()
@@ -484,8 +490,9 @@ impl PerfGroup {
             })
             .collect();
         for fd in fds_to_remove {
-            self.remove_member_fd(fd);
+            self.retire_member_fd(fd)?;
         }
+        Ok(())
     }
 
     fn open_task_perfs(
@@ -621,6 +628,17 @@ impl PerfGroup {
         }
         self.members.remove(&fd);
         self.retired_poll_fds.remove(&fd);
+    }
+
+    fn retire_member_fd(&mut self, fd: RawFd) -> io::Result<()> {
+        let Some(member) = self.members.get(&fd) else {
+            return Ok(());
+        };
+        member.perf.disable()?;
+        let retired = checked_loss_sum(self.retired_lost_records, member.perf.lost_records()?)?;
+        self.remove_member_fd(fd);
+        self.retired_lost_records = retired;
+        Ok(())
     }
 
     fn remove_output_fd(&mut self, fd: RawFd) {
@@ -795,13 +813,39 @@ impl PerfGroup {
             .unwrap_or(original_error)
     }
 
-    pub fn disable(&mut self) {
+    pub fn disable(&mut self) -> io::Result<()> {
+        let mut first_error = None;
         for member in self.outputs.values() {
-            let _ = member.ring.disable();
+            if let Err(err) = member.ring.disable() {
+                first_error.get_or_insert(err);
+            }
         }
         for member in self.members.values_mut() {
-            let _ = member.perf.disable();
+            if let Err(err) = member.perf.disable() {
+                first_error.get_or_insert(err);
+            }
         }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub fn take_lost_records(&mut self) -> io::Result<u64> {
+        let mut total = self.retired_lost_records;
+        for output in self.outputs.values() {
+            total = checked_loss_sum(total, output.ring.lost_records()?)?;
+        }
+        for member in self.members.values() {
+            total = checked_loss_sum(total, member.perf.lost_records()?)?;
+        }
+        let delta = total
+            .checked_sub(self.reported_lost_records)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "perf lost-record counter regressed",
+                )
+            })?;
+        self.reported_lost_records = total;
+        Ok(delta)
     }
 
     pub fn wait(&mut self) -> io::Result<()> {
@@ -870,6 +914,12 @@ impl PerfGroup {
             self.tracked_threads.len(),
         )
     }
+}
+
+fn checked_loss_sum(total: u64, lost: u64) -> io::Result<u64> {
+    total
+        .checked_add(lost)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "perf lost-record overflow"))
 }
 
 fn frequency_for_mode(frequency: u32, mode: FrequencyMode) -> u64 {
@@ -1072,8 +1122,8 @@ mod tests {
         group.tracked_threads.insert(200, 200);
         group.inheriting_threads.extend([101, 200]);
 
-        group.remove_thread(101);
-        group.remove_process(100);
+        group.remove_thread(101).expect("remove thread");
+        group.remove_process(100).expect("remove process");
 
         assert!(!group.tracked_threads.contains_key(&100));
         assert!(!group.tracked_threads.contains_key(&101));
@@ -1090,7 +1140,7 @@ mod tests {
 
         assert!(!group.has_pending_events());
         group.enable().expect("enable empty group");
-        group.disable();
+        group.disable().expect("disable empty group");
         group
             .resume_stopped_processes()
             .expect("resume empty group");
@@ -1104,6 +1154,34 @@ mod tests {
         assert_eq!(
             consumer.calls,
             vec!["advance_round", "drain_ready_events", "flush_ready_events"]
+        );
+    }
+
+    #[test]
+    fn lost_record_deltas_include_retired_events_once() {
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        group.retired_lost_records = 7;
+
+        assert_eq!(group.take_lost_records().unwrap(), 7);
+        assert_eq!(group.take_lost_records().unwrap(), 0);
+
+        group.retired_lost_records = 11;
+        assert_eq!(group.take_lost_records().unwrap(), 4);
+    }
+
+    #[test]
+    fn lost_record_accounting_rejects_overflow_and_regression() {
+        assert_eq!(
+            checked_loss_sum(u64::MAX, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
+            .expect("create perf group");
+        group.reported_lost_records = 1;
+        assert_eq!(
+            group.take_lost_records().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
