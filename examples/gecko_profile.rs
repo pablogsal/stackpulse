@@ -366,7 +366,7 @@ fn frame_info_for_resolved_frame(
     FrameInfo {
         frame: Frame::Label(label),
         category_pair,
-        flags: flags_for_frame(frame),
+        flags: FxFrameFlags::empty(),
     }
 }
 
@@ -384,14 +384,6 @@ fn category_for_frame(frame: &GeckoFrame, categories: Categories) -> CategoryPai
             _ => categories.other,
         },
         GeckoFrame::Resolved(ResolvedFrame::Python(_)) => categories.python,
-    }
-}
-
-fn flags_for_frame(frame: &GeckoFrame) -> FxFrameFlags {
-    if is_python_frame(frame) {
-        FxFrameFlags::IS_JS
-    } else {
-        FxFrameFlags::empty()
     }
 }
 
@@ -571,4 +563,36 @@ fn print_usage() {
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stackpulse::{LocationInfo, PythonFrame};
+
+    #[test]
+    fn python_frames_are_not_javascript() {
+        let mut profile = Profile::new(
+            "test",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_hz(1.0),
+        );
+        let categories = Categories::new(&mut profile);
+        let frame = GeckoFrame::Resolved(ResolvedFrame::Python(PythonFrame::new(
+            "example.py",
+            LocationInfo::default(),
+            "work",
+            None,
+            true,
+        )));
+        let mut kernel_module_labels = HashMap::new();
+        let frame_info = frame_info_for_resolved_frame(
+            &mut profile,
+            &frame,
+            categories,
+            &mut kernel_module_labels,
+        );
+
+        assert_eq!(frame_info.flags, FxFrameFlags::empty());
+    }
 }
