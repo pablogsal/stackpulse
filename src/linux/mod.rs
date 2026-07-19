@@ -1947,19 +1947,13 @@ fn stack_frame_address(frame: StackFrame) -> Option<u64> {
 
 fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackFrame>) {
     for (mode, addresses) in call_chain.iter() {
-        let first_address_is_instruction_pointer = stack.is_empty();
-        push_callchain_addresses(mode, addresses, first_address_is_instruction_pointer, stack);
+        push_callchain_addresses(mode, addresses, stack);
     }
 }
 
-fn push_callchain_addresses(
-    mode: StackMode,
-    addresses: &[u64],
-    first_address_is_instruction_pointer: bool,
-    stack: &mut Vec<StackFrame>,
-) {
+fn push_callchain_addresses(mode: StackMode, addresses: &[u64], stack: &mut Vec<StackFrame>) {
     for (index, &address) in addresses.iter().enumerate() {
-        stack.push(if index == 0 && first_address_is_instruction_pointer {
+        stack.push(if index == 0 {
             StackFrame::InstructionPointer(address, mode)
         } else {
             StackFrame::ReturnAddress(address, mode)
@@ -2960,38 +2954,28 @@ mod tests {
     }
 
     #[test]
-    fn only_first_callchain_address_is_instruction_pointer() {
+    fn each_callchain_context_starts_with_an_instruction_pointer() {
         let mut stack = Vec::new();
 
-        push_callchain_addresses(
-            StackMode::Kernel,
-            &[0xffff_1000, 0xffff_2000],
-            true,
-            &mut stack,
-        );
-        push_callchain_addresses(StackMode::User, &[0x1000, 0x2000], false, &mut stack);
+        push_callchain_addresses(StackMode::Kernel, &[0xffff_1000, 0xffff_2000], &mut stack);
+        push_callchain_addresses(StackMode::User, &[0x1000, 0x2000], &mut stack);
 
         assert_eq!(
             stack,
             vec![
                 StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
                 StackFrame::ReturnAddress(0xffff_2000, StackMode::Kernel),
-                StackFrame::ReturnAddress(0x1000, StackMode::User),
+                StackFrame::InstructionPointer(0x1000, StackMode::User),
                 StackFrame::ReturnAddress(0x2000, StackMode::User),
             ]
         );
     }
 
     #[test]
-    fn resolving_multisegment_callchain_adjusts_segment_head_return_addresses() {
+    fn resolving_multisegment_callchain_preserves_context_heads() {
         let mut stack = Vec::new();
-        push_callchain_addresses(
-            StackMode::Kernel,
-            &[0xffff_1000, 0xffff_2000],
-            true,
-            &mut stack,
-        );
-        push_callchain_addresses(StackMode::User, &[0x1000, 0x2000], false, &mut stack);
+        push_callchain_addresses(StackMode::Kernel, &[0xffff_1000, 0xffff_2000], &mut stack);
+        push_callchain_addresses(StackMode::User, &[0x1000, 0x2000], &mut stack);
         let mut modules = ModuleTable::default();
         let mut summary = PerfSummary::default();
 
@@ -3002,7 +2986,7 @@ mod tests {
 
         assert_eq!(frames[0].abs_ip, 0xffff_1000);
         assert_eq!(frames[1].abs_ip, 0xffff_1fff);
-        assert_eq!(frames[2].abs_ip, 0x0fff);
+        assert_eq!(frames[2].abs_ip, 0x1000);
         assert_eq!(frames[3].abs_ip, 0x1fff);
     }
 
