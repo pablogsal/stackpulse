@@ -715,7 +715,7 @@ impl PerfSymbolizer {
 }
 
 fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
-    crate::is_python_runtime_module_path(&module.path) || is_anonymous_module(&module.path)
+    is_perf_map_mapping(&module.path)
 }
 
 impl NativeSymbolizerGroup {
@@ -814,8 +814,15 @@ fn strip_python_perf_map_line_suffix(file: &str) -> &str {
     file
 }
 
-fn is_anonymous_module(path: &str) -> bool {
-    path == "[anon]" || path == "//anon" || path.starts_with("[anon:")
+fn is_perf_map_mapping(path: &str) -> bool {
+    path == "//anon"
+        || path == "[anon]"
+        || path.starts_with("[anon:")
+        || path == "[heap]"
+        || path.starts_with("[stack")
+        || path.starts_with("/dev/zero")
+        || path.starts_with("/anon_hugepage")
+        || path.starts_with("/SYSV")
 }
 
 fn module_display_name(path: &str) -> &str {
@@ -1273,6 +1280,22 @@ mod tests {
     }
 
     #[test]
+    fn perf_map_symbols_do_not_override_file_backed_python_modules() {
+        let process_id = -(std::process::id() as i32) - 11;
+        let path = temp_perf_map_path(process_id);
+        fs::write(&path, "4000 20 py::stale:/tmp/stale.py\n").expect("write perf map");
+        let module = module_with_path(0, process_id, 0x4000, "/usr/lib/libpython3.13.so.1.0");
+        let mut symbolizer = PerfSymbolizer::new(&[module]);
+        let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(0, 0x4008));
+        let _ = fs::remove_file(&path);
+
+        assert!(matches!(
+            resolved,
+            ResolvedFrame::Native(frame) if frame.origin == SymbolOrigin::Elf
+        ));
+    }
+
+    #[test]
     fn perf_map_symbols_do_not_override_late_resolved_non_python_modules() {
         let process_id = -(std::process::id() as i32) - 6;
         let path = temp_perf_map_path(process_id);
@@ -1352,6 +1375,38 @@ mod tests {
                 panic!("perf anonymous Python code should allow perf-map symbol")
             }
         }
+    }
+
+    #[test]
+    fn perf_map_symbols_cover_perf_anonymous_mapping_names() {
+        let process_id = -(std::process::id() as i32) - 12;
+        let path = temp_perf_map_path(process_id);
+        let mapping_paths = [
+            "[heap]",
+            "[stack:42]",
+            "/dev/zero (deleted)",
+            "/anon_hugepage (deleted)",
+            "/SYSV00000000 (deleted)",
+        ];
+        let mut map = String::new();
+        let mut modules = Vec::new();
+        for (id, mapping_path) in mapping_paths.into_iter().enumerate() {
+            let start = 0x9000 + id as u64 * 0x1000;
+            map.push_str(&format!("{start:x} 20 jit_{id}\n"));
+            modules.push(module_with_path(id as u32, process_id, start, mapping_path));
+        }
+        fs::write(&path, map).expect("write perf map");
+        let mut symbolizer = PerfSymbolizer::new(&modules);
+
+        for (id, module) in modules.iter().enumerate() {
+            let resolved =
+                symbolizer.resolve_frame(process_id, &pinned_frame(id as u32, module.start + 8));
+            assert!(matches!(
+                resolved,
+                ResolvedFrame::Native(frame) if frame.origin == SymbolOrigin::PerfMap
+            ));
+        }
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
