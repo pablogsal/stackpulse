@@ -6,11 +6,15 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::raw::c_char;
 use std::os::unix::prelude::OsStrExt;
 
-use libc::{execvp, execvpe};
+use libc::execvp;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, pipe2, read, write, ForkResult, Pid};
+
+unsafe extern "C" {
+    static mut environ: *mut *mut c_char;
+}
 
 /// Forks a child that blocks before `execve` so the parent can capture its PID
 /// and initialize profiling first.
@@ -141,7 +145,13 @@ impl SuspendedLaunchedProcess {
                 Ok(_) => {
                     let _ = unsafe {
                         match envp {
-                            Some(envp) => execvpe(argv[0], argv.as_ptr(), envp.as_ptr()),
+                            Some(envp) => {
+                                // SAFETY: `envp` is a null-terminated pointer vector whose
+                                // C strings remain alive through this call. Only the forked
+                                // child changes its private `environ`, then it execs or exits.
+                                environ = envp.as_ptr().cast_mut().cast();
+                                execvp(argv[0], argv.as_ptr())
+                            }
                             None => execvp(argv[0], argv.as_ptr()),
                         }
                     };
@@ -269,12 +279,17 @@ fn build_env(env_vars: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
     use std::thread;
     use std::time::{Duration, Instant};
 
     const ENV_HELPER: &str = "linux::process::tests::stackpulse_process_helper_env_probe";
     const EXIT_HELPER: &str = "linux::process::tests::stackpulse_process_helper_exit_7";
+    const PATH_HELPER: &str = "linux::process::tests::stackpulse_process_helper_path_override";
+    const CHILD_PATH_ENV: &str = "STACKPULSE_CHILD_PATH";
+    const PATH_EXECUTABLE: &str = "stackpulse-child-path-executable";
 
     fn current_test_binary() -> OsString {
         std::env::current_exe()
@@ -337,6 +352,41 @@ mod tests {
 
         let running = launched.unsuspend_and_run().expect("resume child");
         let status = running.wait().expect("wait child");
+
+        assert!(matches!(status, WaitStatus::Exited(_, 0)));
+    }
+
+    #[test]
+    fn suspended_launch_resolves_commands_with_the_child_path() {
+        let caller_path = TempDir::new("process-caller-path");
+        let executable_dir = TempDir::new("process-child-path");
+        symlink(
+            current_test_binary(),
+            executable_dir.path().join(PATH_EXECUTABLE),
+        )
+        .expect("create child PATH executable");
+        let args = ignored_test_args(PATH_HELPER);
+        let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
+            current_test_binary().as_os_str(),
+            &args,
+            &[
+                (
+                    OsString::from("PATH"),
+                    caller_path.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from(CHILD_PATH_ENV),
+                    executable_dir.path().as_os_str().to_owned(),
+                ),
+            ],
+        )
+        .expect("launch PATH test helper");
+
+        let status = launched
+            .unsuspend_and_run()
+            .expect("resume PATH test helper")
+            .wait()
+            .expect("wait for PATH test helper");
 
         assert!(matches!(status, WaitStatus::Exited(_, 0)));
     }
@@ -416,5 +466,25 @@ mod tests {
     #[ignore]
     fn stackpulse_process_helper_exit_7() {
         std::process::exit(7);
+    }
+
+    #[test]
+    #[ignore]
+    fn stackpulse_process_helper_path_override() {
+        let child_path = std::env::var_os(CHILD_PATH_ENV).expect("child PATH");
+        let args = ignored_test_args(EXIT_HELPER);
+        let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
+            OsStr::new(PATH_EXECUTABLE),
+            &args,
+            &[(OsString::from("PATH"), child_path)],
+        )
+        .expect("launch executable from child PATH");
+        let status = launched
+            .unsuspend_and_run()
+            .expect("resume child PATH executable")
+            .wait()
+            .expect("wait for child PATH executable");
+
+        assert!(matches!(status, WaitStatus::Exited(_, 7)));
     }
 }
