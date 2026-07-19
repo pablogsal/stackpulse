@@ -17,6 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,8 @@ use fxprof_processed_profile::{
     ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, StringHandle, ThreadHandle,
     Timestamp,
 };
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
+use nix::sys::wait::WaitStatus;
 use stackpulse::process::SuspendedLaunchedProcess;
 use stackpulse::{
     AttachMode, FrameFlags, FrameKind, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
@@ -81,10 +84,10 @@ struct KernelModuleLabelKey {
     module_basename_start: usize,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let Some(options) = parse_options().map_err(invalid_input)? else {
         print_usage();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     };
     if options.frequency == 0 {
         return Err(invalid_input("frequency must be greater than zero").into());
@@ -108,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
 
-    let summary = record_until_exit(&options, &spool, suspended, started_at_us)?;
+    let (summary, command_status) = record_until_exit(&options, &spool, suspended, started_at_us)?;
     let reader = PerfSpoolReader::open(&spool)?;
     let profile = build_profile(&reader, &product, pid_i32, started_at, options.frequency)?;
     write_profile(&profile, &options.output)?;
@@ -128,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (kind, count) in summary.error_stats.iter_nonzero() {
         eprintln!("  err {:?}: {}", kind, count);
     }
-    Ok(())
+    propagate_wait_status(command_status).map_err(Into::into)
 }
 
 fn record_until_exit(
@@ -136,7 +139,7 @@ fn record_until_exit(
     spool: &Path,
     suspended: SuspendedLaunchedProcess,
     started_at_us: u64,
-) -> Result<PerfSummary, Box<dyn std::error::Error>> {
+) -> Result<(PerfSummary, WaitStatus), Box<dyn std::error::Error>> {
     let pid = suspended.pid();
     let mut recorder = PerfRecorder::attach(
         pid,
@@ -153,17 +156,48 @@ fn record_until_exit(
     )?;
 
     let running = suspended.unsuspend_and_run()?;
-    loop {
+    let command_status = loop {
         if !recorder.has_pending_events() {
             recorder.wait()?;
         }
         recorder.consume_available()?;
-        if running.try_wait()?.is_some() {
-            break;
+        if let Some(status) = running.try_wait()? {
+            break status;
         }
-    }
+    };
 
-    recorder.finish().map_err(Into::into)
+    let summary = recorder.finish()?;
+    Ok((summary, command_status))
+}
+
+fn propagate_wait_status(status: WaitStatus) -> io::Result<ExitCode> {
+    match status {
+        WaitStatus::Exited(_, code) => u8::try_from(code).map(ExitCode::from).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid command exit code {code}"),
+            )
+        }),
+        WaitStatus::Signaled(_, signal, _) => {
+            if signal != Signal::SIGKILL {
+                let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+                // SAFETY: installing the default disposition adds no signal handler
+                // that could call into Rust; the signal is raised immediately below.
+                unsafe { signal::sigaction(signal, &action) }?;
+            }
+            let mut mask = SigSet::empty();
+            mask.add(signal);
+            signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None)?;
+            signal::raise(signal)?;
+            Err(io::Error::other(format!(
+                "command signal {signal:?} did not terminate the profiler"
+            )))
+        }
+        status => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("command returned a nonterminal wait status: {status:?}"),
+        )),
+    }
 }
 
 fn build_profile(
@@ -553,7 +587,41 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::unistd::{fork, ForkResult, Pid};
     use stackpulse::{LocationInfo, PythonFrame};
+
+    #[test]
+    fn command_exit_code_is_preserved() {
+        let status = WaitStatus::Exited(Pid::from_raw(42), 7);
+
+        assert_eq!(
+            propagate_wait_status(status).expect("propagate exit status"),
+            ExitCode::from(7)
+        );
+    }
+
+    #[test]
+    fn command_signal_is_preserved() {
+        // SAFETY: the child only resets/unblocks/raises SIGTERM, or calls `_exit`
+        // if that unexpectedly returns; it does not resume the test harness.
+        match unsafe { fork() }.expect("fork signal propagation test") {
+            ForkResult::Child => {
+                let _ = propagate_wait_status(WaitStatus::Signaled(
+                    Pid::this(),
+                    Signal::SIGTERM,
+                    false,
+                ));
+                unsafe { libc::_exit(1) }
+            }
+            ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).expect("wait signal test child");
+                assert!(matches!(
+                    status,
+                    WaitStatus::Signaled(pid, Signal::SIGTERM, false) if pid == child
+                ));
+            }
+        }
+    }
 
     #[test]
     fn python_frames_are_not_javascript() {
