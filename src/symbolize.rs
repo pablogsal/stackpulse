@@ -812,8 +812,8 @@ fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
 }
 
 fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
-    let mut parts = line.splitn(3, ' ');
-    let (start, len, name) = (parts.next()?, parts.next()?, parts.next()?);
+    let (start, rest) = take_ascii_field(line)?;
+    let (len, name) = take_ascii_field(rest)?;
     if name.is_empty() {
         return None;
     }
@@ -828,6 +828,12 @@ fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
         end,
         name: name.to_string(),
     })
+}
+
+fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let end = input.find(|c: char| c.is_ascii_whitespace())?;
+    Some((&input[..end], &input[end + 1..]))
 }
 
 #[cfg(test)]
@@ -1107,6 +1113,39 @@ mod tests {
     #[test]
     fn overflowing_perf_map_range_does_not_match() {
         assert!(parse_perf_map_line("1000 ffffffffffffffff overflow_symbol").is_none());
+    }
+
+    #[test]
+    fn perf_map_fields_accept_ascii_whitespace() {
+        for (line, expected_name) in [
+            ("1000 10 controlled name", "controlled name"),
+            ("1000  10 controlled name", "controlled name"),
+            ("1000\t10\tcontrolled name", "controlled name"),
+            (" \t1000 \t 10 controlled name", "controlled name"),
+            ("1000 10  controlled name", " controlled name"),
+            ("1000 10\t\tcontrolled name", "\tcontrolled name"),
+        ] {
+            let symbol = parse_perf_map_line(line).expect("valid perf-map entry");
+            assert_eq!(symbol.start, 0x1000);
+            assert_eq!(symbol.end, 0x1010);
+            assert_eq!(symbol.name, expected_name);
+        }
+    }
+
+    #[test]
+    fn malformed_perf_map_fields_are_rejected() {
+        for line in [
+            "",
+            "1000",
+            "1000 10",
+            "1000 10 ",
+            "1000 0 symbol",
+            "not-hex 10 symbol",
+            "1000 not-hex symbol",
+            "1000\u{a0}10 symbol",
+        ] {
+            assert!(parse_perf_map_line(line).is_none(), "accepted {line:?}");
+        }
     }
 
     #[test]
