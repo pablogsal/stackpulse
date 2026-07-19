@@ -37,7 +37,6 @@ const DEFAULT_OUTPUT: &str = "stackpulse_gecko.json.gz";
 const STACK_SIZE: u32 = stackpulse::MAX_SAMPLE_USER_STACK;
 const TRUNCATED_STACK_LABEL: &str = "[truncated stack]";
 const UNKNOWN_NATIVE_LABEL: &str = "[unknown native frame]";
-const POST_EXIT_QUIET_DRAINS: usize = 3;
 
 #[derive(Debug)]
 struct Options {
@@ -139,7 +138,6 @@ fn record_until_exit(
     started_at_us: u64,
 ) -> Result<PerfSummary, Box<dyn std::error::Error>> {
     let pid = suspended.pid();
-    let pid_i32 = i32::try_from(pid).map_err(|_| invalid_input("child pid does not fit i32"))?;
     let mut recorder = PerfRecorder::attach(
         pid,
         spool,
@@ -155,26 +153,13 @@ fn record_until_exit(
     )?;
 
     let running = suspended.unsuspend_and_run()?;
-    let mut main_exited = false;
-    let mut quiet_drains_after_exit = 0;
     loop {
         if !recorder.has_pending_events() {
             recorder.wait()?;
         }
         recorder.consume_available()?;
-        if !main_exited {
-            main_exited = running.try_wait()?.is_some();
-        }
-        if !main_exited {
-            continue;
-        }
-
-        if recorder.has_active_processes_except(pid_i32) || recorder.has_pending_events() {
-            quiet_drains_after_exit = 0;
-        } else if quiet_drains_after_exit + 1 >= POST_EXIT_QUIET_DRAINS {
+        if running.try_wait()?.is_some() {
             break;
-        } else {
-            quiet_drains_after_exit += 1;
         }
     }
 
