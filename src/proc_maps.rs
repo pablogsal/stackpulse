@@ -23,7 +23,7 @@ pub fn parse_iter(maps: &str) -> impl Iterator<Item = Region<'_>> + '_ {
 }
 
 pub fn parse_line(line: &str) -> Option<Region<'_>> {
-    let mut rest = line.trim();
+    let mut rest = line.trim_start();
     if rest.is_empty() {
         return None;
     }
@@ -33,7 +33,7 @@ pub fn parse_line(line: &str) -> Option<Region<'_>> {
     let offset = next_field(&mut rest)?;
     let device = next_field(&mut rest)?;
     let inode = next_field(&mut rest)?;
-    let path = normalize_path(rest.trim_start());
+    let path = rest.trim_start();
 
     let (start, end) = range.split_once('-')?;
     let start = u64::from_str_radix(start, 16).ok()?;
@@ -73,10 +73,6 @@ fn next_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
             Some(trimmed)
         }
     }
-}
-
-fn normalize_path(path: &str) -> &str {
-    path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -136,11 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn preserves_spaces_and_strips_deleted_suffix() {
+    fn preserves_path_suffixes_verbatim() {
         let line =
             "7f1234560000-7f1234570000 r-xp 00001000 08:01 12345 /tmp/a path/lib.so (deleted)";
         let region = parse_line(line).unwrap();
-        assert_eq!(region.path, "/tmp/a path/lib.so");
+        assert_eq!(region.path, "/tmp/a path/lib.so (deleted)");
+
+        let line = "7f1234560000-7f1234570000 r-xp 00001000 08:01 12345 /tmp/trailing-space \t";
+        let region = parse_line(line).unwrap();
+        assert_eq!(region.path, "/tmp/trailing-space \t");
     }
 
     #[test]
