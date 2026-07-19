@@ -104,7 +104,7 @@ pub struct PerfSummary {
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
-    /// LOST lifecycle records observed; one drain may recover several at once.
+    /// Recovery passes triggered by one or more lost records.
     pub lifecycle_gaps: u64,
     /// Whether kernel frame capture remained enabled after attach.
     pub kernel_enabled: bool,
@@ -415,6 +415,12 @@ impl PerfRecorder {
                 DrainMode::Consume => perf.consume_events(&mut sink),
                 DrainMode::Flush => perf.flush_events(&mut sink),
             }
+            if sink.result.is_ok() {
+                match perf.take_lost_records() {
+                    Ok(lost) => sink.result = record_lost_events(sink.ctx.summary, lost),
+                    Err(err) => sink.result = Err(err),
+                }
+            }
             if sink.result.is_ok() && sink.ctx.summary.lifecycle_gaps != lifecycle_gaps_before {
                 // A /proc snapshot is current state, not state at the LOST
                 // record timestamp. Drain every event already collected before
@@ -429,10 +435,7 @@ impl PerfRecorder {
         if result.is_ok() {
             for action in &lifecycle_actions {
                 let action_result = match *action {
-                    LifecycleAction::ProcessRetire { pid } => {
-                        perf.remove_process(pid);
-                        Ok(())
-                    }
+                    LifecycleAction::ProcessRetire { pid } => perf.remove_process(pid),
                     LifecycleAction::ProcessFork { pid, parent_tid } if open_new_perf_events => {
                         perf.open_forked_processes(&[(pid, parent_tid)])
                     }
@@ -443,10 +446,7 @@ impl PerfRecorder {
                     } if open_new_perf_events => {
                         perf.open_forked_threads(&[(tid, pid, parent_tid)])
                     }
-                    LifecycleAction::ThreadExit { tid, .. } => {
-                        perf.remove_thread(tid);
-                        Ok(())
-                    }
+                    LifecycleAction::ThreadExit { tid, .. } => perf.remove_thread(tid),
                     LifecycleAction::ProcessFork { .. } | LifecycleAction::ThreadFork { .. } => {
                         Ok(())
                     }
@@ -472,7 +472,10 @@ impl PerfRecorder {
                 .collect();
             for pid in dead_processes {
                 if let Ok(pid_u32) = u32::try_from(pid) {
-                    perf.remove_process(pid_u32);
+                    if let Err(err) = perf.remove_process(pid_u32) {
+                        result = Err(err);
+                        break;
+                    }
                 }
                 if python_runtime_processes.contains(&pid) {
                     let timestamp_ns = lifecycle_actions
@@ -528,7 +531,10 @@ impl PerfRecorder {
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
-                        perf.remove_process(pid_u32);
+                        if let Err(err) = perf.remove_process(pid_u32) {
+                            result = Err(err);
+                            break;
+                        }
                         if let Err(err) = cleanup_process(
                             pid,
                             modules,
@@ -645,7 +651,7 @@ impl PerfRecorder {
                 if !stale {
                     return Ok(());
                 }
-                self.perf.remove_process(pid);
+                self.perf.remove_process(pid)?;
                 cleanup_process(
                     pid_i32,
                     &mut self.modules,
@@ -708,7 +714,7 @@ impl PerfRecorder {
 
     /// Disable sampling for all attached processes.
     pub fn disable(&mut self) {
-        self.perf.disable();
+        let _ = self.perf.disable();
     }
 
     /// Return whether userspace has queued events or [`Self::wait`] observed a
@@ -749,7 +755,7 @@ impl PerfRecorder {
 
     /// Flush the profile file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
-        self.perf.disable();
+        self.perf.disable()?;
         self.drain_events(DrainMode::Flush, false)?;
         self.writer.flush()?;
         Ok(self.summary)
@@ -947,17 +953,28 @@ fn handle_non_sample_record<W: std::io::Write>(
             });
             Ok(())
         }
-        Record::LostRecords(lost) => {
-            ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_records);
-            ctx.summary.lifecycle_gaps = ctx.summary.lifecycle_gaps.saturating_add(1);
-            Ok(())
-        }
+        Record::LostRecords(_) => Ok(()),
         Record::LostSamples(lost) => {
             ctx.summary.lost_events = ctx.summary.lost_events.saturating_add(lost.lost_samples);
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn record_lost_events(summary: &mut PerfSummary, lost: u64) -> io::Result<()> {
+    if lost == 0 {
+        return Ok(());
+    }
+    summary.lost_events = summary
+        .lost_events
+        .checked_add(lost)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "perf lost-record overflow"))?;
+    summary.lifecycle_gaps = summary
+        .lifecycle_gaps
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "perf lifecycle-gap overflow"))?;
+    Ok(())
 }
 
 fn i32_from_u32(value: u32) -> Option<i32> {
@@ -2175,7 +2192,7 @@ mod tests {
     use crate::spool::ModuleTableTestExt;
     use crate::test_support::{SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
-    use perf_event_open::sample::record::lost::LostRecords;
+    use perf_event_open::sample::record::lost::{LostRecords, LostSamples};
     use perf_event_open::sample::record::task::{Exit, Fork};
     use perf_event_open::sample::record::Task;
 
@@ -2350,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn lost_record_defers_recovery_and_does_not_trust_record_id_task() {
+    fn ring_lost_record_is_not_counted_twice() {
         let pid = i32::try_from(std::process::id()).unwrap();
         let mut modules = ModuleTable::default();
         let mut unwinders = FxHashMap::default();
@@ -2392,13 +2409,40 @@ mod tests {
             &mut ctx,
         )
         .unwrap();
+        handle_non_sample_record(
+            124,
+            Priv::User,
+            Record::LostSamples(Box::new(LostSamples {
+                record_id: None,
+                lost_samples: 11,
+            })),
+            &mut ctx,
+        )
+        .unwrap();
 
-        assert_eq!(summary.lost_events, 7);
-        assert_eq!(summary.lifecycle_gaps, 1);
+        assert_eq!(summary.lost_events, 11);
+        assert_eq!(summary.lifecycle_gaps, 0);
         assert!(modules
             .resolve_frame(pid, 0x1800, FrameMode::User)
             .module_id
             .is_some());
+    }
+
+    #[test]
+    fn authoritative_loss_advances_loss_and_recovery_once() {
+        let mut summary = PerfSummary::default();
+
+        record_lost_events(&mut summary, 0).unwrap();
+        assert_eq!((summary.lost_events, summary.lifecycle_gaps), (0, 0));
+
+        record_lost_events(&mut summary, 7).unwrap();
+        assert_eq!((summary.lost_events, summary.lifecycle_gaps), (7, 1));
+
+        summary.lost_events = u64::MAX;
+        assert_eq!(
+            record_lost_events(&mut summary, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

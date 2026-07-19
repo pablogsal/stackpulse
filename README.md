@@ -8,7 +8,7 @@ stack samples and saving them to a compact file. You can read that file later
 and turn the raw frames into function names, source locations where available,
 and a shape that is easier to display in a profiler UI.
 
-The library is Linux-only for now. It is not a command-line tool.
+The library requires Linux 6.0 or newer. It is not a command-line tool.
 
 ## The Idea
 

@@ -232,6 +232,7 @@ impl PerfOptions {
         opts.extra_record.mmap.ext = Some(UseBuildId(false));
         opts.extra_record.comm = true;
         opts.extra_record.task = true;
+        opts.stat_format.lost_records = true;
         opts
     }
 }
@@ -274,6 +275,10 @@ impl OutputRing {
         EventDrain {
             iter: self.sampler.iter().into_cow(),
         }
+    }
+
+    pub fn lost_records(&self) -> io::Result<u64> {
+        self.perf.lost_records()
     }
 }
 
@@ -463,6 +468,15 @@ impl Perf {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    pub fn lost_records(&self) -> io::Result<u64> {
+        self.counter.stat()?.lost_records.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "perf counter omitted PERF_FORMAT_LOST",
+            )
+        })
     }
 }
 
@@ -1451,10 +1465,11 @@ mod tests {
     }
 
     #[test]
-    fn perf_options_request_only_executable_mmaps() {
+    fn perf_options_request_executable_mmaps_and_lost_counters() {
         let opts = PerfOptions::default().perf_open_opts();
         assert!(opts.extra_record.mmap.code);
         assert!(!opts.extra_record.mmap.data);
+        assert!(opts.stat_format.lost_records);
     }
 
     #[test]
