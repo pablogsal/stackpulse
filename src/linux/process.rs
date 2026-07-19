@@ -119,6 +119,7 @@ impl SuspendedLaunchedProcess {
 
         Ok(RunningProcess {
             pid: Cell::new(Some(self.pid)),
+            exit_status: Cell::new(None),
         })
     }
 
@@ -193,11 +194,15 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 #[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
     pid: Cell<Option<Pid>>,
+    exit_status: Cell<Option<WaitStatus>>,
 }
 
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
     pub fn try_wait(&self) -> io::Result<Option<WaitStatus>> {
+        if let Some(status) = self.exit_status.get() {
+            return Ok(Some(status));
+        }
         let Some(pid) = self.pid.get() else {
             return Ok(None);
         };
@@ -205,6 +210,7 @@ impl RunningProcess {
             Ok(WaitStatus::StillAlive) => Ok(None),
             Ok(status) => {
                 self.pid.set(None);
+                self.exit_status.set(Some(status));
                 Ok(Some(status))
             }
             Err(err) => Err(err.into()),
@@ -213,6 +219,9 @@ impl RunningProcess {
 
     /// Wait until the process exits.
     pub fn wait(self) -> io::Result<WaitStatus> {
+        if let Some(status) = self.exit_status.get() {
+            return Ok(status);
+        }
         let Some(pid) = self.pid.replace(None) else {
             return Err(io::Error::other("process was already waited"));
         };
@@ -336,6 +345,7 @@ mod tests {
     fn running_process_reports_none_after_it_has_been_waited() {
         let process = RunningProcess {
             pid: Cell::new(None),
+            exit_status: Cell::new(None),
         };
 
         assert!(process.try_wait().expect("try wait without pid").is_none());
@@ -346,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn try_wait_records_exited_process_once() {
+    fn try_wait_caches_exited_process_status() {
         let command = current_test_binary();
         let args = ignored_test_args(EXIT_HELPER);
         let launched =
@@ -358,7 +368,14 @@ mod tests {
         loop {
             if let Some(status) = running.try_wait().expect("try wait child") {
                 assert!(matches!(status, WaitStatus::Exited(_, 7)));
-                assert!(running.try_wait().expect("try wait reaped child").is_none());
+                assert!(matches!(
+                    running.try_wait().expect("try wait reaped child"),
+                    Some(WaitStatus::Exited(_, 7))
+                ));
+                assert!(matches!(
+                    running.wait().expect("wait reaped child"),
+                    WaitStatus::Exited(_, 7)
+                ));
                 return;
             }
             if Instant::now() >= deadline {
