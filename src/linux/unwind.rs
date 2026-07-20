@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet;
 use std::mem::size_of;
 use std::ops::Range;
 
-use crate::elf::types::{ElfSectionData, ElfSectionInfo};
+use crate::elf::{ElfSectionData, ElfSectionInfo};
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{ModuleRecord, ModuleUpdate};
 
@@ -172,7 +172,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::elf::test_fixtures::fake_hard_case_section_info;
+    use crate::elf::fake_hard_case_section_info;
 
     #[test]
     fn only_indexed_eh_frame_headers_are_forwarded() {

@@ -1,8 +1,8 @@
-//! Shared ELF section extraction for DWARF unwinding.
+//! Shared ELF section extraction for unwinding and symbolization.
 //!
-//! Loads ELF sections used for native stack unwinding and resolves a mapping's
-//! image base via [`ElfImageLayout`]. Consumed by the native live-process path
-//! (`native_module`).
+//! Loads ELF sections used by native stack unwinding and post-recording
+//! symbolization, and resolves a mapping's image base via [`ElfImageLayout`].
+//! Both consumers share these results through `native_module`.
 
 use super::types::{ElfSectionData, ElfSectionInfo};
 use super::{
@@ -115,7 +115,7 @@ impl<'a> ElfImageLayout<'a> {
 }
 
 #[cfg(test)]
-pub(crate) fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
+fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
     use std::fs::File;
 
     let file = File::open(path)?;
@@ -371,7 +371,7 @@ fn calculate_memory_range(elf: &Elf) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::test_fixtures::fake_hard_case_section_info;
+    use crate::elf::fake_hard_case_section_info;
 
     #[test]
     #[cfg(target_os = "linux")]

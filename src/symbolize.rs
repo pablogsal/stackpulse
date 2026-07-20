@@ -880,7 +880,7 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::test_fixtures::fake_hard_case_section_info;
+    use crate::elf::fake_hard_case_section_info;
     use crate::spool::PerfSpoolWriter;
     use std::os::unix::fs::MetadataExt;
 
