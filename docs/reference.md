@@ -98,7 +98,7 @@ record references.
 | `modules()` | Recorded executable memory ranges. |
 | `frames()` | Interned raw frame records. Useful for precomputing symbolization caches. |
 | `samples()` | Timestamped samples. |
-| `process_execs()` | Process exec markers, including Python runtime on/off. |
+| `python_runtime_records()` | Python-runtime status changes. |
 | `recovered_from_truncated_tail()` | Whether the spool ended mid-record and the reader kept only the intact prefix. |
 | `kernel_frame_addresses()` | Iterator over absolute kernel IPs in interned frames. Used by [`PerfSymbolizer::for_spool`] for sparse `kallsyms` loading. |
 | `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`]s for an interned stack without copying. |
@@ -107,8 +107,8 @@ record references.
 | `stack_frames(stack_id, out)` | Expand an interned stack into [`FrameRecord`]s. Clears `out` first. |
 | `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds. |
 
-Frame iteration order is leaf to root. `FrameModuleRef::rel_ip` uses the same
-file-offset coordinate space as `FrameRecord::rel_ip`; external symbolizers can
+Frame iteration order is leaf to root. `FrameModuleRef::file_relative_ip` uses the same
+file-offset coordinate space as `FrameRecord::file_relative_ip`; external symbolizers can
 combine it with the recorded module mapping however their own lookup API
 requires.
 
@@ -129,7 +129,7 @@ requires.
 | Field | Meaning |
 | --- | --- |
 | `module_id` | Matched module, when known. |
-| `rel_ip` | Module-relative address. |
+| `file_relative_ip` | Address in the mapped file's offset coordinate space. |
 | `abs_ip` | Absolute IP. |
 | `mode` | [`FrameMode::User`], [`FrameMode::Kernel`], or [`FrameMode::TruncatedStackMarker`]. |
 
@@ -137,7 +137,7 @@ requires.
 native unwinding stopped before the stack root. Use
 `FrameRecord::is_truncated_stack_marker()` to detect it in raw-frame workflows.
 
-### [`OwnedSampleRecord`]
+### [`SampleRecord`]
 
 | Field | Meaning |
 | --- | --- |
@@ -146,7 +146,7 @@ native unwinding stopped before the stack root. Use
 | `thread_id` | TID. |
 | `stack_id` | Pass to [`PerfSpoolReader::stack_frames`]. |
 
-### [`ProcessExecRecord`]
+### [`PythonRuntimeRecord`]
 
 | Field | Meaning |
 | --- | --- |
@@ -164,17 +164,16 @@ Resolves raw frames into displayable ones. One per profile, reused.
 | --- | --- |
 | `new(modules)` | Default: ELF, kernel symbols, plus Python perf maps for any PID. |
 | `for_spool(reader)` | Create a symbolizer for a loaded spool, including sparse kernel-symbol loading. |
-| `for_spool_with_perf_maps(reader, allow)` | Same as `for_spool`, but explicitly enable or disable Python perf maps. |
-| `for_spool_with_recorded_python_perf_maps(reader)` | Allow perf maps for PIDs ever recorded as Python runtimes in the spool. |
-| `with_perf_maps(modules, allow)` | Globally enable or disable perf-map lookup. |
-| `with_perf_map_processes(modules, pids)` | Allow perf maps only for the listed PIDs. |
+| `PerfSymbolizerBuilder::for_modules(modules)` | Configure symbolization for module records. |
+| `PerfSymbolizerBuilder::for_spool(reader)` | Configure symbolization with spool metadata. |
+| `disable_perf_maps()` | Disable Python perf-map lookup. |
+| `perf_maps_for(pids)` | Allow perf maps only for the listed PIDs. |
+| `native_symbolizer_factory(factory)` | Replace the bundled native symbolizer. |
 | `for_each_sample_stack(stack, visit)` | Resolve a [`SampleStack`] from `sample_stacks()` and stream borrowed resolved frames to `visit`. |
 | `for_each_resolved_frame_slice(pid, frames, visit)` | Resolve a caller-supplied raw-frame slice and stream borrowed resolved frames to `visit`. |
 
-`for_spool_with_recorded_python_perf_maps` is intentionally broader than a
-"last observed as Python" filter: a PID remains allowed if it was ever marked
-as a Python runtime in the spool. Use `with_perf_map_processes` for stricter
-PID-reuse handling.
+Use `perf_maps_for` with IDs from `python_runtime_records()` when perf-map
+lookup should follow the runtime metadata captured in the spool.
 
 Resolution order, top to bottom:
 
@@ -219,7 +218,7 @@ Resolution order, top to bottom:
 | `flags` | [`FrameFlags`] for UI policy. |
 
 `NativeSymbol` carries the symbol name, optional source file / line, module
-name, basename offsets, module-relative offset, and Python-runtime helpers
+name, basename access, function-relative offset, and Python-runtime helpers
 like `is_eval_frame` and `should_ignore`.
 
 ### Kinds, origins, flags
@@ -292,7 +291,7 @@ printable via [`ErrorStatsFormatter`].
 | `iter_nonzero()` | Iterate the non-zero counters. |
 | `reset()` | Zero everything. |
 | `ErrorStatsFormatter::new(stats, total_samples, successful_samples)` | Build a display formatter. |
-| `write_to(writer)` | Write a grouped report. |
+| `Display` / `to_string()` | Format the report. |
 
 ## Constants and helpers
 
@@ -309,7 +308,7 @@ printable via [`ErrorStatsFormatter`].
 
 Append-only and compact:
 
-- Modules, frames, stack nodes, threads, samples, and process exec markers
+- Modules, frames, stack nodes, threads, samples, and Python-runtime records
   are separate record kinds.
 - Frames are interned. Repeated frames stored once.
 - Stacks are prefix nodes. Common suffixes shared.

@@ -38,6 +38,7 @@ pub enum SampleErrorKind {
 /// Number of error kinds; sizes the counter array. Derived from
 /// [`SampleErrorKind::ALL`] so it can never drift from the enum.
 const ERROR_KIND_COUNT: usize = SampleErrorKind::ALL.len();
+const NATIVE_UNWINDING_CATEGORY: &str = "Native Unwinding";
 
 // Enforce that each variant's discriminant equals its index in `ALL`, so
 // `kind as usize` is always a valid, unique slot in the counter array.
@@ -64,13 +65,6 @@ impl SampleErrorKind {
         SampleErrorKind::NativeFramehopIntegerOverflow,
         SampleErrorKind::NativeUserRegistersMissing,
     ];
-
-    /// Category name for grouping in display. All current failure kinds are
-    /// native-unwinding failures, so they share a single category.
-    #[must_use]
-    pub fn category(&self) -> &'static str {
-        "Native Unwinding"
-    }
 
     /// Short human-readable description.
     #[must_use]
@@ -142,7 +136,7 @@ impl SampleErrorStats {
             tracing::debug!(
                 target: "stackpulse::sampler::error",
                 kind = %kind,
-                category = kind.category(),
+                category = NATIVE_UNWINDING_CATEGORY,
                 context = %context(),
                 "sample error recorded"
             );
@@ -222,9 +216,6 @@ impl Clone for SampleErrorStats {
 }
 
 /// Format error statistics for display.
-///
-/// Groups errors by category with counts and percentages.
-/// Includes progress bars for visual representation.
 pub struct ErrorStatsFormatter<'a> {
     stats: &'a SampleErrorStats,
     total_samples: u64,
@@ -241,26 +232,25 @@ impl<'a> ErrorStatsFormatter<'a> {
         }
     }
 
-    /// Generate a progress bar string.
-    fn progress_bar(percentage: f64, width: usize) -> String {
-        let filled = ((percentage / 100.0) * width as f64).round() as usize;
-        let empty = width.saturating_sub(filled);
+    fn progress_bar(percentage: f64) -> String {
+        const WIDTH: usize = 20;
+        let filled = ((percentage / 100.0) * WIDTH as f64).round() as usize;
+        let empty = WIDTH.saturating_sub(filled);
         format!("{}{}", "█".repeat(filled), "░".repeat(empty))
     }
+}
 
-    /// Write formatted stats to the provided writer.
-    ///
-    /// # Errors
-    /// Returns a `fmt::Error` if writing to the output fails.
-    pub fn write_to(&self, w: &mut impl fmt::Write) -> fmt::Result {
+impl fmt::Display for ErrorStatsFormatter<'_> {
+    fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MIN_DESCRIPTION_WIDTH: usize = 24;
         let total_errors = self.stats.total();
         let entries: Vec<_> = self.stats.iter_nonzero().collect();
         let desc_width = entries
             .iter()
-            .map(|(kind, _)| kind.description().len() + 1) // include trailing ':'
+            .map(|(kind, _)| kind.description().len() + 1)
             .max()
-            .unwrap_or(24)
-            .max(24);
+            .unwrap_or(MIN_DESCRIPTION_WIDTH)
+            .max(MIN_DESCRIPTION_WIDTH);
 
         writeln!(w, "\nOverview:")?;
         writeln!(
@@ -272,21 +262,13 @@ impl<'a> ErrorStatsFormatter<'a> {
             w,
             "  Successful:          {} ({:.2}%)",
             format_number(self.successful_samples),
-            if self.total_samples > 0 {
-                self.successful_samples as f64 / self.total_samples as f64 * 100.0
-            } else {
-                0.0
-            }
+            percentage(self.successful_samples, self.total_samples)
         )?;
         writeln!(
             w,
             "  Sample errors:       {} ({:.2}%)",
             format_number(total_errors),
-            if self.total_samples > 0 {
-                total_errors as f64 / self.total_samples as f64 * 100.0
-            } else {
-                0.0
-            }
+            percentage(total_errors, self.total_samples)
         )?;
 
         if total_errors == 0 {
@@ -294,21 +276,11 @@ impl<'a> ErrorStatsFormatter<'a> {
             return Ok(());
         }
 
-        let mut current_category = "";
+        writeln!(w, "\n{NATIVE_UNWINDING_CATEGORY}:")?;
         for (kind, count) in &entries {
-            let category = kind.category();
-            if category != current_category {
-                writeln!(w, "\n{category}:")?;
-                current_category = category;
-            }
-
-            let pct_of_errors = (*count as f64 / total_errors as f64) * 100.0;
-            let pct_of_samples = if self.total_samples > 0 {
-                (*count as f64 / self.total_samples as f64) * 100.0
-            } else {
-                0.0
-            };
-            let bar = Self::progress_bar(pct_of_errors, 20);
+            let pct_of_errors = percentage(*count, total_errors);
+            let pct_of_samples = percentage(*count, self.total_samples);
+            let bar = Self::progress_bar(pct_of_errors);
 
             writeln!(
                 w,
@@ -323,6 +295,14 @@ impl<'a> ErrorStatsFormatter<'a> {
         }
 
         Ok(())
+    }
+}
+
+fn percentage(count: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64 * 100.0
     }
 }
 
@@ -342,13 +322,6 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_all_kinds_share_native_category() {
-        for kind in SampleErrorKind::ALL {
-            assert_eq!(kind.category(), "Native Unwinding");
-        }
-    }
 
     #[test]
     fn test_discriminants_match_all_order() {
@@ -480,12 +453,12 @@ mod tests {
         let stats = SampleErrorStats::new();
         let formatter = ErrorStatsFormatter::new(&stats, 1000, 1000);
 
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
+        let output = formatter.to_string();
 
-        assert!(output.contains("Total samples:"));
-        assert!(output.contains("1,000"));
-        assert!(output.contains("No sample errors recorded"));
+        assert_eq!(
+            output,
+            "\nOverview:\n  Total samples:       1,000\n  Successful:          1,000 (100.00%)\n  Sample errors:       0 (0.00%)\n\n  No sample errors recorded\n"
+        );
     }
 
     #[test]
@@ -494,109 +467,25 @@ mod tests {
         stats.record(SampleErrorKind::NativeStackRead);
         stats.record(SampleErrorKind::NativeStackRead);
         stats.record(SampleErrorKind::NativeRegisterCapture);
-
-        let formatter = ErrorStatsFormatter::new(&stats, 100, 97);
-
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
-
-        assert!(output.contains("Total samples:"));
-        assert!(output.contains("100"));
-        assert!(output.contains("Successful:"));
-        assert!(output.contains("97"));
-        assert!(output.contains("Sample errors:"));
-        assert!(output.contains("Native Unwinding:"));
-        assert!(output.contains("Stack read failed:"));
-        assert!(output.contains("Register capture failed:"));
-    }
-
-    #[test]
-    fn test_formatter_errors_add_up() {
-        let stats = SampleErrorStats::new();
-        for _ in 0..50 {
-            stats.record(SampleErrorKind::NativeStackRead);
-        }
-        for _ in 0..30 {
-            stats.record(SampleErrorKind::NativeFramehopDidNotAdvance);
-        }
-        for _ in 0..20 {
-            stats.record(SampleErrorKind::NativeStackTruncated);
-        }
-
-        let formatter = ErrorStatsFormatter::new(&stats, 1000, 900);
-
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
-
-        assert!(output.contains("Sample errors:"));
-        assert!(output.contains("100"));
-    }
-
-    #[test]
-    fn test_formatter_lists_each_kind_under_one_category() {
-        let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::NativeRegisterCapture);
-        stats.record(SampleErrorKind::NativeStackRead);
         stats.record(SampleErrorKind::NativeFramehopMovedBackwards);
 
         let formatter = ErrorStatsFormatter::new(&stats, 100, 96);
 
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
+        let output = formatter.to_string();
 
-        assert_eq!(output.matches("Native Unwinding:").count(), 1);
-        assert!(output.contains("Register capture failed:"));
-        assert!(output.contains("Stack read failed:"));
-        assert!(output.contains("Framehop: frame pointer moved backwards:"));
-    }
-
-    #[test]
-    fn test_formatter_percentages() {
-        let stats = SampleErrorStats::new();
-        for _ in 0..80 {
-            stats.record(SampleErrorKind::NativeStackRead);
-        }
-        for _ in 0..20 {
-            stats.record(SampleErrorKind::NativeRegisterCapture);
-        }
-
-        let formatter = ErrorStatsFormatter::new(&stats, 1000, 900);
-
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
-
-        assert!(output.contains("80.0% of errors"));
-        assert!(output.contains("20.0% of errors"));
-        assert!(output.contains("8.00% of samples"));
-        assert!(output.contains("2.00% of samples"));
-    }
-
-    #[test]
-    fn test_formatter_progress_bars_are_aligned() {
-        let stats = SampleErrorStats::new();
-        stats.record(SampleErrorKind::NativeFramehopMovedBackwards);
-        stats.record(SampleErrorKind::NativeFramehopDidNotAdvance);
-        stats.record(SampleErrorKind::NativeFramehopReturnAddressNull);
-
-        let formatter = ErrorStatsFormatter::new(&stats, 1000, 997);
-        let mut output = String::new();
-        formatter.write_to(&mut output).unwrap();
-
-        let lines: Vec<&str> = output
-            .lines()
-            .filter(|line| line.contains("Framehop:"))
-            .collect();
-        assert_eq!(lines.len(), 3);
-
-        let bar_start = |line: &str| {
-            line.find('█')
-                .or_else(|| line.find('░'))
-                .expect("formatted line should contain a progress bar")
-        };
-
-        let first = bar_start(lines[0]);
-        assert_eq!(bar_start(lines[1]), first);
-        assert_eq!(bar_start(lines[2]), first);
+        assert_eq!(
+            output,
+            concat!(
+                "\nOverview:\n",
+                "  Total samples:       100\n",
+                "  Successful:          96 (96.00%)\n",
+                "  Sample errors:       4 (4.00%)\n",
+                "\nNative Unwinding:\n",
+                "  ●   Register capture failed:                        1 ( 25.0% of errors,  1.00% of samples)  █████░░░░░░░░░░░░░░░\n",
+                "  ●   Stack read failed:                              2 ( 50.0% of errors,  2.00% of samples)  ██████████░░░░░░░░░░\n",
+                "  ●   Framehop: frame pointer moved backwards:        1 ( 25.0% of errors,  1.00% of samples)  █████░░░░░░░░░░░░░░░\n",
+            )
+        );
     }
 
     #[test]

@@ -540,16 +540,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "  {} modules={}  exec markers={}",
+        "  {} modules={}  Python runtime records={}",
         c.dim_pad("recording state", 22),
         c.bold(&reader.modules().len().to_string()),
-        c.bold(&reader.process_execs().len().to_string()),
+        c.bold(&reader.python_runtime_records().len().to_string()),
     );
 
     if summary.error_stats.has_errors() {
-        let mut report = String::new();
-        ErrorStatsFormatter::new(&summary.error_stats, raw_events, written)
-            .write_to(&mut report)?;
+        let report =
+            ErrorStatsFormatter::new(&summary.error_stats, raw_events, written).to_string();
         let indented: String = report
             .lines()
             .map(|l| format!("    {l}"))

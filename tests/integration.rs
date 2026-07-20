@@ -648,7 +648,7 @@ fn resolve_test_frame(frame: &ResolvedFrame) -> ResolvedTestFrame {
             file: frame
                 .symbol
                 .as_ref()
-                .and_then(|symbol| symbol.file.as_ref().map(ToString::to_string)),
+                .and_then(|symbol| symbol.source.file.as_ref().map(ToString::to_string)),
         },
     }
 }

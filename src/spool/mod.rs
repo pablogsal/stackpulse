@@ -10,23 +10,27 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+pub(crate) use model::VDSO_PATH;
 pub use model::{
-    FrameMode, FrameRecord, ModulePath, ModuleRecord, OwnedSampleRecord, ProcessExecRecord,
+    FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
 };
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
 
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
-pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
+const MAGIC_V3: &[u8; 8] = b"SPULSE3\0";
+pub(crate) const CURRENT_MAGIC: &[u8; 8] = MAGIC_V3;
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
 const REC_THREAD: u8 = 4;
 const REC_SAMPLE: u8 = 5;
-const REC_PROCESS_EXEC: u8 = 6;
+const REC_PYTHON_RUNTIME: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
+// Pinned frames use even tags and unpinned frames use 1 or 3, leaving 5 as a
+// distinct marker outside both frame encodings.
 const TRUNCATED_STACK_MARKER_TAG: u64 = 5;
 const NONE_U32: u32 = u32::MAX;
 
@@ -140,13 +144,13 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(Some(stack_id))
     }
 
-    pub fn write_process_exec(
+    pub fn write_python_runtime(
         &mut self,
         timestamp_ns: u64,
         process_id: i32,
         is_python_runtime: bool,
     ) -> io::Result<()> {
-        self.writer.write_all(&[REC_PROCESS_EXEC])?;
+        self.writer.write_all(&[REC_PYTHON_RUNTIME])?;
         self.writer.write_varint(timestamp_ns)?;
         self.writer.write_varint(i64::from(process_id))?;
         self.writer.write_all(&[u8::from(is_python_runtime)])
@@ -243,7 +247,7 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 }
 
-/// Reader for profile files written by [`crate::PerfRecorder`].
+/// Reader for spool files written by [`crate::PerfRecorder`].
 pub struct PerfSpoolReader {
     start_timestamp_us: u64,
     sample_interval_us: u64,
@@ -251,8 +255,8 @@ pub struct PerfSpoolReader {
     frames: Vec<FrameRecord>,
     frame_contexts: SpoolFrameModuleContexts,
     stack_nodes: Vec<StackNodeRecord>,
-    samples: Vec<OwnedSampleRecord>,
-    process_execs: Vec<ProcessExecRecord>,
+    samples: Vec<SampleRecord>,
+    python_runtime_records: Vec<PythonRuntimeRecord>,
     truncated_tail: bool,
 }
 
@@ -262,13 +266,13 @@ pub struct FrameModuleRef<'a> {
     /// Recorded module that contains the frame.
     pub module: &'a ModuleRecord,
     /// Address relative to the module's file-offset coordinate space.
-    pub rel_ip: u64,
+    pub file_relative_ip: u64,
 }
 
 impl<'a> FrameModuleRef<'a> {
     #[must_use]
     pub(crate) fn into_owned(self) -> (ModuleRecord, u64) {
-        (self.module.clone(), self.rel_ip)
+        (self.module.clone(), self.file_relative_ip)
     }
 }
 
@@ -280,15 +284,15 @@ pub(crate) struct FrameLookupContext {
 
 #[derive(Clone, Default)]
 pub(crate) struct SpoolFrameModuleContexts {
-    frame_module_limits: Arc<Vec<usize>>,
-    module_deactivated_at: Arc<Vec<Option<usize>>>,
+    frame_module_limits: Arc<[usize]>,
+    module_deactivated_at: Arc<[Option<usize>]>,
 }
 
 impl SpoolFrameModuleContexts {
     fn new(frame_module_limits: Vec<usize>, module_deactivated_at: Vec<Option<usize>>) -> Self {
         Self {
-            frame_module_limits: Arc::new(frame_module_limits),
-            module_deactivated_at: Arc::new(module_deactivated_at),
+            frame_module_limits: frame_module_limits.into(),
+            module_deactivated_at: module_deactivated_at.into(),
         }
     }
 
@@ -333,7 +337,7 @@ pub struct StackFrameContexts<'a> {
 /// Borrowed sample and its no-copy raw stack iterator.
 pub struct SampleStack<'a> {
     /// Sample metadata.
-    pub sample: &'a OwnedSampleRecord,
+    pub sample: &'a SampleRecord,
     /// Borrowed raw frames for `sample.stack_id`.
     pub frames: StackFrameRefs<'a>,
 }
@@ -341,7 +345,7 @@ pub struct SampleStack<'a> {
 /// No-copy iterator over all samples and their raw stacks.
 pub struct SampleStacks<'a> {
     reader: &'a PerfSpoolReader,
-    samples: std::slice::Iter<'a, OwnedSampleRecord>,
+    samples: std::slice::Iter<'a, SampleRecord>,
 }
 
 /// Borrowed raw frames for one interned stack.
@@ -436,7 +440,7 @@ impl ExactSizeIterator for SampleStacks<'_> {
 }
 
 impl PerfSpoolReader {
-    /// Open and read a profile file.
+    /// Open and read a spool file.
     ///
     /// The reader borrows path strings from a memory map of the file. The file
     /// must not be truncated or mutated while the reader is alive.
@@ -455,7 +459,7 @@ impl PerfSpoolReader {
             mut stack_nodes,
             mut threads,
             mut samples,
-            mut process_execs,
+            mut python_runtime_records,
         ) = (
             Vec::new(),
             Vec::new(),
@@ -494,7 +498,9 @@ impl PerfSpoolReader {
                         stack_nodes.len(),
                         &mut last_timestamp_ns,
                     )?),
-                    REC_PROCESS_EXEC => process_execs.push(read_process_exec(&mut reader)?),
+                    REC_PYTHON_RUNTIME => {
+                        python_runtime_records.push(read_python_runtime(&mut reader)?)
+                    }
                     REC_MODULE_DEACTIVATE => {
                         let process_id = read_process_id(&mut reader)?;
                         let deactivated_at = frames.len();
@@ -544,7 +550,7 @@ impl PerfSpoolReader {
             frame_contexts,
             stack_nodes,
             samples,
-            process_execs,
+            python_runtime_records,
             truncated_tail,
         })
     }
@@ -570,13 +576,13 @@ impl PerfSpoolReader {
     }
 
     /// Return samples recorded in the profile.
-    pub fn samples(&self) -> &[OwnedSampleRecord] {
+    pub fn samples(&self) -> &[SampleRecord] {
         &self.samples
     }
 
-    /// Return process execution markers recorded in the profile.
-    pub fn process_execs(&self) -> &[ProcessExecRecord] {
-        &self.process_execs
+    /// Return recorded Python-runtime status changes.
+    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
+        &self.python_runtime_records
     }
 
     /// Whether the file ended mid-record (e.g. the recorder crashed while
@@ -668,7 +674,7 @@ impl PerfSpoolReader {
     }
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
-    pub fn timestamp_us(&self, sample: &OwnedSampleRecord) -> u64 {
+    pub fn timestamp_us(&self, sample: &SampleRecord) -> u64 {
         let first = self
             .samples
             .first()
@@ -827,12 +833,12 @@ fn read_module_mmap(
     })
 }
 
-fn read_process_exec(reader: &mut impl SpoolRead) -> io::Result<ProcessExecRecord> {
+fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeRecord> {
     let timestamp_ns = reader.read_varint::<u64>()?;
     let process_id = read_process_id(reader)?;
     let mut flag = [0_u8; 1];
     reader.read_exact_spool(&mut flag)?;
-    Ok(ProcessExecRecord {
+    Ok(PythonRuntimeRecord {
         timestamp_ns,
         process_id,
         is_python_runtime: flag[0] != 0,
@@ -849,7 +855,7 @@ fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Resu
     }
 
     let (tag, address) = match frame.module_id {
-        Some(module_id) => (u64::from(module_id) << 1, frame.rel_ip),
+        Some(module_id) => (u64::from(module_id) << 1, frame.file_relative_ip),
         None => (
             1 | (u64::from(frame.mode == FrameMode::Kernel) << 1),
             frame.abs_ip,
@@ -870,7 +876,7 @@ pub(crate) fn module_for_frame_unbounded<'a>(
     if let Some(module_id) = frame.module_id {
         return Some(FrameModuleRef {
             module: modules.get(module_id as usize)?,
-            rel_ip: frame.rel_ip,
+            file_relative_ip: frame.file_relative_ip,
         });
     }
     let module = modules
@@ -893,7 +899,7 @@ pub(crate) fn module_for_frame_with_context<'a>(
     if let Some(module_id) = frame.module_id {
         return Some(FrameModuleRef {
             module: modules.get(module_id as usize)?,
-            rel_ip: frame.rel_ip,
+            file_relative_ip: frame.file_relative_ip,
         });
     }
     let module_limit = context.module_limit.min(modules.len());
@@ -923,7 +929,7 @@ fn module_owns_frame(module: &ModuleRecord, process_id: i32, frame: &FrameRecord
 fn frame_module_ref<'a>(module: &'a ModuleRecord, frame: &FrameRecord) -> FrameModuleRef<'a> {
     FrameModuleRef {
         module,
-        rel_ip: frame
+        file_relative_ip: frame
             .abs_ip
             .saturating_sub(module.start)
             .saturating_add(module.file_offset),
@@ -1044,14 +1050,14 @@ fn read_frame(
         let abs_ip = module.start + offset;
         Ok(FrameRecord {
             module_id: Some(module_ref.id),
-            rel_ip: encoded_ip,
+            file_relative_ip: encoded_ip,
             abs_ip,
             mode: frame_mode(module.is_kernel),
         })
     } else {
         Ok(FrameRecord {
             module_id: None,
-            rel_ip: encoded_ip,
+            file_relative_ip: encoded_ip,
             abs_ip: encoded_ip,
             mode: frame_mode(tag & 2 != 0),
         })
@@ -1112,7 +1118,7 @@ fn read_sample(
     threads: &[(i32, u64)],
     stack_count: usize,
     last_timestamp_ns: &mut u64,
-) -> io::Result<OwnedSampleRecord> {
+) -> io::Result<SampleRecord> {
     let delta = reader.read_varint::<i64>()?;
     let timestamp_ns = last_timestamp_ns
         .checked_add_signed(delta)
@@ -1121,7 +1127,7 @@ fn read_sample(
     let thread_ref = read_index_within(reader, threads.len(), "sample thread")?;
     let (process_id, thread_id) = threads[thread_ref];
     let stack_id = read_id_within(reader, stack_count, "sample stack")?;
-    Ok(OwnedSampleRecord {
+    Ok(SampleRecord {
         timestamp_ns,
         process_id,
         thread_id,
@@ -1153,7 +1159,7 @@ mod tests {
     fn frame(abs_ip: u64) -> FrameRecord {
         FrameRecord {
             module_id: None,
-            rel_ip: abs_ip,
+            file_relative_ip: abs_ip,
             abs_ip,
             mode: FrameMode::User,
         }
@@ -1417,19 +1423,19 @@ mod tests {
                 [
                     FrameRecord {
                         module_id: Some(0),
-                        rel_ip: 0x110,
+                        file_relative_ip: 0x110,
                         abs_ip: 0x1010,
                         mode: FrameMode::User,
                     },
                     FrameRecord {
                         module_id: None,
-                        rel_ip: 0x3010,
+                        file_relative_ip: 0x3010,
                         abs_ip: 0x3010,
                         mode: FrameMode::User,
                     },
                     FrameRecord {
                         module_id: None,
-                        rel_ip: 0xffff_ffff_8100_0010,
+                        file_relative_ip: 0xffff_ffff_8100_0010,
                         abs_ip: 0xffff_ffff_8100_0010,
                         mode: FrameMode::Kernel,
                     },
@@ -1462,7 +1468,7 @@ mod tests {
                         (
                             module.module.id,
                             module.module.path.as_str().to_owned(),
-                            module.rel_ip,
+                            module.file_relative_ip,
                         )
                     }),
                 )
@@ -1634,7 +1640,7 @@ mod tests {
             .unwrap();
         let pinned = FrameRecord {
             module_id: Some(0),
-            rel_ip: 0x10,
+            file_relative_ip: 0x10,
             abs_ip: 0x1010,
             mode: FrameMode::User,
         };
@@ -1719,11 +1725,11 @@ mod tests {
         );
     }
 
-    fn module_frame_reader_result(rel_ip: u64) -> io::Result<FrameRecord> {
+    fn module_frame_reader_result(file_relative_ip: u64) -> io::Result<FrameRecord> {
         let mut bytes = Vec::new();
         bytes.write_varint(0_u64).unwrap();
         bytes.write_varint(0_u64).unwrap();
-        bytes.write_varint(rel_ip).unwrap();
+        bytes.write_varint(file_relative_ip).unwrap();
         read_frame(
             &mut bytes.as_slice(),
             &[ModuleRecord {
@@ -1772,10 +1778,7 @@ mod tests {
         assert_error_contains(result, io::ErrorKind::InvalidInput, expected, message);
     }
 
-    fn read_sample_with_delta(
-        last_timestamp_ns: &mut u64,
-        delta: i64,
-    ) -> io::Result<OwnedSampleRecord> {
+    fn read_sample_with_delta(last_timestamp_ns: &mut u64, delta: i64) -> io::Result<SampleRecord> {
         let mut bytes = Vec::new();
         bytes.write_varint(delta).unwrap();
         bytes.write_varint(0_u64).unwrap();
@@ -1853,16 +1856,16 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_out_of_range_process_exec_process_id() {
+    fn reader_rejects_out_of_range_python_runtime_process_id() {
         let mut bytes = Vec::new();
         bytes.write_varint(1_u64).unwrap();
         bytes.write_varint(out_of_range_process_id()).unwrap();
         bytes.write_all(&[1]).unwrap();
 
         assert_invalid_data_contains(
-            read_process_exec(&mut bytes.as_slice()),
+            read_python_runtime(&mut bytes.as_slice()),
             "process id",
-            "reader accepted an out-of-range process-exec process id",
+            "reader accepted an out-of-range Python-runtime process id",
         );
     }
 
@@ -2149,8 +2152,8 @@ mod tests {
         assert_ne!(left.module_id, Some(replacement));
         assert_eq!(middle.module_id, Some(replacement));
         assert_ne!(right.module_id, Some(replacement));
-        assert_eq!(left.rel_ip, 0x8800);
-        assert_eq!(right.rel_ip, 0xa800);
+        assert_eq!(left.file_relative_ip, 0x8800);
+        assert_eq!(right.file_relative_ip, 0xa800);
     }
 
     #[test]
@@ -2189,8 +2192,8 @@ mod tests {
         let user_frame_in_kernel_module = table.resolve_frame(7, 0x3008, FrameMode::User);
 
         assert_eq!(kernel_frame_in_user_module.module_id, None);
-        assert_eq!(kernel_frame_in_user_module.rel_ip, 0x1008);
+        assert_eq!(kernel_frame_in_user_module.file_relative_ip, 0x1008);
         assert_eq!(user_frame_in_kernel_module.module_id, None);
-        assert_eq!(user_frame_in_kernel_module.rel_ip, 0x3008);
+        assert_eq!(user_frame_in_kernel_module.file_relative_ip, 0x3008);
     }
 }

@@ -46,7 +46,7 @@ for stack in reader.sample_stacks() {
 | Type | Role |
 | --- | --- |
 | [`PerfRecorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
-| [`PerfSpoolReader`] | Reads a spool file back into samples, modules, exec markers, interned stack frames, and borrowed frame contexts. |
+| [`PerfSpoolReader`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
 | [`PerfSymbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`NativeSymbolizer`]. |
 | [`NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`PerfSymbolizer`] still handles kernel and perf-map frames. |
 | [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
@@ -68,7 +68,7 @@ for sample in reader.samples() {
     for context in reader.stack_frame_contexts(sample.process_id, sample.stack_id)? {
         let ip = context.frame.abs_ip;
         if let Some(module) = context.module {
-            // Pass `ip`, `module.module`, and `module.rel_ip` to your symbolizer.
+            // Pass `ip`, `module.module`, and `module.file_relative_ip` to your symbolizer.
         }
     }
 }
@@ -84,8 +84,7 @@ the module mapping stackpulse recorded at capture time.
 Callers with their own debuginfod, debug-dir, or source-info pipeline can keep
 using [`PerfSymbolizer`] for kernel and perf-map frames while substituting a
 different backend for native ELF modules. Implement [`NativeSymbolizer`] and
-hand a factory to [`PerfSymbolizer::with_native_factory`] (or
-[`PerfSymbolizer::for_spool_with_native_factory`]). stackpulse parses each
+hand a factory to [`PerfSymbolizerBuilder::native_symbolizer_factory`]. stackpulse parses each
 module's ELF, computes its image base, and calls `set_modules` whenever the
 module set for a process group changes; you then receive `symbolize_one(addr)`
 for every native frame:
@@ -93,8 +92,7 @@ for every native frame:
 ```rust,no_run
 use std::rc::Rc;
 use stackpulse::{
-    NativeSymbolizer, NativeSymbolizerFactory, PerfSpoolReader, PerfSymbolizer,
-    SymModule, SymbolsRc,
+    NativeSymbolizer, PerfSpoolReader, PerfSymbolizerBuilder, SymModule, SymbolsRc,
 };
 
 struct MySymbolizer { /* your wholesym / debuginfod / dwarf state */ }
@@ -112,19 +110,20 @@ impl NativeSymbolizer for MySymbolizer {
 
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = PerfSpoolReader::open("profile.spool")?;
-let factory: NativeSymbolizerFactory = Box::new(|_pid: i32| -> Box<dyn NativeSymbolizer> {
+let factory = |_pid: i32| -> Box<dyn NativeSymbolizer> {
     Box::new(MySymbolizer { /* ... */ })
-});
-let mut symbolizer = PerfSymbolizer::for_spool_with_native_factory(&reader, true, factory);
+};
+let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+    .native_symbolizer_factory(factory)
+    .build();
 # Ok(())
 # }
 ```
 
 Kernel frames (`/proc/kallsyms`) and Python or JIT perf maps
 (`/tmp/perf-PID.map`) stay inside `PerfSymbolizer`; the plug-in only sees
-native module addresses. The default factory
-([`default_native_symbolizer_factory`]) returns the bundled wholesym backend
-and is what the no-argument constructors install.
+native module addresses. The default constructors install the bundled
+wholesym backend.
 
 # Vocabulary
 

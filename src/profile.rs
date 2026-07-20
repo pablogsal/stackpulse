@@ -161,20 +161,10 @@ pub struct SourceLocation {
 pub struct NativeSymbol {
     /// Demangled symbol name (function/method).
     pub name: Rc<str>,
-    /// Source file path, if debug info or perf-map metadata provided one.
-    pub file: Option<Rc<str>>,
-    /// 1-based source line of the sampled instruction.
-    pub line: Option<u32>,
-    /// 1-based source column of the sampled instruction.
-    pub column: Option<u32>,
-    /// 1-based line where the enclosing function starts.
-    pub function_start_line: Option<u32>,
-    /// 1-based column where the enclosing function starts.
-    pub function_start_column: Option<u32>,
+    /// Source position information, when available.
+    pub source: SourceLocation,
     /// On-disk path of the owning module (binary or shared library).
     pub module: Rc<str>,
-    /// Byte offset into [`Self::module`] where the basename starts.
-    pub module_basename_start: usize,
     /// Byte offset of the instruction within its enclosing function.
     ///
     /// `0` for fallback pseudo-symbols whose [`Self::name`] already embeds an
@@ -194,7 +184,7 @@ pub struct NativeSymbol {
 
 impl NativeSymbol {
     /// Build a [`NativeSymbol`] for the innermost (non-inline) frame,
-    /// precomputing the module basename offset.
+    /// with its source and module metadata.
     #[must_use]
     pub fn new(
         name: impl Into<Rc<str>>,
@@ -205,21 +195,22 @@ impl NativeSymbol {
         should_ignore: bool,
     ) -> Self {
         let module = module.into();
-        let module_basename_start = basename_start(&module);
         Self {
             name: name.into(),
-            file: source.file,
-            line: source.line,
-            column: source.column,
-            function_start_line: source.function_start_line,
-            function_start_column: source.function_start_column,
+            source,
             module,
-            module_basename_start,
             offset,
             inline_depth: 0,
             is_eval_frame,
             should_ignore,
         }
+    }
+
+    /// Final path component of [`Self::module`].
+    #[inline]
+    #[must_use]
+    pub fn module_basename(&self) -> &str {
+        &self.module[basename_start(&self.module)..]
     }
 }
 

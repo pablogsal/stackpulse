@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+pub(crate) const VDSO_PATH: &str = "[vdso]";
+
 /// File path or display name for a recorded module.
 #[derive(Clone)]
 pub struct ModulePath(ModulePathStorage);
@@ -51,6 +53,10 @@ impl ModulePath {
 
     pub(crate) fn is_bracketed_mapping(&self) -> bool {
         self.as_str().starts_with('[')
+    }
+
+    pub(crate) fn is_vdso(&self) -> bool {
+        self.as_str() == VDSO_PATH
     }
 
     pub(super) fn from_mmap(mmap: Arc<Mmap>, range: Range<usize>) -> io::Result<Self> {
@@ -136,10 +142,10 @@ impl Hash for ModulePath {
     }
 }
 
-/// A code area recorded in a profile file.
+/// One executable memory mapping recorded in a spool file.
 #[derive(Clone, Debug)]
 pub struct ModuleRecord {
-    /// Stable module id within the profile.
+    /// Stable module id within the spool.
     pub id: u32,
     /// Process that owned this code area, or a kernel marker for kernel code.
     pub process_id: i32,
@@ -175,13 +181,13 @@ pub enum FrameMode {
     TruncatedStackMarker,
 }
 
-/// A raw frame stored in a profile file.
+/// A raw frame stored in a spool file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRecord {
     /// Module id when the frame was matched to a module.
     pub module_id: Option<u32>,
-    /// Address relative to the matched module.
-    pub rel_ip: u64,
+    /// Address in the matched module's file-offset coordinate space.
+    pub file_relative_ip: u64,
     /// Absolute instruction pointer.
     pub abs_ip: u64,
     /// User/kernel mode for the frame.
@@ -196,7 +202,7 @@ impl FrameRecord {
     pub fn truncated_stack_marker() -> Self {
         Self {
             module_id: None,
-            rel_ip: 0,
+            file_relative_ip: 0,
             abs_ip: 0,
             mode: FrameMode::TruncatedStackMarker,
         }
@@ -210,9 +216,9 @@ impl FrameRecord {
     }
 }
 
-/// A sample record loaded from a profile file.
+/// A sample record loaded from a spool file.
 #[derive(Clone, Debug)]
-pub struct OwnedSampleRecord {
+pub struct SampleRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// Process id for the sample.
@@ -223,9 +229,9 @@ pub struct OwnedSampleRecord {
     pub stack_id: u32,
 }
 
-/// Marker for a process that executed during recording.
+/// Marker for a process's Python-runtime status during recording.
 #[derive(Clone, Debug)]
-pub struct ProcessExecRecord {
+pub struct PythonRuntimeRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// Process id.

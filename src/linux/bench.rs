@@ -103,14 +103,10 @@ pub(crate) fn bench_replay_live_perf_ring_records(
                     let (timestamp, prepared) =
                         fixture.samples.dispatch_event(record, &mut |event| {
                             let timestamp = event.timestamp().unwrap_or(0);
-                            (timestamp, prepare_event(event, &mut ctx))
+                            (timestamp, prepare_event(event, ctx.summary))
                         });
-                    match prepared {
-                        Ok(Some(prepared)) => sorter.push_current_group(timestamp, prepared),
-                        Ok(None) => {}
-                        Err(err) => {
-                            result = Err(err);
-                        }
+                    if let Some(prepared) = prepared {
+                        sorter.push_current_group(timestamp, prepared);
                     }
                 }
                 while let Some(prepared) = sorter.pop() {

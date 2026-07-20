@@ -267,7 +267,7 @@ impl ModuleTable {
             .index
             .find(process_id, abs_ip, mode)
             .and_then(|id| self.slots.get(id as usize).map(|slot| (id, &slot.module)));
-        let (module_id, rel_ip) = match module {
+        let (module_id, file_relative_ip) = match module {
             Some((id, module)) => (
                 Some(id),
                 abs_ip.saturating_sub(module.start) + module.file_offset,
@@ -276,7 +276,7 @@ impl ModuleTable {
         };
         FrameRecord {
             module_id,
-            rel_ip,
+            file_relative_ip,
             abs_ip,
             mode,
         }

@@ -44,7 +44,7 @@ use perf_event::{
     SampleRecordRef,
 };
 pub use perf_group::AttachMode;
-use perf_group::{EventConsumer, PerfGroupOptions};
+use perf_group::{EventConsumer, PerfGroupOptions, ProcessFork, RecoveredProcessFork, ThreadFork};
 use sorter::EventSorter;
 use types::{StackFrame, StackMode};
 use unwind::{NativeUnwinder, ProcessUnwinder};
@@ -93,9 +93,9 @@ pub struct PerfRecorderOptions {
     pub include_kernel: bool,
     /// Follow child processes created after recording starts.
     pub inherit_child_processes: bool,
-    /// Timestamp anchor stored in the profile file.
+    /// Timestamp anchor stored in the spool file.
     pub start_timestamp_us: u64,
-    /// Optional sampling interval metadata stored in the profile file.
+    /// Optional sampling interval metadata stored in the spool file.
     pub sample_interval_us: u64,
 }
 
@@ -104,7 +104,7 @@ pub struct PerfRecorderOptions {
 pub struct PerfSummary {
     /// Raw sample events seen by the recorder.
     pub sample_events: u64,
-    /// Samples written to the profile file.
+    /// Samples written to the spool file.
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
@@ -190,6 +190,14 @@ struct ProcessState {
 }
 
 #[derive(Default)]
+struct ForkInheritance {
+    image: Option<ProcessImageIdentity>,
+    python_perf_support: Option<bool>,
+    python_runtime: bool,
+    unwinder: ProcessUnwinder,
+}
+
+#[derive(Default)]
 struct ProcessTable {
     states: FxHashMap<i32, ProcessState>,
 }
@@ -197,6 +205,40 @@ struct ProcessTable {
 impl ProcessTable {
     fn state_mut(&mut self, pid: i32) -> &mut ProcessState {
         self.states.entry(pid).or_default()
+    }
+
+    fn snapshot_for_fork(&self, parent_pid: i32) -> ForkInheritance {
+        self.states
+            .get(&parent_pid)
+            .map_or_else(ForkInheritance::default, |state| ForkInheritance {
+                image: state.image.clone(),
+                python_perf_support: state.python_perf_support,
+                python_runtime: state.python_runtime,
+                unwinder: state
+                    .unwinder
+                    .as_ref()
+                    .map_or_else(ProcessUnwinder::default, ProcessUnwinder::inherit_for_fork),
+            })
+    }
+
+    fn install_fork_inheritance(
+        &mut self,
+        child_pid: i32,
+        start_time: Option<u64>,
+        inheritance: ForkInheritance,
+    ) {
+        let child = self.state_mut(child_pid);
+        if let Some(image) = inheritance.image {
+            child.image = Some(image);
+        }
+        if let Some(start_time) = start_time {
+            child.start_time = Some(start_time);
+        }
+        if let Some(supported) = inheritance.python_perf_support {
+            child.python_perf_support = Some(supported);
+        }
+        child.python_runtime |= inheritance.python_runtime;
+        child.unwinder = Some(inheritance.unwinder);
     }
 
     fn track_or_refresh(&mut self, pid: i32) {
@@ -369,13 +411,7 @@ impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
         if self.result.is_err() {
             return None;
         }
-        match prepare_event(event_ref, &mut self.ctx) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                self.result = Err(err);
-                None
-            }
-        }
+        prepare_event(event_ref, self.ctx.summary)
     }
 
     fn queue_event(&mut self, timestamp: u64, prepared: Self::Prepared) {
@@ -485,7 +521,7 @@ impl PerfRecorder {
         Ok(recorder)
     }
 
-    /// Drain currently readable events into the profile file.
+    /// Drain currently readable events into the spool file.
     pub fn consume_available(&mut self) -> io::Result<()> {
         self.drain_events(DrainMode::Consume)
     }
@@ -551,15 +587,17 @@ impl PerfRecorder {
                 let action_result = match *action {
                     LifecycleAction::ProcessRetire { pid } => perf.remove_process(pid),
                     LifecycleAction::ProcessFork { pid, parent_tid } if open_new_perf_events => {
-                        perf.open_forked_processes(&[(pid, parent_tid)])
+                        perf.open_forked_processes(&[ProcessFork { pid, parent_tid }])
                     }
                     LifecycleAction::ThreadFork {
                         tid,
                         pid,
                         parent_tid,
-                    } if open_new_perf_events => {
-                        perf.open_forked_threads(&[(tid, pid, parent_tid)])
-                    }
+                    } if open_new_perf_events => perf.open_forked_threads(&[ThreadFork {
+                        tid,
+                        owner_pid: pid,
+                        parent_tid,
+                    }]),
                     LifecycleAction::ThreadExit { tid, .. } => perf.remove_thread(tid),
                     LifecycleAction::ProcessFork { .. } | LifecycleAction::ThreadFork { .. } => {
                         Ok(())
@@ -580,30 +618,21 @@ impl PerfRecorder {
                         break;
                     }
                 }
-                if processes
-                    .states
-                    .get(&pid)
-                    .is_some_and(|state| state.python_runtime)
-                {
-                    let timestamp_ns = lifecycle_actions
-                        .iter()
-                        .filter_map(|action| match action {
-                            LifecycleAction::ThreadExit {
-                                pid: exit_pid,
-                                timestamp_ns,
-                                ..
-                            } if i32_from_u32(*exit_pid) == Some(pid) => Some(*timestamp_ns),
-                            _ => None,
-                        })
-                        .max()
-                        .unwrap_or(recovery_timestamp_ns);
-                    if let Err(err) = writer.write_process_exec(timestamp_ns, pid, false) {
-                        result = Err(err);
-                        break;
-                    }
-                    if let Some(state) = processes.states.get_mut(&pid) {
-                        state.python_runtime = false;
-                    }
+                let timestamp_ns = lifecycle_actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        LifecycleAction::ThreadExit {
+                            pid: exit_pid,
+                            timestamp_ns,
+                            ..
+                        } if i32_from_u32(*exit_pid) == Some(pid) => Some(*timestamp_ns),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(recovery_timestamp_ns);
+                if let Err(err) = end_python_runtime_process(processes, writer, timestamp_ns, pid) {
+                    result = Err(err);
+                    break;
                 }
                 if let Err(err) = cleanup_process(pid, modules, processes, writer) {
                     result = Err(err);
@@ -680,7 +709,10 @@ impl PerfRecorder {
                     processes.ensure_tracked(child);
                     processes.capture_available_generation(child);
                     if let Ok(parent_u32) = u32::try_from(parent) {
-                        recovered_process_forks.push((child_u32, parent_u32));
+                        recovered_process_forks.push(RecoveredProcessFork {
+                            pid: child_u32,
+                            parent_pid: parent_u32,
+                        });
                     }
                 }
                 if result.is_err() {
@@ -815,7 +847,7 @@ impl PerfRecorder {
         self.processes.active_process_count()
     }
 
-    /// Flush the profile file and return the final counters.
+    /// Flush the spool file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.perf.disable()?;
         self.drain_events(DrainMode::Flush)?;
@@ -843,20 +875,17 @@ impl PerfRecorder {
     }
 }
 
-fn prepare_event<W: std::io::Write>(
-    event_ref: EventRef,
-    ctx: &mut EventContext<'_, W>,
-) -> io::Result<Option<PreparedEvent>> {
+fn prepare_event(event_ref: EventRef, summary: &mut PerfSummary) -> Option<PreparedEvent> {
     let event_timestamp_ns = event_ref.timestamp().unwrap_or(0);
     let (privilege, record) = event_ref.into_parts();
     match record {
-        EventRecord::Sample(sample) => prepare_sample_ref(ctx, sample, privilege),
-        EventRecord::Owned(Record::Sample(sample)) => prepare_sample(ctx, *sample, privilege),
-        EventRecord::Owned(record) => Ok(Some(PreparedEvent::Record {
+        EventRecord::Sample(sample) => prepare_sample_ref(summary, sample, privilege),
+        EventRecord::Owned(Record::Sample(sample)) => prepare_sample(summary, *sample, privilege),
+        EventRecord::Owned(record) => Some(PreparedEvent::Record {
             timestamp_ns: event_timestamp_ns,
             privilege,
             record,
-        })),
+        }),
     }
 }
 
@@ -890,18 +919,7 @@ fn handle_non_sample_record<W: std::io::Write>(
 
             // Snapshot all inherited state before touching the child: numeric
             // PID reuse can make child cleanup mutate the same table.
-            let (parent_image, parent_python_support, parent_python_runtime, mut child_unwinder) =
-                ctx.processes.states.get(&ppid).map_or_else(
-                    || (None, None, false, ProcessUnwinder::default()),
-                    |state| {
-                        (
-                            state.image.clone(),
-                            state.python_perf_support,
-                            state.python_runtime,
-                            state.unwinder.clone().unwrap_or_default(),
-                        )
-                    },
-                );
+            let mut inheritance = ctx.processes.snapshot_for_fork(ppid);
             let current_start_time = read_process_start_time(fork.task.pid).ok();
             let reused_pid = ctx
                 .processes
@@ -914,24 +932,15 @@ fn handle_non_sample_record<W: std::io::Write>(
                     .push(LifecycleAction::ProcessRetire { pid: fork.task.pid });
             }
             ctx.processes.ensure_tracked(pid);
-            let child = ctx.processes.state_mut(pid);
-            if let Some(identity) = parent_image {
-                child.image = Some(identity);
-            }
-            if let Some(start_time) = current_start_time {
-                child.start_time = Some(start_time);
-            }
-            if let Some(supported) = parent_python_support {
-                child.python_perf_support = Some(supported);
-            }
-            if parent_python_runtime {
+            if inheritance.python_runtime {
                 mark_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
             }
             let updates = ctx.modules.clone_process_modules(ppid, pid, ctx.writer)?;
             for update in &updates {
-                child_unwinder.apply_module_update(update);
+                inheritance.unwinder.apply_module_update(update);
             }
-            ctx.processes.state_mut(pid).unwinder = Some(child_unwinder);
+            ctx.processes
+                .install_fork_inheritance(pid, current_start_time, inheritance);
             ctx.lifecycle_actions.push(LifecycleAction::ProcessFork {
                 pid: fork.task.pid,
                 parent_tid: fork.parent_task.tid,
@@ -1194,7 +1203,7 @@ fn mark_python_runtime_process<W: std::io::Write>(
 ) -> io::Result<()> {
     let state = processes.state_mut(pid);
     if !std::mem::replace(&mut state.python_runtime, true) {
-        writer.write_process_exec(timestamp_ns, pid, true)?;
+        writer.write_python_runtime(timestamp_ns, pid, true)?;
     }
     Ok(())
 }
@@ -1205,13 +1214,14 @@ fn end_python_runtime_process<W: std::io::Write>(
     timestamp_ns: u64,
     pid: i32,
 ) -> io::Result<()> {
-    let was_python_runtime = processes
-        .states
-        .get_mut(&pid)
-        .is_some_and(|state| std::mem::take(&mut state.python_runtime));
-    if was_python_runtime {
-        writer.write_process_exec(timestamp_ns, pid, false)?;
+    let Some(state) = processes.states.get_mut(&pid) else {
+        return Ok(());
+    };
+    if !state.python_runtime {
+        return Ok(());
     }
+    writer.write_python_runtime(timestamp_ns, pid, false)?;
+    state.python_runtime = false;
     Ok(())
 }
 
@@ -1240,11 +1250,11 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     Ok(())
 }
 
-fn prepare_sample<W: std::io::Write>(
-    ctx: &mut EventContext<'_, W>,
+fn prepare_sample(
+    summary: &mut PerfSummary,
     sample: Sample,
     privilege: Priv,
-) -> io::Result<Option<PreparedEvent>> {
+) -> Option<PreparedEvent> {
     let Sample {
         record_id,
         call_chain,
@@ -1254,11 +1264,9 @@ fn prepare_sample<W: std::io::Write>(
         ..
     } = sample;
     let task = record_id.task.as_ref().map(|task| (task.pid, task.tid));
-    let Some(meta) = prepare_sample_meta(ctx, task, record_id.time) else {
-        return Ok(None);
-    };
+    let meta = prepare_sample_meta(summary, task, record_id.time)?;
 
-    Ok(Some(PreparedEvent::Sample(PreparedSample {
+    Some(PreparedEvent::Sample(PreparedSample {
         meta,
         privilege,
         code_addr: code_addr.map(|(ip, _)| ip),
@@ -1268,15 +1276,15 @@ fn prepare_sample<W: std::io::Write>(
             .as_deref()
             .map_or(SampleCallChain::None, SampleCallChain::Owned)
             .to_stack_frames(),
-    })))
+    }))
 }
 
-fn prepare_sample_ref<W: std::io::Write>(
-    ctx: &mut EventContext<'_, W>,
+fn prepare_sample_ref(
+    summary: &mut PerfSummary,
     sample: SampleRecordRef<'_>,
     privilege: Priv,
-) -> io::Result<Option<PreparedEvent>> {
-    prepare_sample_view(ctx, SampleView::from_ref(sample), privilege)
+) -> Option<PreparedEvent> {
+    prepare_sample_view(summary, SampleView::from_ref(sample), privilege)
 }
 
 #[derive(Clone, Copy)]
@@ -1394,49 +1402,47 @@ impl<'a> SampleView<'a> {
     }
 }
 
-fn prepare_sample_view<W: std::io::Write>(
-    ctx: &mut EventContext<'_, W>,
+fn prepare_sample_view(
+    summary: &mut PerfSummary,
     sample: SampleView<'_>,
     privilege: Priv,
-) -> io::Result<Option<PreparedEvent>> {
-    let Some(meta) = prepare_sample_meta(ctx, sample.task, sample.timestamp_ns) else {
-        return Ok(None);
-    };
+) -> Option<PreparedEvent> {
+    let meta = prepare_sample_meta(summary, sample.task, sample.timestamp_ns)?;
 
-    Ok(Some(PreparedEvent::Sample(PreparedSample {
+    Some(PreparedEvent::Sample(PreparedSample {
         meta,
         privilege,
         code_addr: sample.code_addr,
         user_regs: sample.user_regs.map(<[u64]>::to_vec),
         user_stack: sample.user_stack.map(<[u8]>::to_vec),
         callchain_stack: sample.call_chain.to_stack_frames(),
-    })))
+    }))
 }
 
-fn prepare_sample_meta<W: std::io::Write>(
-    ctx: &mut EventContext<'_, W>,
+fn prepare_sample_meta(
+    summary: &mut PerfSummary,
     task: Option<(u32, u32)>,
     timestamp_ns: Option<u64>,
 ) -> Option<PreparedSampleMeta> {
-    bump(&mut ctx.summary.sample_events);
+    bump(&mut summary.sample_events);
     let Some((raw_pid, raw_tid)) = task else {
-        bump(&mut ctx.summary.missing_pid_samples);
+        bump(&mut summary.missing_pid_samples);
         return None;
     };
     let Some(pid) = i32_from_u32(raw_pid) else {
-        bump(&mut ctx.summary.missing_pid_samples);
+        bump(&mut summary.missing_pid_samples);
         return None;
     };
     let Some(tid) = i32_from_u32(raw_tid) else {
-        bump(&mut ctx.summary.missing_tid_samples);
+        bump(&mut summary.missing_tid_samples);
         return None;
     };
     if tid == 0 {
-        bump(&mut ctx.summary.idle_tid_samples);
+        bump(&mut summary.idle_tid_samples);
         return None;
     }
     let Some(timestamp_ns) = timestamp_ns else {
-        bump(&mut ctx.summary.missing_timestamp_samples);
+        bump(&mut summary.missing_timestamp_samples);
         return None;
     };
 
@@ -2433,13 +2439,13 @@ mod tests {
     }
 
     #[test]
-    fn cloned_unwinder_resets_refresh_cache() {
+    fn forked_unwinder_resets_refresh_cache() {
         let mut unwinder = ProcessUnwinder::default();
         assert!(unwinder.should_refresh_for_uncovered_pc(0x3000));
 
-        let mut cloned = unwinder.clone();
+        let mut inherited = unwinder.inherit_for_fork();
 
-        assert!(cloned.should_refresh_for_uncovered_pc(0x3000));
+        assert!(inherited.should_refresh_for_uncovered_pc(0x3000));
     }
 
     fn test_module(start: u64, end: u64) -> ModuleRecord {
@@ -2476,20 +2482,8 @@ mod tests {
             user_stack: Some(&user_stack),
             call_chain: SampleCallChain::Owned(&chains),
         };
-        let prepared = {
-            let mut ctx = EventContext {
-                modules: &mut modules,
-                processes: &mut processes,
-                writer: &mut writer,
-                summary: &mut summary,
-                stack_scratch: &mut stack_scratch,
-                lifecycle_actions: &mut lifecycle_actions,
-                inherit_child_processes: false,
-            };
-            prepare_sample_view(&mut ctx, sample, Priv::User)
-                .expect("prepare sample")
-                .expect("prepared sample")
-        };
+        let prepared =
+            prepare_sample_view(&mut summary, sample, Priv::User).expect("prepared sample");
 
         assert!(processes.states.is_empty());
         assert_eq!(summary.sample_events, 1);
@@ -2814,7 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn forked_python_runtime_child_gets_process_exec_marker() {
+    fn forked_python_runtime_child_gets_runtime_marker() {
         let path = std::env::temp_dir().join(format!(
             "stackpulse-forked-python-runtime-{}.spool",
             std::process::id()
@@ -2833,8 +2827,11 @@ mod tests {
         let reader = crate::spool::PerfSpoolReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         assert!(processes.states[&8].python_runtime);
-        assert!(reader.process_execs().iter().any(|exec| {
-            exec.timestamp_ns == 456 && exec.process_id == 8 && exec.is_python_runtime
-        }));
+        let [runtime] = reader.python_runtime_records() else {
+            panic!("expected one Python-runtime record");
+        };
+        assert_eq!(runtime.timestamp_ns, 456);
+        assert_eq!(runtime.process_id, 8);
+        assert!(runtime.is_python_runtime);
     }
 }

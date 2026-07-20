@@ -170,7 +170,7 @@ Mappings come from two places:
 
 Each mapping becomes a `ModuleRecord` with its runtime address range, file
 offset, inode, path, owning PID, and kernel flag. The recorder resolves each
-frame's absolute address to a module ID plus a module-relative IP when
+frame's absolute address to a module ID plus a file-relative IP when
 possible, so symbolization doesn't need the target process to still exist.
 
 ## Symbolization
@@ -186,7 +186,7 @@ possible, so symbolization doesn't need the target process to still exist.
 
 Python frames exist only when the runtime emits perf-map entries. For
 modern CPython, `-X perf` or `PYTHONPERFSUPPORT=1`. The recorder writes
-process exec markers so readers can restrict perf-map lookup to PIDs that
+Python-runtime records so readers can restrict perf-map lookup to PIDs that
 actually looked like Python runtimes during recording.
 
 The spool file does not embed perf-map content. Symbolization reads the
@@ -201,8 +201,8 @@ Native symbolization is delegated to a `NativeSymbolizer` implementor, one
 per non-overlapping module group. The default is the bundled wholesym
 backend, configured from `STACKPULSE_DEBUG_DIRS`, `DEBUGINFOD_URLS`, and
 related environment variables. Embedders with their own debuginfod,
-debug-dir, or source-info pipeline can swap that backend out through
-`PerfSymbolizer::with_native_factory`, and `PerfSymbolizer` keeps owning
+debug-dir, or source-info pipeline can swap that backend through
+`PerfSymbolizerBuilder::native_symbolizer_factory`, and `PerfSymbolizer` keeps owning
 kernel-frame and perf-map resolution. Each `SymModule` handed to the plug-in
 already carries a resolved `ModuleImageBase`, so the plug-in only needs to
 parse ELF for symbol lookup, not for layout.
@@ -235,7 +235,7 @@ Sampling has predictable limits:
 - Symbol quality depends on binaries, debug info, perf maps, kernel
   symbol visibility, and whether the mappings were observed.
 - PID reuse makes stale `/tmp/perf-<pid>.map` files dangerous unless lookup
-  is restricted to PIDs whose latest exec marker says they're Python.
+  is restricted to PIDs whose latest runtime record marks them as Python.
 
 The `PerfSummary` counters exist to make those limits visible. A profile is
 only as trustworthy as those numbers say it is: check sample count, lost

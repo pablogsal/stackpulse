@@ -12,8 +12,8 @@ use stackpulse::bench_support::{
 use stackpulse::profile::{basename_start, LocationInfo, PythonFrame};
 use stackpulse::{
     is_python_module, path_to_name, ErrorStatsFormatter, FrameMode, FrameRecord, ModuleImageBase,
-    ModulePath, ModuleRecord, NativeFrame, PerfSpoolReader, PerfSymbolizer, ProcessExecRecord,
-    ResolvedFrame, SampleErrorKind, SampleErrorStats,
+    ModulePath, ModuleRecord, NativeFrame, PerfSpoolReader, PerfSymbolizer, PerfSymbolizerBuilder,
+    PythonRuntimeRecord, ResolvedFrame, SampleErrorKind, SampleErrorStats,
 };
 
 const FIXTURE_VERSION: u32 = 10;
@@ -46,7 +46,7 @@ struct ScenarioSpec {
     stack_depth: usize,
     include_kernel: bool,
     include_python: bool,
-    include_process_execs: bool,
+    include_python_runtime_records: bool,
 }
 
 const SPOOL_SCENARIOS: &[ScenarioSpec] = &[
@@ -59,7 +59,7 @@ const SPOOL_SCENARIOS: &[ScenarioSpec] = &[
         stack_depth: 16,
         include_kernel: false,
         include_python: false,
-        include_process_execs: false,
+        include_python_runtime_records: false,
     },
     ScenarioSpec {
         name: "many_unique_stacks",
@@ -70,7 +70,7 @@ const SPOOL_SCENARIOS: &[ScenarioSpec] = &[
         stack_depth: 32,
         include_kernel: false,
         include_python: false,
-        include_process_execs: true,
+        include_python_runtime_records: true,
     },
     ScenarioSpec {
         name: "deep_native_stacks",
@@ -81,7 +81,7 @@ const SPOOL_SCENARIOS: &[ScenarioSpec] = &[
         stack_depth: 96,
         include_kernel: false,
         include_python: false,
-        include_process_execs: false,
+        include_python_runtime_records: false,
     },
     ScenarioSpec {
         name: "python_kernel_mix",
@@ -92,7 +92,7 @@ const SPOOL_SCENARIOS: &[ScenarioSpec] = &[
         stack_depth: 48,
         include_kernel: true,
         include_python: true,
-        include_process_execs: true,
+        include_python_runtime_records: true,
     },
 ];
 
@@ -133,7 +133,7 @@ fn bench_spool_open(c: &mut Criterion) {
                     checksum = checksum
                         .wrapping_add(reader.modules().len())
                         .wrapping_add(reader.samples().len())
-                        .wrapping_add(reader.process_execs().len());
+                        .wrapping_add(reader.python_runtime_records().len());
                 }
                 black_box(checksum)
             });
@@ -203,7 +203,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
                             checksum = checksum
                                 .wrapping_add(raw_frame_score(context.frame))
                                 .wrapping_add(context.module.map_or(0, |module| {
-                                    module.module.id as usize ^ module.rel_ip as usize
+                                    module.module.id as usize ^ module.file_relative_ip as usize
                                 }));
                         }
                     }
@@ -300,7 +300,7 @@ fn bench_spool_write(c: &mut Criterion) {
                     checksum = checksum.wrapping_add(
                         bench_support::write_spool_samples_to_memory(
                             black_box(&case.modules),
-                            black_box(&case.process_execs),
+                            black_box(&case.python_runtime_records),
                             black_box(&case.samples),
                             *capacity,
                         )
@@ -356,7 +356,9 @@ fn bench_symbolization(c: &mut Criterion) {
     address_group.throughput(Throughput::Elements(total_frames(&address_stacks) as u64));
     address_group.bench_function("unique_stacks", |b| {
         b.iter(|| {
-            let mut symbolizer = PerfSymbolizer::with_perf_maps(&[], false);
+            let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+                .disable_perf_maps()
+                .build();
             let mut checksum = 0usize;
             for frames in &address_stacks {
                 checksum =
@@ -366,7 +368,9 @@ fn bench_symbolization(c: &mut Criterion) {
         });
     });
 
-    let mut warm_symbolizer = PerfSymbolizer::with_perf_maps(&[], false);
+    let mut warm_symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+        .disable_perf_maps()
+        .build();
     for frames in &address_stacks {
         let _ = score_resolved_frame_slice(&mut warm_symbolizer, 42, frames);
     }
@@ -396,7 +400,9 @@ fn bench_symbolization(c: &mut Criterion) {
             .map(|spec| {
                 let reader = PerfSpoolReader::open(ensure_spool_fixture(spec))
                     .expect("open synthetic spool");
-                let mut symbolizer = PerfSymbolizer::with_perf_maps(reader.modules(), false);
+                let mut symbolizer = PerfSymbolizerBuilder::for_modules(reader.modules())
+                    .disable_perf_maps()
+                    .build();
                 let _ = symbolize_reader(&reader, &mut symbolizer);
                 (spec, reader, symbolizer)
             })
@@ -454,7 +460,9 @@ fn bench_symbolization(c: &mut Criterion) {
         native_group.throughput(Throughput::Elements(frames.len() as u64));
         native_group.bench_function("cold_current_exe_batch", |b| {
             b.iter(|| {
-                let mut symbolizer = PerfSymbolizer::with_perf_maps(&modules, false);
+                let mut symbolizer = PerfSymbolizerBuilder::for_modules(&modules)
+                    .disable_perf_maps()
+                    .build();
                 black_box(score_resolved_frame_slice(
                     &mut symbolizer,
                     std::process::id() as i32,
@@ -536,8 +544,8 @@ fn bench_helpers(c: &mut Criterion) {
                 }
                 for (base, avma) in &bases {
                     checksum = checksum
-                        .wrapping_add(base.relative_address(*avma) as usize)
-                        .wrapping_add(base.svma_for_avma(*avma) as usize);
+                        .wrapping_add(base.relative_address(*avma).expect("valid AVMA") as usize)
+                        .wrapping_add(base.svma_for_avma(*avma).expect("valid AVMA") as usize);
                 }
             }
             black_box(checksum)
@@ -551,10 +559,7 @@ fn bench_helpers(c: &mut Criterion) {
             for _ in 0..ERROR_STATS_BATCH {
                 let stats = dense_error_stats();
                 stats.record(SampleErrorKind::NativeStackRead);
-                let mut output = String::new();
-                ErrorStatsFormatter::new(&stats, 100_000, 97_000)
-                    .write_to(&mut output)
-                    .expect("format dense stats");
+                let output = ErrorStatsFormatter::new(&stats, 100_000, 97_000).to_string();
                 checksum = checksum.wrapping_add(stats.total() as usize ^ output.len());
             }
             black_box(checksum)
@@ -608,22 +613,22 @@ fn write_synthetic_spool(path: &Path, spec: ScenarioSpec) -> io::Result<()> {
     bench_support::write_spool_samples_to_path(
         path,
         &case.modules,
-        &case.process_execs,
+        &case.python_runtime_records,
         &case.samples,
     )
 }
 
 struct SpoolBenchCase {
     modules: Vec<ModuleRecord>,
-    process_execs: Vec<ProcessExecRecord>,
+    python_runtime_records: Vec<PythonRuntimeRecord>,
     samples: Vec<BenchSpoolSample>,
 }
 
 fn materialize_spool_case(spec: ScenarioSpec) -> SpoolBenchCase {
     let modules = synthetic_modules(spec);
-    let process_execs = if spec.include_process_execs {
+    let python_runtime_records = if spec.include_python_runtime_records {
         (0..spec.processes)
-            .map(|process| ProcessExecRecord {
+            .map(|process| PythonRuntimeRecord {
                 timestamp_ns: 10_000 + process as u64,
                 process_id: process_id(process),
                 is_python_runtime: spec.include_python && process % 2 == 0,
@@ -663,7 +668,7 @@ fn materialize_spool_case(spec: ScenarioSpec) -> SpoolBenchCase {
     }
     SpoolBenchCase {
         modules,
-        process_execs,
+        python_runtime_records,
         samples,
     }
 }
@@ -735,11 +740,11 @@ fn frame_in_module(
 ) -> FrameRecord {
     let span = module.end - module.start;
     let offset = ((variant as u64 * 131) + (depth as u64 * 67)) % span.saturating_sub(0x100);
-    let rel_ip = module.file_offset + offset;
+    let file_relative_ip = module.file_offset + offset;
     let abs_ip = module.start + offset;
     FrameRecord {
         module_id: Some(module.id),
-        rel_ip,
+        file_relative_ip,
         abs_ip,
         mode: if module.is_kernel {
             FrameMode::Kernel
@@ -774,7 +779,7 @@ fn address_only_stacks(
                     let abs_ip = base + stack_id as u64 * 0x1000 + depth as u64 * 0x30 + 8;
                     FrameRecord {
                         module_id: None,
-                        rel_ip: abs_ip,
+                        file_relative_ip: abs_ip,
                         abs_ip,
                         mode,
                     }
@@ -821,7 +826,7 @@ fn raw_frames_score(frames: &[FrameRecord]) -> usize {
 fn raw_frame_score(frame: &FrameRecord) -> usize {
     frame
         .abs_ip
-        .wrapping_add(frame.rel_ip)
+        .wrapping_add(frame.file_relative_ip)
         .wrapping_add(u64::from(frame.module_id.unwrap_or(u32::MAX))) as usize
 }
 
@@ -897,7 +902,7 @@ fn current_exe_symbolization_fixture() -> Option<(Vec<ModuleRecord>, Vec<FrameRe
     let abs_ip = native_symbol_probe_addr();
     let maps = fs::read_to_string("/proc/self/maps").ok()?;
     let (start, end, file_offset, inode) = find_current_exe_mapping(&maps, &exe, abs_ip)?;
-    let rel_ip = file_offset + abs_ip.saturating_sub(start);
+    let file_relative_ip = file_offset + abs_ip.saturating_sub(start);
     let module = ModuleRecord {
         id: 0,
         process_id: std::process::id() as i32,
@@ -915,7 +920,7 @@ fn current_exe_symbolization_fixture() -> Option<(Vec<ModuleRecord>, Vec<FrameRe
     let frames = if frames.is_empty() {
         vec![FrameRecord {
             module_id: Some(0),
-            rel_ip,
+            file_relative_ip,
             abs_ip,
             mode: FrameMode::User,
         }]
@@ -948,7 +953,7 @@ fn current_exe_frame_batch(
             .clamp(start, last);
             FrameRecord {
                 module_id: Some(0),
-                rel_ip: file_offset + abs_ip.saturating_sub(start),
+                file_relative_ip: file_offset + abs_ip.saturating_sub(start),
                 abs_ip,
                 mode: FrameMode::User,
             }
@@ -1008,7 +1013,7 @@ impl PerfMapFixture {
             ));
             frames.push(FrameRecord {
                 module_id: None,
-                rel_ip: start + 8,
+                file_relative_ip: start + 8,
                 abs_ip: start + 8,
                 mode: FrameMode::User,
             });

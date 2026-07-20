@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::linux;
-use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, ProcessExecRecord};
+use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, PythonRuntimeRecord};
 
 #[doc(hidden)]
 pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
@@ -21,14 +21,14 @@ pub struct BenchSpoolSample {
 #[doc(hidden)]
 pub fn write_spool_samples_to_memory(
     modules: &[ModuleRecord],
-    process_execs: &[ProcessExecRecord],
+    python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
     capacity: usize,
 ) -> io::Result<usize> {
     let bytes = write_spool_samples_to_writer(
         Vec::with_capacity(capacity.max(1024)),
         modules,
-        process_execs,
+        python_runtime_records,
         samples,
     )?;
     Ok(bytes.len())
@@ -38,19 +38,19 @@ pub fn write_spool_samples_to_memory(
 pub fn write_spool_samples_to_path(
     path: impl AsRef<Path>,
     modules: &[ModuleRecord],
-    process_execs: &[ProcessExecRecord],
+    python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
 ) -> io::Result<()> {
     let mut writer =
         PerfSpoolWriter::create(path, FIXTURE_START_TIMESTAMP_US, FIXTURE_SAMPLE_INTERVAL_US)?;
-    write_spool_samples(&mut writer, modules, process_execs, samples)?;
+    write_spool_samples(&mut writer, modules, python_runtime_records, samples)?;
     writer.flush()
 }
 
 fn write_spool_samples_to_writer<W: Write>(
     writer: W,
     modules: &[ModuleRecord],
-    process_execs: &[ProcessExecRecord],
+    python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
 ) -> io::Result<W> {
     let mut writer = PerfSpoolWriter::from_writer(
@@ -58,7 +58,7 @@ fn write_spool_samples_to_writer<W: Write>(
         FIXTURE_START_TIMESTAMP_US,
         FIXTURE_SAMPLE_INTERVAL_US,
     )?;
-    write_spool_samples(&mut writer, modules, process_execs, samples)?;
+    write_spool_samples(&mut writer, modules, python_runtime_records, samples)?;
     writer.flush()?;
     Ok(writer.into_inner())
 }
@@ -66,14 +66,18 @@ fn write_spool_samples_to_writer<W: Write>(
 fn write_spool_samples<W: Write>(
     writer: &mut PerfSpoolWriter<W>,
     modules: &[ModuleRecord],
-    process_execs: &[ProcessExecRecord],
+    python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
 ) -> io::Result<()> {
     for module in modules {
         writer.write_module(module)?;
     }
-    for exec in process_execs {
-        writer.write_process_exec(exec.timestamp_ns, exec.process_id, exec.is_python_runtime)?;
+    for runtime in python_runtime_records {
+        writer.write_python_runtime(
+            runtime.timestamp_ns,
+            runtime.process_id,
+            runtime.is_python_runtime,
+        )?;
     }
     for sample in samples {
         writer.write_sample_frames(
@@ -205,14 +209,14 @@ mod tests {
             path: "/tmp/libstackpulse.so".into(),
             is_kernel: false,
         };
-        let exec = ProcessExecRecord {
+        let runtime = PythonRuntimeRecord {
             timestamp_ns: 1_700_000_000_000_001,
             process_id: 42,
             is_python_runtime: true,
         };
         let frame = FrameRecord {
             module_id: Some(0),
-            rel_ip: 0x120,
+            file_relative_ip: 0x120,
             abs_ip: 0x1020,
             mode: FrameMode::User,
         };
@@ -227,13 +231,13 @@ mod tests {
         let bytes = write_spool_samples_to_writer(
             Vec::new(),
             std::slice::from_ref(&module),
-            std::slice::from_ref(&exec),
+            std::slice::from_ref(&runtime),
             &samples,
         )
         .expect("write spool samples");
         let reported_len = write_spool_samples_to_memory(
             std::slice::from_ref(&module),
-            std::slice::from_ref(&exec),
+            std::slice::from_ref(&runtime),
             &samples,
             bytes.len() * 2,
         )
@@ -241,7 +245,7 @@ mod tests {
         write_spool_samples_to_path(
             &path,
             std::slice::from_ref(&module),
-            std::slice::from_ref(&exec),
+            std::slice::from_ref(&runtime),
             &samples,
         )
         .expect("persist spool bytes through real writer");
@@ -258,10 +262,13 @@ mod tests {
         assert_eq!(reader.modules().len(), 1);
         assert_eq!(reader.modules()[0].path.as_str(), "/tmp/libstackpulse.so");
         assert_eq!(reader.modules()[0].file_offset, 0x100);
-        assert_eq!(reader.process_execs().len(), 1);
-        assert_eq!(reader.process_execs()[0].timestamp_ns, exec.timestamp_ns);
-        assert_eq!(reader.process_execs()[0].process_id, 42);
-        assert!(reader.process_execs()[0].is_python_runtime);
+        assert_eq!(reader.python_runtime_records().len(), 1);
+        assert_eq!(
+            reader.python_runtime_records()[0].timestamp_ns,
+            runtime.timestamp_ns
+        );
+        assert_eq!(reader.python_runtime_records()[0].process_id, 42);
+        assert!(reader.python_runtime_records()[0].is_python_runtime);
         assert_eq!(reader.samples().len(), 1);
         assert_eq!(reader.samples()[0].timestamp_ns, samples[0].timestamp_ns);
         assert_eq!(reader.samples()[0].process_id, 42);

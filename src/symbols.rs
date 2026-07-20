@@ -5,11 +5,8 @@
 
 use crate::{ModuleImageBase, NativeSymbol, SourceLocation};
 
-#[cfg(target_os = "linux")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
-#[cfg(target_os = "linux")]
 use wholesym::CodeId;
-#[cfg(target_os = "linux")]
 use wholesym::{
     FramesLookupResult, LookupAddress, SymbolManager, SymbolManagerConfig,
     SymbolMap as WholeSymbolMap,
@@ -146,7 +143,7 @@ fn symbols_rc(symbols: Vec<NativeSymbol>) -> SymbolsRc {
 /// instead of stackpulse's bundled wholesym-backed `SymbolizerWrapper`.
 ///
 /// One implementor is created per non-overlapping process module group via
-/// the factory passed to [`crate::PerfSymbolizer::with_native_factory`].
+/// the factory passed to [`crate::PerfSymbolizerBuilder::native_symbolizer_factory`].
 /// Implementors keep their own per-module symbol-map cache; stackpulse calls
 /// `set_modules` whenever the module set changes and `symbolize_one` for
 /// each native frame address.
@@ -162,7 +159,6 @@ pub trait NativeSymbolizer {
     fn symbolize_one(&mut self, addr: u64) -> SymbolsRc;
 }
 
-#[cfg(target_os = "linux")]
 impl NativeSymbolizer for SymbolizerWrapper {
     fn set_modules(&mut self, modules: Vec<SymModule>) {
         SymbolizerWrapper::set_modules(self, modules);
@@ -175,16 +171,13 @@ impl NativeSymbolizer for SymbolizerWrapper {
 
 /// Factory that produces a [`NativeSymbolizer`] for a given process id.
 /// `PerfSymbolizer` calls this once per non-overlapping module group.
-pub type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolizer>>;
+pub(crate) type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolizer>>;
 
 /// Default factory: returns stackpulse's bundled wholesym-backed
 /// `SymbolizerWrapper`, configured from `STACKPULSE_*` env vars.
-#[cfg(target_os = "linux")]
 #[must_use]
-pub fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
-    Box::new(|pid: i32| -> Box<dyn NativeSymbolizer> {
-        Box::new(SymbolizerWrapper::new(pid as u32))
-    })
+pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
+    Box::new(|_pid: i32| -> Box<dyn NativeSymbolizer> { Box::new(SymbolizerWrapper::new()) })
 }
 
 /// Symbols that indicate the Python eval loop.
@@ -206,12 +199,10 @@ fn mark_python_runtime_modules(modules: &mut [SymModule]) {
 }
 
 /// Standard system debug directory on Linux.
-#[cfg(target_os = "linux")]
 const DEFAULT_DEBUG_DIR: &str = "/usr/lib/debug";
 
 /// Parse debug directories from environment.
 /// Priority: `STACKPULSE_DEBUG_DIRS` (runtime) > `STACKPULSE_DEFAULT_DEBUG_DIRS` (build-time) > /usr/lib/debug
-#[cfg(target_os = "linux")]
 fn parse_debug_dirs() -> Vec<PathBuf> {
     let dirs_str = std::env::var("STACKPULSE_DEBUG_DIRS")
         .ok()
@@ -243,7 +234,6 @@ fn parse_debug_dirs() -> Vec<PathBuf> {
 ///
 /// Returns a concrete debug file path if one of the configured roots contains
 /// a `.build-id/<xx>/<rest>.debug` entry for the build ID.
-#[cfg(target_os = "linux")]
 fn lookup_local_debug_file(build_id: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
     let expected_relative_path = standard_build_id_debug_path(build_id)?;
 
@@ -281,7 +271,6 @@ fn lookup_local_debug_file(build_id: &str, search_dirs: &[PathBuf]) -> Option<Pa
     None
 }
 
-#[cfg(target_os = "linux")]
 fn standard_build_id_debug_path(build_id: &str) -> Option<PathBuf> {
     if build_id.len() <= 2 {
         return None;
@@ -312,7 +301,6 @@ fn default_debuginfod_cache_dir() -> PathBuf {
     std::env::temp_dir().join("stackpulse-debuginfod")
 }
 
-#[cfg(target_os = "linux")]
 fn build_symbol_manager_config(
     debug_dirs: &[PathBuf],
     redirect_paths: &[(PathBuf, PathBuf)],
@@ -336,7 +324,6 @@ fn build_symbol_manager_config(
     config
 }
 
-#[cfg(target_os = "linux")]
 fn discover_linux_debug_file_redirect(
     runtime: &TokioRuntime,
     path: &Path,
@@ -368,7 +355,6 @@ fn discover_linux_debug_file_redirect(
     (actual_path != standard_path).then_some((standard_path, actual_path))
 }
 
-#[cfg(target_os = "linux")]
 fn linux_build_id_string(info: &wholesym::LibraryInfo) -> Option<String> {
     match &info.code_id {
         Some(CodeId::ElfBuildId(build_id)) => Some(build_id.to_string()),
@@ -397,30 +383,24 @@ pub struct SymbolizerWrapper {
     cache_keys_by_path: HashMap<PathBuf, Vec<u64>>,
 
     /// Local debug directories for `.build-id` lookup (Linux only).
-    #[cfg(target_os = "linux")]
     local_debug_dirs: Box<[PathBuf]>,
 
     /// Cached redirect mappings keyed by module path (Linux only).
     /// Maps module path -> (standard_debug_path, actual_debug_path).
-    #[cfg(target_os = "linux")]
     redirect_cache: HashMap<PathBuf, (PathBuf, PathBuf)>,
 
     /// Shared symbol manager used for symbolization.
-    #[cfg(target_os = "linux")]
     symbol_manager: SymbolManager,
 
     /// Loaded wholesym maps keyed by module path.
-    #[cfg(target_os = "linux")]
     symbol_maps: HashMap<PathBuf, Option<WholeSymbolMap>>,
 
     /// Tokio runtime for wholesym async APIs. Wrapped so Drop can hand it to
     /// `shutdown_background`, which is safe even inside another tokio runtime
     /// (a plain runtime drop there panics mid-unwind and aborts the process).
-    #[cfg(target_os = "linux")]
     runtime: std::mem::ManuallyDrop<TokioRuntime>,
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for SymbolizerWrapper {
     fn drop(&mut self) {
         let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
@@ -432,7 +412,6 @@ impl Drop for SymbolizerWrapper {
 /// the calling thread is already driving a tokio runtime (e.g. a consumer
 /// symbolizing from inside an async task); in that case run the blocking wait
 /// on a temporary OS thread instead.
-#[cfg(target_os = "linux")]
 fn block_on_runtime<F>(runtime: &TokioRuntime, future: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -450,12 +429,10 @@ where
 }
 
 /// Extract a short module name from a path (file name, or full path as fallback).
-#[cfg(target_os = "linux")]
 fn module_name_rc(path: &Path) -> Rc<str> {
     crate::path_to_name(path).into()
 }
 
-#[cfg(target_os = "linux")]
 fn build_native_symbol(
     name: String,
     source: SourceLocation,
@@ -464,30 +441,22 @@ fn build_native_symbol(
     is_python_runtime: bool,
 ) -> NativeSymbol {
     let name_str: Rc<str> = name.into();
-    let module_basename_start = crate::profile::basename_start(module);
     NativeSymbol {
         is_eval_frame: is_eval_frame(&name_str),
         name: name_str,
-        file: source.file,
-        line: source.line,
-        column: source.column,
-        function_start_line: source.function_start_line,
-        function_start_column: source.function_start_column,
+        source,
         module: Rc::clone(module),
-        module_basename_start,
         offset,
         inline_depth: 0,
         should_ignore: is_python_runtime,
     }
 }
 
-#[cfg(target_os = "linux")]
 #[inline]
 fn inline_depth_for_frame(frame_count: usize, index: usize) -> u16 {
     u16::try_from(frame_count.saturating_sub(index + 1)).unwrap_or(u16::MAX)
 }
 
-#[cfg(target_os = "linux")]
 fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
@@ -545,10 +514,9 @@ fn build_native_symbols_from_wholesym_parts(
 }
 
 impl SymbolizerWrapper {
-    /// Create a new symbolizer for the given process.
-    #[cfg(target_os = "linux")]
+    /// Create a symbolizer with the configured debug-file search paths.
     #[must_use]
-    pub fn new(_pid: u32) -> Self {
+    pub fn new() -> Self {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
             .build()
@@ -590,7 +558,6 @@ impl SymbolizerWrapper {
 
     /// Drop all per-path state for `path`. On Linux, returns `true` when a
     /// debug-file redirect was removed (caller must rebuild `SymbolManager`).
-    #[cfg(target_os = "linux")]
     fn evict_path_state(&mut self, path: &Path) -> bool {
         self.evict_cache_for_path(path);
         self.symbol_maps.remove(path);
@@ -629,7 +596,6 @@ impl SymbolizerWrapper {
             })
             .collect();
 
-        #[cfg(target_os = "linux")]
         {
             let mut redirects_evicted = false;
             for path in &evicted {
@@ -666,7 +632,6 @@ impl SymbolizerWrapper {
             return;
         }
 
-        #[cfg(target_os = "linux")]
         if self.evict_path_state(path) {
             self.rebuild_symbol_manager();
         }
@@ -698,7 +663,6 @@ impl SymbolizerWrapper {
         (!executable_only || module.is_executable).then_some(entry.module_index)
     }
 
-    #[cfg(target_os = "linux")]
     fn rebuild_symbol_manager(&mut self) {
         let all_redirects: Vec<(PathBuf, PathBuf)> =
             self.redirect_cache.values().cloned().collect();
@@ -709,7 +673,6 @@ impl SymbolizerWrapper {
     }
 
     /// Resolve one instruction address to symbol information.
-    #[cfg(target_os = "linux")]
     pub fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
         if let Some(cached) = self.cache.get(&addr) {
             return Rc::clone(cached);
@@ -727,10 +690,10 @@ impl SymbolizerWrapper {
             return empty;
         };
 
-        let Some(svma) = image_base.checked_svma_for_avma(addr) else {
+        let Some(svma) = image_base.svma_for_avma(addr) else {
             return empty;
         };
-        let Some(module_offset) = image_base.checked_relative_address(addr) else {
+        let Some(module_offset) = image_base.relative_address(addr) else {
             return empty;
         };
         let module_rc = module_name_rc(&path);
@@ -750,7 +713,6 @@ impl SymbolizerWrapper {
         symbols_rc
     }
 
-    #[cfg(target_os = "linux")]
     fn symbolize_with_wholesym(
         &mut self,
         path: &Path,
@@ -781,7 +743,6 @@ impl SymbolizerWrapper {
         ))
     }
 
-    #[cfg(target_os = "linux")]
     fn ensure_symbol_map_loaded(&mut self, path: &Path) {
         if !self.symbol_maps.contains_key(path) {
             self.prefetch_linux_debug_redirects([path]);
@@ -806,7 +767,6 @@ impl SymbolizerWrapper {
 
     /// Discover and cache debug-file redirects for `paths` (skipping ones
     /// already cached); rebuild the `SymbolManager` once if anything new.
-    #[cfg(target_os = "linux")]
     fn prefetch_linux_debug_redirects<P>(&mut self, paths: impl IntoIterator<Item = P>)
     where
         P: AsRef<Path>,
@@ -834,7 +794,6 @@ impl SymbolizerWrapper {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn block_on_runtime_falls_back_to_a_thread_inside_tokio() {
         let outer = TokioRuntimeBuilder::new_current_thread()
@@ -863,7 +822,6 @@ mod tests {
         assert!(!is_eval_frame("some_function.llvm.123"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_inline_depth_for_innermost_first_frames() {
         assert_eq!(inline_depth_for_frame(3, 0), 2);
@@ -871,7 +829,6 @@ mod tests {
         assert_eq!(inline_depth_for_frame(3, 2), 0);
     }
 
-    #[cfg(target_os = "linux")]
     fn test_sym_module_with_range(path: &str, avma_range: Range<u64>) -> SymModule {
         SymModule {
             path: PathBuf::from(path),
@@ -913,7 +870,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_lookup_local_debug_file_uses_configured_root() {
         let unique = std::time::SystemTime::now()
@@ -937,14 +893,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_set_modules_evicts_only_changed_paths_from_symbol_cache() {
         let keep = PathBuf::from("/tmp/libkeep.so");
         let removed = PathBuf::from("/tmp/libremoved.so");
         let added = PathBuf::from("/tmp/libadded.so");
 
-        let mut symbolizer = SymbolizerWrapper::new(0);
+        let mut symbolizer = SymbolizerWrapper::new();
         symbolizer.local_debug_dirs = Box::default();
         symbolizer.modules = vec![
             test_sym_module_with_range(keep.to_str().unwrap(), 0x1000..0x2000),
@@ -992,11 +947,10 @@ mod tests {
         assert!(!symbolizer.redirect_cache.contains_key(&removed));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_missing_image_base_does_not_poison_symbol_cache() {
         let path = PathBuf::from("/tmp/libpending.so");
-        let mut symbolizer = SymbolizerWrapper::new(0);
+        let mut symbolizer = SymbolizerWrapper::new();
         symbolizer.local_debug_dirs = Box::default();
         symbolizer.set_modules(vec![SymModule {
             path: path.clone(),
@@ -1011,7 +965,6 @@ mod tests {
         assert!(!symbolizer.cache_keys_by_path.contains_key(&path));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_set_modules_evicts_same_path_when_file_identity_changes() {
         let unique = std::time::SystemTime::now()
@@ -1023,7 +976,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&path, b"old").unwrap();
 
-        let mut symbolizer = SymbolizerWrapper::new(0);
+        let mut symbolizer = SymbolizerWrapper::new();
         symbolizer.local_debug_dirs = Box::default();
         let module = test_sym_module_with_range(path.to_str().unwrap(), 0x1000..0x2000);
         symbolizer.set_modules(vec![module.clone()]);
@@ -1042,12 +995,11 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_update_modules_for_path_evicts_only_that_path_from_symbol_cache() {
         let keep = PathBuf::from("/tmp/libkeep.so");
         let changed = PathBuf::from("/tmp/libchanged.so");
-        let mut symbolizer = SymbolizerWrapper::new(0);
+        let mut symbolizer = SymbolizerWrapper::new();
         symbolizer.local_debug_dirs = Box::default();
         symbolizer.set_modules(vec![
             test_sym_module_with_range(keep.to_str().unwrap(), 0x1000..0x2000),

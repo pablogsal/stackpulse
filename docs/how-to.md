@@ -196,7 +196,7 @@ The default symbolizer allows perf-map lookup for any PID:
 
 ```rust,no_run
 # fn run(reader: &stackpulse::PerfSpoolReader) {
-let mut symbolizer = stackpulse::PerfSymbolizer::new(reader.modules());
+let mut symbolizer = stackpulse::PerfSymbolizer::for_spool(reader);
 # }
 ```
 
@@ -211,29 +211,30 @@ recorder last saw as Python runtimes:
 ```rust,no_run
 # fn run(reader: &stackpulse::PerfSpoolReader) {
 let mut python_pids = std::collections::BTreeSet::new();
-for exec in reader.process_execs() {
-    if exec.is_python_runtime {
-        python_pids.insert(exec.process_id);
+for runtime in reader.python_runtime_records() {
+    if runtime.is_python_runtime {
+        python_pids.insert(runtime.process_id);
     } else {
-        python_pids.remove(&exec.process_id);
+        python_pids.remove(&runtime.process_id);
     }
 }
 
-let mut symbolizer = stackpulse::PerfSymbolizer::with_perf_map_processes(
-    reader.modules(), python_pids,
-);
+let mut symbolizer = stackpulse::PerfSymbolizerBuilder::for_spool(reader)
+    .perf_maps_for(python_pids)
+    .build();
 # }
 ```
 
-`PerfSymbolizer::for_spool_with_recorded_python_perf_maps(reader)` is a
-broader convenience helper: it allows any PID that was ever marked as a Python
-runtime in the spool.
+The loop retains only processes whose latest recorded status is Python. This
+avoids accepting an older Python status after a PID is reused.
 
 Or skip perf maps entirely:
 
 ```rust,no_run
 # fn run(reader: &stackpulse::PerfSpoolReader) {
-let mut symbolizer = stackpulse::PerfSymbolizer::with_perf_maps(reader.modules(), false);
+let mut symbolizer = stackpulse::PerfSymbolizerBuilder::for_spool(reader)
+    .disable_perf_maps()
+    .build();
 # }
 ```
 
@@ -297,13 +298,11 @@ Reading the numbers:
 For a formatted breakdown:
 
 ```rust,no_run
-# fn run(summary: &stackpulse::PerfSummary) -> std::fmt::Result {
-let mut report = String::new();
-stackpulse::ErrorStatsFormatter::new(
+# fn run(summary: &stackpulse::PerfSummary) {
+let report = stackpulse::ErrorStatsFormatter::new(
     &summary.error_stats, summary.sample_events, summary.samples,
-).write_to(&mut report)?;
+).to_string();
 println!("{report}");
-# Ok(())
 # }
 ```
 
