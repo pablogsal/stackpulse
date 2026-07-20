@@ -164,6 +164,19 @@ enum ProcessTracking {
     Tracked(Option<ProcessExitWatcher>),
 }
 
+impl ProcessTracking {
+    fn is_tracked(&self) -> bool {
+        matches!(self, Self::Tracked(_))
+    }
+
+    fn watcher_mut(&mut self) -> Option<&mut Option<ProcessExitWatcher>> {
+        match self {
+            Self::Untracked => None,
+            Self::Tracked(watcher) => Some(watcher),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ProcessState {
     tracking: ProcessTracking,
@@ -202,7 +215,7 @@ impl ProcessTable {
 
     fn ensure_tracked(&mut self, pid: i32) {
         let state = self.state_mut(pid);
-        if matches!(state.tracking, ProcessTracking::Untracked) {
+        if !state.tracking.is_tracked() {
             state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
         }
     }
@@ -210,15 +223,13 @@ impl ProcessTable {
     fn is_tracked(&self, pid: i32) -> bool {
         self.states
             .get(&pid)
-            .is_some_and(|state| matches!(state.tracking, ProcessTracking::Tracked(_)))
+            .is_some_and(|state| state.tracking.is_tracked())
     }
 
     fn tracked_pids(&self) -> Vec<i32> {
         self.states
             .iter()
-            .filter_map(|(&pid, state)| {
-                matches!(state.tracking, ProcessTracking::Tracked(_)).then_some(pid)
-            })
+            .filter_map(|(&pid, state)| state.tracking.is_tracked().then_some(pid))
             .collect()
     }
 
@@ -226,9 +237,7 @@ impl ProcessTable {
         self.states
             .iter_mut()
             .filter_map(|(&pid, state)| {
-                let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
-                    return None;
-                };
+                let watcher = state.tracking.watcher_mut()?;
                 let dead = !process_is_alive(watcher, pid);
                 let generation_changed = u32::try_from(pid)
                     .ok()
@@ -246,9 +255,7 @@ impl ProcessTable {
         current_start_time: Option<u64>,
     ) -> Option<bool> {
         let state = self.states.get_mut(&pid)?;
-        let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
-            return None;
-        };
+        let watcher = state.tracking.watcher_mut()?;
         Some(
             !process_is_alive(watcher, pid)
                 || state
@@ -260,7 +267,7 @@ impl ProcessTable {
 
     fn process_is_active(&mut self, pid: i32) -> bool {
         self.states.get_mut(&pid).is_some_and(|state| {
-            let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+            let Some(watcher) = state.tracking.watcher_mut() else {
                 return false;
             };
             process_is_alive(watcher, pid)
@@ -272,7 +279,7 @@ impl ProcessTable {
             if pid == excluded_pid {
                 return false;
             }
-            let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+            let Some(watcher) = state.tracking.watcher_mut() else {
                 return false;
             };
             process_is_alive(watcher, pid)
@@ -283,9 +290,7 @@ impl ProcessTable {
         self.states
             .iter_mut()
             .filter_map(|(&pid, state)| {
-                let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
-                    return None;
-                };
+                let watcher = state.tracking.watcher_mut()?;
                 process_is_alive(watcher, pid).then_some(())
             })
             .count()

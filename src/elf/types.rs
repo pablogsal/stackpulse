@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(crate) use super::LoadSegment;
+use super::LoadSegment;
 
 #[derive(Clone)]
 pub(crate) struct ElfSectionData {
