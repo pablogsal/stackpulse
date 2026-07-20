@@ -2030,6 +2030,38 @@ mod tests {
     }
 
     #[test]
+    fn tracked_process_queries_follow_liveness() {
+        let live_pid = i32::try_from(std::process::id()).expect("current PID fits in i32");
+        let missing_pid = i32::MAX;
+        let mut processes = ProcessTable::default();
+
+        processes.track_or_refresh(live_pid);
+        processes.track_or_refresh(live_pid);
+        processes.track_or_refresh(missing_pid);
+        processes.track_or_refresh(missing_pid);
+
+        assert!(processes.is_tracked(live_pid));
+        assert!(processes.is_tracked(missing_pid));
+        let mut tracked = processes.tracked_pids();
+        tracked.sort_unstable();
+        assert_eq!(tracked, [live_pid, missing_pid]);
+        assert_eq!(
+            processes.tracked_process_is_stale(live_pid, None),
+            Some(false)
+        );
+        assert_eq!(
+            processes.tracked_process_is_stale(missing_pid, None),
+            Some(true)
+        );
+        assert!(processes.process_is_active(live_pid));
+        assert!(!processes.process_is_active(missing_pid));
+        assert!(processes.has_active_processes_except(missing_pid));
+        assert!(!processes.has_active_processes_except(live_pid));
+        assert_eq!(processes.active_process_count(), 1);
+        assert_eq!(processes.dead_or_reused_pids(), [missing_pid]);
+    }
+
+    #[test]
     fn reopening_the_same_process_is_idempotent() {
         let child = SleepChild::spawn();
         let temp = TempDir::new("duplicate-open");
