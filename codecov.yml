@@ -7,3 +7,6 @@ coverage:
         # be instrumented (no atexit flush). Allow small dips so the check flags
         # real regressions, not these artifacts.
         threshold: 1%
+    patch:
+      default:
+        threshold: 1%
