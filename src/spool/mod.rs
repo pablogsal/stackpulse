@@ -896,21 +896,11 @@ pub(crate) fn module_for_frame_unbounded<'a>(
             rel_ip: frame.rel_ip,
         });
     }
-    let module = modules.iter().rev().find(|module| {
-        let owned_by = match frame.mode {
-            FrameMode::Kernel => module.is_kernel,
-            FrameMode::User => !module.is_kernel && module.process_id == process_id,
-            FrameMode::TruncatedStackMarker => false,
-        };
-        owned_by && module.start <= frame.abs_ip && frame.abs_ip < module.end
-    })?;
-    Some(FrameModuleRef {
-        module,
-        rel_ip: frame
-            .abs_ip
-            .saturating_sub(module.start)
-            .saturating_add(module.file_offset),
-    })
+    let module = modules
+        .iter()
+        .rev()
+        .find(|module| module_owns_frame(module, process_id, frame))?;
+    Some(frame_module_ref(module, frame))
 }
 
 pub(crate) fn module_for_frame_with_context<'a>(
@@ -939,21 +929,28 @@ pub(crate) fn module_for_frame_with_context<'a>(
             if !contexts.module_active(index, context) {
                 return None;
             }
-            let owned_by = match frame.mode {
-                FrameMode::Kernel => module.is_kernel,
-                FrameMode::User => !module.is_kernel && module.process_id == process_id,
-                FrameMode::TruncatedStackMarker => false,
-            };
-            (owned_by && module.start <= frame.abs_ip && frame.abs_ip < module.end)
-                .then_some(module)
+            module_owns_frame(module, process_id, frame).then_some(module)
         })?;
-    Some(FrameModuleRef {
+    Some(frame_module_ref(module, frame))
+}
+
+fn module_owns_frame(module: &ModuleRecord, process_id: i32, frame: &FrameRecord) -> bool {
+    let owned_by = match frame.mode {
+        FrameMode::Kernel => module.is_kernel,
+        FrameMode::User => !module.is_kernel && module.process_id == process_id,
+        FrameMode::TruncatedStackMarker => false,
+    };
+    owned_by && module.start <= frame.abs_ip && frame.abs_ip < module.end
+}
+
+fn frame_module_ref<'a>(module: &'a ModuleRecord, frame: &FrameRecord) -> FrameModuleRef<'a> {
+    FrameModuleRef {
         module,
         rel_ip: frame
             .abs_ip
             .saturating_sub(module.start)
             .saturating_add(module.file_offset),
-    })
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
