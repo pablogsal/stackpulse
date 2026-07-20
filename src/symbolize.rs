@@ -867,10 +867,13 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::rc::Rc;
+
     use crate::elf::fake_hard_case_section_info;
     use crate::spool::PerfSpoolWriter;
-    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
 
     fn temp_perf_map_path(process_id: i32) -> String {
         format!("/tmp/perf-{process_id}.map")
@@ -950,7 +953,14 @@ mod tests {
 
     #[test]
     fn native_symbolizer_is_reused_for_non_overlapping_modules_in_same_process() {
-        let mut symbolizer = PerfSymbolizer::new(&[]);
+        let factory_pids = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_pids = Rc::clone(&factory_pids);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+            .native_symbolizer_factory(move |pid| {
+                observed_pids.borrow_mut().push(pid);
+                default_native_symbolizer_factory()(pid)
+            })
+            .build();
         let first = executable_module(1, 42, 0x1000);
         let second = executable_module(2, 42, 0x3000);
         let overlapping = executable_module(3, 42, 0x1800);
@@ -974,6 +984,7 @@ mod tests {
             .ensure_native_symbolizer_for_module(&other_process)
             .is_some());
         assert_eq!(symbolizer.native_symbolizers.len(), 3);
+        assert_eq!(*factory_pids.borrow(), [42, 42, 43]);
     }
 
     #[test]

@@ -361,4 +361,13 @@ mod tests {
 
         assert_eq!(basename_start(&path), path.rfind('/').unwrap() + 1);
     }
+
+    #[test]
+    fn native_symbol_basename_follows_mutated_module_path() {
+        let mut symbol =
+            NativeSymbol::new("f", SourceLocation::default(), "/old/f.so", 0, false, false);
+        symbol.module = "new.so".into();
+
+        assert_eq!(symbol.module_basename(), "new.so");
+    }
 }
