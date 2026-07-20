@@ -128,27 +128,14 @@ pub struct PerfRecorder {
     event_sorter: EventSorter<RawFd, u64, PreparedEvent>,
     writer: PerfSpoolWriter<std::io::BufWriter<std::fs::File>>,
     modules: ModuleTable,
-    unwinders: FxHashMap<i32, ProcessUnwinder>,
-    active_processes: FxHashMap<i32, Option<ProcessExitWatcher>>,
-    process_images: FxHashMap<i32, ProcessImageIdentity>,
-    process_start_times: FxHashMap<i32, u64>,
-    // Cached per-exec probe results (environ + cmdline); false entries avoid
-    // re-reading /proc for every executable python-runtime mmap. Cleared on
-    // execve, inherited across fork.
-    python_perf_support_processes: FxHashMap<i32, bool>,
-    python_runtime_processes: FxHashSet<i32>,
+    processes: ProcessTable,
     stack_scratch: Vec<StackFrame>,
     summary: PerfSummary,
 }
 
 struct EventContext<'a, W: std::io::Write> {
     modules: &'a mut ModuleTable,
-    unwinders: &'a mut FxHashMap<i32, ProcessUnwinder>,
-    active_processes: &'a mut FxHashMap<i32, Option<ProcessExitWatcher>>,
-    process_images: &'a mut FxHashMap<i32, ProcessImageIdentity>,
-    process_start_times: &'a mut FxHashMap<i32, u64>,
-    python_perf_support_processes: &'a mut FxHashMap<i32, bool>,
-    python_runtime_processes: &'a mut FxHashSet<i32>,
+    processes: &'a mut ProcessTable,
     writer: &'a mut PerfSpoolWriter<W>,
     summary: &'a mut PerfSummary,
     stack_scratch: &'a mut Vec<StackFrame>,
@@ -160,6 +147,141 @@ struct EventContext<'a, W: std::io::Write> {
 struct ProcessImageIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Default)]
+enum ProcessTracking {
+    #[default]
+    Untracked,
+    Tracked(Option<ProcessExitWatcher>),
+}
+
+#[derive(Default)]
+struct ProcessState {
+    tracking: ProcessTracking,
+    unwinder: Option<ProcessUnwinder>,
+    image: Option<ProcessImageIdentity>,
+    start_time: Option<u64>,
+    // Per-exec probe result. `None` means it has not been probed; `Some(false)`
+    // deliberately avoids re-reading /proc for every runtime-looking mmap.
+    python_perf_support: Option<bool>,
+    python_runtime: bool,
+}
+
+#[derive(Default)]
+struct ProcessTable {
+    states: FxHashMap<i32, ProcessState>,
+}
+
+impl ProcessTable {
+    fn state_mut(&mut self, pid: i32) -> &mut ProcessState {
+        self.states.entry(pid).or_default()
+    }
+
+    fn track(&mut self, pid: i32) {
+        let state = self.state_mut(pid);
+        match &mut state.tracking {
+            ProcessTracking::Untracked => {
+                state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
+            }
+            ProcessTracking::Tracked(watcher) => {
+                if !process_is_alive(watcher, pid) {
+                    *watcher = try_new_exit_watcher(pid);
+                }
+            }
+        }
+    }
+
+    fn track_if_untracked(&mut self, pid: i32) {
+        let state = self.state_mut(pid);
+        if matches!(state.tracking, ProcessTracking::Untracked) {
+            state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
+        }
+    }
+
+    fn is_tracked(&self, pid: i32) -> bool {
+        self.states
+            .get(&pid)
+            .is_some_and(|state| matches!(state.tracking, ProcessTracking::Tracked(_)))
+    }
+
+    fn tracked_pids(&self) -> Vec<i32> {
+        self.states
+            .iter()
+            .filter_map(|(&pid, state)| {
+                matches!(state.tracking, ProcessTracking::Tracked(_)).then_some(pid)
+            })
+            .collect()
+    }
+
+    fn dead_or_reused_pids(&mut self) -> Vec<i32> {
+        self.states
+            .iter_mut()
+            .filter_map(|(&pid, state)| {
+                let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+                    return None;
+                };
+                let dead = !process_is_alive(watcher, pid);
+                let generation_changed = u32::try_from(pid)
+                    .ok()
+                    .and_then(|pid| read_process_start_time(pid).ok())
+                    .zip(state.start_time)
+                    .is_some_and(|(current, previous)| current != previous);
+                (dead || generation_changed).then_some(pid)
+            })
+            .collect()
+    }
+
+    fn tracked_process_is_stale(
+        &mut self,
+        pid: i32,
+        current_start_time: Option<u64>,
+    ) -> Option<bool> {
+        let state = self.states.get_mut(&pid)?;
+        let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+            return None;
+        };
+        Some(
+            !process_is_alive(watcher, pid)
+                || state
+                    .start_time
+                    .zip(current_start_time)
+                    .is_some_and(|(previous, current)| current != previous),
+        )
+    }
+
+    fn process_is_active(&mut self, pid: i32) -> bool {
+        self.states.get_mut(&pid).is_some_and(|state| {
+            let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+                return false;
+            };
+            process_is_alive(watcher, pid)
+        })
+    }
+
+    fn has_active_processes_except(&mut self, excluded_pid: i32) -> bool {
+        self.states.iter_mut().any(|(&pid, state)| {
+            if pid == excluded_pid {
+                return false;
+            }
+            let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+                return false;
+            };
+            process_is_alive(watcher, pid)
+        })
+    }
+
+    fn active_process_count(&mut self) -> usize {
+        self.states
+            .iter_mut()
+            .filter_map(|(&pid, state)| {
+                let ProcessTracking::Tracked(watcher) = &mut state.tracking else {
+                    return None;
+                };
+                process_is_alive(watcher, pid).then_some(())
+            })
+            .count()
+    }
 }
 
 fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
@@ -304,35 +426,24 @@ impl PerfRecorder {
         )
         .map_err(|err| perf.resume_error_or(err))?;
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
-            active_processes.insert(pid_i32, try_new_exit_watcher(pid_i32));
+            processes.track_if_untracked(pid_i32);
             if let Ok((identity, _)) = read_process_image_identity(pid) {
-                process_images.insert(pid_i32, identity);
+                processes.state_mut(pid_i32).image = Some(identity);
             }
             if let Ok(start_time) = read_process_start_time(pid) {
-                process_start_times.insert(pid_i32, start_time);
+                processes.state_mut(pid_i32).start_time = Some(start_time);
             }
         }
-        let python_perf_support =
-            process_has_python_perf_support(pid, &mut python_perf_support_processes);
+        let python_perf_support = process_has_python_perf_support(pid, &mut processes);
         (|| {
             let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
-                && register_existing_maps(pid, &mut modules, &mut unwinders, &mut writer)?;
+                && register_existing_maps(pid, &mut modules, &mut processes, &mut writer)?;
             if let Some(pid_i32) =
                 i32_from_u32(pid).filter(|_| registered_existing_maps && python_perf_support)
             {
-                mark_python_runtime_process(
-                    &mut python_runtime_processes,
-                    &mut writer,
-                    0,
-                    pid_i32,
-                )?;
+                mark_python_runtime_process(&mut processes, &mut writer, 0, pid_i32)?;
             }
             Ok::<_, io::Error>(())
         })()
@@ -343,12 +454,7 @@ impl PerfRecorder {
             event_sorter: EventSorter::new(),
             writer,
             modules,
-            unwinders,
-            active_processes,
-            process_images,
-            process_start_times,
-            python_perf_support_processes,
-            python_runtime_processes,
+            processes,
             stack_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
@@ -372,12 +478,7 @@ impl PerfRecorder {
             perf,
             event_sorter,
             modules,
-            unwinders,
-            active_processes,
-            process_images,
-            process_start_times,
-            python_perf_support_processes,
-            python_runtime_processes,
+            processes,
             stack_scratch,
             writer,
             summary,
@@ -389,12 +490,7 @@ impl PerfRecorder {
         let (mut result, recovery_timestamp_ns) = {
             let ctx = EventContext {
                 modules,
-                unwinders,
-                active_processes,
-                process_images,
-                process_start_times,
-                python_perf_support_processes,
-                python_runtime_processes,
+                processes,
                 writer,
                 summary,
                 stack_scratch,
@@ -454,18 +550,7 @@ impl PerfRecorder {
             }
         }
         if result.is_ok() {
-            let dead_processes: Vec<_> = active_processes
-                .iter_mut()
-                .filter_map(|(&pid, watcher)| {
-                    let dead = !process_is_alive(watcher, pid);
-                    let generation_changed = u32::try_from(pid)
-                        .ok()
-                        .and_then(|pid_u32| read_process_start_time(pid_u32).ok())
-                        .zip(process_start_times.get(&pid).copied())
-                        .is_some_and(|(current, previous)| current != previous);
-                    (dead || generation_changed).then_some(pid)
-                })
-                .collect();
+            let dead_processes = processes.dead_or_reused_pids();
             for pid in dead_processes {
                 if let Ok(pid_u32) = u32::try_from(pid) {
                     if let Err(err) = perf.remove_process(pid_u32) {
@@ -473,7 +558,11 @@ impl PerfRecorder {
                         break;
                     }
                 }
-                if python_runtime_processes.contains(&pid) {
+                if processes
+                    .states
+                    .get(&pid)
+                    .is_some_and(|state| state.python_runtime)
+                {
                     let timestamp_ns = lifecycle_actions
                         .iter()
                         .filter_map(|action| match action {
@@ -490,26 +579,18 @@ impl PerfRecorder {
                         result = Err(err);
                         break;
                     }
-                    python_runtime_processes.remove(&pid);
+                    if let Some(state) = processes.states.get_mut(&pid) {
+                        state.python_runtime = false;
+                    }
                 }
-                if let Err(err) = cleanup_process(
-                    pid,
-                    modules,
-                    unwinders,
-                    writer,
-                    active_processes,
-                    process_images,
-                    process_start_times,
-                    python_perf_support_processes,
-                    python_runtime_processes,
-                ) {
+                if let Err(err) = cleanup_process(pid, modules, processes, writer) {
                     result = Err(err);
                     break;
                 }
             }
         }
         if result.is_ok() && recovered_lifecycle_gap {
-            let tracked_pids: Vec<_> = active_processes.keys().copied().collect();
+            let tracked_pids = processes.tracked_pids();
             for pid in tracked_pids {
                 let Ok(pid_u32) = u32::try_from(pid) else {
                     continue;
@@ -518,12 +599,8 @@ impl PerfRecorder {
                     pid_u32,
                     recovery_timestamp_ns,
                     modules,
-                    unwinders,
+                    processes,
                     writer,
-                    process_images,
-                    process_start_times,
-                    python_perf_support_processes,
-                    python_runtime_processes,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -531,17 +608,7 @@ impl PerfRecorder {
                             result = Err(err);
                             break;
                         }
-                        if let Err(err) = cleanup_process(
-                            pid,
-                            modules,
-                            unwinders,
-                            writer,
-                            active_processes,
-                            process_images,
-                            process_start_times,
-                            python_perf_support_processes,
-                            python_runtime_processes,
-                        ) {
+                        if let Err(err) = cleanup_process(pid, modules, processes, writer) {
                             result = Err(err);
                             break;
                         }
@@ -558,22 +625,21 @@ impl PerfRecorder {
             && recovered_lifecycle_gap
             && inherit_child_processes
         {
-            let roots: Vec<_> = active_processes.keys().copied().collect();
+            let roots = processes.tracked_pids();
             let mut discovered = FxHashSet::default();
             for root in roots {
                 for (child, parent) in crate::children::discover_descendant_edges(root) {
-                    if !discovered.insert(child) || active_processes.contains_key(&child) {
+                    if !discovered.insert(child) || processes.is_tracked(child) {
                         continue;
                     }
                     let Ok(child_u32) = u32::try_from(child) else {
                         continue;
                     };
-                    let python_perf_support =
-                        process_has_python_perf_support(child_u32, python_perf_support_processes);
-                    match register_existing_maps(child_u32, modules, unwinders, writer) {
+                    let python_perf_support = process_has_python_perf_support(child_u32, processes);
+                    match register_existing_maps(child_u32, modules, processes, writer) {
                         Ok(true) if python_perf_support => {
                             if let Err(err) = mark_python_runtime_process(
-                                python_runtime_processes,
+                                processes,
                                 writer,
                                 recovery_timestamp_ns,
                                 child,
@@ -589,12 +655,12 @@ impl PerfRecorder {
                             break;
                         }
                     }
-                    active_processes.insert(child, try_new_exit_watcher(child));
+                    processes.track_if_untracked(child);
                     if let Ok((identity, _)) = read_process_image_identity(child_u32) {
-                        process_images.insert(child, identity);
+                        processes.state_mut(child).image = Some(identity);
                     }
                     if let Ok(start_time) = read_process_start_time(child_u32) {
-                        process_start_times.insert(child, start_time);
+                        processes.state_mut(child).start_time = Some(start_time);
                     }
                     if let Ok(parent_u32) = u32::try_from(parent) {
                         recovered_process_forks.push((child_u32, parent_u32));
@@ -609,9 +675,10 @@ impl PerfRecorder {
             result = perf.recover_forked_processes(&recovered_process_forks);
         }
         if result.is_ok() && open_new_perf_events && recovered_lifecycle_gap {
-            for pid in active_processes
-                .keys()
-                .filter_map(|pid| u32::try_from(*pid).ok())
+            for pid in processes
+                .tracked_pids()
+                .into_iter()
+                .filter_map(|pid| u32::try_from(pid).ok())
             {
                 if let Err(err) = perf.refresh_threads(pid) {
                     if !process_gone_error(&err) {
@@ -635,52 +702,49 @@ impl PerfRecorder {
 
     /// Add another process to this recording.
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
-        if let Some(pid_i32) = i32_from_u32(pid) {
-            let previous_start_time = self.process_start_times.get(&pid_i32).copied();
-            if let Some(watcher) = self.active_processes.get_mut(&pid_i32) {
-                // Reopen only after proving that the old process is gone or
-                // that this numeric PID now identifies a new generation.
-                let stale = !process_is_alive(watcher, pid_i32)
-                    || previous_start_time.is_some_and(|previous| {
-                        read_process_start_time(pid).is_ok_and(|current| current != previous)
-                    });
-                if !stale {
-                    return Ok(());
-                }
-                self.perf.remove_process(pid)?;
-                cleanup_process(
-                    pid_i32,
-                    &mut self.modules,
-                    &mut self.unwinders,
-                    &mut self.writer,
-                    &mut self.active_processes,
-                    &mut self.process_images,
-                    &mut self.process_start_times,
-                    &mut self.python_perf_support_processes,
-                    &mut self.python_runtime_processes,
-                )?;
+        if let Some(pid_i32) = i32_from_u32(pid).filter(|pid| self.processes.is_tracked(*pid)) {
+            let current_start_time = self
+                .processes
+                .states
+                .get(&pid_i32)
+                .and_then(|state| state.start_time)
+                .and_then(|_| read_process_start_time(pid).ok());
+            let stale = self
+                .processes
+                .tracked_process_is_stale(pid_i32, current_start_time)
+                .expect("filtered to a tracked process");
+            // Reopen only after proving that the old process is gone or
+            // that this numeric PID now identifies a new generation.
+            if !stale {
+                return Ok(());
             }
+            self.perf.remove_process(pid)?;
+            cleanup_process(
+                pid_i32,
+                &mut self.modules,
+                &mut self.processes,
+                &mut self.writer,
+            )?;
         }
         let opened = self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
-            self.track_process(pid_i32);
+            self.processes.track(pid_i32);
             if let Ok((identity, _)) = read_process_image_identity(pid) {
-                self.process_images.insert(pid_i32, identity);
+                self.processes.state_mut(pid_i32).image = Some(identity);
             }
             if let Ok(start_time) = read_process_start_time(pid) {
-                self.process_start_times.insert(pid_i32, start_time);
+                self.processes.state_mut(pid_i32).start_time = Some(start_time);
             }
-            let python_perf_support =
-                process_has_python_perf_support(pid, &mut self.python_perf_support_processes);
+            let python_perf_support = process_has_python_perf_support(pid, &mut self.processes);
             match register_existing_maps(
                 pid,
                 &mut self.modules,
-                &mut self.unwinders,
+                &mut self.processes,
                 &mut self.writer,
             ) {
                 Ok(true) if python_perf_support => {
                     if let Err(err) = mark_python_runtime_process(
-                        &mut self.python_runtime_processes,
+                        &mut self.processes,
                         &mut self.writer,
                         0,
                         pid_i32,
@@ -726,27 +790,17 @@ impl PerfRecorder {
 
     /// Return whether `pid` is still believed to be alive.
     pub fn process_is_active(&mut self, pid: i32) -> bool {
-        self.active_processes
-            .get_mut(&pid)
-            .is_some_and(|watcher| process_is_alive(watcher, pid))
+        self.processes.process_is_active(pid)
     }
 
     /// Return whether any active process other than `pid` remains.
     pub fn has_active_processes_except(&mut self, pid: i32) -> bool {
-        self.active_processes
-            .iter_mut()
-            .any(|(&active_pid, watcher)| {
-                active_pid != pid && process_is_alive(watcher, active_pid)
-            })
+        self.processes.has_active_processes_except(pid)
     }
 
     /// Return the number of processes still believed to be alive.
     pub fn active_process_count(&mut self) -> usize {
-        let mut count = 0;
-        for (&pid, watcher) in &mut self.active_processes {
-            count += usize::from(process_is_alive(watcher, pid));
-        }
-        count
+        self.processes.active_process_count()
     }
 
     /// Flush the profile file and return the final counters.
@@ -755,19 +809,6 @@ impl PerfRecorder {
         self.drain_events(DrainMode::Flush, false)?;
         self.writer.flush()?;
         Ok(self.summary)
-    }
-
-    fn track_process(&mut self, pid: i32) {
-        match self.active_processes.entry(pid) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(try_new_exit_watcher(pid));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if !process_is_alive(entry.get_mut(), pid) {
-                    entry.insert(try_new_exit_watcher(pid));
-                }
-            }
-        }
     }
 
     fn rollback_open_process(
@@ -782,13 +823,8 @@ impl PerfRecorder {
             let _ = cleanup_process(
                 pid,
                 &mut self.modules,
-                &mut self.unwinders,
+                &mut self.processes,
                 &mut self.writer,
-                &mut self.active_processes,
-                &mut self.process_images,
-                &mut self.process_start_times,
-                &mut self.python_perf_support_processes,
-                &mut self.python_runtime_processes,
             );
         }
         error
@@ -820,13 +856,12 @@ fn handle_non_sample_record<W: std::io::Write>(
 ) -> io::Result<()> {
     match record {
         Record::Mmap(mmap) => {
-            record_mmap(ctx.modules, ctx.unwinders, ctx.writer, &mmap, privilege)?;
+            record_mmap(ctx.modules, ctx.processes, ctx.writer, &mmap, privilege)?;
             record_python_runtime_mmap(
                 &mmap,
                 privilege,
                 event_timestamp_ns,
-                ctx.python_perf_support_processes,
-                ctx.python_runtime_processes,
+                ctx.processes,
                 ctx.writer,
             )
         }
@@ -841,57 +876,58 @@ fn handle_non_sample_record<W: std::io::Write>(
                 return Ok(());
             };
 
+            // Snapshot all inherited state before touching the child: numeric
+            // PID reuse can make child cleanup mutate the same table.
+            let (parent_image, parent_python_support, parent_python_runtime, mut child_unwinder) =
+                ctx.processes.states.get(&ppid).map_or_else(
+                    || (None, None, false, ProcessUnwinder::default()),
+                    |state| {
+                        (
+                            state.image.clone(),
+                            state.python_perf_support,
+                            state.python_runtime,
+                            state.unwinder.clone().unwrap_or_default(),
+                        )
+                    },
+                );
             let current_start_time = read_process_start_time(fork.task.pid).ok();
-            let reused_pid = ctx.active_processes.get_mut(&pid).is_some_and(|watcher| {
-                !process_is_alive(watcher, pid)
-                    || current_start_time
-                        .zip(ctx.process_start_times.get(&pid).copied())
-                        .is_some_and(|(current, previous)| current != previous)
-            });
+            let reused_pid = ctx
+                .processes
+                .tracked_process_is_stale(pid, current_start_time)
+                .unwrap_or(false);
             if reused_pid {
-                if ctx.python_runtime_processes.remove(&pid) {
+                let was_python_runtime = ctx
+                    .processes
+                    .states
+                    .get_mut(&pid)
+                    .is_some_and(|state| std::mem::take(&mut state.python_runtime));
+                if was_python_runtime {
                     ctx.writer
                         .write_process_exec(event_timestamp_ns, pid, false)?;
                 }
-                cleanup_process(
-                    pid,
-                    ctx.modules,
-                    ctx.unwinders,
-                    ctx.writer,
-                    ctx.active_processes,
-                    ctx.process_images,
-                    ctx.process_start_times,
-                    ctx.python_perf_support_processes,
-                    ctx.python_runtime_processes,
-                )?;
+                cleanup_process(pid, ctx.modules, ctx.processes, ctx.writer)?;
                 ctx.lifecycle_actions
                     .push(LifecycleAction::ProcessRetire { pid: fork.task.pid });
             }
-            ctx.active_processes
-                .entry(pid)
-                .or_insert_with(|| try_new_exit_watcher(pid));
-            if let Some(identity) = ctx.process_images.get(&ppid).cloned() {
-                ctx.process_images.insert(pid, identity);
+            ctx.processes.track_if_untracked(pid);
+            let child = ctx.processes.state_mut(pid);
+            if let Some(identity) = parent_image {
+                child.image = Some(identity);
             }
             if let Some(start_time) = current_start_time {
-                ctx.process_start_times.insert(pid, start_time);
+                child.start_time = Some(start_time);
             }
-            if let Some(&supported) = ctx.python_perf_support_processes.get(&ppid) {
-                ctx.python_perf_support_processes.insert(pid, supported);
+            if let Some(supported) = parent_python_support {
+                child.python_perf_support = Some(supported);
             }
-            inherit_python_runtime_process(
-                ctx.python_runtime_processes,
-                ctx.writer,
-                event_timestamp_ns,
-                ppid,
-                pid,
-            )?;
+            if parent_python_runtime {
+                mark_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
+            }
             let updates = ctx.modules.clone_process_modules(ppid, pid, ctx.writer)?;
-            let mut child_unwinder = ctx.unwinders.get(&ppid).cloned().unwrap_or_default();
             for update in &updates {
                 child_unwinder.apply_module_update(update);
             }
-            ctx.unwinders.insert(pid, child_unwinder);
+            ctx.processes.state_mut(pid).unwinder = Some(child_unwinder);
             ctx.lifecycle_actions.push(LifecycleAction::ProcessFork {
                 pid: fork.task.pid,
                 parent_tid: fork.parent_task.tid,
@@ -914,9 +950,14 @@ fn handle_non_sample_record<W: std::io::Write>(
             };
             let current = read_process_image_identity(comm.task.pid).ok();
             let identity_changed = current.as_ref().is_some_and(|(identity, current_comm)| {
-                ctx.process_images.get(&pid).is_some_and(|previous| {
-                    previous.device != identity.device || previous.inode != identity.inode
-                }) && current_comm.as_slice() == comm.comm.as_bytes()
+                ctx.processes
+                    .states
+                    .get(&pid)
+                    .and_then(|state| state.image.as_ref())
+                    .is_some_and(|previous| {
+                        previous.device != identity.device || previous.inode != identity.inode
+                    })
+                    && current_comm.as_slice() == comm.comm.as_bytes()
             });
             if !comm.by_execve && !identity_changed {
                 return Ok(());
@@ -924,17 +965,18 @@ fn handle_non_sample_record<W: std::io::Write>(
 
             // A confirmed exec is an epoch boundary. Do not read current maps
             // here: the subsequent MMAP records retain their proper ordering.
-            cleanup_process_modules(pid, ctx.modules, ctx.unwinders, ctx.writer)?;
-            ctx.python_perf_support_processes.remove(&pid);
-            if ctx.python_runtime_processes.remove(&pid) {
+            cleanup_process_modules(pid, ctx.modules, ctx.processes, ctx.writer)?;
+            let was_python_runtime = if let Some(state) = ctx.processes.states.get_mut(&pid) {
+                state.python_perf_support = None;
+                std::mem::take(&mut state.python_runtime)
+            } else {
+                false
+            };
+            if was_python_runtime {
                 ctx.writer
                     .write_process_exec(event_timestamp_ns, pid, false)?;
             }
-            if let Some((identity, _)) = current {
-                ctx.process_images.insert(pid, identity);
-            } else {
-                ctx.process_images.remove(&pid);
-            }
+            ctx.processes.state_mut(pid).image = current.map(|(identity, _)| identity);
             Ok(())
         }
         Record::Exit(exit) => {
@@ -977,49 +1019,36 @@ fn i32_from_u32(value: u32) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cleanup_process(
     pid: i32,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<impl std::io::Write>,
-    active_processes: &mut FxHashMap<i32, Option<ProcessExitWatcher>>,
-    process_images: &mut FxHashMap<i32, ProcessImageIdentity>,
-    process_start_times: &mut FxHashMap<i32, u64>,
-    python_perf_support_processes: &mut FxHashMap<i32, bool>,
-    python_runtime_processes: &mut FxHashSet<i32>,
 ) -> io::Result<()> {
-    let result = cleanup_process_modules(pid, modules, unwinders, writer);
-    active_processes.remove(&pid);
-    process_images.remove(&pid);
-    process_start_times.remove(&pid);
-    python_perf_support_processes.remove(&pid);
-    python_runtime_processes.remove(&pid);
+    let result = cleanup_process_modules(pid, modules, processes, writer);
+    processes.states.remove(&pid);
     result
 }
 
 fn cleanup_process_modules<W: std::io::Write>(
     pid: i32,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<()> {
     modules.deactivate_process_modules(pid, writer)?;
-    unwinders.remove(&pid);
+    if let Some(state) = processes.states.get_mut(&pid) {
+        state.unwinder = None;
+    }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn reconcile_process_image<W: std::io::Write>(
     pid: u32,
     timestamp_ns: u64,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
-    process_images: &mut FxHashMap<i32, ProcessImageIdentity>,
-    process_start_times: &mut FxHashMap<i32, u64>,
-    python_perf_support_processes: &mut FxHashMap<i32, bool>,
-    python_runtime_processes: &mut FxHashSet<i32>,
 ) -> io::Result<bool> {
     let Some(pid_i32) = i32_from_u32(pid) else {
         return Ok(false);
@@ -1028,8 +1057,10 @@ fn reconcile_process_image<W: std::io::Write>(
     let current_start_time = match read_process_start_time(pid) {
         Ok(start_time) => start_time,
         Err(err) if process_gone_error(&err) => {
-            process_images.remove(&pid_i32);
-            process_start_times.remove(&pid_i32);
+            if let Some(state) = processes.states.get_mut(&pid_i32) {
+                state.image = None;
+                state.start_time = None;
+            }
             return Ok(false);
         }
         Err(err) => return Err(err),
@@ -1044,8 +1075,10 @@ fn reconcile_process_image<W: std::io::Write>(
     let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
         Ok(maps) => maps,
         Err(err) if process_gone_error(&err) => {
-            process_images.remove(&pid_i32);
-            process_start_times.remove(&pid_i32);
+            if let Some(state) = processes.states.get_mut(&pid_i32) {
+                state.image = None;
+                state.start_time = None;
+            }
             return Ok(false);
         }
         Err(err) => return Err(err),
@@ -1058,43 +1091,60 @@ fn reconcile_process_image<W: std::io::Write>(
         return Ok(true);
     }
 
-    let image_matches = current_identity
-        .as_ref()
-        .is_none_or(|identity| process_images.get(&pid_i32) == Some(identity));
-    let start_time_matches = process_start_times.get(&pid_i32) == Some(&current_start_time);
+    let image_matches = current_identity.as_ref().is_none_or(|identity| {
+        processes
+            .states
+            .get(&pid_i32)
+            .and_then(|state| state.image.as_ref())
+            == Some(identity)
+    });
+    let start_time_matches = processes
+        .states
+        .get(&pid_i32)
+        .and_then(|state| state.start_time)
+        == Some(current_start_time);
     if image_matches && start_time_matches && modules.process_modules_match(pid_i32, &snapshot) {
         if let Some(identity) = current_identity {
-            process_images.insert(pid_i32, identity);
+            processes.state_mut(pid_i32).image = Some(identity);
         }
         return Ok(true);
     }
 
-    cleanup_process_modules(pid_i32, modules, unwinders, writer)?;
-    python_perf_support_processes.remove(&pid_i32);
-    if python_runtime_processes.remove(&pid_i32) {
+    cleanup_process_modules(pid_i32, modules, processes, writer)?;
+    let was_python_runtime = if let Some(state) = processes.states.get_mut(&pid_i32) {
+        state.python_perf_support = None;
+        std::mem::take(&mut state.python_runtime)
+    } else {
+        false
+    };
+    if was_python_runtime {
         writer.write_process_exec(timestamp_ns, pid_i32, false)?;
     }
 
-    let registered = register_existing_modules(snapshot, modules, unwinders, writer);
+    let registered = register_existing_modules(snapshot, modules, processes, writer);
     match registered {
-        Ok(true) if process_has_python_perf_support(pid, python_perf_support_processes) => {
+        Ok(true) if process_has_python_perf_support(pid, processes) => {
+            let state = processes.state_mut(pid_i32);
             if let Some(identity) = current_identity {
-                process_images.insert(pid_i32, identity);
+                state.image = Some(identity);
             }
-            process_start_times.insert(pid_i32, current_start_time);
-            mark_python_runtime_process(python_runtime_processes, writer, timestamp_ns, pid_i32)?;
+            state.start_time = Some(current_start_time);
+            mark_python_runtime_process(processes, writer, timestamp_ns, pid_i32)?;
             Ok(true)
         }
         Ok(_) => {
+            let state = processes.state_mut(pid_i32);
             if let Some(identity) = current_identity {
-                process_images.insert(pid_i32, identity);
+                state.image = Some(identity);
             }
-            process_start_times.insert(pid_i32, current_start_time);
+            state.start_time = Some(current_start_time);
             Ok(true)
         }
         Err(err) if process_gone_error(&err) => {
-            process_images.remove(&pid_i32);
-            process_start_times.remove(&pid_i32);
+            if let Some(state) = processes.states.get_mut(&pid_i32) {
+                state.image = None;
+                state.start_time = None;
+            }
             Ok(false)
         }
         Err(err) => Err(err),
@@ -1141,42 +1191,31 @@ fn cmdline_has_python_perf_support(cmdline: &[u8]) -> bool {
     false
 }
 
-fn process_has_python_perf_support(
-    pid: u32,
-    python_perf_support_processes: &mut FxHashMap<i32, bool>,
-) -> bool {
+fn process_has_python_perf_support(pid: u32, processes: &mut ProcessTable) -> bool {
     let Some(pid_i32) = i32_from_u32(pid) else {
         return false;
     };
-    if let Some(&supported) = python_perf_support_processes.get(&pid_i32) {
+    if let Some(supported) = processes
+        .states
+        .get(&pid_i32)
+        .and_then(|state| state.python_perf_support)
+    {
         return supported;
     }
     let supported = process_has_python_perf_support_enabled(pid);
-    python_perf_support_processes.insert(pid_i32, supported);
+    processes.state_mut(pid_i32).python_perf_support = Some(supported);
     supported
 }
 
 fn mark_python_runtime_process<W: std::io::Write>(
-    python_runtime_processes: &mut FxHashSet<i32>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
     timestamp_ns: u64,
     pid: i32,
 ) -> io::Result<()> {
-    if python_runtime_processes.insert(pid) {
+    let state = processes.state_mut(pid);
+    if !std::mem::replace(&mut state.python_runtime, true) {
         writer.write_process_exec(timestamp_ns, pid, true)?;
-    }
-    Ok(())
-}
-
-fn inherit_python_runtime_process<W: std::io::Write>(
-    python_runtime_processes: &mut FxHashSet<i32>,
-    writer: &mut PerfSpoolWriter<W>,
-    timestamp_ns: u64,
-    parent_pid: i32,
-    child_pid: i32,
-) -> io::Result<()> {
-    if python_runtime_processes.contains(&parent_pid) {
-        mark_python_runtime_process(python_runtime_processes, writer, timestamp_ns, child_pid)?;
     }
     Ok(())
 }
@@ -1185,8 +1224,7 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     mmap: &Mmap,
     privilege: Priv,
     timestamp_ns: u64,
-    python_perf_support_processes: &mut FxHashMap<i32, bool>,
-    python_runtime_processes: &mut FxHashSet<i32>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<()> {
     if is_kernel_mode(privilege) || !mmap_is_executable(mmap) {
@@ -1201,8 +1239,8 @@ fn record_python_runtime_mmap<W: std::io::Write>(
     if !crate::is_python_runtime_module_path(path) {
         return Ok(());
     }
-    if process_has_python_perf_support(mmap.task.pid, python_perf_support_processes) {
-        mark_python_runtime_process(python_runtime_processes, writer, timestamp_ns, pid)?;
+    if process_has_python_perf_support(mmap.task.pid, processes) {
+        mark_python_runtime_process(processes, writer, timestamp_ns, pid)?;
     }
     Ok(())
 }
@@ -1453,7 +1491,11 @@ fn record_prepared_sample<W: std::io::Write>(
         user_regs: sample.user_regs.as_deref(),
         user_stack: sample.user_stack.as_deref(),
     };
-    let unwinder = ctx.unwinders.entry(pid).or_default();
+    let unwinder = ctx
+        .processes
+        .state_mut(pid)
+        .unwinder
+        .get_or_insert_default();
     build_sample_stack::<ConvertRegsNative>(
         input,
         sample.privilege,
@@ -1507,21 +1549,17 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
         return Ok(());
     }
     if !ctx
-        .unwinders
-        .entry(sample.pid)
-        .or_default()
+        .processes
+        .state_mut(sample.pid)
+        .unwinder
+        .get_or_insert_default()
         .should_refresh_for_uncovered_pc(pc)
     {
         return Ok(());
     }
-    match register_existing_maps(pid, ctx.modules, ctx.unwinders, ctx.writer) {
-        Ok(true) if process_has_python_perf_support(pid, ctx.python_perf_support_processes) => {
-            mark_python_runtime_process(
-                ctx.python_runtime_processes,
-                ctx.writer,
-                sample.timestamp_ns,
-                sample.pid,
-            )
+    match register_existing_maps(pid, ctx.modules, ctx.processes, ctx.writer) {
+        Ok(true) if process_has_python_perf_support(pid, ctx.processes) => {
+            mark_python_runtime_process(ctx.processes, ctx.writer, sample.timestamp_ns, sample.pid)
         }
         Ok(_) => Ok(()),
         Err(err) if process_gone_error(&err) => Ok(()),
@@ -1560,7 +1598,7 @@ fn is_kernel_mode(privilege: Priv) -> bool {
 
 fn record_module<W: std::io::Write>(
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
     module: ModuleRecord,
 ) -> io::Result<()> {
@@ -1574,9 +1612,10 @@ fn record_module<W: std::io::Write>(
     for activation in &update.active {
         let module = &activation.module;
         if !module.is_kernel {
-            unwinders
-                .entry(module.process_id)
-                .or_default()
+            processes
+                .state_mut(module.process_id)
+                .unwinder
+                .get_or_insert_default()
                 .apply_module_update(&update);
             break;
         }
@@ -1600,7 +1639,7 @@ struct MmapEvent<'a> {
 
 fn record_mmap_event<W: std::io::Write>(
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
     event: MmapEvent<'_>,
 ) -> io::Result<()> {
@@ -1610,7 +1649,7 @@ fn record_mmap_event<W: std::io::Write>(
     }
     record_module(
         modules,
-        unwinders,
+        processes,
         writer,
         ModuleRecord {
             id: 0,
@@ -1630,7 +1669,7 @@ fn record_mmap_event<W: std::io::Write>(
 
 fn record_mmap<W: std::io::Write>(
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
     mmap: &Mmap,
     privilege: Priv,
@@ -1652,7 +1691,7 @@ fn record_mmap<W: std::io::Write>(
     };
     record_mmap_event(
         modules,
-        unwinders,
+        processes,
         writer,
         MmapEvent {
             pid,
@@ -1701,24 +1740,24 @@ fn open_perf_group(
 fn register_existing_maps<W: std::io::Write>(
     pid: u32,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
-    register_existing_maps_snapshot(pid, &maps, modules, unwinders, writer)
+    register_existing_maps_snapshot(pid, &maps, modules, processes, writer)
 }
 
 fn register_existing_maps_snapshot<W: std::io::Write>(
     pid: u32,
     maps: &str,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
     register_existing_modules(
         executable_modules_from_maps(pid, maps),
         modules,
-        unwinders,
+        processes,
         writer,
     )
 }
@@ -1745,13 +1784,13 @@ fn executable_modules_from_maps(pid: u32, maps: &str) -> Vec<ModuleRecord> {
 fn register_existing_modules<W: std::io::Write>(
     snapshot: Vec<ModuleRecord>,
     modules: &mut ModuleTable,
-    unwinders: &mut FxHashMap<i32, ProcessUnwinder>,
+    processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
     let mut saw_python_runtime = false;
     for module in snapshot {
         saw_python_runtime |= crate::is_python_runtime_module_path(&module.path);
-        record_module(modules, unwinders, writer, module)?;
+        record_module(modules, processes, writer, module)?;
     }
     Ok(saw_python_runtime)
 }
@@ -1998,16 +2037,11 @@ pub(crate) fn bench_replay_live_perf_ring_records(
             1_000,
         )?;
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
+        let mut processes = ProcessTable::default();
         for module in &fixture.modules {
-            record_module(&mut modules, &mut unwinders, &mut writer, module.clone())?;
+            record_module(&mut modules, &mut processes, &mut writer, module.clone())?;
         }
 
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
         let mut lifecycle_actions = Vec::new();
@@ -2016,12 +2050,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
         {
             let mut ctx = EventContext {
                 modules: &mut modules,
-                unwinders: &mut unwinders,
-                active_processes: &mut active_processes,
-                process_images: &mut process_images,
-                process_start_times: &mut process_start_times,
-                python_perf_support_processes: &mut python_perf_support_processes,
-                python_runtime_processes: &mut python_runtime_processes,
+                processes: &mut processes,
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
@@ -2185,12 +2214,7 @@ mod tests {
         let pid = std::process::id();
         let pid_i32 = i32::try_from(pid).unwrap();
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
@@ -2202,12 +2226,7 @@ mod tests {
         {
             let mut ctx = EventContext {
                 modules: &mut modules,
-                unwinders: &mut unwinders,
-                active_processes: &mut active_processes,
-                process_images: &mut process_images,
-                process_start_times: &mut process_start_times,
-                python_perf_support_processes: &mut python_perf_support_processes,
-                python_runtime_processes: &mut python_runtime_processes,
+                processes: &mut processes,
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
@@ -2243,24 +2262,14 @@ mod tests {
         let pid = std::process::id();
         let tid = pid.saturating_add(1);
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut ctx = EventContext {
             modules: &mut modules,
-            unwinders: &mut unwinders,
-            active_processes: &mut active_processes,
-            process_images: &mut process_images,
-            process_start_times: &mut process_start_times,
-            python_perf_support_processes: &mut python_perf_support_processes,
-            python_runtime_processes: &mut python_runtime_processes,
+            processes: &mut processes,
             writer: &mut writer,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
@@ -2314,12 +2323,7 @@ mod tests {
     fn ring_lost_record_is_not_counted_twice() {
         let pid = i32::try_from(std::process::id()).unwrap();
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
@@ -2330,12 +2334,7 @@ mod tests {
 
         let mut ctx = EventContext {
             modules: &mut modules,
-            unwinders: &mut unwinders,
-            active_processes: &mut active_processes,
-            process_images: &mut process_images,
-            process_start_times: &mut process_start_times,
-            python_perf_support_processes: &mut python_perf_support_processes,
-            python_runtime_processes: &mut python_runtime_processes,
+            processes: &mut processes,
             writer: &mut writer,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
@@ -2408,32 +2407,20 @@ mod tests {
         let snapshot = executable_modules_from_maps(pid, &maps);
         let probe_address = snapshot.first().expect("executable mapping").start;
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
+        let mut processes = ProcessTable::default();
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
-        register_existing_modules(snapshot, &mut modules, &mut unwinders, &mut writer).unwrap();
+        register_existing_modules(snapshot, &mut modules, &mut processes, &mut writer).unwrap();
         let module_id = modules
             .resolve_frame(pid_i32, probe_address, FrameMode::User)
             .module_id
             .expect("registered mapping");
-        let mut process_images =
-            FxHashMap::from_iter([(pid_i32, read_process_image_identity(pid).unwrap().0)]);
-        let mut process_start_times =
-            FxHashMap::from_iter([(pid_i32, read_process_start_time(pid).unwrap())]);
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let state = processes.state_mut(pid_i32);
+        state.image = Some(read_process_image_identity(pid).unwrap().0);
+        state.start_time = Some(read_process_start_time(pid).unwrap());
 
-        assert!(reconcile_process_image(
-            pid,
-            123,
-            &mut modules,
-            &mut unwinders,
-            &mut writer,
-            &mut process_images,
-            &mut process_start_times,
-            &mut python_perf_support_processes,
-            &mut python_runtime_processes,
-        )
-        .unwrap());
+        assert!(
+            reconcile_process_image(pid, 123, &mut modules, &mut processes, &mut writer,).unwrap()
+        );
         assert_eq!(
             modules
                 .resolve_frame(pid_i32, probe_address, FrameMode::User)
@@ -2448,12 +2435,8 @@ mod tests {
         let pid = i32::try_from(pid_u32).unwrap();
         let (identity, current_comm) = read_process_image_identity(pid_u32).unwrap();
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::from_iter([(pid, identity)]);
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
+        processes.state_mut(pid).image = Some(identity);
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
@@ -2464,12 +2447,7 @@ mod tests {
 
         let mut ctx = EventContext {
             modules: &mut modules,
-            unwinders: &mut unwinders,
-            active_processes: &mut active_processes,
-            process_images: &mut process_images,
-            process_start_times: &mut process_start_times,
-            python_perf_support_processes: &mut python_perf_support_processes,
-            python_runtime_processes: &mut python_runtime_processes,
+            processes: &mut processes,
             writer: &mut writer,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
@@ -2511,12 +2489,8 @@ mod tests {
         };
         let (_, current_comm) = read_process_image_identity(child_pid_u32).unwrap();
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::from_iter([(parent_pid, inherited_identity.clone())]);
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
+        processes.state_mut(parent_pid).image = Some(inherited_identity.clone());
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
@@ -2527,12 +2501,7 @@ mod tests {
 
         let mut ctx = EventContext {
             modules: &mut modules,
-            unwinders: &mut unwinders,
-            active_processes: &mut active_processes,
-            process_images: &mut process_images,
-            process_start_times: &mut process_start_times,
-            python_perf_support_processes: &mut python_perf_support_processes,
-            python_runtime_processes: &mut python_runtime_processes,
+            processes: &mut processes,
             writer: &mut writer,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
@@ -2556,10 +2525,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ctx.process_images.get(&child_pid),
+            ctx.processes
+                .states
+                .get(&child_pid)
+                .and_then(|state| state.image.as_ref()),
             Some(&inherited_identity)
         );
-        assert!(ctx.process_start_times.contains_key(&child_pid));
+        assert!(ctx
+            .processes
+            .states
+            .get(&child_pid)
+            .is_some_and(|state| state.start_time.is_some()));
         assert!(ctx
             .modules
             .resolve_frame(child_pid, 0x1800, FrameMode::User)
@@ -2628,12 +2604,7 @@ mod tests {
     #[test]
     fn sample_prepare_defers_unwind_until_finish() {
         let mut modules = ModuleTable::default();
-        let mut unwinders = FxHashMap::default();
-        let mut active_processes = FxHashMap::default();
-        let mut process_images = FxHashMap::default();
-        let mut process_start_times = FxHashMap::default();
-        let mut python_perf_support_processes = FxHashMap::default();
-        let mut python_runtime_processes = FxHashSet::default();
+        let mut processes = ProcessTable::default();
         let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).expect("spool writer");
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
@@ -2651,12 +2622,7 @@ mod tests {
         let prepared = {
             let mut ctx = EventContext {
                 modules: &mut modules,
-                unwinders: &mut unwinders,
-                active_processes: &mut active_processes,
-                process_images: &mut process_images,
-                process_start_times: &mut process_start_times,
-                python_perf_support_processes: &mut python_perf_support_processes,
-                python_runtime_processes: &mut python_runtime_processes,
+                processes: &mut processes,
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
@@ -2668,7 +2634,7 @@ mod tests {
                 .expect("prepared sample")
         };
 
-        assert!(unwinders.is_empty());
+        assert!(processes.states.is_empty());
         assert_eq!(summary.sample_events, 1);
         assert_eq!(
             summary
@@ -2679,12 +2645,7 @@ mod tests {
 
         let mut ctx = EventContext {
             modules: &mut modules,
-            unwinders: &mut unwinders,
-            active_processes: &mut active_processes,
-            process_images: &mut process_images,
-            process_start_times: &mut process_start_times,
-            python_perf_support_processes: &mut python_perf_support_processes,
-            python_runtime_processes: &mut python_runtime_processes,
+            processes: &mut processes,
             writer: &mut writer,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
@@ -2693,7 +2654,10 @@ mod tests {
         };
         finish_prepared_event(prepared, &mut ctx).expect("finish sample");
 
-        assert!(unwinders.contains_key(&7));
+        assert!(processes
+            .states
+            .get(&7)
+            .is_some_and(|state| state.unwinder.is_some()));
         assert_eq!(
             summary
                 .error_stats
@@ -3000,16 +2964,18 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
-        let mut runtime_processes = FxHashSet::default();
-        runtime_processes.insert(7);
+        let mut processes = ProcessTable::default();
+        processes.state_mut(7).python_runtime = true;
 
-        inherit_python_runtime_process(&mut runtime_processes, &mut writer, 456, 7, 8).unwrap();
+        if processes.states[&7].python_runtime {
+            mark_python_runtime_process(&mut processes, &mut writer, 456, 8).unwrap();
+        }
         writer.flush().unwrap();
         drop(writer);
 
         let reader = crate::spool::PerfSpoolReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
-        assert!(runtime_processes.contains(&8));
+        assert!(processes.states[&8].python_runtime);
         assert!(reader.process_execs().iter().any(|exec| {
             exec.timestamp_ns == 456 && exec.process_id == 8 && exec.is_python_runtime
         }));
