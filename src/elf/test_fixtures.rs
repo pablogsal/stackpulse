@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Hard-case section info with 4 segments and non-zero text offsets,
 /// matching the samply hard-case test scenario.
-pub fn fake_hard_case_section_info() -> Arc<ElfSectionInfo> {
+pub(crate) fn fake_hard_case_section_info() -> Arc<ElfSectionInfo> {
     Arc::new(ElfSectionInfo {
         base_svma: 0,
         text_svma: Some(0x14be0c0..(0x14be0c0 + 0xf5bf60)),

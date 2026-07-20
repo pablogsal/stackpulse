@@ -15,17 +15,17 @@ use std::sync::OnceLock;
 
 /// A PT_LOAD segment from an ELF binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadSegment {
+pub(crate) struct LoadSegment {
     /// File offset of this segment
-    pub p_offset: u64,
+    pub(crate) p_offset: u64,
     /// Size of this segment in the file
-    pub p_filesz: u64,
+    pub(crate) p_filesz: u64,
     /// Size of this segment in memory (may exceed p_filesz for BSS)
-    pub p_memsz: u64,
+    pub(crate) p_memsz: u64,
     /// Virtual address of this segment (SVMA)
-    pub p_vaddr: u64,
+    pub(crate) p_vaddr: u64,
     /// Segment flags (PF_X = 0x1, PF_W = 0x2, PF_R = 0x4)
-    pub p_flags: u32,
+    pub(crate) p_flags: u32,
 }
 
 impl LoadSegment {
@@ -153,7 +153,7 @@ impl PageSize {
 }
 
 /// Collect PT_LOAD segments from an ELF, sorted by file offset.
-pub fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
+pub(crate) fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
     let mut segments: Vec<LoadSegment> = elf
         .program_headers
         .iter()
@@ -173,7 +173,7 @@ pub fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for a mapping.
 ///
-pub fn find_load_contribution_for_file_range(
+pub(crate) fn find_load_contribution_for_file_range(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -188,7 +188,7 @@ pub fn find_load_contribution_for_file_range(
 
 /// Variant of [`find_load_contribution_for_file_range`] with an explicit page
 /// size, useful for off-host inputs and deterministic tests.
-pub fn find_load_contribution_for_file_range_with_page_size(
+pub(crate) fn find_load_contribution_for_file_range_with_page_size(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -258,7 +258,7 @@ pub(crate) fn system_page_size() -> u64 {
 
 /// Check whether two file ranges mutually contain each other (either A
 /// contains B or B contains A).
-pub fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
+pub(crate) fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
     FileRange::new(a_start, a_size).correlates_with(FileRange::new(b_start, b_size))
 }
 
@@ -267,7 +267,7 @@ pub fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u6
 /// Given a reference whose file offset and SVMA are known, together with the
 /// mapping's start file offset and start AVMA, returns the bias such that
 /// `svma + bias == avma` for any address in the image.
-pub fn compute_vma_bias(
+pub(crate) fn compute_vma_bias(
     reference_file_offset: u64,
     reference_svma: u64,
     mapping_start_file_offset: u64,

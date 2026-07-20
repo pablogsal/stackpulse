@@ -6,10 +6,10 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub use super::LoadSegment;
+pub(crate) use super::LoadSegment;
 
 #[derive(Clone)]
-pub struct ElfSectionData {
+pub(crate) struct ElfSectionData {
     storage: ElfSectionStorage,
     range: Range<usize>,
 }
@@ -22,7 +22,7 @@ enum ElfSectionStorage {
 
 impl ElfSectionData {
     #[must_use]
-    pub fn owned(data: impl Into<Arc<[u8]>>) -> Self {
+    pub(crate) fn owned(data: impl Into<Arc<[u8]>>) -> Self {
         let data = data.into();
         Self {
             range: 0..data.len(),
@@ -83,36 +83,36 @@ impl Eq for ElfSectionData {}
 /// `eh_frame` and `eh_frame_hdr` clone cheaply so multiple mappings of the same
 /// library share storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ElfSectionInfo {
+pub(crate) struct ElfSectionInfo {
     /// Base stated virtual address from the first PT_LOAD segment.
-    pub base_svma: u64,
+    pub(crate) base_svma: u64,
 
     /// .text section range (SVMA)
-    pub text_svma: Option<Range<u64>>,
+    pub(crate) text_svma: Option<Range<u64>>,
 
     /// .text section range in file-offset space.
-    pub text_file_range: Option<Range<u64>>,
+    pub(crate) text_file_range: Option<Range<u64>>,
 
     /// .text section data.
-    pub text: Option<ElfSectionData>,
+    pub(crate) text: Option<ElfSectionData>,
 
     /// .eh_frame section address (SVMA)
-    pub eh_frame_svma: Option<u64>,
+    pub(crate) eh_frame_svma: Option<u64>,
 
     /// .eh_frame section data
-    pub eh_frame: Option<ElfSectionData>,
+    pub(crate) eh_frame: Option<ElfSectionData>,
 
     /// .eh_frame_hdr section address (SVMA)
-    pub eh_frame_hdr_svma: Option<u64>,
+    pub(crate) eh_frame_hdr_svma: Option<u64>,
 
     /// .eh_frame_hdr section data
-    pub eh_frame_hdr: Option<ElfSectionData>,
+    pub(crate) eh_frame_hdr: Option<ElfSectionData>,
 
     /// .got section range (SVMA)
-    pub got_svma: Option<Range<u64>>,
+    pub(crate) got_svma: Option<Range<u64>>,
 
     /// PT_LOAD segments sorted by file offset.
-    pub load_segments: Box<[LoadSegment]>,
+    pub(crate) load_segments: Box<[LoadSegment]>,
 }
 
 #[cfg(test)]
