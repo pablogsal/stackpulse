@@ -1,15 +1,13 @@
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-use integer_encoding::VarIntWriter;
-use rustc_hash::FxHashMap;
 use stackpulse::bench_support::{
-    self, BenchSpoolSample, LivePerfSampleFixture, SparseKernelSymbolsFixture,
+    self, BenchSpoolSample, LivePerfSampleFixture, SparseKernelSymbolsFixture, CURRENT_SPOOL_MAGIC,
 };
 use stackpulse::profile::{basename_start, LocationInfo, PythonFrame};
 use stackpulse::{
@@ -18,15 +16,7 @@ use stackpulse::{
     ResolvedFrame, SampleErrorKind, SampleErrorStats,
 };
 
-const MAGIC: &[u8; 8] = b"SPULSE1\0";
-const REC_MODULE: u8 = 1;
-const REC_FRAME: u8 = 2;
-const REC_STACK: u8 = 3;
-const REC_THREAD: u8 = 4;
-const REC_SAMPLE: u8 = 5;
-const REC_PROCESS_EXEC: u8 = 6;
-const NONE_U32: u32 = u32::MAX;
-const FIXTURE_VERSION: u32 = 9;
+const FIXTURE_VERSION: u32 = 10;
 
 const OPEN_BATCH: u64 = 8;
 const BORROWED_ITERATE_BATCH: u64 = 64;
@@ -577,9 +567,10 @@ fn ensure_spool_fixture(spec: ScenarioSpec) -> PathBuf {
     let dir = fixture_dir();
     fs::create_dir_all(&dir).expect("create synthetic fixture directory");
     let path = dir.join(format!("{}-v{FIXTURE_VERSION}.spool", spec.name));
-    if path.exists() {
+    if fixture_has_current_magic(&path) {
         return path;
     }
+    let _ = fs::remove_file(&path);
 
     let tmp_path = dir.join(format!(
         "{}-v{FIXTURE_VERSION}.{}.tmp",
@@ -587,6 +578,10 @@ fn ensure_spool_fixture(spec: ScenarioSpec) -> PathBuf {
         std::process::id()
     ));
     write_synthetic_spool(&tmp_path, spec).expect("write synthetic spool fixture");
+    assert!(
+        fixture_has_current_magic(&tmp_path),
+        "synthetic fixture was not written in the current spool format"
+    );
     fs::rename(&tmp_path, &path).expect("install immutable synthetic spool fixture");
     path
 }
@@ -597,35 +592,25 @@ fn fixture_dir() -> PathBuf {
         .join("stackpulse-bench-fixtures")
 }
 
+fn fixture_has_current_magic(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0; CURRENT_SPOOL_MAGIC.len()];
+    file.read_exact(&mut magic).is_ok() && magic == *CURRENT_SPOOL_MAGIC
+}
+
 fn write_synthetic_spool(path: &Path, spec: ScenarioSpec) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut writer = SyntheticSpoolWriter::create(path, 1_700_000_000_000_000, 1_000)?;
-    write_synthetic_spool_records(&mut writer, spec)?;
-    writer.flush()
-}
-
-fn write_synthetic_spool_records<W: Write>(
-    writer: &mut SyntheticSpoolWriter<W>,
-    spec: ScenarioSpec,
-) -> io::Result<()> {
     let case = materialize_spool_case(spec);
-    for module in &case.modules {
-        writer.write_module(module)?;
-    }
-    for exec in &case.process_execs {
-        writer.write_process_exec(exec.timestamp_ns, exec.process_id, exec.is_python_runtime)?;
-    }
-    for sample in &case.samples {
-        writer.write_sample_frames(
-            sample.timestamp_ns,
-            sample.process_id,
-            sample.thread_id,
-            &sample.frames,
-        )?;
-    }
-    Ok(())
+    bench_support::write_spool_samples_to_path(
+        path,
+        &case.modules,
+        &case.process_execs,
+        &case.samples,
+    )
 }
 
 struct SpoolBenchCase {
@@ -1041,144 +1026,4 @@ impl Drop for PerfMapFixture {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-struct SyntheticSpoolWriter<W: Write> {
-    writer: W,
-    last_timestamp_ns: u64,
-    frame_cache: FxHashMap<FrameRecord, u32>,
-    stack_cache: FxHashMap<(u32, u32), u32>,
-    thread_cache: FxHashMap<(i32, u64), u32>,
-}
-
-impl SyntheticSpoolWriter<BufWriter<File>> {
-    fn create(path: &Path, start_timestamp_us: u64, sample_interval_us: u64) -> io::Result<Self> {
-        let mut writer = Self {
-            writer: BufWriter::new(File::create(path)?),
-            last_timestamp_ns: 0,
-            frame_cache: FxHashMap::default(),
-            stack_cache: FxHashMap::default(),
-            thread_cache: FxHashMap::default(),
-        };
-        writer.writer.write_all(MAGIC)?;
-        writer.writer.write_varint(start_timestamp_us)?;
-        writer.writer.write_varint(sample_interval_us)?;
-        Ok(writer)
-    }
-}
-
-impl<W: Write> SyntheticSpoolWriter<W> {
-    fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
-        self.writer.write_all(&[REC_MODULE])?;
-        self.writer.write_varint(module.id as u64)?;
-        self.writer.write_varint(module.process_id as i64)?;
-        self.writer.write_varint(module.start)?;
-        self.writer.write_varint(module.end)?;
-        self.writer.write_varint(module.file_offset)?;
-        self.writer.write_varint(module.inode)?;
-        self.writer.write_all(&[u8::from(module.is_kernel)])?;
-        write_bytes(&mut self.writer, module.path.as_bytes())
-    }
-
-    fn write_sample_frames(
-        &mut self,
-        timestamp_ns: u64,
-        process_id: i32,
-        thread_id: u64,
-        frames: &[FrameRecord],
-    ) -> io::Result<Option<u32>> {
-        let Some(stack_id) = self.intern_stack(frames)? else {
-            return Ok(None);
-        };
-        let thread_id = self.intern_thread(process_id, thread_id)?;
-        let delta = timestamp_ns as i64 - self.last_timestamp_ns as i64;
-        self.last_timestamp_ns = timestamp_ns;
-
-        self.writer.write_all(&[REC_SAMPLE])?;
-        self.writer.write_varint(delta)?;
-        self.writer.write_varint(u64::from(thread_id))?;
-        self.writer.write_varint(u64::from(stack_id))?;
-        Ok(Some(stack_id))
-    }
-
-    fn write_process_exec(
-        &mut self,
-        timestamp_ns: u64,
-        process_id: i32,
-        is_python_runtime: bool,
-    ) -> io::Result<()> {
-        self.writer.write_all(&[REC_PROCESS_EXEC])?;
-        self.writer.write_varint(timestamp_ns)?;
-        self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_all(&[u8::from(is_python_runtime)])
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-
-    fn intern_thread(&mut self, process_id: i32, thread_id: u64) -> io::Result<u32> {
-        let key = (process_id, thread_id);
-        if let Some(&id) = self.thread_cache.get(&key) {
-            return Ok(id);
-        }
-        let id = self.thread_cache.len() as u32;
-        self.writer.write_all(&[REC_THREAD])?;
-        self.writer.write_varint(u64::from(id))?;
-        self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_varint(thread_id)?;
-        self.thread_cache.insert(key, id);
-        Ok(id)
-    }
-
-    fn intern_frame(&mut self, frame: &FrameRecord) -> io::Result<u32> {
-        if let Some(&id) = self.frame_cache.get(frame) {
-            return Ok(id);
-        }
-        let id = self.frame_cache.len() as u32;
-        self.writer.write_all(&[REC_FRAME])?;
-        self.writer.write_varint(u64::from(id))?;
-        write_compact_frame(&mut self.writer, frame)?;
-        self.frame_cache.insert(*frame, id);
-        Ok(id)
-    }
-
-    fn intern_stack(&mut self, frames: &[FrameRecord]) -> io::Result<Option<u32>> {
-        let mut prefix = NONE_U32;
-        let mut saw_frame = false;
-        for frame in frames.iter().rev() {
-            saw_frame = true;
-            let frame_id = self.intern_frame(frame)?;
-            let key = (prefix, frame_id);
-            if let Some(&stack_id) = self.stack_cache.get(&key) {
-                prefix = stack_id;
-                continue;
-            }
-            let stack_id = self.stack_cache.len() as u32;
-            self.writer.write_all(&[REC_STACK])?;
-            self.writer.write_varint(u64::from(stack_id))?;
-            self.writer.write_varint(u64::from(prefix))?;
-            self.writer.write_varint(u64::from(frame_id))?;
-            self.stack_cache.insert(key, stack_id);
-            prefix = stack_id;
-        }
-        Ok(saw_frame.then_some(prefix))
-    }
-}
-
-fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Result<()> {
-    let (tag, address) = match frame.module_id {
-        Some(module_id) => (u64::from(module_id) << 1, frame.rel_ip),
-        None => (
-            1 | (u64::from(frame.mode == FrameMode::Kernel) << 1),
-            frame.abs_ip,
-        ),
-    };
-    writer.write_varint(tag)?;
-    writer.write_varint(address).map(drop)
-}
-
-fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-    writer.write_varint(bytes.len() as u64)?;
-    writer.write_all(bytes)
 }

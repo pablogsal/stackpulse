@@ -67,6 +67,7 @@ pub(super) fn load_sparse_kernel_symbols_from_file(
     }
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn parse_sparse_kernel_symbols(
     data: &[u8],
     requested_addresses: &[u64],
@@ -80,6 +81,7 @@ fn parse_sparse_kernel_symbols(
     }
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) fn bench_parse_sparse_kernel_symbols(
     data: &[u8],
     requested_addresses: &[u64],

@@ -26,6 +26,7 @@ use crate::spool::ModuleRecord;
 mod kallsyms;
 mod system_map;
 
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) use kallsyms::bench_parse_sparse_kernel_symbols;
 use kallsyms::{load_kernel_symbols, load_sparse_kernel_symbols_from_file};
 use system_map::{kernel_rebase_anchors, load_sparse_kernel_symbols_from_system_map};

@@ -42,7 +42,7 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build benchmark targets
-        run: cargo codspeed build
+        run: cargo codspeed build --features bench-support
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4

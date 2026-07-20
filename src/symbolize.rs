@@ -31,6 +31,7 @@ use crate::spool::{
 };
 
 mod kernel;
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
 #[cfg(test)]
 use kernel::KernelSymbol;
