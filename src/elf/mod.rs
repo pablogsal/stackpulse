@@ -6,10 +6,17 @@
 
 use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::Elf;
-pub(crate) mod loader;
+mod loader;
 #[cfg(test)]
-pub(crate) mod test_fixtures;
-pub(crate) mod types;
+mod test_fixtures;
+mod types;
+
+pub(crate) use loader::{
+    load_elf_sections_from_bytes, load_elf_sections_from_file, ElfImageLayout,
+};
+#[cfg(test)]
+pub(crate) use test_fixtures::fake_hard_case_section_info;
+pub(crate) use types::{ElfSectionData, ElfSectionInfo};
 
 use std::sync::OnceLock;
 
@@ -153,7 +160,7 @@ impl PageSize {
 }
 
 /// Collect PT_LOAD segments from an ELF, sorted by file offset.
-pub(crate) fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
+fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
     let mut segments: Vec<LoadSegment> = elf
         .program_headers
         .iter()
@@ -173,7 +180,7 @@ pub(crate) fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for a mapping.
 ///
-pub(crate) fn find_load_contribution_for_file_range(
+fn find_load_contribution_for_file_range(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -188,7 +195,7 @@ pub(crate) fn find_load_contribution_for_file_range(
 
 /// Variant of [`find_load_contribution_for_file_range`] with an explicit page
 /// size, useful for off-host inputs and deterministic tests.
-pub(crate) fn find_load_contribution_for_file_range_with_page_size(
+fn find_load_contribution_for_file_range_with_page_size(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -258,7 +265,7 @@ pub(crate) fn system_page_size() -> u64 {
 
 /// Check whether two file ranges mutually contain each other (either A
 /// contains B or B contains A).
-pub(crate) fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
+fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
     FileRange::new(a_start, a_size).correlates_with(FileRange::new(b_start, b_size))
 }
 
@@ -267,7 +274,7 @@ pub(crate) fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_s
 /// Given a reference whose file offset and SVMA are known, together with the
 /// mapping's start file offset and start AVMA, returns the bias such that
 /// `svma + bias == avma` for any address in the image.
-pub(crate) fn compute_vma_bias(
+fn compute_vma_bias(
     reference_file_offset: u64,
     reference_svma: u64,
     mapping_start_file_offset: u64,

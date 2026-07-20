@@ -4,8 +4,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use crate::elf::loader;
-use crate::elf::types::ElfSectionInfo;
+use crate::elf::{
+    load_elf_sections_from_bytes, load_elf_sections_from_file, ElfImageLayout, ElfSectionInfo,
+};
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
@@ -38,10 +39,10 @@ impl ElfSectionCache {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let section_info = Arc::new(if module.path.as_str() == "[vdso]" {
                     let bytes = local_vdso_bytes()?;
-                    loader::load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
+                    load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
                 } else {
                     let file = open_module_file(module)?;
-                    loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?
+                    load_elf_sections_from_file(&file, module.path.as_path()).ok()?
                 });
                 Arc::clone(entry.insert(section_info))
             }
@@ -148,11 +149,7 @@ fn resolve_image_base(
     section_info: &ElfSectionInfo,
 ) -> Option<ModuleImageBase> {
     let span = module.end.saturating_sub(module.start);
-    loader::ElfImageLayout::new(section_info).resolve_mapping(
-        module.file_offset,
-        module.start,
-        span,
-    )
+    ElfImageLayout::new(section_info).resolve_mapping(module.file_offset, module.start, span)
 }
 
 #[cfg(test)]
