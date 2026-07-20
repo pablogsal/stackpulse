@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-07-20
 
 ### Changed
 
-- The doc-hidden benchmark API now requires the non-default `bench-support` feature, and benchmark fixtures are generated through the current `SPULSE3` writer instead of a duplicate legacy encoder. This compatibility change is intended for the next 0.x minor release.
+- The doc-hidden benchmark API now requires the non-default `bench-support` feature, and benchmark fixtures are generated through the current `SPULSE3` writer instead of a duplicate legacy encoder.
 - `PerfSymbolizerBuilder` replaces the combinatorial symbolizer constructors; spool samples and Python-runtime records now use names that match their contents; native source fields are grouped under `SourceLocation`; and `ModuleImageBase` exposes only checked address translation.
 - Removed the unused public `Error` wrapper. Internal ELF parsing continues to preserve the affected path and parser source inside an `InvalidData` I/O error.
 
