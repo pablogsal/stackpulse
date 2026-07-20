@@ -6,8 +6,6 @@
 use crate::{ModuleImageBase, NativeSymbol, SourceLocation};
 
 #[cfg(target_os = "linux")]
-use crate::linux::elf_types::ModuleInfo as LinuxModuleInfo;
-#[cfg(target_os = "linux")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 #[cfg(target_os = "linux")]
 use wholesym::CodeId;
@@ -48,19 +46,6 @@ pub struct SymModule {
     pub is_executable: bool,
     /// Whether this module is the Python runtime binary/shared library.
     pub is_python_runtime: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl From<&LinuxModuleInfo> for SymModule {
-    fn from(module: &LinuxModuleInfo) -> Self {
-        Self {
-            path: module.path.clone(),
-            avma_range: module.avma_range.clone(),
-            image_base: module.image_base,
-            is_executable: module.is_executable,
-            is_python_runtime: false,
-        }
-    }
 }
 
 type SymModuleLayoutKey = (Range<u64>, Option<ModuleImageBase>, bool, bool);

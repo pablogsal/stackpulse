@@ -24,7 +24,7 @@ use crate::symbols::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::native_module::ElfSectionCache;
+use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader, SampleStack,
     SpoolFrameModuleContexts, StackFrameRefs,
@@ -114,6 +114,16 @@ impl From<&ModuleRecord> for NativeFileIdentity {
             inode: module.inode,
             inode_generation: module.inode_generation,
         }
+    }
+}
+
+fn sym_module_for_mapping(module: &ModuleRecord, loaded: &LoadedElfMapping) -> SymModule {
+    SymModule {
+        path: module.path.as_path().to_path_buf(),
+        avma_range: module.start..module.end,
+        image_base: loaded.image_base,
+        is_executable: true,
+        is_python_runtime: false,
     }
 }
 
@@ -593,11 +603,11 @@ impl PerfSymbolizer {
     }
 
     fn create_native_symbolizer_for_module(&mut self, module: &ModuleRecord) -> Option<()> {
-        let Some((module_info, _section_info)) = self.elf_sections.module_info(module) else {
+        let Some(loaded) = self.elf_sections.load_mapping(module) else {
             self.unsupported_native_modules.insert(module.id);
             return None;
         };
-        let requested_module = SymModule::from(&module_info);
+        let requested_module = sym_module_for_mapping(module, &loaded);
         if let Some(idx) = self
             .native_symbolizers
             .iter()
@@ -650,12 +660,11 @@ impl PerfSymbolizer {
             .cloned()
             .collect();
         for candidate in candidates {
-            let Some((module_info, _section_info)) = self.elf_sections.module_info(&candidate)
-            else {
+            let Some(loaded) = self.elf_sections.load_mapping(&candidate) else {
                 self.unsupported_native_modules.insert(candidate.id);
                 continue;
             };
-            let sym_module = SymModule::from(&module_info);
+            let sym_module = sym_module_for_mapping(&candidate, &loaded);
             if grouped_modules.iter().all(|(_, existing)| {
                 !ranges_overlap(&existing.info.avma_range, &sym_module.avma_range)
             }) {
@@ -870,6 +879,7 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::test_fixtures::fake_hard_case_section_info;
     use crate::spool::PerfSpoolWriter;
     use std::os::unix::fs::MetadataExt;
 
@@ -929,6 +939,24 @@ mod tests {
             path: path.into(),
             is_kernel: false,
         }
+    }
+
+    #[test]
+    fn sym_module_mapping_preserves_the_previous_linux_defaults() {
+        let module = module_with_path(7, 42, 0x1000, "/tmp/libpython3.12.so");
+        let image_base = crate::ModuleImageBase::new(0x1000, 0);
+        let loaded = LoadedElfMapping {
+            image_base: Some(image_base),
+            sections: fake_hard_case_section_info(),
+        };
+
+        let sym_module = sym_module_for_mapping(&module, &loaded);
+
+        assert_eq!(sym_module.path, module.path.as_path());
+        assert_eq!(sym_module.avma_range, module.start..module.end);
+        assert_eq!(sym_module.image_base, Some(image_base));
+        assert!(sym_module.is_executable);
+        assert!(!sym_module.is_python_runtime);
     }
 
     #[test]
@@ -1035,8 +1063,8 @@ mod tests {
         replaced_file.inode_generation += 1;
 
         let requested_module = {
-            let (module_info, _) = symbolizer.elf_sections.module_info(&first).unwrap();
-            SymModule::from(&module_info)
+            let loaded = symbolizer.elf_sections.load_mapping(&first).unwrap();
+            sym_module_for_mapping(&first, &loaded)
         };
 
         assert!(symbolizer

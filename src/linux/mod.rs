@@ -1,8 +1,6 @@
 mod attach;
 mod convert_regs;
 mod cpu;
-pub(crate) mod elf_loader;
-pub(crate) mod elf_types;
 pub(crate) mod perf_event;
 mod perf_group;
 /// Spawn and attach helpers for the target process.
@@ -13,8 +11,6 @@ mod perf_group;
 /// instruction, and unsuspended afterwards.
 pub mod process;
 mod sorter;
-#[cfg(test)]
-mod test_fixtures;
 mod types;
 mod unwind;
 
