@@ -19,7 +19,7 @@ processes, and kernel frames when the machine allows them.
 In practice the flow is:
 
 1. Start or attach to a process.
-2. Record samples into a profile file.
+2. Record samples into a spool file.
 3. Read the file back.
 4. Convert the recorded frames into readable names.
 5. Build your own report, flame graph, UI, or export format on top.

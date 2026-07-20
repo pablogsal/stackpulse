@@ -20,8 +20,12 @@ unsafe extern "C" {
 /// and initialize profiling first.
 pub struct SuspendedLaunchedProcess {
     pid: Pid,
-    send_end_of_resume_pipe: Option<OwnedFd>,
-    recv_end_of_execerr_pipe: Option<OwnedFd>,
+    pipes: Option<SuspendPipes>,
+}
+
+struct SuspendPipes {
+    resume_tx: OwnedFd,
+    exec_error_rx: OwnedFd,
 }
 
 impl SuspendedLaunchedProcess {
@@ -54,8 +58,10 @@ impl SuspendedLaunchedProcess {
                 drop((resume_rp, execerr_sp));
                 Ok(Self {
                     pid: child,
-                    send_end_of_resume_pipe: Some(resume_sp),
-                    recv_end_of_execerr_pipe: Some(execerr_rp),
+                    pipes: Some(SuspendPipes {
+                        resume_tx: resume_sp,
+                        exec_error_rx: execerr_rp,
+                    }),
                 })
             }
         }
@@ -80,22 +86,21 @@ impl SuspendedLaunchedProcess {
     }
 
     fn unsuspend_inner(&mut self) -> io::Result<RunningProcess> {
-        let send_end_of_resume_pipe = self
-            .send_end_of_resume_pipe
-            .take()
-            .ok_or_else(|| io::Error::other("process was already resumed"))?;
-        let recv_end_of_execerr_pipe = self
-            .recv_end_of_execerr_pipe
+        let SuspendPipes {
+            resume_tx,
+            exec_error_rx,
+        } = self
+            .pipes
             .take()
             .ok_or_else(|| io::Error::other("process was already resumed"))?;
 
-        write(&send_end_of_resume_pipe, &[0x42])?;
-        drop(send_end_of_resume_pipe);
+        write(&resume_tx, &[0x42])?;
+        drop(resume_tx);
 
         // Loop to handle EINTR. The child closes execerr on exec success.
         loop {
             let mut bytes = [0; 8];
-            match read(recv_end_of_execerr_pipe.as_raw_fd(), &mut bytes) {
+            match read(exec_error_rx.as_raw_fd(), &mut bytes) {
                 Ok(0) => break, // exec succeeded; pipe closed
                 Ok(8) => {
                     let (errno_bytes, footer) = bytes.split_first_chunk::<4>().unwrap();
@@ -121,8 +126,7 @@ impl SuspendedLaunchedProcess {
         }
 
         Ok(RunningProcess {
-            pid: Cell::new(Some(self.pid)),
-            exit_status: Cell::new(None),
+            state: Cell::new(ChildState::Running(self.pid)),
         })
     }
 
@@ -182,10 +186,9 @@ fn reap(pid: Pid) {
 
 impl Drop for SuspendedLaunchedProcess {
     fn drop(&mut self) {
-        if self.send_end_of_resume_pipe.take().is_none() {
+        if self.pipes.take().is_none() {
             return;
         }
-        drop(self.recv_end_of_execerr_pipe.take());
         reap(self.pid);
     }
 }
@@ -202,24 +205,28 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 /// A launched process that is now running.
 #[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
-    pid: Cell<Option<Pid>>,
-    exit_status: Cell<Option<WaitStatus>>,
+    state: Cell<ChildState>,
+}
+
+#[derive(Clone, Copy)]
+enum ChildState {
+    Running(Pid),
+    Exited(WaitStatus),
+    Waited,
 }
 
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
     pub fn try_wait(&self) -> io::Result<Option<WaitStatus>> {
-        if let Some(status) = self.exit_status.get() {
-            return Ok(Some(status));
-        }
-        let Some(pid) = self.pid.get() else {
-            return Ok(None);
+        let pid = match self.state.get() {
+            ChildState::Running(pid) => pid,
+            ChildState::Exited(status) => return Ok(Some(status)),
+            ChildState::Waited => return Ok(None),
         };
         match waitpid_retry(pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => Ok(None),
             Ok(status) => {
-                self.pid.set(None);
-                self.exit_status.set(Some(status));
+                self.state.set(ChildState::Exited(status));
                 Ok(Some(status))
             }
             Err(err) => Err(err.into()),
@@ -228,19 +235,17 @@ impl RunningProcess {
 
     /// Wait until the process exits.
     pub fn wait(self) -> io::Result<WaitStatus> {
-        if let Some(status) = self.exit_status.get() {
-            return Ok(status);
+        match self.state.replace(ChildState::Waited) {
+            ChildState::Running(pid) => waitpid_retry(pid, None).map_err(Into::into),
+            ChildState::Exited(status) => Ok(status),
+            ChildState::Waited => Err(io::Error::other("process was already waited")),
         }
-        let Some(pid) = self.pid.replace(None) else {
-            return Err(io::Error::other("process was already waited"));
-        };
-        waitpid_retry(pid, None).map_err(Into::into)
     }
 }
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid.get() {
+        if let ChildState::Running(pid) = self.state.get() {
             let _ = waitpid_retry(pid, Some(WaitPidFlag::WNOHANG));
         }
     }
@@ -393,8 +398,7 @@ mod tests {
     #[test]
     fn running_process_reports_none_after_it_has_been_waited() {
         let process = RunningProcess {
-            pid: Cell::new(None),
-            exit_status: Cell::new(None),
+            state: Cell::new(ChildState::Waited),
         };
 
         assert!(process.try_wait().expect("try wait without pid").is_none());
@@ -428,7 +432,7 @@ mod tests {
                 return;
             }
             if Instant::now() >= deadline {
-                if let Some(pid) = running.pid.get() {
+                if let ChildState::Running(pid) = running.state.get() {
                     unsafe {
                         libc::kill(pid.as_raw(), libc::SIGKILL);
                     }

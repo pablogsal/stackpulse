@@ -19,8 +19,9 @@ pub(super) struct ProcessUnwinder {
     elf_sections: ElfSectionCache,
 }
 
-impl Clone for ProcessUnwinder {
-    fn clone(&self) -> Self {
+impl ProcessUnwinder {
+    /// Copy inherited module state while resetting per-process unwind caches.
+    pub(super) fn inherit_for_fork(&self) -> Self {
         Self {
             unwinder: self.unwinder.clone(),
             cache: NativeCache::default(),
@@ -28,9 +29,7 @@ impl Clone for ProcessUnwinder {
             elf_sections: self.elf_sections.clone(),
         }
     }
-}
 
-impl ProcessUnwinder {
     pub(super) fn apply_module_update(&mut self, update: &ModuleUpdate) {
         for module in &update.retired {
             self.unwinder.remove_module(module.start);

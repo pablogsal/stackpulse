@@ -93,10 +93,20 @@ impl TaskInheritance {
     }
 }
 
+struct OpenedCounter {
+    counter: Counter,
+    inherit: TaskInheritance,
+    include_kernel: bool,
+}
+
 impl PerfOptions {
     pub fn open(mut self) -> io::Result<Perf> {
         self.align_stack_size()?;
-        let (counter, inherit, include_kernel) = self.open_counter()?;
+        let OpenedCounter {
+            counter,
+            inherit,
+            include_kernel,
+        } = self.open_counter()?;
 
         Ok(Perf::new(
             counter,
@@ -109,7 +119,11 @@ impl PerfOptions {
 
     pub fn open_ring(mut self) -> io::Result<OutputRing> {
         self.align_stack_size()?;
-        let (counter, inherit, include_kernel) = self.open_counter()?;
+        let OpenedCounter {
+            counter,
+            inherit,
+            include_kernel,
+        } = self.open_counter()?;
         let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
         Ok(OutputRing {
             perf: Perf::new(counter, self.pid, self.cpu, inherit, include_kernel),
@@ -132,19 +146,25 @@ impl PerfOptions {
         Ok(())
     }
 
-    fn open_counter(&self) -> io::Result<(Counter, TaskInheritance, bool)> {
+    fn open_counter(&self) -> io::Result<OpenedCounter> {
         self.validate()?;
         let opts = self.perf_open_opts();
         match self.open_counter_once(&opts) {
-            Ok((counter, include_kernel)) => Ok((counter, self.inherit, include_kernel)),
+            Ok((counter, include_kernel)) => Ok(OpenedCounter {
+                counter,
+                inherit: self.inherit,
+                include_kernel,
+            }),
             Err(err)
                 if self.inherit == TaskInheritance::Threads && is_inherit_thread_error(&err) =>
             {
                 let mut no_inherit_opts = opts.clone();
                 no_inherit_opts.inherit = None;
                 self.open_counter_once(&no_inherit_opts)
-                    .map(|(counter, include_kernel)| {
-                        (counter, TaskInheritance::None, include_kernel)
+                    .map(|(counter, include_kernel)| OpenedCounter {
+                        counter,
+                        inherit: TaskInheritance::None,
+                        include_kernel,
                     })
             }
             Err(err) => Err(err),

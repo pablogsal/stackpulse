@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stackpulse::{FrameRecord, PerfSpoolReader, PerfSymbolizer, ResolvedFrame};
+use stackpulse::{
+    FrameRecord, PerfSpoolReader, PerfSymbolizer, PerfSymbolizerBuilder, ResolvedFrame,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -27,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reader = PerfSpoolReader::open(&options.spool)?;
         checksum = checksum
             .wrapping_add(reader.modules().len())
-            .wrapping_add(reader.process_execs().len());
+            .wrapping_add(reader.python_runtime_records().len());
         samples += reader.samples().len();
 
         match options.mode {
@@ -38,7 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Mode::Symbolize => {
-                let mut symbolizer = PerfSymbolizer::for_spool_with_perf_maps(&reader, false);
+                let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+                    .disable_perf_maps()
+                    .build();
                 symbolize_samples(&reader, &mut symbolizer, &mut frames, &mut checksum);
             }
         }
@@ -117,7 +121,7 @@ fn raw_frame_score<'a>(frames: impl IntoIterator<Item = &'a FrameRecord>) -> usi
     frames.into_iter().fold(0, |score, frame| {
         score
             .wrapping_add(frame.abs_ip as usize)
-            .wrapping_add(frame.rel_ip as usize)
+            .wrapping_add(frame.file_relative_ip as usize)
             .wrapping_add(frame.module_id.unwrap_or(u32::MAX) as usize)
     })
 }

@@ -34,11 +34,7 @@ mod proc_maps;
 /// skip symbolization entirely and read [`FrameRecord`]s from the spool.
 pub mod profile;
 mod spool;
-/// Process-state snapshots used by the recorder to translate kernel events.
-///
-/// Exposes the minimal `/proc` parsing that stackpulse performs on attach so
-/// integrators can mirror it (for example, to seed their own module table
-/// before replaying a spool).
+/// Process liveness checks, exit watching, and signal helpers.
 pub mod state;
 mod stats;
 mod symbolize;
@@ -46,7 +42,6 @@ mod symbols;
 #[cfg(test)]
 mod test_support;
 
-pub use error::{ElfParseError, Error};
 pub use linux::perf_event::PerfFrequencyLimit;
 pub use linux::perf_event::MAX_SAMPLE_USER_STACK;
 pub use linux::{process, AttachMode, PerfRecorder, PerfRecorderOptions, PerfSummary};
@@ -57,15 +52,12 @@ pub use profile::{
 };
 pub use spool::{
     FrameContext, FrameMode, FrameModuleRef, FrameRecord, ModulePath, ModuleRecord,
-    OwnedSampleRecord, PerfSpoolReader, ProcessExecRecord, SampleStack, SampleStacks,
+    PerfSpoolReader, PythonRuntimeRecord, SampleRecord, SampleStack, SampleStacks,
     StackFrameContexts, StackFrameRefs,
 };
 pub use stats::{ErrorStatsFormatter, SampleErrorKind, SampleErrorStats};
-pub use symbolize::PerfSymbolizer;
-pub use symbols::{
-    default_native_symbolizer_factory, NativeSymbolizer, NativeSymbolizerFactory, SymModule,
-    SymbolsRc,
-};
+pub use symbolize::{PerfSymbolizer, PerfSymbolizerBuilder};
+pub use symbols::{NativeSymbolizer, SymModule, SymbolsRc};
 
 /// Read the kernel's current maximum perf sample rate, in samples per second.
 ///

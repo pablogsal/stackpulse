@@ -22,42 +22,19 @@ impl ModuleImageBase {
         Self { avma, svma }
     }
 
-    /// Distance of `avma` from the image base, i.e. an image-relative offset.
-    ///
-    /// Saturates to `0` if `avma` lies below the base; a debug build also
-    /// asserts that this never happens for legitimate samples.
-    #[must_use]
-    pub fn relative_address(self, avma: u64) -> u64 {
-        debug_assert!(
-            avma >= self.avma,
-            "module address {avma:#x} must not be below base {:#x}",
-            self.avma
-        );
-        avma.saturating_sub(self.avma)
-    }
-
-    /// Checked form of [`Self::relative_address`].
-    ///
     /// Returns `None` when `avma` lies below the image base.
     #[must_use]
-    pub const fn checked_relative_address(self, avma: u64) -> Option<u64> {
+    pub const fn relative_address(self, avma: u64) -> Option<u64> {
         avma.checked_sub(self.avma)
     }
 
     /// Translate a runtime AVMA into the SVMA used by the object's symbol
     /// tables, debug info, and unwind sections.
-    #[must_use]
-    pub fn svma_for_avma(self, avma: u64) -> u64 {
-        self.relative_address(avma) + self.svma
-    }
-
-    /// Checked form of [`Self::svma_for_avma`].
-    ///
     /// Returns `None` when the AVMA is below the image base or when adding the
     /// image-relative offset to the static base would overflow.
     #[must_use]
-    pub const fn checked_svma_for_avma(self, avma: u64) -> Option<u64> {
-        let relative = match self.checked_relative_address(avma) {
+    pub const fn svma_for_avma(self, avma: u64) -> Option<u64> {
+        let relative = match self.relative_address(avma) {
             Some(relative) => relative,
             None => return None,
         };
@@ -72,20 +49,20 @@ mod tests {
     #[test]
     fn checked_translation_rejects_avma_below_base() {
         let base = ModuleImageBase::new(0x2000, 0x1000);
-        assert_eq!(base.checked_relative_address(0x1fff), None);
-        assert_eq!(base.checked_svma_for_avma(0x1fff), None);
+        assert_eq!(base.relative_address(0x1fff), None);
+        assert_eq!(base.svma_for_avma(0x1fff), None);
     }
 
     #[test]
     fn checked_translation_rejects_svma_overflow() {
         let base = ModuleImageBase::new(0x1000, u64::MAX - 1);
-        assert_eq!(base.checked_svma_for_avma(0x1002), None);
+        assert_eq!(base.svma_for_avma(0x1002), None);
     }
 
     #[test]
     fn checked_translation_preserves_valid_addresses() {
         let base = ModuleImageBase::new(0x2000, 0x1000);
-        assert_eq!(base.checked_relative_address(0x2123), Some(0x123));
-        assert_eq!(base.checked_svma_for_avma(0x2123), Some(0x1123));
+        assert_eq!(base.relative_address(0x2123), Some(0x123));
+        assert_eq!(base.svma_for_avma(0x2123), Some(0x1123));
     }
 }

@@ -81,7 +81,6 @@ enum GeckoFrame {
 struct KernelModuleLabelKey {
     name: Rc<str>,
     module: Rc<str>,
-    module_basename_start: usize,
 }
 
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -425,14 +424,13 @@ fn intern_label_for_frame(
                 return profile.intern_string(UNKNOWN_NATIVE_LABEL);
             };
             let name = symbol.name.as_ref();
-            let module = &symbol.module[symbol.module_basename_start..];
+            let module = symbol.module_basename();
             if is_addressish_symbol_name(name, module) {
                 Cow::Owned(format!("[unknown native frame in {module}]"))
             } else if frame.kind == FrameKind::Kernel && module != "[kernel]" {
                 let key = KernelModuleLabelKey {
                     name: Rc::clone(&symbol.name),
                     module: Rc::clone(&symbol.module),
-                    module_basename_start: symbol.module_basename_start,
                 };
                 return match kernel_module_labels.entry(key) {
                     Entry::Occupied(entry) => *entry.get(),
@@ -466,7 +464,7 @@ fn label_for_frame(frame: &GeckoFrame) -> Cow<'_, str> {
                 return Cow::Borrowed(UNKNOWN_NATIVE_LABEL);
             };
             let name = symbol.name.as_ref();
-            let module = &symbol.module[symbol.module_basename_start..];
+            let module = symbol.module_basename();
             if is_addressish_symbol_name(name, module) {
                 return Cow::Owned(format!("[unknown native frame in {module}]"));
             }

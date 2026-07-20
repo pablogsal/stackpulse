@@ -11,7 +11,7 @@ use crate::elf::{
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
-use crate::spool::ModuleRecord;
+use crate::spool::{ModuleRecord, VDSO_PATH};
 
 #[derive(Clone, Default)]
 pub(crate) struct ElfSectionCache {
@@ -30,7 +30,7 @@ impl ElfSectionCache {
     pub(crate) fn load_mapping(&mut self, module: &ModuleRecord) -> Option<LoadedElfMapping> {
         if module.is_kernel
             || module.path.is_empty()
-            || (module.path.is_bracketed_mapping() && module.path.as_str() != "[vdso]")
+            || (module.path.is_bracketed_mapping() && !module.path.is_vdso())
         {
             return None;
         }
@@ -38,7 +38,7 @@ impl ElfSectionCache {
         let section_info = match self.by_module.entry(module.id) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let section_info = Arc::new(if module.path.as_str() == "[vdso]" {
+                let section_info = Arc::new(if module.path.is_vdso() {
                     let bytes = local_vdso_bytes()?;
                     load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
                 } else {
@@ -86,7 +86,7 @@ fn local_vdso_bytes() -> Option<Arc<[u8]>> {
         return Some(Arc::clone(bytes));
     }
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    let region = crate::proc_maps::parse_iter(&maps).find(|region| region.path == "[vdso]")?;
+    let region = crate::proc_maps::parse_iter(&maps).find(|region| region.path == VDSO_PATH)?;
     let length = region.address.end.checked_sub(region.address.start)?;
     if length == 0 || length > MAX_MAPPED_ELF_SIZE {
         return None;

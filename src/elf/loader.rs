@@ -5,7 +5,7 @@
 
 use super::types::{ElfSectionData, ElfSectionInfo};
 use super::LoadSegment;
-use crate::error::{ElfParseError, Error};
+use crate::error::ElfParseError;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
 use goblin::elf::section_header::{SectionHeader, SHF_COMPRESSED};
@@ -17,7 +17,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::io::Result<T>;
 
 #[cfg(test)]
 fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
@@ -70,7 +70,7 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
     // Use lazy parsing rather than Elf::parse to avoid reading symbol tables
     // and relocation sections; on a cold page cache those can be several MB per
     // library and block the sample loop for seconds in CI containers.
-    let parse_err = |source| Error::from(ElfParseError::new(path, source));
+    let parse_err = |source| ElfParseError::new(path, source).into_io_error();
     let header = Elf::parse_header(bytes).map_err(&parse_err)?;
     let mut elf = Elf::lazy_parse(header).map_err(&parse_err)?;
 
@@ -253,7 +253,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_extract_sections_from_libc() {
         let libc_paths = [
             "/lib/x86_64-linux-gnu/libc.so.6",
@@ -277,7 +276,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     #[allow(clippy::manual_is_multiple_of)]
     fn test_calculate_base_svma_from_real_elf() {
         use std::fs::File;
@@ -315,7 +313,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_missing_section_returns_none() {
         use std::fs::File;
 
@@ -345,7 +342,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_compressed_section_data_is_decompressed() {
         use std::fs::{self, File};
         use std::io::Write;
@@ -437,11 +433,15 @@ mod tests {
         {
             let err = load_elf_sections_from_path(Path::new("/etc/passwd"))
                 .expect_err("non-ELF file should return error");
-            let Error::ElfParse(parse) = err else {
-                panic!("non-ELF file should return structured parse error");
-            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let parse = err
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ElfParseError>())
+                .expect("structured parse error");
             assert_eq!(parse.path(), Path::new("/etc/passwd"));
-            assert!(std::error::Error::source(&parse).is_some());
+            std::error::Error::source(parse)
+                .and_then(|source| source.downcast_ref::<goblin::error::Error>())
+                .expect("Goblin parser source");
         }
     }
 }

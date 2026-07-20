@@ -56,22 +56,88 @@ pub struct PerfSymbolizer {
     native_factory: NativeSymbolizerFactory,
 }
 
+enum SymbolizerInput<'a> {
+    Modules(&'a [ModuleRecord]),
+    Spool(&'a PerfSpoolReader),
+}
+
+/// Configures a [`PerfSymbolizer`].
+pub struct PerfSymbolizerBuilder<'a> {
+    input: SymbolizerInput<'a>,
+    perf_map_processes: PerfMapProcesses,
+    native_factory: Option<NativeSymbolizerFactory>,
+}
+
+impl<'a> PerfSymbolizerBuilder<'a> {
+    /// Configure symbolization for a module list.
+    #[must_use]
+    pub fn for_modules(modules: &'a [ModuleRecord]) -> Self {
+        Self {
+            input: SymbolizerInput::Modules(modules),
+            perf_map_processes: PerfMapProcesses::All,
+            native_factory: None,
+        }
+    }
+
+    /// Configure symbolization for a loaded spool.
+    #[must_use]
+    pub fn for_spool(reader: &'a PerfSpoolReader) -> Self {
+        Self {
+            input: SymbolizerInput::Spool(reader),
+            perf_map_processes: PerfMapProcesses::All,
+            native_factory: None,
+        }
+    }
+
+    /// Disable Python perf-map lookup.
+    #[must_use]
+    pub fn disable_perf_maps(mut self) -> Self {
+        self.perf_map_processes = PerfMapProcesses::Pids(FxHashSet::default());
+        self
+    }
+
+    /// Restrict Python perf-map lookup to selected processes.
+    #[must_use]
+    pub fn perf_maps_for(mut self, processes: impl IntoIterator<Item = i32>) -> Self {
+        self.perf_map_processes = PerfMapProcesses::Pids(processes.into_iter().collect());
+        self
+    }
+
+    /// Use a caller-supplied native symbolizer factory.
+    #[must_use]
+    pub fn native_symbolizer_factory(
+        mut self,
+        factory: impl FnMut(i32) -> Box<dyn NativeSymbolizer> + 'static,
+    ) -> Self {
+        self.native_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Build the configured symbolizer.
+    #[must_use]
+    pub fn build(self) -> PerfSymbolizer {
+        let native_factory = self
+            .native_factory
+            .unwrap_or_else(default_native_symbolizer_factory);
+        match self.input {
+            SymbolizerInput::Modules(modules) => PerfSymbolizer::with_perf_map_processes_inner(
+                modules,
+                self.perf_map_processes,
+                native_factory,
+            ),
+            SymbolizerInput::Spool(reader) => {
+                PerfSymbolizer::for_spool_inner(reader, self.perf_map_processes, native_factory)
+            }
+        }
+    }
+}
+
 /// Which processes may use Python perf-map lookups.
 pub(crate) enum PerfMapProcesses {
     /// Allow perf-map lookup for every process.
     All,
     /// Allow perf-map lookup only for the listed process ids.
     Pids(FxHashSet<i32>),
-}
-
-impl From<bool> for PerfMapProcesses {
-    fn from(allow_perf_maps: bool) -> Self {
-        if allow_perf_maps {
-            Self::All
-        } else {
-            Self::Pids(FxHashSet::default())
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -131,94 +197,12 @@ fn sym_module_for_mapping(module: &ModuleRecord, loaded: &LoadedElfMapping) -> S
 impl PerfSymbolizer {
     /// Create a resolver for the modules in a profile.
     pub fn new(modules: &[ModuleRecord]) -> Self {
-        Self::with_perf_maps(modules, true)
-    }
-
-    /// Create a resolver and choose whether Python perf-map lookup is allowed.
-    pub fn with_perf_maps(modules: &[ModuleRecord], allow_perf_maps: bool) -> Self {
-        Self::with_perf_map_processes_inner(
-            modules,
-            allow_perf_maps.into(),
-            default_native_symbolizer_factory(),
-        )
-    }
-
-    /// Create a resolver that only uses Python perf maps for selected processes.
-    pub fn with_perf_map_processes(
-        modules: &[ModuleRecord],
-        processes: impl IntoIterator<Item = i32>,
-    ) -> Self {
-        Self::with_perf_map_processes_inner(
-            modules,
-            PerfMapProcesses::Pids(processes.into_iter().collect()),
-            default_native_symbolizer_factory(),
-        )
-    }
-
-    /// Create a resolver with a caller-supplied native symbolizer factory.
-    ///
-    /// The factory is invoked once per non-overlapping process module group;
-    /// each returned [`NativeSymbolizer`] is responsible for ELF/Mach-O
-    /// symbolization of the modules in that group. Kernel frames and
-    /// `/tmp/perf-PID.map` lookups remain handled internally by
-    /// `PerfSymbolizer`.
-    ///
-    /// Use this when integrating with an external symbolizer (debuginfod,
-    /// custom debug-dir policy, alternate symbol backends) instead of the
-    /// bundled wholesym-backed default.
-    pub fn with_native_factory(
-        modules: &[ModuleRecord],
-        allow_perf_maps: bool,
-        native_factory: NativeSymbolizerFactory,
-    ) -> Self {
-        Self::with_perf_map_processes_inner(modules, allow_perf_maps.into(), native_factory)
+        PerfSymbolizerBuilder::for_modules(modules).build()
     }
 
     /// Create a resolver for a loaded spool, using its kernel PCs for sparse kallsyms loading.
     pub fn for_spool(reader: &PerfSpoolReader) -> Self {
-        Self::for_spool_with_perf_maps(reader, true)
-    }
-
-    /// Create a resolver for a loaded spool and choose whether Python perf maps are allowed.
-    pub fn for_spool_with_perf_maps(reader: &PerfSpoolReader, allow_perf_maps: bool) -> Self {
-        Self::for_spool_with_native_factory(
-            reader,
-            allow_perf_maps,
-            default_native_symbolizer_factory(),
-        )
-    }
-
-    /// Create a spool-backed resolver that only uses Python perf maps for selected processes.
-    pub fn for_spool_with_perf_map_processes(
-        reader: &PerfSpoolReader,
-        processes: impl IntoIterator<Item = i32>,
-    ) -> Self {
-        Self::for_spool_inner(
-            reader,
-            PerfMapProcesses::Pids(processes.into_iter().collect()),
-            default_native_symbolizer_factory(),
-        )
-    }
-
-    /// Create a spool-backed resolver that restricts Python perf maps to
-    /// processes recorded as Python runtimes at least once.
-    pub fn for_spool_with_recorded_python_perf_maps(reader: &PerfSpoolReader) -> Self {
-        Self::for_spool_with_perf_map_processes(
-            reader,
-            reader
-                .process_execs()
-                .iter()
-                .filter_map(|exec| exec.is_python_runtime.then_some(exec.process_id)),
-        )
-    }
-
-    /// Spool-backed resolver with a caller-supplied native symbolizer factory.
-    pub fn for_spool_with_native_factory(
-        reader: &PerfSpoolReader,
-        allow_perf_maps: bool,
-        native_factory: NativeSymbolizerFactory,
-    ) -> Self {
-        Self::for_spool_inner(reader, allow_perf_maps.into(), native_factory)
+        PerfSymbolizerBuilder::for_spool(reader).build()
     }
 
     fn for_spool_inner(
@@ -393,7 +377,7 @@ impl PerfSymbolizer {
             .filter(|module| !perf_map_module_allowed(module))
         {
             return self
-                .resolve_native_frames(frame, Some((module.clone(), frame.rel_ip)))
+                .resolve_native_frames(frame, Some((module.clone(), frame.file_relative_ip)))
                 .into_iter()
                 .map(ResolvedFrame::Native)
                 .collect();
@@ -448,7 +432,7 @@ impl PerfSymbolizer {
         if let Some(module_id) = frame.module_id {
             return Some(FrameModuleRef {
                 module: self.module_by_id(module_id)?,
-                rel_ip: frame.rel_ip,
+                file_relative_ip: frame.file_relative_ip,
             });
         }
         match (self.spool_frame_contexts.as_ref(), spool_frame_id) {
@@ -526,7 +510,7 @@ impl PerfSymbolizer {
                     flags: FrameFlags::empty(),
                 }]
             }
-            (false, Some((module, rel_ip))) => {
+            (false, Some((module, file_relative_ip))) => {
                 if let Some(symbols) = self.resolve_module_symbols(&module, frame.abs_ip) {
                     return symbols
                         .iter()
@@ -551,9 +535,13 @@ impl PerfSymbolizer {
 
                 let is_python_runtime = frame.mode == FrameMode::User
                     && crate::is_python_runtime_module_path(&module.path);
-                let symbol_name = format!("{}+0x{:x}", module_display_name(&module.path), rel_ip);
+                let symbol_name = format!(
+                    "{}+0x{:x}",
+                    module_display_name(&module.path),
+                    file_relative_ip
+                );
                 // Pseudo-symbol without a function: the name embeds the
-                // module-relative address, so the function offset is 0.
+                // file-relative address, so the function offset is 0.
                 let symbol = NativeSymbol::new(
                     symbol_name.clone(),
                     SourceLocation::default(),
@@ -891,7 +879,7 @@ mod tests {
     fn frame(abs_ip: u64) -> FrameRecord {
         FrameRecord {
             module_id: None,
-            rel_ip: abs_ip,
+            file_relative_ip: abs_ip,
             abs_ip,
             mode: FrameMode::User,
         }
@@ -900,7 +888,7 @@ mod tests {
     fn pinned_frame(module_id: u32, abs_ip: u64) -> FrameRecord {
         FrameRecord {
             module_id: Some(module_id),
-            rel_ip: 8,
+            file_relative_ip: 8,
             abs_ip,
             mode: FrameMode::User,
         }
@@ -992,7 +980,9 @@ mod tests {
     fn module_ids_are_not_treated_as_slice_indexes() {
         let process_id = 42;
         let module = module_with_path(7, process_id, 0x1000, "/stable-seven.so");
-        let mut symbolizer = PerfSymbolizer::with_perf_maps(&[module], false);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x1008));
         let invalid = symbolizer.resolve_frame(process_id, &pinned_frame(0, 0x1008));
 
@@ -1010,7 +1000,9 @@ mod tests {
             module_with_path(1, process_id, 0x1000, "/module-one.so"),
             module_with_path(0, process_id, 0x2000, "/module-zero.so"),
         ];
-        let mut symbolizer = PerfSymbolizer::with_perf_maps(&modules, false);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&modules)
+            .disable_perf_maps()
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(0, 0x2008));
 
         assert_eq!(resolved.func_name(), "module-zero.so+0x8");
@@ -1029,7 +1021,9 @@ mod tests {
             ));
         }
         modules.push(module_with_path(7, process_id, 0x9000, "/index-seven.so"));
-        let mut symbolizer = PerfSymbolizer::with_perf_maps(&modules, false);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&modules)
+            .disable_perf_maps()
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x9008));
 
         assert!(matches!(
@@ -1042,7 +1036,9 @@ mod tests {
     fn sparse_ids_use_the_module_fallback_path() {
         let process_id = 42;
         let module = module_with_path(7, process_id, 0x1000, "[anon:sparse-seven]");
-        let mut symbolizer = PerfSymbolizer::with_perf_maps(&[module], false);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &pinned_frame(7, 0x1008));
 
         assert_eq!(resolved.func_name(), "[anon:sparse-seven]+0x8");
@@ -1202,7 +1198,9 @@ mod tests {
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "2800 20 py::stale:/tmp/stale.py\n").expect("write perf map");
 
-        let mut symbolizer = PerfSymbolizer::with_perf_maps(&[], false);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+            .disable_perf_maps()
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &frame(0x2808));
         let _ = fs::remove_file(&path);
 
@@ -1223,7 +1221,9 @@ mod tests {
         fs::write(&blocked_path, "2900 20 py::blocked:/tmp/blocked.py\n")
             .expect("write blocked perf map");
 
-        let mut symbolizer = PerfSymbolizer::with_perf_map_processes(&[], [allowed_process]);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+            .perf_maps_for([allowed_process])
+            .build();
         let allowed = symbolizer.resolve_frame(allowed_process, &frame(0x2908));
         let blocked = symbolizer.resolve_frame(blocked_process, &frame(0x2908));
         let _ = fs::remove_file(&allowed_path);
@@ -1288,7 +1288,7 @@ mod tests {
             process_id,
             &FrameRecord {
                 module_id: Some(0),
-                rel_ip: 0x8,
+                file_relative_ip: 0x8,
                 abs_ip: 0x4008,
                 mode: FrameMode::User,
             },
@@ -1360,7 +1360,7 @@ mod tests {
             process_id,
             &FrameRecord {
                 module_id: Some(0),
-                rel_ip: 0x8,
+                file_relative_ip: 0x8,
                 abs_ip: 0x5808,
                 mode: FrameMode::User,
             },
@@ -1468,7 +1468,7 @@ mod tests {
             process_id,
             &FrameRecord {
                 module_id: Some(0),
-                rel_ip: 0x18,
+                file_relative_ip: 0x18,
                 abs_ip: 0x8018,
                 mode: FrameMode::User,
             },
@@ -1494,7 +1494,7 @@ mod tests {
         symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([])));
         let frame = FrameRecord {
             module_id: None,
-            rel_ip: 0xffff_ffff_8000_1234,
+            file_relative_ip: 0xffff_ffff_8000_1234,
             abs_ip: 0xffff_ffff_8000_1234,
             mode: FrameMode::Kernel,
         };
@@ -1519,7 +1519,7 @@ mod tests {
         }])));
         let frame = FrameRecord {
             module_id: None,
-            rel_ip: 0xffff_ffff_8100_0014,
+            file_relative_ip: 0xffff_ffff_8100_0014,
             abs_ip: 0xffff_ffff_8100_0014,
             mode: FrameMode::Kernel,
         };
@@ -1540,7 +1540,7 @@ mod tests {
         let null_pc = symbolizer.resolve_native_frame(
             &FrameRecord {
                 module_id: None,
-                rel_ip: 0,
+                file_relative_ip: 0,
                 abs_ip: 0,
                 mode: FrameMode::User,
             },
@@ -1652,7 +1652,9 @@ mod tests {
         let (path, stack_id) = write_future_module_spool("future-module");
         let reader = PerfSpoolReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
-        let symbolizer = PerfSymbolizer::for_spool_with_perf_maps(&reader, false);
+        let symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+            .disable_perf_maps()
+            .build();
         assert_future_module_unresolved(&reader, symbolizer, stack_id);
     }
 
@@ -1661,7 +1663,9 @@ mod tests {
         let (path, stack_id) = write_future_module_spool("future-module-pid-filter");
         let reader = PerfSpoolReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
-        let symbolizer = PerfSymbolizer::for_spool_with_perf_map_processes(&reader, [7]);
+        let symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+            .perf_maps_for([7])
+            .build();
         assert_future_module_unresolved(&reader, symbolizer, stack_id);
     }
 
@@ -1674,17 +1678,24 @@ mod tests {
         let path = temp_symbolize_spool_path("python-perf-map-exit-marker");
         let frame = frame(0x5908);
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
-        writer.write_process_exec(0, process_id, true).unwrap();
+        writer.write_python_runtime(0, process_id, true).unwrap();
         writer
             .write_sample_frames(1, process_id, 11, [frame])
             .unwrap();
-        writer.write_process_exec(2, process_id, false).unwrap();
+        writer.write_python_runtime(2, process_id, false).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
         let reader = PerfSpoolReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
-        let mut symbolizer = PerfSymbolizer::for_spool_with_recorded_python_perf_maps(&reader);
+        let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+            .perf_maps_for(
+                reader
+                    .python_runtime_records()
+                    .iter()
+                    .filter_map(|runtime| runtime.is_python_runtime.then_some(runtime.process_id)),
+            )
+            .build();
         let resolved = symbolizer.resolve_frame(process_id, &frame);
         let _ = fs::remove_file(&perf_map_path);
 
@@ -1697,7 +1708,7 @@ mod tests {
     fn wireguard_kernel_frame() -> FrameRecord {
         FrameRecord {
             module_id: None,
-            rel_ip: 0xffff_ffff_c001_0014,
+            file_relative_ip: 0xffff_ffff_c001_0014,
             abs_ip: 0xffff_ffff_c001_0014,
             mode: FrameMode::Kernel,
         }

@@ -39,8 +39,29 @@ struct TaskTarget {
     owner_pid: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ThreadFork {
+    pub(super) tid: u32,
+    pub(super) owner_pid: u32,
+    pub(super) parent_tid: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ProcessFork {
+    pub(super) pid: u32,
+    pub(super) parent_tid: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RecoveredProcessFork {
+    pub(super) pid: u32,
+    pub(super) parent_pid: u32,
+}
+
 struct OutputMember {
     ring: OutputRing,
+    // One fd anchors polling for the shared ring. Its token always identifies
+    // the output fd, even when a redirected member supplies the poll fd.
     poll_fd: Option<RawFd>,
 }
 
@@ -105,7 +126,8 @@ pub struct PerfGroup {
     members: BTreeMap<RawFd, Member>,
     outputs: BTreeMap<RawFd, OutputMember>,
     cpu_outputs: BTreeMap<u32, RawFd>,
-    ready_fds: BTreeSet<RawFd>,
+    saw_readable: bool,
+    // Closed poll fds cannot become anchors again before their members are removed.
     retired_poll_fds: BTreeSet<RawFd>,
     poll: Poll,
     poll_events: Events,
@@ -181,28 +203,21 @@ pub struct PerfGroupOptions {
 }
 
 impl PerfGroup {
-    pub fn new(
-        frequency: u32,
-        stack_size: u32,
-        regs_mask: u64,
-        event_source: EventSource,
-        include_kernel: bool,
-        inherit_child_processes: bool,
-    ) -> io::Result<Self> {
+    pub fn new(options: PerfGroupOptions) -> io::Result<Self> {
         Ok(PerfGroup {
             members: Default::default(),
             outputs: Default::default(),
             cpu_outputs: Default::default(),
-            ready_fds: BTreeSet::new(),
+            saw_readable: false,
             retired_poll_fds: BTreeSet::new(),
             poll: Poll::new()?,
             poll_events: Events::with_capacity(16),
-            frequency,
-            stack_size,
-            event_source,
-            regs_mask,
-            include_kernel,
-            inherit_child_processes,
+            frequency: options.frequency,
+            stack_size: options.stack_size,
+            event_source: options.event_source,
+            regs_mask: options.regs_mask,
+            include_kernel: options.include_kernel,
+            inherit_child_processes: options.inherit_child_processes,
             tracked_threads: BTreeMap::new(),
             stopped_processes: Vec::new(),
             retired_lost_records: 0,
@@ -211,14 +226,7 @@ impl PerfGroup {
     }
 
     pub fn open(pid: u32, attach_mode: AttachMode, options: PerfGroupOptions) -> io::Result<Self> {
-        let mut group = PerfGroup::new(
-            options.frequency,
-            options.stack_size,
-            options.regs_mask,
-            options.event_source,
-            options.include_kernel,
-            options.inherit_child_processes,
-        )?;
+        let mut group = PerfGroup::new(options)?;
         let _ = group.open_process(pid, attach_mode)?;
         Ok(group)
     }
@@ -379,9 +387,7 @@ impl PerfGroup {
         Ok(())
     }
 
-    /// Open counters for freshly forked threads, given as
-    /// `(tid, owning pid, parent tid)` triples.
-    pub fn open_forked_threads(&mut self, thread_forks: &[(u32, u32, u32)]) -> io::Result<()> {
+    pub fn open_forked_threads(&mut self, thread_forks: &[ThreadFork]) -> io::Result<()> {
         if thread_forks.is_empty() {
             return Ok(());
         }
@@ -396,7 +402,12 @@ impl PerfGroup {
         let mut tracked_threads =
             FxHashMap::with_capacity_and_hasher(thread_forks.len(), Default::default());
 
-        for &(tid, owner, parent_tid) in thread_forks {
+        for &ThreadFork {
+            tid,
+            owner_pid,
+            parent_tid,
+        } in thread_forks
+        {
             if self.tracked_threads.contains_key(&tid) || tracked_threads.contains_key(&tid) {
                 continue;
             }
@@ -406,15 +417,12 @@ impl PerfGroup {
                 .or_else(|| tracked_threads.get(&parent_tid))
                 .is_some_and(|track| track.events_inherit);
             if parent_events_inherit {
-                tracked_threads.insert(tid, ThreadTrack::new(owner, true));
+                tracked_threads.insert(tid, ThreadTrack::new(owner_pid, true));
                 continue;
             }
 
             if let Some(thread_perfs) = self.try_open_thread_perfs(
-                TaskTarget {
-                    tid,
-                    owner_pid: owner,
-                },
+                TaskTarget { tid, owner_pid },
                 &cpu_ids,
                 AttachMode::StopAttachEnableResume,
                 frequency,
@@ -422,7 +430,7 @@ impl PerfGroup {
             )? {
                 let events_inherit = thread_perfs.inherits;
                 pending.perfs.extend(thread_perfs.events);
-                tracked_threads.insert(tid, ThreadTrack::new(owner, events_inherit));
+                tracked_threads.insert(tid, ThreadTrack::new(owner_pid, events_inherit));
             }
         }
 
@@ -431,12 +439,12 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn open_forked_processes(&mut self, process_forks: &[(u32, u32)]) -> io::Result<()> {
+    pub fn open_forked_processes(&mut self, process_forks: &[ProcessFork]) -> io::Result<()> {
         if !self.inherit_child_processes {
             return Ok(());
         }
 
-        for &(pid, parent_tid) in process_forks {
+        for &ProcessFork { pid, parent_tid } in process_forks {
             let parent_events_inherit = self
                 .tracked_threads
                 .get(&parent_tid)
@@ -472,9 +480,12 @@ impl PerfGroup {
 
     /// Repair process bookkeeping after LOST when only the owning parent
     /// process (not the exact forking TID) can be recovered from /proc.
-    pub fn recover_forked_processes(&mut self, process_forks: &[(u32, u32)]) -> io::Result<()> {
+    pub fn recover_forked_processes(
+        &mut self,
+        process_forks: &[RecoveredProcessFork],
+    ) -> io::Result<()> {
         let mut need_explicit_open = Vec::new();
-        for &(pid, parent_pid) in process_forks {
+        for &RecoveredProcessFork { pid, parent_pid } in process_forks {
             let parent_process_inherits = self
                 .tracked_threads
                 .values()
@@ -483,7 +494,10 @@ impl PerfGroup {
                 self.tracked_threads
                     .insert(pid, ThreadTrack::new(pid, true));
             } else {
-                need_explicit_open.push((pid, parent_pid));
+                need_explicit_open.push(ProcessFork {
+                    pid,
+                    parent_tid: parent_pid,
+                });
             }
         }
         self.open_forked_processes(&need_explicit_open)
@@ -673,7 +687,6 @@ impl PerfGroup {
             }
             self.cpu_outputs.remove(&member.ring.cpu());
         }
-        self.ready_fds.remove(&fd);
         self.retired_poll_fds.remove(&fd);
     }
 
@@ -802,7 +815,7 @@ impl PerfGroup {
     }
 
     pub fn has_pending_events(&self) -> bool {
-        !self.ready_fds.is_empty()
+        self.saw_readable
     }
 
     pub fn kernel_enabled(&self) -> bool {
@@ -875,7 +888,7 @@ impl PerfGroup {
     }
 
     pub fn wait(&mut self) -> io::Result<()> {
-        if !self.ready_fds.is_empty() {
+        if self.saw_readable {
             return Ok(());
         }
         self.ensure_poll_anchors()?;
@@ -894,7 +907,7 @@ impl PerfGroup {
         for ev in self.poll_events.iter() {
             let fd = ev.token().0 as RawFd;
             if ev.is_readable() {
-                self.ready_fds.insert(fd);
+                self.saw_readable = true;
             }
             if ev.is_read_closed() {
                 closed.push(fd);
@@ -907,7 +920,7 @@ impl PerfGroup {
     }
 
     pub fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) {
-        self.ready_fds.clear();
+        self.saw_readable = false;
         // Drain every ring buffer on every pass. Poll readiness is only a wakeup
         // hint; using it as a filter can let older mmap/fork records sit behind
         // newer samples from another fd, which breaks timestamp-ordered unwinding.
@@ -968,6 +981,15 @@ mod tests {
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
 
+    const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
+        frequency: 1,
+        stack_size: 0,
+        event_source: EventSource::SwCpuClock,
+        regs_mask: 0,
+        include_kernel: false,
+        inherit_child_processes: false,
+    };
+
     struct EmptyConsumer {
         calls: Vec<&'static str>,
     }
@@ -1003,14 +1025,11 @@ mod tests {
     #[test]
     fn failed_open_process_does_not_track_process() {
         let pid = std::process::id();
-        let mut group = PerfGroup::new(
-            1,
-            MAX_SAMPLE_USER_STACK + 1,
-            0,
-            EventSource::SwCpuClock,
-            false,
-            true,
-        )
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            stack_size: MAX_SAMPLE_USER_STACK + 1,
+            inherit_child_processes: true,
+            ..TEST_OPTIONS
+        })
         .expect("create perf group");
 
         let err = group
@@ -1024,18 +1043,7 @@ mod tests {
 
     #[test]
     fn open_rejects_invalid_pid_before_tracking_process() {
-        let err = match PerfGroup::open(
-            0,
-            AttachMode::AttachWithEnableOnExec,
-            PerfGroupOptions {
-                frequency: 1,
-                stack_size: 0,
-                regs_mask: 0,
-                event_source: EventSource::SwCpuClock,
-                include_kernel: false,
-                inherit_child_processes: false,
-            },
-        ) {
+        let err = match PerfGroup::open(0, AttachMode::AttachWithEnableOnExec, TEST_OPTIONS) {
             Ok(_) => panic!("pid 0 should be rejected"),
             Err(err) => err,
         };
@@ -1045,14 +1053,20 @@ mod tests {
 
     #[test]
     fn inherited_forked_process_is_tracked_without_opening_new_fds() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            inherit_child_processes: true,
+            ..TEST_OPTIONS
+        })
+        .expect("create perf group");
         group
             .tracked_threads
             .insert(100, ThreadTrack::new(100, true));
 
         group
-            .open_forked_processes(&[(200, 100)])
+            .open_forked_processes(&[ProcessFork {
+                pid: 200,
+                parent_tid: 100,
+            }])
             .expect("track inherited child process");
 
         assert!(group.tracked_threads.contains_key(&200));
@@ -1062,8 +1076,11 @@ mod tests {
 
     #[test]
     fn lost_fork_recovery_uses_any_inheriting_thread_owned_by_parent_process() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            inherit_child_processes: true,
+            ..TEST_OPTIONS
+        })
+        .expect("create perf group");
         group
             .tracked_threads
             .insert(100, ThreadTrack::new(100, false));
@@ -1072,7 +1089,10 @@ mod tests {
             .insert(101, ThreadTrack::new(100, true));
 
         group
-            .recover_forked_processes(&[(200, 100)])
+            .recover_forked_processes(&[RecoveredProcessFork {
+                pid: 200,
+                parent_pid: 100,
+            }])
             .expect("recover inherited child process");
 
         assert_eq!(
@@ -1086,8 +1106,7 @@ mod tests {
     fn refresh_threads_drops_stale_inheriting_tids() {
         let pid = std::process::id();
         let stale_tid = u32::MAX;
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         group
             .tracked_threads
             .insert(pid, ThreadTrack::new(pid, true));
@@ -1105,11 +1124,13 @@ mod tests {
 
     #[test]
     fn forked_processes_are_ignored_when_child_inheritance_is_disabled() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
 
         group
-            .open_forked_processes(&[(200, 100)])
+            .open_forked_processes(&[ProcessFork {
+                pid: 200,
+                parent_tid: 100,
+            }])
             .expect("ignore forked process");
 
         assert!(group.tracked_threads.is_empty());
@@ -1118,14 +1139,29 @@ mod tests {
 
     #[test]
     fn forked_threads_under_inheriting_parent_are_tracked_without_opening_fds() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         group
             .tracked_threads
             .insert(100, ThreadTrack::new(100, true));
 
         group
-            .open_forked_threads(&[(101, 100, 100), (102, 100, 101), (101, 100, 100)])
+            .open_forked_threads(&[
+                ThreadFork {
+                    tid: 101,
+                    owner_pid: 100,
+                    parent_tid: 100,
+                },
+                ThreadFork {
+                    tid: 102,
+                    owner_pid: 100,
+                    parent_tid: 101,
+                },
+                ThreadFork {
+                    tid: 101,
+                    owner_pid: 100,
+                    parent_tid: 100,
+                },
+            ])
             .expect("track forked threads");
 
         assert_eq!(
@@ -1141,8 +1177,7 @@ mod tests {
 
     #[test]
     fn empty_forked_threads_are_noop() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
 
         group.open_forked_threads(&[]).expect("empty fork list");
 
@@ -1151,8 +1186,7 @@ mod tests {
 
     #[test]
     fn remove_thread_and_process_clear_bookkeeping() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         group
             .tracked_threads
             .insert(100, ThreadTrack::new(100, false));
@@ -1176,8 +1210,7 @@ mod tests {
 
     #[test]
     fn empty_group_control_paths_are_noops() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let mut consumer = EmptyConsumer { calls: Vec::new() };
 
         assert!(!group.has_pending_events());
@@ -1201,8 +1234,7 @@ mod tests {
 
     #[test]
     fn lost_record_deltas_include_retired_events_once() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         group.retired_lost_records = 7;
 
         assert_eq!(group.take_lost_records().unwrap(), 7);
@@ -1218,8 +1250,7 @@ mod tests {
             checked_loss_sum(u64::MAX, 1).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         group.reported_lost_records = 1;
         assert_eq!(
             group.take_lost_records().unwrap_err().kind(),
@@ -1232,8 +1263,7 @@ mod tests {
         let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
             return;
         };
-        let group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let pid = std::process::id();
         let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 2, TaskInheritance::None)
         else {
@@ -1249,8 +1279,7 @@ mod tests {
         let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
             return;
         };
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let pid = std::process::id();
         let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 3, TaskInheritance::None)
         else {
@@ -1294,8 +1323,7 @@ mod tests {
             (TaskInheritance::Threads, 0),
             (TaskInheritance::Children, 1),
         ] {
-            let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-                .expect("create perf group");
+            let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
             let pid = std::process::id();
             let Some(pending) = open_fixed_cpu_events(&group, pid, pid, cpu, 2, inherit) else {
                 return;
@@ -1316,8 +1344,7 @@ mod tests {
         };
         let target_tid = std::process::id();
         let owner_pid = u32::MAX - 1;
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let Some(pending) = open_fixed_cpu_events(
             &group,
             target_tid,
@@ -1373,8 +1400,7 @@ mod tests {
 
     #[test]
     fn rollback_removes_exact_open_transaction() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let opened =
             match group.open_process(std::process::id(), AttachMode::AttachWithEnableOnExec) {
                 Ok(opened) => opened,
@@ -1392,8 +1418,7 @@ mod tests {
 
     #[test]
     fn rollback_restores_exact_thread_tracking_state() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
         let previous = ThreadTrack::new(100, true);
         group
             .tracked_threads
@@ -1416,8 +1441,11 @@ mod tests {
 
     #[test]
     fn rollback_restores_kernel_sampling_state() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, true, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            include_kernel: true,
+            ..TEST_OPTIONS
+        })
+        .expect("create perf group");
         let pending = PendingEvents {
             kernel_excluded: true,
             ..PendingEvents::default()
@@ -1440,8 +1468,7 @@ mod tests {
 
     #[test]
     fn task_inheritance_follows_options() {
-        let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
-            .expect("create perf group");
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
 
         assert_eq!(group.task_inheritance(), TaskInheritance::Threads);
 
