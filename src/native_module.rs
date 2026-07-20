@@ -4,8 +4,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use crate::linux::elf_loader;
-use crate::linux::elf_types::{ElfSectionInfo, ModuleInfo};
+use crate::elf::loader;
+use crate::elf::types::ElfSectionInfo;
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
@@ -19,11 +19,13 @@ pub(crate) struct ElfSectionCache {
     by_module: FxHashMap<u32, Arc<ElfSectionInfo>>,
 }
 
+pub(crate) struct LoadedElfMapping {
+    pub(crate) image_base: Option<ModuleImageBase>,
+    pub(crate) sections: Arc<ElfSectionInfo>,
+}
+
 impl ElfSectionCache {
-    pub(crate) fn module_info(
-        &mut self,
-        module: &ModuleRecord,
-    ) -> Option<(ModuleInfo, Arc<ElfSectionInfo>)> {
+    pub(crate) fn load_mapping(&mut self, module: &ModuleRecord) -> Option<LoadedElfMapping> {
         if module.is_kernel
             || module.path.is_empty()
             || (module.path.is_bracketed_mapping() && module.path.as_str() != "[vdso]")
@@ -36,19 +38,19 @@ impl ElfSectionCache {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let section_info = Arc::new(if module.path.as_str() == "[vdso]" {
                     let bytes = local_vdso_bytes()?;
-                    elf_loader::load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
+                    loader::load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
                 } else {
                     let file = open_module_file(module)?;
-                    elf_loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?
+                    loader::load_elf_sections_from_file(&file, module.path.as_path()).ok()?
                 });
                 Arc::clone(entry.insert(section_info))
             }
         };
 
-        Some((
-            module_info_with_sections(module, &section_info),
-            section_info,
-        ))
+        Some(LoadedElfMapping {
+            image_base: resolve_image_base(module, &section_info),
+            sections: section_info,
+        })
     }
 
     pub(crate) fn remove(&mut self, module_id: u32) {
@@ -141,26 +143,12 @@ fn validated_module_file(path: &std::path::Path, module: &ModuleRecord) -> Optio
     Some(file)
 }
 
-fn module_info_with_sections(module: &ModuleRecord, section_info: &ElfSectionInfo) -> ModuleInfo {
-    let path = PathBuf::from(module.path.as_path());
-    let name = crate::path_to_name(&path);
-    let image_base = resolve_image_base(module, section_info);
-
-    ModuleInfo {
-        name,
-        path,
-        avma_range: module.start..module.end,
-        image_base,
-        is_executable: true,
-    }
-}
-
 fn resolve_image_base(
     module: &ModuleRecord,
     section_info: &ElfSectionInfo,
 ) -> Option<ModuleImageBase> {
     let span = module.end.saturating_sub(module.start);
-    elf_loader::ElfImageLayout::new(section_info).resolve_mapping(
+    loader::ElfImageLayout::new(section_info).resolve_mapping(
         module.file_offset,
         module.start,
         span,
@@ -208,6 +196,33 @@ mod tests {
         };
 
         assert_eq!(resolve_image_base(&module, &section_info), None);
+    }
+
+    #[test]
+    fn loaded_elf_is_retained_when_mapping_cannot_be_correlated() {
+        let module = ModuleRecord {
+            id: 1,
+            process_id: i32::try_from(std::process::id()).unwrap(),
+            start: 0x7000_0000,
+            end: 0x7000_1000,
+            file_offset: u64::MAX - 0xfff,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+            is_kernel: false,
+        };
+
+        let loaded = ElfSectionCache::default()
+            .load_mapping(&module)
+            .expect("ELF sections still load for an uncorrelated mapping");
+
+        assert_eq!(loaded.image_base, None);
     }
 
     #[test]
@@ -267,9 +282,9 @@ mod tests {
         };
         let mut cache = ElfSectionCache::default();
 
-        assert!(cache.module_info(&module).is_none());
+        assert!(cache.load_mapping(&module).is_none());
         std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
-        assert!(cache.module_info(&module).is_some());
+        assert!(cache.load_mapping(&module).is_some());
 
         let _ = std::fs::remove_file(path);
     }
@@ -291,14 +306,14 @@ mod tests {
             is_kernel: false,
         };
         let mut cache = ElfSectionCache::default();
-        assert!(cache.module_info(&module).is_some());
+        assert!(cache.load_mapping(&module).is_some());
 
         cache.reuse(1, 2);
         module.id = 2;
         cache.remove(1);
 
         assert_eq!(cache.len(), 1);
-        assert!(cache.module_info(&module).is_some());
+        assert!(cache.load_mapping(&module).is_some());
     }
 
     #[test]
@@ -351,11 +366,11 @@ mod tests {
             is_kernel: false,
         };
 
-        let (info, sections) = ElfSectionCache::default()
-            .module_info(&module)
+        let loaded = ElfSectionCache::default()
+            .load_mapping(&module)
             .expect("vDSO is a readable ELF mapping");
 
-        assert!(info.image_base.is_some());
-        assert!(sections.eh_frame.is_some() || sections.eh_frame_hdr.is_some());
+        assert!(loaded.image_base.is_some());
+        assert!(loaded.sections.eh_frame.is_some() || loaded.sections.eh_frame_hdr.is_some());
     }
 }

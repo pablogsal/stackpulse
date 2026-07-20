@@ -1,7 +1,7 @@
-//! Shared test fixtures for Linux ELF module tests.
+//! Shared test fixtures for ELF module tests.
 
-use super::elf_types::ElfSectionInfo;
-use crate::elf::LoadSegment;
+use super::types::ElfSectionInfo;
+use super::LoadSegment;
 use std::sync::Arc;
 
 /// Hard-case section info with 4 segments and non-zero text offsets,

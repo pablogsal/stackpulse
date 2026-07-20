@@ -6,6 +6,11 @@
 
 use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::Elf;
+pub(crate) mod loader;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+pub(crate) mod types;
+
 use std::sync::OnceLock;
 
 /// A PT_LOAD segment from an ELF binary.

@@ -1,14 +1,12 @@
-//! Shared Linux module and ELF metadata types.
+//! Shared ELF section data and metadata types.
 
-use crate::ModuleImageBase;
 use memmap2::Mmap;
 use std::fmt;
 use std::ops::Deref;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use crate::elf::LoadSegment;
+pub use super::LoadSegment;
 
 #[derive(Clone)]
 pub struct ElfSectionData {
@@ -79,33 +77,6 @@ impl PartialEq for ElfSectionData {
 }
 
 impl Eq for ElfSectionData {}
-
-/// Information about a loaded module/DSO in the target process.
-///
-/// Each `ModuleInfo` represents a single memory mapping, not a whole library.
-/// Multiple entries may share the same path but have different `avma_range`
-/// values while sharing the same image-wide base.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleInfo {
-    /// Module name (e.g., "libpython3.12.so.1.0")
-    pub name: String,
-
-    /// Full path to the module file
-    pub path: PathBuf,
-
-    /// Address range in process memory (AVMA - Actual Virtual Memory Address)
-    pub avma_range: Range<u64>,
-
-    /// Image-wide base addresses resolved from the ELF object.
-    ///
-    /// This is `None` until the mapping has been correlated back to the object
-    /// file. Unwinding and Linux symbolization only use mappings with a
-    /// resolved image base.
-    pub image_base: Option<ModuleImageBase>,
-
-    /// Whether this mapping has executable permissions.
-    pub is_executable: bool,
-}
 
 /// ELF section addresses and data needed for DWARF unwinding.
 ///
