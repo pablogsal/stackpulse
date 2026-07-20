@@ -2518,6 +2518,30 @@ mod tests {
     }
 
     #[test]
+    fn rejected_sample_metadata_updates_exact_counters() {
+        for (task, timestamp, expected) in [
+            (None, Some(1), (1, 1, 0, 0, 0)),
+            (Some((u32::MAX, 1)), Some(1), (1, 1, 0, 0, 0)),
+            (Some((1, u32::MAX)), Some(1), (1, 0, 1, 0, 0)),
+            (Some((1, 0)), Some(1), (1, 0, 0, 1, 0)),
+            (Some((1, 1)), None, (1, 0, 0, 0, 1)),
+        ] {
+            let mut summary = PerfSummary::default();
+            assert!(prepare_sample_meta(&mut summary, task, timestamp).is_none());
+            assert_eq!(
+                (
+                    summary.sample_events,
+                    summary.missing_pid_samples,
+                    summary.missing_tid_samples,
+                    summary.idle_tid_samples,
+                    summary.missing_timestamp_samples,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn resolve_stack_frame_preserves_truncated_stack_marker() {
         let mut modules = ModuleTable::default();
         let mut summary = PerfSummary::default();
