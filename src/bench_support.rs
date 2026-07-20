@@ -7,6 +7,9 @@ use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, ProcessExecRecord
 #[doc(hidden)]
 pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
 
+const FIXTURE_START_TIMESTAMP_US: u64 = 1_700_000_000_000_000;
+const FIXTURE_SAMPLE_INTERVAL_US: u64 = 1_000;
+
 #[doc(hidden)]
 pub struct BenchSpoolSample {
     pub timestamp_ns: u64,
@@ -38,7 +41,8 @@ pub fn write_spool_samples_to_path(
     process_execs: &[ProcessExecRecord],
     samples: &[BenchSpoolSample],
 ) -> io::Result<()> {
-    let mut writer = PerfSpoolWriter::create(path, 1_700_000_000_000_000, 1_000)?;
+    let mut writer =
+        PerfSpoolWriter::create(path, FIXTURE_START_TIMESTAMP_US, FIXTURE_SAMPLE_INTERVAL_US)?;
     write_spool_samples(&mut writer, modules, process_execs, samples)?;
     writer.flush()
 }
@@ -49,7 +53,11 @@ fn write_spool_samples_to_writer<W: Write>(
     process_execs: &[ProcessExecRecord],
     samples: &[BenchSpoolSample],
 ) -> io::Result<W> {
-    let mut writer = PerfSpoolWriter::from_writer(writer, 1_700_000_000_000_000, 1_000)?;
+    let mut writer = PerfSpoolWriter::from_writer(
+        writer,
+        FIXTURE_START_TIMESTAMP_US,
+        FIXTURE_SAMPLE_INTERVAL_US,
+    )?;
     write_spool_samples(&mut writer, modules, process_execs, samples)?;
     writer.flush()?;
     Ok(writer.into_inner())
@@ -245,8 +253,8 @@ mod tests {
         assert_eq!(file_bytes.get(..8), Some(CURRENT_SPOOL_MAGIC.as_slice()));
         assert_eq!(file_bytes, bytes);
         assert_eq!(reported_len, bytes.len());
-        assert_eq!(reader.start_timestamp_us(), 1_700_000_000_000_000);
-        assert_eq!(reader.sample_interval_us(), 1_000);
+        assert_eq!(reader.start_timestamp_us(), FIXTURE_START_TIMESTAMP_US);
+        assert_eq!(reader.sample_interval_us(), FIXTURE_SAMPLE_INTERVAL_US);
         assert_eq!(reader.modules().len(), 1);
         assert_eq!(reader.modules()[0].path.as_str(), "/tmp/libstackpulse.so");
         assert_eq!(reader.modules()[0].file_offset, 0x100);

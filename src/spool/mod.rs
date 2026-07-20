@@ -887,14 +887,8 @@ pub(crate) fn module_for_frame_with_context<'a>(
     process_id: i32,
     frame: &FrameRecord,
 ) -> Option<FrameModuleRef<'a>> {
-    if frame.mode == FrameMode::TruncatedStackMarker {
-        return None;
-    }
-    if let Some(module_id) = frame.module_id {
-        return Some(FrameModuleRef {
-            module: modules.get(module_id as usize)?,
-            rel_ip: frame.rel_ip,
-        });
+    if frame.mode == FrameMode::TruncatedStackMarker || frame.module_id.is_some() {
+        return module_for_frame_unbounded(modules, process_id, frame);
     }
     let module_limit = context.module_limit.min(modules.len());
     let module = modules
@@ -1345,6 +1339,33 @@ mod tests {
             module_for_frame_unbounded(&modules, 7, &FrameRecord::truncated_stack_marker())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pinned_frame_resolution_ignores_record_context() {
+        let modules = [module(7, 0x1000, 0x2000, "/module", false)];
+        let frame = FrameRecord {
+            module_id: Some(0),
+            rel_ip: 0x123,
+            abs_ip: 0x1123,
+            mode: FrameMode::User,
+        };
+        let context = FrameLookupContext {
+            frame_index: 0,
+            module_limit: 0,
+        };
+
+        let resolved = module_for_frame_with_context(
+            &modules,
+            &SpoolFrameModuleContexts::default(),
+            context,
+            7,
+            &frame,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.module.id, 0);
+        assert_eq!(resolved.rel_ip, 0x123);
     }
 
     #[test]
