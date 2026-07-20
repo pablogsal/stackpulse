@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The doc-hidden benchmark API now requires the non-default `bench-support` feature, and benchmark fixtures are generated through the current `SPULSE3` writer instead of a duplicate legacy encoder. This compatibility change is intended for the next 0.x minor release.
+
 ## 0.4.0 - 2026-07-19
 
 ### Fixed

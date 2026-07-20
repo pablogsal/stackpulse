@@ -282,6 +282,7 @@ impl OutputRing {
     }
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn sample_type_bits(
     include_callchain: bool,
     include_user_regs: bool,
@@ -947,6 +948,7 @@ fn is_callchain_marker(address: u64) -> bool {
     address.wrapping_add(4095) < 4095
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) struct BenchSampleBatch {
     parser: perf_event_open::sample::record::UnsafeParser,
     records: Vec<AlignedPerfRecord>,
@@ -954,6 +956,7 @@ pub(crate) struct BenchSampleBatch {
     frames_per_sample: usize,
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) struct BenchSampleBatchSpec {
     pub samples: usize,
     pub user_frames: usize,
@@ -966,6 +969,7 @@ pub(crate) struct BenchSampleBatchSpec {
     pub kernel_base: u64,
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 impl BenchSampleBatch {
     pub(crate) fn new(spec: BenchSampleBatchSpec) -> Self {
         let parser = perf_event_open::sample::record::UnsafeParser {
@@ -1025,6 +1029,7 @@ impl BenchSampleBatch {
     }
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) -> usize {
     let mut checksum = 0usize;
     for _ in 0..rounds {
@@ -1076,6 +1081,7 @@ pub(crate) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) 
 }
 
 enum AlignedPerfRecordStorage {
+    #[cfg(any(test, feature = "bench-support"))]
     Bytes(Vec<u8>),
     Words(Vec<u64>),
 }
@@ -1086,6 +1092,7 @@ pub(crate) struct AlignedPerfRecord {
 }
 
 impl AlignedPerfRecord {
+    #[cfg(any(test, feature = "bench-support"))]
     fn from_vec(bytes: Vec<u8>) -> Self {
         if is_u64_aligned(&bytes) {
             return Self {
@@ -1109,6 +1116,7 @@ impl AlignedPerfRecord {
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
         match &self.storage {
+            #[cfg(any(test, feature = "bench-support"))]
             AlignedPerfRecordStorage::Bytes(bytes) => bytes,
             AlignedPerfRecordStorage::Words(words) => unsafe {
                 slice::from_raw_parts(words.as_ptr().cast::<u8>(), self.len)
@@ -1119,6 +1127,7 @@ impl AlignedPerfRecord {
     #[cfg(test)]
     fn as_mut_bytes(&mut self) -> &mut [u8] {
         match &mut self.storage {
+            #[cfg(any(test, feature = "bench-support"))]
             AlignedPerfRecordStorage::Bytes(bytes) => bytes,
             AlignedPerfRecordStorage::Words(words) => unsafe {
                 slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8)
@@ -1126,15 +1135,18 @@ impl AlignedPerfRecord {
         }
     }
 
+    #[cfg(any(test, feature = "bench-support"))]
     fn len(&self) -> usize {
         self.len
     }
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> AlignedPerfRecord {
     build_bench_sample_record_with_abi(spec, sample_idx, sys::PERF_SAMPLE_REGS_ABI_64)
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn build_bench_sample_record_with_abi(
     spec: &BenchSampleBatchSpec,
     sample_idx: usize,
@@ -1209,18 +1221,22 @@ fn build_bench_sample_record_with_abi(
     AlignedPerfRecord::from_vec(bytes)
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn privilege_score(privilege: Priv) -> usize {
     match privilege {
         Priv::User => 1,

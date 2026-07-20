@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+#[cfg(any(test, feature = "bench-support"))]
 #[doc(hidden)]
 pub mod bench_support;
 /// Helpers for discovering and following child processes spawned by a target.

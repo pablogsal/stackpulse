@@ -42,7 +42,7 @@ impl ModuleTableTestExt for ModuleTable {
 
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
-const MAGIC_V3: &[u8; 8] = b"SPULSE3\0";
+pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -105,12 +105,13 @@ impl<W: Write> PerfSpoolWriter<W> {
             thread_cache: FxHashMap::default(),
             last_timestamp_ns: 0,
         };
-        writer.writer.write_all(MAGIC_V3)?;
+        writer.writer.write_all(CURRENT_MAGIC)?;
         writer.writer.write_varint(start_timestamp_us)?;
         writer.writer.write_varint(sample_interval_us)?;
         Ok(writer)
     }
 
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn into_inner(self) -> W {
         self.writer
     }
@@ -722,7 +723,7 @@ impl MmapSpoolCursor {
         match &magic {
             magic if magic == MAGIC_V1 => Ok(1),
             magic if magic == MAGIC_V2 => Ok(2),
-            magic if magic == MAGIC_V3 => Ok(3),
+            magic if magic == CURRENT_MAGIC => Ok(3),
             _ => Err(invalid_data("invalid stackpulse spool magic")),
         }
     }

@@ -1,7 +1,11 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use crate::linux;
 use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, ProcessExecRecord};
+
+#[doc(hidden)]
+pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
 
 #[doc(hidden)]
 pub struct BenchSpoolSample {
@@ -27,6 +31,18 @@ pub fn write_spool_samples_to_memory(
     Ok(bytes.len())
 }
 
+#[doc(hidden)]
+pub fn write_spool_samples_to_path(
+    path: impl AsRef<Path>,
+    modules: &[ModuleRecord],
+    process_execs: &[ProcessExecRecord],
+    samples: &[BenchSpoolSample],
+) -> io::Result<()> {
+    let mut writer = PerfSpoolWriter::create(path, 1_700_000_000_000_000, 1_000)?;
+    write_spool_samples(&mut writer, modules, process_execs, samples)?;
+    writer.flush()
+}
+
 fn write_spool_samples_to_writer<W: Write>(
     writer: W,
     modules: &[ModuleRecord],
@@ -34,6 +50,17 @@ fn write_spool_samples_to_writer<W: Write>(
     samples: &[BenchSpoolSample],
 ) -> io::Result<W> {
     let mut writer = PerfSpoolWriter::from_writer(writer, 1_700_000_000_000_000, 1_000)?;
+    write_spool_samples(&mut writer, modules, process_execs, samples)?;
+    writer.flush()?;
+    Ok(writer.into_inner())
+}
+
+fn write_spool_samples<W: Write>(
+    writer: &mut PerfSpoolWriter<W>,
+    modules: &[ModuleRecord],
+    process_execs: &[ProcessExecRecord],
+    samples: &[BenchSpoolSample],
+) -> io::Result<()> {
     for module in modules {
         writer.write_module(module)?;
     }
@@ -48,8 +75,7 @@ fn write_spool_samples_to_writer<W: Write>(
             sample.frames.iter().copied(),
         )?;
     }
-    writer.flush()?;
-    Ok(writer.into_inner())
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -204,10 +230,20 @@ mod tests {
             bytes.len() * 2,
         )
         .expect("write sized spool samples");
-        fs::write(&path, &bytes).expect("persist spool bytes");
+        write_spool_samples_to_path(
+            &path,
+            std::slice::from_ref(&module),
+            std::slice::from_ref(&exec),
+            &samples,
+        )
+        .expect("persist spool bytes through real writer");
+        let file_bytes = fs::read(&path).expect("read persisted spool bytes");
 
         let reader = PerfSpoolReader::open(&path).expect("read generated spool");
 
+        assert_eq!(bytes.get(..8), Some(CURRENT_SPOOL_MAGIC.as_slice()));
+        assert_eq!(file_bytes.get(..8), Some(CURRENT_SPOOL_MAGIC.as_slice()));
+        assert_eq!(file_bytes, bytes);
         assert_eq!(reported_len, bytes.len());
         assert_eq!(reader.start_timestamp_us(), 1_700_000_000_000_000);
         assert_eq!(reader.sample_interval_us(), 1_000);
