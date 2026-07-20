@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::elf::{
-    load_elf_sections_from_bytes, load_elf_sections_from_file, ElfImageLayout, ElfSectionInfo,
+    load_elf_sections_from_bytes, load_elf_sections_from_file, resolve_mapping_image_base,
+    ElfSectionInfo,
 };
 use crate::ModuleImageBase;
 use rustc_hash::FxHashMap;
@@ -149,7 +150,7 @@ fn resolve_image_base(
     section_info: &ElfSectionInfo,
 ) -> Option<ModuleImageBase> {
     let span = module.end.saturating_sub(module.start);
-    ElfImageLayout::new(section_info).resolve_mapping(module.file_offset, module.start, span)
+    resolve_mapping_image_base(section_info, module.file_offset, module.start, span)
 }
 
 #[cfg(test)]

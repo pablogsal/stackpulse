@@ -1,16 +1,11 @@
 //! Shared ELF section extraction for unwinding and symbolization.
 //!
 //! Loads ELF sections used by native stack unwinding and post-recording
-//! symbolization, and resolves a mapping's image base via [`ElfImageLayout`].
-//! Both consumers share these results through `native_module`.
+//! symbolization. Both consumers share these results through `native_module`.
 
 use super::types::{ElfSectionData, ElfSectionInfo};
-use super::{
-    collect_load_segments, file_ranges_correlate, find_load_contribution_for_file_range,
-    LoadSegment,
-};
+use super::LoadSegment;
 use crate::error::{ElfParseError, Error};
-use crate::ModuleImageBase;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
 use goblin::elf::section_header::{SectionHeader, SHF_COMPRESSED};
@@ -23,96 +18,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SvmaFileRange {
-    svma: u64,
-    file_offset: u64,
-    size: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReferenceContribution<'a> {
-    Segment(&'a LoadSegment),
-    Text(SvmaFileRange),
-}
-
-impl ReferenceContribution<'_> {
-    fn file_range(self) -> SvmaFileRange {
-        match self {
-            Self::Segment(seg) => contribution_from_segment(seg),
-            Self::Text(range) => range,
-        }
-    }
-}
-
-pub(crate) struct ElfImageLayout<'a> {
-    info: &'a ElfSectionInfo,
-}
-
-impl<'a> ElfImageLayout<'a> {
-    pub(crate) fn new(info: &'a ElfSectionInfo) -> Self {
-        Self { info }
-    }
-
-    #[must_use]
-    pub(crate) fn resolve_mapping(
-        &self,
-        mapping_start_file_offset: u64,
-        mapping_start_avma: u64,
-        mapping_span: u64,
-    ) -> Option<ModuleImageBase> {
-        let reference = self.reference_contribution(mapping_start_file_offset, mapping_span)?;
-        Some(resolve_image_base_from_reference(
-            self.info.base_svma,
-            reference.file_range(),
-            mapping_start_file_offset,
-            mapping_start_avma,
-        ))
-    }
-
-    fn reference_contribution(
-        &self,
-        mapping_start_file_offset: u64,
-        mapping_span: u64,
-    ) -> Option<ReferenceContribution<'a>> {
-        find_load_contribution_for_file_range(
-            &self.info.load_segments,
-            mapping_start_file_offset,
-            mapping_span,
-        )
-        .map(ReferenceContribution::Segment)
-        .or_else(|| {
-            self.info
-                .load_segments
-                .is_empty()
-                .then(|| self.text_reference(mapping_start_file_offset, mapping_span))?
-        })
-    }
-
-    fn text_reference(
-        &self,
-        mapping_start_file_offset: u64,
-        mapping_span: u64,
-    ) -> Option<ReferenceContribution<'a>> {
-        let (text_svma, text_file_range) = (
-            self.info.text_svma.as_ref()?,
-            self.info.text_file_range.as_ref()?,
-        );
-        let text = SvmaFileRange {
-            svma: text_svma.start,
-            file_offset: text_file_range.start,
-            size: text_file_range.end.saturating_sub(text_file_range.start),
-        };
-        file_ranges_correlate(
-            text.file_offset,
-            text.size,
-            mapping_start_file_offset,
-            mapping_span,
-        )
-        .then_some(ReferenceContribution::Text(text))
-    }
-}
 
 #[cfg(test)]
 fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
@@ -236,6 +141,23 @@ fn calculate_base_svma(elf: &Elf) -> u64 {
         .map_or(0, |ph| ph.p_vaddr)
 }
 
+fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
+    let mut segments: Vec<_> = elf
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type == PT_LOAD)
+        .map(|ph| LoadSegment {
+            p_offset: ph.p_offset,
+            p_filesz: ph.p_filesz,
+            p_memsz: ph.p_memsz,
+            p_vaddr: ph.p_vaddr,
+            p_flags: ph.p_flags,
+        })
+        .collect();
+    segments.sort_by_key(|segment| segment.p_offset);
+    segments
+}
+
 /// Find a section header by name.
 fn find_section_header<'a>(name: &str, elf: &'a Elf) -> Option<&'a goblin::elf::SectionHeader> {
     elf.section_headers.iter().find(|sh| {
@@ -326,52 +248,9 @@ fn find_section_file_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
     checked_u64_range(sh.sh_offset, sh.sh_size)
 }
 
-fn contribution_from_segment(seg: &crate::elf::LoadSegment) -> SvmaFileRange {
-    SvmaFileRange {
-        svma: seg.p_vaddr,
-        file_offset: seg.p_offset,
-        size: seg.p_filesz,
-    }
-}
-
-fn resolve_image_base_from_reference(
-    base_svma: u64,
-    reference: SvmaFileRange,
-    mapping_start_file_offset: u64,
-    mapping_start_avma: u64,
-) -> ModuleImageBase {
-    let image_bias = crate::elf::compute_vma_bias(
-        reference.file_offset,
-        reference.svma,
-        mapping_start_file_offset,
-        mapping_start_avma,
-    );
-    ModuleImageBase::new(base_svma.wrapping_add(image_bias), base_svma)
-}
-
-/// Calculate the memory range from `PT_LOAD` segments.
-///
-/// Returns (`min_vaddr`, `max_vaddr`) covering all loadable segments.
-#[cfg(test)]
-fn calculate_memory_range(elf: &Elf) -> (u64, u64) {
-    let (min, max) = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .fold((u64::MAX, 0u64), |(mi, ma), ph| {
-            (mi.min(ph.p_vaddr), ma.max(ph.p_vaddr + ph.p_memsz))
-        });
-    if min == u64::MAX {
-        (0, 0)
-    } else {
-        (min, max)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::fake_hard_case_section_info;
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -428,125 +307,6 @@ mod tests {
                             base == first_load,
                             "base_svma {base:#x} should match first PT_LOAD {first_load:#x} for {path}",
                         );
-                        return;
-                    }
-                }
-            }
-        }
-        eprintln!("No ELF binary found, skipping test");
-    }
-
-    #[test]
-    fn test_resolve_mapping_matches_samply_hard_case() {
-        let section_info = fake_hard_case_section_info();
-
-        let resolved =
-            ElfImageLayout::new(&section_info).resolve_mapping(0x14bd000, 0x55d605384000, 0xf5d000);
-        assert_eq!(resolved, Some(ModuleImageBase::new(0x55d603ec6000, 0)));
-    }
-
-    #[test]
-    fn test_resolve_mapping_uses_zero_offset_load_for_large_mapping() {
-        let section_info = ElfSectionInfo {
-            base_svma: 0,
-            text_svma: Some(0x0..0x1661_3000),
-            text_file_range: Some(0x0..0x1661_3000),
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: vec![
-                crate::elf::LoadSegment {
-                    p_offset: 0,
-                    p_filesz: 0x1661_3000,
-                    p_memsz: 0x1661_3000,
-                    p_vaddr: 0,
-                    p_flags: 0x5,
-                },
-                crate::elf::LoadSegment {
-                    p_offset: 0x15e3_d000,
-                    p_filesz: 0x1000,
-                    p_memsz: 0x1000,
-                    p_vaddr: 0x15e3_e000,
-                    p_flags: 0x6,
-                },
-            ]
-            .into_boxed_slice(),
-        };
-
-        let mapping_start = 0x7f61_4879_9000;
-        let resolved =
-            ElfImageLayout::new(&section_info).resolve_mapping(0, mapping_start, 0x1661_3000);
-        assert_eq!(resolved, Some(ModuleImageBase::new(mapping_start, 0)));
-    }
-
-    #[test]
-    fn test_resolve_mapping_falls_back_to_text_section() {
-        let section_info = ElfSectionInfo {
-            base_svma: 0,
-            text_svma: Some(0x4000..0x5000),
-            text_file_range: Some(0x3000..0x4000),
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: Box::default(),
-        };
-
-        let resolved =
-            ElfImageLayout::new(&section_info).resolve_mapping(0x3000, 0x7f00_1000, 0x1000);
-        assert_eq!(resolved, Some(ModuleImageBase::new(0x7eff_d000, 0)));
-    }
-
-    #[test]
-    fn test_resolve_mapping_does_not_guess_from_page_overlap() {
-        let section_info = ElfSectionInfo {
-            base_svma: 0,
-            text_svma: Some(0x23c10..0x24c10),
-            text_file_range: Some(0x13c10..0x14c10),
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: vec![crate::elf::LoadSegment {
-                p_offset: 0x13c10,
-                p_filesz: 0x1000,
-                p_memsz: 0x1000,
-                p_vaddr: 0x23c10,
-                p_flags: 0x5,
-            }]
-            .into_boxed_slice(),
-        };
-
-        let resolved =
-            ElfImageLayout::new(&section_info).resolve_mapping(0x13000, 0x5555_5556_8000, 0x800);
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_calculate_memory_range_from_real_elf() {
-        use std::fs::File;
-
-        let paths = ["/bin/ls", "/usr/bin/ls", "/bin/cat", "/usr/bin/cat"];
-
-        for path in &paths {
-            if let Ok(file) = File::open(path) {
-                if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                    if let Ok(elf) = Elf::parse(&mmap) {
-                        let (min, max) = calculate_memory_range(&elf);
-                        // Should have valid range
-                        assert!(max >= min, "max should be >= min");
-                        if min != u64::MAX {
-                            // If we found PT_LOAD segments, range should be reasonable
-                            assert!(max - min > 0, "memory range should be non-zero");
-                        }
                         return;
                     }
                 }

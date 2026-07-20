@@ -4,21 +4,19 @@
 //! map a process memory mapping back to its backing `PT_LOAD` segment and to
 //! compute the SVMA-to-AVMA image-base bias for that mapping.
 
-use goblin::elf::program_header::PT_LOAD;
-use goblin::elf::Elf;
 mod loader;
 #[cfg(test)]
 mod test_fixtures;
 mod types;
 
-pub(crate) use loader::{
-    load_elf_sections_from_bytes, load_elf_sections_from_file, ElfImageLayout,
-};
+pub(crate) use loader::{load_elf_sections_from_bytes, load_elf_sections_from_file};
 #[cfg(test)]
 pub(crate) use test_fixtures::fake_hard_case_section_info;
 pub(crate) use types::{ElfSectionData, ElfSectionInfo};
 
 use std::sync::OnceLock;
+
+use crate::ModuleImageBase;
 
 /// A PT_LOAD segment from an ELF binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,24 +157,6 @@ impl PageSize {
     }
 }
 
-/// Collect PT_LOAD segments from an ELF, sorted by file offset.
-fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
-    let mut segments: Vec<LoadSegment> = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .map(|ph| LoadSegment {
-            p_offset: ph.p_offset,
-            p_filesz: ph.p_filesz,
-            p_memsz: ph.p_memsz,
-            p_vaddr: ph.p_vaddr,
-            p_flags: ph.p_flags,
-        })
-        .collect();
-    segments.sort_by_key(|s| s.p_offset);
-    segments
-}
-
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for a mapping.
 ///
@@ -263,12 +243,6 @@ pub(crate) fn system_page_size() -> u64 {
     })
 }
 
-/// Check whether two file ranges mutually contain each other (either A
-/// contains B or B contains A).
-fn file_ranges_correlate(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
-    FileRange::new(a_start, a_size).correlates_with(FileRange::new(b_start, b_size))
-}
-
 /// Compute the SVMA-to-AVMA bias from a known reference point.
 ///
 /// Given a reference whose file offset and SVMA are known, together with the
@@ -288,9 +262,56 @@ fn compute_vma_bias(
     reference_avma.wrapping_sub(reference_svma)
 }
 
+#[derive(Clone, Copy)]
+struct ImageReference {
+    svma: u64,
+    file_offset: u64,
+}
+
+pub(crate) fn resolve_mapping_image_base(
+    info: &ElfSectionInfo,
+    mapping_start_file_offset: u64,
+    mapping_start_avma: u64,
+    mapping_span: u64,
+) -> Option<ModuleImageBase> {
+    let reference = find_load_contribution_for_file_range(
+        &info.load_segments,
+        mapping_start_file_offset,
+        mapping_span,
+    )
+    .map(|segment| ImageReference {
+        svma: segment.p_vaddr,
+        file_offset: segment.p_offset,
+    })
+    .or_else(|| {
+        info.load_segments.is_empty().then(|| {
+            let text_svma = info.text_svma.as_ref()?;
+            let text_file_range = info.text_file_range.as_ref()?;
+            let text_size = text_file_range.end.saturating_sub(text_file_range.start);
+            FileRange::new(text_file_range.start, text_size)
+                .correlates_with(FileRange::new(mapping_start_file_offset, mapping_span))
+                .then_some(ImageReference {
+                    svma: text_svma.start,
+                    file_offset: text_file_range.start,
+                })
+        })?
+    })?;
+    let image_bias = compute_vma_bias(
+        reference.file_offset,
+        reference.svma,
+        mapping_start_file_offset,
+        mapping_start_avma,
+    );
+    Some(ModuleImageBase::new(
+        info.base_svma.wrapping_add(image_bias),
+        info.base_svma,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::fake_hard_case_section_info;
 
     fn seg(p_offset: u64, p_filesz: u64, p_memsz: u64, p_vaddr: u64) -> LoadSegment {
         LoadSegment {
@@ -311,6 +332,75 @@ mod tests {
             seg(0x0000000000053cc0, 0x02e98, 0x03340, 0x0000000000055cc0), // RW
             seg(0x0000000000056b58, 0x009c0, 0x00a98, 0x0000000000059b58), // RW
         ]
+    }
+
+    fn section_info(
+        text_svma: Option<std::ops::Range<u64>>,
+        text_file_range: Option<std::ops::Range<u64>>,
+        load_segments: Vec<LoadSegment>,
+    ) -> ElfSectionInfo {
+        ElfSectionInfo {
+            base_svma: 0,
+            text_svma,
+            text_file_range,
+            text: None,
+            eh_frame_svma: None,
+            eh_frame: None,
+            eh_frame_hdr_svma: None,
+            eh_frame_hdr: None,
+            got_svma: None,
+            load_segments: load_segments.into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_mapping_matches_samply_hard_case() {
+        let resolved = resolve_mapping_image_base(
+            &fake_hard_case_section_info(),
+            0x14bd000,
+            0x55d605384000,
+            0xf5d000,
+        );
+        assert_eq!(resolved, Some(ModuleImageBase::new(0x55d603ec6000, 0)));
+    }
+
+    #[test]
+    fn test_resolve_mapping_uses_zero_offset_load_for_large_mapping() {
+        let info = section_info(
+            Some(0x0..0x1661_3000),
+            Some(0x0..0x1661_3000),
+            vec![
+                seg(0, 0x1661_3000, 0x1661_3000, 0),
+                seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
+            ],
+        );
+        let mapping_start = 0x7f61_4879_9000;
+
+        let resolved = resolve_mapping_image_base(&info, 0, mapping_start, 0x1661_3000);
+
+        assert_eq!(resolved, Some(ModuleImageBase::new(mapping_start, 0)));
+    }
+
+    #[test]
+    fn test_resolve_mapping_falls_back_to_text_section() {
+        let info = section_info(Some(0x4000..0x5000), Some(0x3000..0x4000), Vec::new());
+
+        let resolved = resolve_mapping_image_base(&info, 0x3000, 0x7f00_1000, 0x1000);
+
+        assert_eq!(resolved, Some(ModuleImageBase::new(0x7eff_d000, 0)));
+    }
+
+    #[test]
+    fn test_resolve_mapping_does_not_guess_from_page_overlap() {
+        let info = section_info(
+            Some(0x23c10..0x24c10),
+            Some(0x13c10..0x14c10),
+            vec![seg(0x13c10, 0x1000, 0x1000, 0x23c10)],
+        );
+
+        let resolved = resolve_mapping_image_base(&info, 0x13000, 0x5555_5556_8000, 0x800);
+
+        assert_eq!(resolved, None);
     }
 
     #[test]
