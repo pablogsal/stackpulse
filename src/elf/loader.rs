@@ -255,7 +255,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_extract_sections_from_libc() {
-        // Test with libc which should always be available
         let libc_paths = [
             "/lib/x86_64-linux-gnu/libc.so.6",
             "/lib/aarch64-linux-gnu/libc.so.6",
@@ -326,7 +325,6 @@ mod tests {
             if let Ok(file) = File::open(path) {
                 if let Ok(mmap) = unsafe { Mmap::map(&file) } {
                     if let Ok(elf) = Elf::parse(&mmap) {
-                        // .nonexistent_section_xyz should not exist
                         let missing = find_section_range_in_file(".nonexistent_section_xyz", &elf);
                         assert!(
                             missing.is_none(),
@@ -435,7 +433,6 @@ mod tests {
 
     #[test]
     fn test_load_elf_sections_from_non_elf() {
-        // /etc/passwd is definitely not an ELF file
         #[cfg(unix)]
         {
             let err = load_elf_sections_from_path(Path::new("/etc/passwd"))

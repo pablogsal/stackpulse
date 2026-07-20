@@ -1190,7 +1190,6 @@ mod tests {
         let len = std::fs::metadata(&path).unwrap().len();
         drop(writer);
 
-        // Simulate a crash mid-write: drop the final byte of the last record.
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)

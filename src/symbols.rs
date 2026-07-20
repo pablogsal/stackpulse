@@ -224,7 +224,6 @@ fn parse_debug_dirs() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .collect(),
         _ => {
-            // Use default system debug directory
             let default_dir = PathBuf::from(DEFAULT_DEBUG_DIR);
             if default_dir.exists() {
                 vec![default_dir]
@@ -885,8 +884,6 @@ mod tests {
 
     #[test]
     fn test_build_id_path_construction() {
-        // Test the hex encoding and path construction logic used by lookup_local_debug_file
-        // Build ID: 00db9c4d7f584f8f622578265ba9abd86723710f (20 bytes)
         let build_id: Vec<u8> = vec![
             0x00, 0xdb, 0x9c, 0x4d, 0x7f, 0x58, 0x4f, 0x8f, 0x62, 0x25, 0x78, 0x26, 0x5b, 0xa9,
             0xab, 0xd8, 0x67, 0x23, 0x71, 0x0f,
@@ -903,7 +900,6 @@ mod tests {
         assert_eq!(dir_part, "00");
         assert_eq!(file_part, "db9c4d7f584f8f622578265ba9abd86723710f");
 
-        // Verify path construction matches expected .build-id layout
         let base_dir = PathBuf::from("/usr/lib/debug");
         let path = base_dir
             .join(".build-id")
@@ -1089,8 +1085,6 @@ mod tests {
         );
     }
 
-    // ── is_python_runtime_module_path tests ─────────────────────────────
-
     #[test]
     fn test_python_runtime_libpython_shared_lib() {
         assert!(crate::is_python_runtime_module_path(
@@ -1120,7 +1114,6 @@ mod tests {
 
     #[test]
     fn test_cpython_extensions_not_hidden() {
-        // C extensions use the .cpython-XXX convention; these must NOT be hidden
         assert!(!crate::is_python_runtime_module_path(
             "/usr/lib/python3.13/lib-dynload/_ctypes.cpython-313-aarch64-linux-gnu.so"
         ));
@@ -1166,11 +1159,9 @@ mod tests {
 
     #[test]
     fn test_edge_cases() {
-        // Bare module name (no path)
         assert!(crate::is_python_runtime_module_path("libpython3.13.so"));
         assert!(crate::is_python_runtime_module_path("python3"));
 
-        // Should not match things that just happen to end with "python"
         assert!(!crate::is_python_runtime_module_path("/usr/bin/bpython"));
         assert!(!crate::is_python_runtime_module_path("/usr/bin/ipython"));
         assert!(!crate::is_python_runtime_module_path(
@@ -1181,7 +1172,6 @@ mod tests {
         assert!(!crate::is_python_runtime_module_path("python3.13m"));
         assert!(!crate::is_python_runtime_module_path("python.3"));
 
-        // Empty / weird
         assert!(!crate::is_python_runtime_module_path(""));
         assert!(!crate::is_python_runtime_module_path("/"));
     }

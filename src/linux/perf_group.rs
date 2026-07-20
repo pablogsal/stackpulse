@@ -115,8 +115,6 @@ pub struct PerfGroup {
     event_source: EventSource,
     include_kernel: bool,
     pub(crate) inherit_child_processes: bool,
-    // tid -> tracking state, so per-process reconciliation can tell foreign
-    // threads apart and inherited counters do not need parallel bookkeeping.
     tracked_threads: BTreeMap<u32, ThreadTrack>,
     stopped_processes: Vec<StoppedProcess>,
     retired_lost_records: u64,
