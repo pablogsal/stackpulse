@@ -186,7 +186,7 @@ impl ProcessTable {
         self.states.entry(pid).or_default()
     }
 
-    fn track(&mut self, pid: i32) {
+    fn track_or_refresh(&mut self, pid: i32) {
         let state = self.state_mut(pid);
         match &mut state.tracking {
             ProcessTracking::Untracked => {
@@ -200,7 +200,7 @@ impl ProcessTable {
         }
     }
 
-    fn track_if_untracked(&mut self, pid: i32) {
+    fn ensure_tracked(&mut self, pid: i32) {
         let state = self.state_mut(pid);
         if matches!(state.tracking, ProcessTracking::Untracked) {
             state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
@@ -436,7 +436,7 @@ impl PerfRecorder {
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
-            processes.track_if_untracked(pid_i32);
+            processes.ensure_tracked(pid_i32);
             if let Ok((identity, _)) = read_process_image_identity(pid) {
                 processes.state_mut(pid_i32).image = Some(identity);
             }
@@ -663,7 +663,7 @@ impl PerfRecorder {
                             break;
                         }
                     }
-                    processes.track_if_untracked(child);
+                    processes.ensure_tracked(child);
                     if let Ok((identity, _)) = read_process_image_identity(child_u32) {
                         processes.state_mut(child).image = Some(identity);
                     }
@@ -736,7 +736,7 @@ impl PerfRecorder {
         }
         let opened = self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
-            self.processes.track(pid_i32);
+            self.processes.track_or_refresh(pid_i32);
             if let Ok((identity, _)) = read_process_image_identity(pid) {
                 self.processes.state_mut(pid_i32).image = Some(identity);
             }
@@ -917,7 +917,7 @@ fn handle_non_sample_record<W: std::io::Write>(
                 ctx.lifecycle_actions
                     .push(LifecycleAction::ProcessRetire { pid: fork.task.pid });
             }
-            ctx.processes.track_if_untracked(pid);
+            ctx.processes.ensure_tracked(pid);
             let child = ctx.processes.state_mut(pid);
             if let Some(identity) = parent_image {
                 child.image = Some(identity);
@@ -1999,6 +1999,29 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<PerfRecorder>();
+    }
+
+    #[test]
+    fn untracked_process_metadata_is_not_active() {
+        let pid = i32::MAX;
+        let mut processes = ProcessTable::default();
+        let state = processes.state_mut(pid);
+        state.unwinder = Some(ProcessUnwinder::default());
+        state.image = Some(ProcessImageIdentity {
+            device: 1,
+            inode: 2,
+        });
+        state.start_time = Some(3);
+        state.python_perf_support = Some(false);
+        state.python_runtime = true;
+
+        assert!(!processes.is_tracked(pid));
+        assert!(processes.tracked_pids().is_empty());
+        assert!(processes.dead_or_reused_pids().is_empty());
+        assert_eq!(processes.tracked_process_is_stale(pid, Some(3)), None);
+        assert!(!processes.process_is_active(pid));
+        assert!(!processes.has_active_processes_except(0));
+        assert_eq!(processes.active_process_count(), 0);
     }
 
     #[test]

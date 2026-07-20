@@ -1,4 +1,11 @@
-use super::*;
+use std::io;
+
+use super::sorter::EventSorter;
+use super::{
+    finish_prepared_event, perf_event, prepare_event, record_module, ConvertRegs,
+    ConvertRegsNative, EventContext, PerfSummary, PreparedEvent, ProcessTable,
+};
+use crate::spool::{ModuleRecord, ModuleTable, PerfSpoolWriter};
 
 const LIVE_BENCH_PROCESS_ID: u32 = 42_000;
 const LIVE_BENCH_USER_BASE: u64 = 0x7000_0000_0000;
@@ -69,7 +76,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
         let mut lifecycle_actions = Vec::new();
-        let mut sorter = sorter::EventSorter::<usize, u64, PreparedEvent>::new();
+        let mut sorter = EventSorter::<usize, u64, PreparedEvent>::new();
         let mut result: io::Result<()> = Ok(());
         {
             let mut ctx = EventContext {

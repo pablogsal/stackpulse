@@ -46,17 +46,17 @@ impl ReferenceContribution<'_> {
     }
 }
 
-pub struct ElfImageLayout<'a> {
+pub(crate) struct ElfImageLayout<'a> {
     info: &'a ElfSectionInfo,
 }
 
 impl<'a> ElfImageLayout<'a> {
-    pub fn new(info: &'a ElfSectionInfo) -> Self {
+    pub(crate) fn new(info: &'a ElfSectionInfo) -> Self {
         Self { info }
     }
 
     #[must_use]
-    pub fn resolve_mapping(
+    pub(crate) fn resolve_mapping(
         &self,
         mapping_start_file_offset: u64,
         mapping_start_avma: u64,
@@ -115,19 +115,25 @@ impl<'a> ElfImageLayout<'a> {
 }
 
 #[cfg(test)]
-pub fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
+pub(crate) fn load_elf_sections_from_path(path: &Path) -> Result<ElfSectionInfo> {
     use std::fs::File;
 
     let file = File::open(path)?;
     load_elf_sections_from_file(&file, path)
 }
 
-pub fn load_elf_sections_from_file(file: &std::fs::File, path: &Path) -> Result<ElfSectionInfo> {
+pub(crate) fn load_elf_sections_from_file(
+    file: &std::fs::File,
+    path: &Path,
+) -> Result<ElfSectionInfo> {
     let mmap = Arc::new(unsafe { Mmap::map(file) }?);
     load_elf_sections(ElfFileData::Mmap(mmap), path)
 }
 
-pub fn load_elf_sections_from_bytes(bytes: Arc<[u8]>, path: &Path) -> Result<ElfSectionInfo> {
+pub(crate) fn load_elf_sections_from_bytes(
+    bytes: Arc<[u8]>,
+    path: &Path,
+) -> Result<ElfSectionInfo> {
     load_elf_sections(ElfFileData::Owned(bytes), path)
 }
 

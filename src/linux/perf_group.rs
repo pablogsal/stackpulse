@@ -970,10 +970,6 @@ mod tests {
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
 
-    fn thread_track(owner_pid: u32, events_inherit: bool) -> ThreadTrack {
-        ThreadTrack::new(owner_pid, events_inherit)
-    }
-
     struct EmptyConsumer {
         calls: Vec<&'static str>,
     }
@@ -1053,7 +1049,9 @@ mod tests {
     fn inherited_forked_process_is_tracked_without_opening_new_fds() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
             .expect("create perf group");
-        group.tracked_threads.insert(100, thread_track(100, true));
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(100, true));
 
         group
             .open_forked_processes(&[(200, 100)])
@@ -1068,8 +1066,12 @@ mod tests {
     fn lost_fork_recovery_uses_any_inheriting_thread_owned_by_parent_process() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, true)
             .expect("create perf group");
-        group.tracked_threads.insert(100, thread_track(100, false));
-        group.tracked_threads.insert(101, thread_track(100, true));
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(100, false));
+        group
+            .tracked_threads
+            .insert(101, ThreadTrack::new(100, true));
 
         group
             .recover_forked_processes(&[(200, 100)])
@@ -1077,7 +1079,7 @@ mod tests {
 
         assert_eq!(
             group.tracked_threads.get(&200),
-            Some(&thread_track(200, true))
+            Some(&ThreadTrack::new(200, true))
         );
         assert!(group.members.is_empty());
     }
@@ -1088,10 +1090,12 @@ mod tests {
         let stale_tid = u32::MAX;
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        group.tracked_threads.insert(pid, thread_track(pid, true));
         group
             .tracked_threads
-            .insert(stale_tid, thread_track(pid, true));
+            .insert(pid, ThreadTrack::new(pid, true));
+        group
+            .tracked_threads
+            .insert(stale_tid, ThreadTrack::new(pid, true));
 
         group
             .refresh_threads(pid)
@@ -1118,7 +1122,9 @@ mod tests {
     fn forked_threads_under_inheriting_parent_are_tracked_without_opening_fds() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        group.tracked_threads.insert(100, thread_track(100, true));
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(100, true));
 
         group
             .open_forked_threads(&[(101, 100, 100), (102, 100, 101), (101, 100, 100)])
@@ -1126,11 +1132,11 @@ mod tests {
 
         assert_eq!(
             group.tracked_threads.get(&101),
-            Some(&thread_track(100, true))
+            Some(&ThreadTrack::new(100, true))
         );
         assert_eq!(
             group.tracked_threads.get(&102),
-            Some(&thread_track(100, true))
+            Some(&ThreadTrack::new(100, true))
         );
         assert!(group.members.is_empty());
     }
@@ -1149,9 +1155,15 @@ mod tests {
     fn remove_thread_and_process_clear_bookkeeping() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        group.tracked_threads.insert(100, thread_track(100, false));
-        group.tracked_threads.insert(101, thread_track(100, true));
-        group.tracked_threads.insert(200, thread_track(200, true));
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(100, false));
+        group
+            .tracked_threads
+            .insert(101, ThreadTrack::new(100, true));
+        group
+            .tracked_threads
+            .insert(200, ThreadTrack::new(200, true));
 
         group.remove_thread(101).expect("remove thread");
         group.remove_process(100).expect("remove process");
@@ -1160,7 +1172,7 @@ mod tests {
         assert!(!group.tracked_threads.contains_key(&101));
         assert_eq!(
             group.tracked_threads.get(&200),
-            Some(&thread_track(200, true))
+            Some(&ThreadTrack::new(200, true))
         );
     }
 
@@ -1321,7 +1333,7 @@ mod tests {
         group.register_pending(pending).expect("register events");
         group
             .tracked_threads
-            .insert(target_tid, thread_track(owner_pid, false));
+            .insert(target_tid, ThreadTrack::new(owner_pid, false));
 
         group.remove_thread(target_tid).expect("remove thread");
         assert_eq!(group.members.len(), 1);
@@ -1384,9 +1396,13 @@ mod tests {
     fn rollback_restores_exact_thread_tracking_state() {
         let mut group = PerfGroup::new(1, 0, 0, EventSource::SwCpuClock, false, false)
             .expect("create perf group");
-        let previous = thread_track(100, true);
-        group.tracked_threads.insert(100, thread_track(200, false));
-        group.tracked_threads.insert(300, thread_track(300, true));
+        let previous = ThreadTrack::new(100, true);
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(200, false));
+        group
+            .tracked_threads
+            .insert(300, ThreadTrack::new(300, true));
         let opened = OpenTransaction {
             member_fds: Vec::new(),
             output_fds: Vec::new(),
