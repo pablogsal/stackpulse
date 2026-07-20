@@ -61,6 +61,19 @@ pub(crate) struct ModuleActivation {
 }
 
 impl ModuleTable {
+    #[cfg(test)]
+    pub(crate) fn intern_module<W: Write>(
+        &mut self,
+        module: ModuleRecord,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> io::Result<u32> {
+        Ok(self
+            .apply_module(module, writer)?
+            .active
+            .last()
+            .map_or(u32::MAX, |activation| activation.module.id))
+    }
+
     pub(crate) fn process_modules_match(&self, process_id: i32, snapshot: &[ModuleRecord]) -> bool {
         let active_count = self
             .slots

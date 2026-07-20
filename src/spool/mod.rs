@@ -16,30 +16,6 @@ pub use model::{
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
 
-#[cfg(test)]
-pub(crate) trait ModuleTableTestExt {
-    fn intern_module<W: Write>(
-        &mut self,
-        module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<u32>;
-}
-
-#[cfg(test)]
-impl ModuleTableTestExt for ModuleTable {
-    fn intern_module<W: Write>(
-        &mut self,
-        module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<u32> {
-        Ok(self
-            .apply_module(module, writer)?
-            .active
-            .last()
-            .map_or(u32::MAX, |activation| activation.module.id))
-    }
-}
-
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
 pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
