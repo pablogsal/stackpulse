@@ -302,6 +302,13 @@ impl ProcessTable {
             state.start_time = Some(start_time);
         }
     }
+
+    fn forget_generation(&mut self, pid: i32) {
+        if let Some(state) = self.states.get_mut(&pid) {
+            state.image = None;
+            state.start_time = None;
+        }
+    }
 }
 
 fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
@@ -1048,10 +1055,7 @@ fn reconcile_process_image<W: std::io::Write>(
     let current_start_time = match read_process_start_time(pid) {
         Ok(start_time) => start_time,
         Err(err) if process_gone_error(&err) => {
-            if let Some(state) = processes.states.get_mut(&pid_i32) {
-                state.image = None;
-                state.start_time = None;
-            }
+            processes.forget_generation(pid_i32);
             return Ok(false);
         }
         Err(err) => return Err(err),
@@ -1066,10 +1070,7 @@ fn reconcile_process_image<W: std::io::Write>(
     let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
         Ok(maps) => maps,
         Err(err) if process_gone_error(&err) => {
-            if let Some(state) = processes.states.get_mut(&pid_i32) {
-                state.image = None;
-                state.start_time = None;
-            }
+            processes.forget_generation(pid_i32);
             return Ok(false);
         }
         Err(err) => return Err(err),
@@ -1122,10 +1123,7 @@ fn reconcile_process_image<W: std::io::Write>(
             Ok(true)
         }
         Err(err) if process_gone_error(&err) => {
-            if let Some(state) = processes.states.get_mut(&pid_i32) {
-                state.image = None;
-                state.start_time = None;
-            }
+            processes.forget_generation(pid_i32);
             Ok(false)
         }
         Err(err) => Err(err),

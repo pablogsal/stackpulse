@@ -262,7 +262,6 @@ impl<'a> ErrorStatsFormatter<'a> {
             .unwrap_or(24)
             .max(24);
 
-        // Overview section
         writeln!(w, "\nOverview:")?;
         writeln!(
             w,
@@ -274,7 +273,6 @@ impl<'a> ErrorStatsFormatter<'a> {
             "  Successful:          {} ({:.2}%)",
             format_number(self.successful_samples),
             if self.total_samples > 0 {
-                // Stats counters converted to f64 for percentage display
                 self.successful_samples as f64 / self.total_samples as f64 * 100.0
             } else {
                 0.0
@@ -285,7 +283,6 @@ impl<'a> ErrorStatsFormatter<'a> {
             "  Sample errors:       {} ({:.2}%)",
             format_number(total_errors),
             if self.total_samples > 0 {
-                // Stats counters converted to f64 for percentage display
                 total_errors as f64 / self.total_samples as f64 * 100.0
             } else {
                 0.0
@@ -297,7 +294,6 @@ impl<'a> ErrorStatsFormatter<'a> {
             return Ok(());
         }
 
-        // Group by category
         let mut current_category = "";
         for (kind, count) in &entries {
             let category = kind.category();
@@ -306,7 +302,6 @@ impl<'a> ErrorStatsFormatter<'a> {
                 current_category = category;
             }
 
-            // Stats counters converted to f64 for percentage display
             let pct_of_errors = (*count as f64 / total_errors as f64) * 100.0;
             let pct_of_samples = if self.total_samples > 0 {
                 (*count as f64 / self.total_samples as f64) * 100.0
@@ -366,8 +361,6 @@ mod tests {
         assert_eq!(SampleErrorKind::ALL.len(), ERROR_KIND_COUNT);
     }
 
-    // SampleErrorStats basic operations
-
     #[test]
     fn test_new_stats_are_zero() {
         let stats = SampleErrorStats::new();
@@ -425,12 +418,9 @@ mod tests {
 
         let nonzero: Vec<_> = stats.iter_nonzero().collect();
 
-        // Should be in ALL order, not recording order
         assert_eq!(nonzero[0].0, SampleErrorKind::NativeRegisterCapture);
         assert_eq!(nonzero[1].0, SampleErrorKind::NativeFramehopIntegerOverflow);
     }
-
-    // SampleErrorStats reset
 
     #[test]
     fn test_reset() {
@@ -453,8 +443,6 @@ mod tests {
         }
     }
 
-    // SampleErrorStats clone
-
     #[test]
     fn test_clone() {
         let stats = SampleErrorStats::new();
@@ -463,7 +451,6 @@ mod tests {
 
         let cloned = stats.clone();
 
-        // Clone has same values
         assert_eq!(cloned.get(SampleErrorKind::NativeStackRead), 1);
         assert_eq!(cloned.get(SampleErrorKind::NativeRegisterCapture), 1);
         assert_eq!(cloned.total(), 2);
@@ -476,22 +463,17 @@ mod tests {
 
         let cloned = stats.clone();
 
-        // Modify original
         stats.record(SampleErrorKind::NativeStackRead);
         stats.record(SampleErrorKind::NativeRegisterCapture);
 
-        // Clone is unaffected
         assert_eq!(cloned.get(SampleErrorKind::NativeStackRead), 1);
         assert_eq!(cloned.get(SampleErrorKind::NativeRegisterCapture), 0);
         assert_eq!(cloned.total(), 1);
 
-        // Original has new values
         assert_eq!(stats.get(SampleErrorKind::NativeStackRead), 2);
         assert_eq!(stats.get(SampleErrorKind::NativeRegisterCapture), 1);
         assert_eq!(stats.total(), 3);
     }
-
-    // ErrorStatsFormatter tests
 
     #[test]
     fn test_formatter_no_errors() {
@@ -562,7 +544,6 @@ mod tests {
         let mut output = String::new();
         formatter.write_to(&mut output).unwrap();
 
-        // Single category header, one line per recorded kind.
         assert_eq!(output.matches("Native Unwinding:").count(), 1);
         assert!(output.contains("Register capture failed:"));
         assert!(output.contains("Stack read failed:"));
@@ -572,8 +553,6 @@ mod tests {
     #[test]
     fn test_formatter_percentages() {
         let stats = SampleErrorStats::new();
-        // Add 80 of one type, 20 of another = 80% and 20% of errors
-        // With 1000 total samples: 8% and 2% of samples
         for _ in 0..80 {
             stats.record(SampleErrorKind::NativeStackRead);
         }
@@ -586,10 +565,8 @@ mod tests {
         let mut output = String::new();
         formatter.write_to(&mut output).unwrap();
 
-        // Check percentage of errors
         assert!(output.contains("80.0% of errors"));
         assert!(output.contains("20.0% of errors"));
-        // Check percentage of samples
         assert!(output.contains("8.00% of samples"));
         assert!(output.contains("2.00% of samples"));
     }
@@ -621,8 +598,6 @@ mod tests {
         assert_eq!(bar_start(lines[1]), first);
         assert_eq!(bar_start(lines[2]), first);
     }
-
-    // Thread safety (basic verification)
 
     #[test]
     fn test_concurrent_recording() {

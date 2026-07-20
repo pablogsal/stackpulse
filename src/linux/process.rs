@@ -89,7 +89,6 @@ impl SuspendedLaunchedProcess {
             .take()
             .ok_or_else(|| io::Error::other("process was already resumed"))?;
 
-        // Signal the child to exec.
         write(&send_end_of_resume_pipe, &[0x42])?;
         drop(send_end_of_resume_pipe);
 
