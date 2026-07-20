@@ -323,11 +323,9 @@ enum PreparedEvent {
 }
 
 struct PreparedSample {
-    timestamp_ns: u64,
-    pid: i32,
-    tid: u64,
+    meta: PreparedSampleMeta,
     privilege: Priv,
-    code_addr: Option<(u64, bool)>,
+    code_addr: Option<u64>,
     user_regs: Option<Vec<u64>>,
     user_stack: Option<Vec<u8>>,
     callchain_stack: Vec<StackFrame>,
@@ -337,8 +335,6 @@ struct PreparedSampleMeta {
     timestamp_ns: u64,
     pid: i32,
     tid: u64,
-    privilege: Priv,
-    code_addr: Option<(u64, bool)>,
 }
 
 struct DrainSink<'a, W: std::io::Write> {
@@ -407,7 +403,7 @@ impl<W: std::io::Write> DrainSink<'_, W> {
             return;
         }
         let timestamp_ns = match &prepared {
-            PreparedEvent::Sample(sample) => sample.timestamp_ns,
+            PreparedEvent::Sample(sample) => sample.meta.timestamp_ns,
             PreparedEvent::Record { timestamp_ns, .. } => *timestamp_ns,
         };
         if let Err(err) = finish_prepared_event(prepared, &mut self.ctx) {
@@ -482,11 +478,15 @@ impl PerfRecorder {
 
     /// Drain currently readable events into the profile file.
     pub fn consume_available(&mut self) -> io::Result<()> {
-        self.drain_events(DrainMode::Consume, true)
+        self.drain_events(DrainMode::Consume)
     }
 
     #[allow(clippy::cognitive_complexity)]
-    fn drain_events(&mut self, mode: DrainMode, open_new_perf_events: bool) -> io::Result<()> {
+    fn drain_events(&mut self, mode: DrainMode) -> io::Result<()> {
+        let open_new_perf_events = match mode {
+            DrainMode::Consume => true,
+            DrainMode::Flush => false,
+        };
         let Self {
             perf,
             event_sorter,
@@ -819,7 +819,7 @@ impl PerfRecorder {
     /// Flush the profile file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.perf.disable()?;
-        self.drain_events(DrainMode::Flush, false)?;
+        self.drain_events(DrainMode::Flush)?;
         self.writer.flush()?;
         Ok(self.summary)
     }
@@ -1272,16 +1272,14 @@ fn prepare_sample<W: std::io::Write>(
         ..
     } = sample;
     let task = record_id.task.as_ref().map(|task| (task.pid, task.tid));
-    let Some(meta) = prepare_sample_meta(ctx, task, record_id.time, code_addr, privilege) else {
+    let Some(meta) = prepare_sample_meta(ctx, task, record_id.time) else {
         return Ok(None);
     };
 
     Ok(Some(PreparedEvent::Sample(PreparedSample {
-        timestamp_ns: meta.timestamp_ns,
-        pid: meta.pid,
-        tid: meta.tid,
-        privilege: meta.privilege,
-        code_addr: meta.code_addr,
+        meta,
+        privilege,
+        code_addr: code_addr.map(|(ip, _)| ip),
         user_regs: user_regs.and_then(|(regs, abi)| (abi == SampleRegsAbi::_64).then_some(regs)),
         user_stack,
         callchain_stack: call_chain
@@ -1303,7 +1301,7 @@ fn prepare_sample_ref<W: std::io::Write>(
 struct SampleView<'a> {
     task: Option<(u32, u32)>,
     timestamp_ns: Option<u64>,
-    code_addr: Option<(u64, bool)>,
+    code_addr: Option<u64>,
     user_regs: Option<&'a [u64]>,
     user_stack: Option<&'a [u8]>,
     call_chain: SampleCallChain<'a>,
@@ -1311,7 +1309,7 @@ struct SampleView<'a> {
 
 #[derive(Clone, Copy)]
 struct StackInput<'a> {
-    code_addr: Option<(u64, bool)>,
+    code_addr: Option<u64>,
     user_regs: Option<&'a [u64]>,
     user_stack: Option<&'a [u8]>,
 }
@@ -1395,7 +1393,7 @@ impl<'a> SampleView<'a> {
         Self {
             task: sample.task.map(|task| (task.pid, task.tid)),
             timestamp_ns: sample.time,
-            code_addr: sample.code_addr,
+            code_addr: sample.code_addr.map(|(ip, _)| ip),
             user_regs: sample.user_regs,
             user_stack: sample.user_stack,
             call_chain: sample
@@ -1419,22 +1417,14 @@ fn prepare_sample_view<W: std::io::Write>(
     sample: SampleView<'_>,
     privilege: Priv,
 ) -> io::Result<Option<PreparedEvent>> {
-    let Some(meta) = prepare_sample_meta(
-        ctx,
-        sample.task,
-        sample.timestamp_ns,
-        sample.code_addr,
-        privilege,
-    ) else {
+    let Some(meta) = prepare_sample_meta(ctx, sample.task, sample.timestamp_ns) else {
         return Ok(None);
     };
 
     Ok(Some(PreparedEvent::Sample(PreparedSample {
-        timestamp_ns: meta.timestamp_ns,
-        pid: meta.pid,
-        tid: meta.tid,
-        privilege: meta.privilege,
-        code_addr: meta.code_addr,
+        meta,
+        privilege,
+        code_addr: sample.code_addr,
         user_regs: sample.user_regs.map(<[u64]>::to_vec),
         user_stack: sample.user_stack.map(<[u8]>::to_vec),
         callchain_stack: sample.call_chain.to_stack_frames(),
@@ -1445,8 +1435,6 @@ fn prepare_sample_meta<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
     task: Option<(u32, u32)>,
     timestamp_ns: Option<u64>,
-    code_addr: Option<(u64, bool)>,
-    privilege: Priv,
 ) -> Option<PreparedSampleMeta> {
     bump(&mut ctx.summary.sample_events);
     let Some((raw_pid, raw_tid)) = task else {
@@ -1474,8 +1462,6 @@ fn prepare_sample_meta<W: std::io::Write>(
         timestamp_ns,
         pid,
         tid: tid as u64,
-        privilege,
-        code_addr,
     })
 }
 
@@ -1497,7 +1483,7 @@ fn record_prepared_sample<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
     sample: PreparedSample,
 ) -> io::Result<()> {
-    let pid = sample.pid;
+    let pid = sample.meta.pid;
     refresh_maps_for_uncovered_user_pc(ctx, &sample)?;
     let input = StackInput {
         code_addr: sample.code_addr,
@@ -1521,9 +1507,9 @@ fn record_prepared_sample<W: std::io::Write>(
         let modules = &mut *ctx.modules;
         let summary = &mut *ctx.summary;
         ctx.writer.write_sample_frames(
-            sample.timestamp_ns,
+            sample.meta.timestamp_ns,
             pid,
-            sample.tid,
+            sample.meta.tid,
             ctx.stack_scratch
                 .iter()
                 .copied()
@@ -1547,7 +1533,7 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     ctx: &mut EventContext<'_, W>,
     sample: &PreparedSample,
 ) -> io::Result<()> {
-    let Some(pid) = u32::try_from(sample.pid).ok() else {
+    let Some(pid) = u32::try_from(sample.meta.pid).ok() else {
         return Ok(());
     };
     let Some(pc) = sample
@@ -1558,12 +1544,12 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     else {
         return Ok(());
     };
-    if ctx.modules.covers_user_pc(sample.pid, pc) {
+    if ctx.modules.covers_user_pc(sample.meta.pid, pc) {
         return Ok(());
     }
     if !ctx
         .processes
-        .state_mut(sample.pid)
+        .state_mut(sample.meta.pid)
         .unwinder
         .get_or_insert_default()
         .should_refresh_for_uncovered_pc(pc)
@@ -1572,7 +1558,12 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     }
     match register_existing_maps(pid, ctx.modules, ctx.processes, ctx.writer) {
         Ok(true) if process_has_python_perf_support(pid, ctx.processes) => {
-            mark_python_runtime_process(ctx.processes, ctx.writer, sample.timestamp_ns, sample.pid)
+            mark_python_runtime_process(
+                ctx.processes,
+                ctx.writer,
+                sample.meta.timestamp_ns,
+                sample.meta.pid,
+            )
         }
         Ok(_) => Ok(()),
         Err(err) if process_gone_error(&err) => Ok(()),
@@ -1927,7 +1918,7 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
     }
 
     if stack.is_empty() {
-        if let Some((ip, _)) = sample.code_addr {
+        if let Some(ip) = sample.code_addr {
             stack.push(StackFrame::InstructionPointer(ip, privilege.into()));
         }
     }
@@ -1992,7 +1983,6 @@ fn c_string_to_string(data: &std::ffi::CString) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::ModuleTableTestExt;
     use crate::test_support::{SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
     use perf_event_open::sample::record::lost::{LostRecords, LostSamples};
@@ -2720,7 +2710,7 @@ mod tests {
         let sample = SampleView {
             task: None,
             timestamp_ns: None,
-            code_addr: Some((0x3000, false)),
+            code_addr: Some(0x3000),
             user_regs: None,
             user_stack: None,
             call_chain: SampleCallChain::Owned(&chains),
@@ -2787,7 +2777,7 @@ mod tests {
         let sample = SampleView {
             task: None,
             timestamp_ns: None,
-            code_addr: Some((0x1000, false)),
+            code_addr: Some(0x1000),
             user_regs: Some(&[]),
             user_stack: Some(&[]),
             call_chain: SampleCallChain::Owned(&[]),
