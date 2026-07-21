@@ -38,13 +38,14 @@ impl LoadSegment {
         FileRange::new(self.p_offset, self.p_filesz)
     }
 
-    fn correlates_with_mapping(
-        &self,
-        mapping: FileRange,
-        prev_segment: Option<&LoadSegment>,
-        next_segment: Option<&LoadSegment>,
-        page_size: PageSize,
-    ) -> bool {
+    fn has_file_contribution(&self) -> bool {
+        self.file_range().is_valid()
+    }
+
+    fn correlates_with_mapping(&self, mapping: FileRange, page_size: PageSize) -> bool {
+        if !mapping.is_valid() {
+            return false;
+        }
         if self.file_range().correlates_with(mapping) {
             return true;
         }
@@ -53,43 +54,36 @@ impl LoadSegment {
             return false;
         }
 
-        self.contains_unshared_page_rounded_head(mapping, prev_segment, page_size)
-            || self.contains_unshared_page_rounded_tail(mapping, next_segment, page_size)
+        self.contains_page_rounded_head(mapping, page_size)
+            || self.contains_page_rounded_tail(mapping, page_size)
     }
 
-    fn contains_unshared_page_rounded_head(
-        &self,
-        mapping: FileRange,
-        prev_segment: Option<&LoadSegment>,
-        page_size: PageSize,
-    ) -> bool {
+    fn contains_page_rounded_head(&self, mapping: FileRange, page_size: PageSize) -> bool {
         let segment = self.file_range();
+        let (Some(segment_end), Some(mapping_end)) = (segment.end(), mapping.end()) else {
+            return false;
+        };
         if !(segment.page_floor_start(page_size) <= mapping.start && mapping.start < segment.start)
         {
             return false;
         }
-        if !(segment.start < mapping.end() && mapping.end() <= segment.end()) {
-            return false;
-        }
-
-        prev_segment.is_none_or(|prev| prev.file_range().end() <= mapping.start)
+        segment.start < mapping_end && mapping_end <= segment_end
     }
 
-    fn contains_unshared_page_rounded_tail(
-        &self,
-        mapping: FileRange,
-        next_segment: Option<&LoadSegment>,
-        page_size: PageSize,
-    ) -> bool {
+    fn contains_page_rounded_tail(&self, mapping: FileRange, page_size: PageSize) -> bool {
         let segment = self.file_range();
+        let (Some(segment_end), Some(mapping_end), Some(page_ceil_end)) = (
+            segment.end(),
+            mapping.end(),
+            segment.page_ceil_end(page_size),
+        ) else {
+            return false;
+        };
         if !segment.contains_value(mapping.start) {
             return false;
         }
-        if !(segment.end() < mapping.end() && mapping.end() <= segment.page_ceil_end(page_size)) {
-            return false;
-        }
 
-        next_segment.is_none_or(|next| mapping.end() <= next.p_offset)
+        segment_end < mapping_end && mapping_end <= page_ceil_end
     }
 }
 
@@ -104,16 +98,24 @@ impl FileRange {
         Self { start, size }
     }
 
-    fn end(self) -> u64 {
-        self.start.saturating_add(self.size)
+    fn end(self) -> Option<u64> {
+        self.start.checked_add(self.size)
+    }
+
+    fn is_valid(self) -> bool {
+        self.size != 0 && self.end().is_some()
     }
 
     fn contains(self, other: Self) -> bool {
-        self.start <= other.start && other.end() <= self.end()
+        let (Some(end), Some(other_end)) = (self.end(), other.end()) else {
+            return false;
+        };
+        self.size != 0 && other.size != 0 && self.start <= other.start && other_end <= end
     }
 
     fn contains_value(self, value: u64) -> bool {
-        self.start <= value && value < self.end()
+        self.end()
+            .is_some_and(|end| self.start <= value && value < end)
     }
 
     fn correlates_with(self, other: Self) -> bool {
@@ -130,8 +132,8 @@ impl FileRange {
         page_size.align_down(self.start)
     }
 
-    fn page_ceil_end(self, page_size: PageSize) -> u64 {
-        page_size.align_up(self.end())
+    fn page_ceil_end(self, page_size: PageSize) -> Option<u64> {
+        self.end().and_then(|end| page_size.align_up(end))
     }
 }
 
@@ -147,18 +149,18 @@ impl PageSize {
         value - value % self.0
     }
 
-    fn align_up(self, value: u64) -> u64 {
+    fn align_up(self, value: u64) -> Option<u64> {
         let remainder = value % self.0;
         if remainder == 0 {
-            value
+            Some(value)
         } else {
-            value.saturating_add(self.0 - remainder)
+            value.checked_add(self.0 - remainder)
         }
     }
 }
 
 /// Find the PT_LOAD segment whose file contribution should be used as the
-/// reference for computing an image-wide AVMA bias for a mapping.
+/// reference for computing an image-wide AVMA bias for an executable mapping.
 ///
 fn find_load_contribution_for_file_range(
     segments: &[LoadSegment],
@@ -190,12 +192,11 @@ fn find_load_contribution_for_file_range_with_page_size(
     let mut fallback_bias = None;
     let mut fallback_ambiguous = false;
 
-    for (index, segment) in segments.iter().enumerate() {
-        let prev_segment = index
-            .checked_sub(1)
-            .and_then(|previous| segments.get(previous));
-        let next_segment = segments.get(index + 1);
-        if !segment.correlates_with_mapping(mapping, prev_segment, next_segment, page_size) {
+    for segment in segments
+        .iter()
+        .filter(|segment| segment.has_file_contribution())
+    {
+        if !segment.correlates_with_mapping(mapping, page_size) {
             continue;
         }
 
@@ -203,7 +204,8 @@ fn find_load_contribution_for_file_range_with_page_size(
         // mapping. They are interchangeable only when they describe the same
         // image-wide SVMA/file-offset relationship.
         let bias = i128::from(segment.p_vaddr) - i128::from(segment.p_offset);
-        let (candidate, candidate_bias, ambiguous) = if segment.p_offset == file_off {
+        let is_exact = segment.p_offset == file_off && segment.file_range().contains(mapping);
+        let (candidate, candidate_bias, ambiguous) = if is_exact {
             (&mut exact, &mut exact_bias, &mut exact_ambiguous)
         } else {
             (&mut fallback, &mut fallback_bias, &mut fallback_ambiguous)
@@ -218,12 +220,13 @@ fn find_load_contribution_for_file_range_with_page_size(
         }
     }
 
-    if exact_ambiguous {
+    let cross_bucket_ambiguous = exact_bias
+        .zip(fallback_bias)
+        .is_some_and(|(exact, fallback)| exact != fallback);
+    if exact_ambiguous || fallback_ambiguous || cross_bucket_ambiguous {
         None
     } else if exact.is_some() {
         exact
-    } else if fallback_ambiguous {
-        None
     } else {
         fallback
     }
@@ -326,12 +329,14 @@ mod tests {
     /// Real Rust PIE layout (from `rustc -g -C opt-level=0`).
     /// Key property: non-uniform bias (p_vaddr - p_offset differs per segment).
     fn rust_pie_segments() -> Vec<LoadSegment> {
-        vec![
-            seg(0x0000000000000000, 0x13c04, 0x13c04, 0x0000000000000000), // R
-            seg(0x0000000000013c10, 0x400b0, 0x400b0, 0x0000000000014c10), // R E
-            seg(0x0000000000053cc0, 0x02e98, 0x03340, 0x0000000000055cc0), // RW
-            seg(0x0000000000056b58, 0x009c0, 0x00a98, 0x0000000000059b58), // RW
-        ]
+        let mut read_only = seg(0, 0x13c04, 0x13c04, 0);
+        read_only.p_flags = 0x4;
+        let executable = seg(0x13c10, 0x400b0, 0x400b0, 0x14c10);
+        let mut read_write = seg(0x53cc0, 0x02e98, 0x03340, 0x55cc0);
+        read_write.p_flags = 0x6;
+        let mut read_write_bss = seg(0x56b58, 0x009c0, 0x00a98, 0x59b58);
+        read_write_bss.p_flags = 0x6;
+        vec![read_only, executable, read_write, read_write_bss]
     }
 
     fn section_info(
@@ -369,10 +374,7 @@ mod tests {
         let info = section_info(
             Some(0x0..0x1661_3000),
             Some(0x0..0x1661_3000),
-            vec![
-                seg(0, 0x1661_3000, 0x1661_3000, 0),
-                seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
-            ],
+            vec![seg(0, 0x1661_3000, 0x1661_3000, 0)],
         );
         let mapping_start = 0x7f61_4879_9000;
 
@@ -412,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_load_contribution_for_file_range_prefers_exact_mapping_start() {
+    fn test_find_load_contribution_rejects_ambiguous_shared_page_head() {
         let segs = vec![
             LoadSegment {
                 p_offset: 0x0,
@@ -430,11 +432,61 @@ mod tests {
             },
         ];
 
-        let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1000).unwrap();
-        assert_eq!(matched.p_offset, 0x0);
+        assert!(find_load_contribution_for_file_range(&segs, 0x0, 0x1000).is_none());
+    }
 
-        let bias = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, 0x5555_5555_5000);
-        assert_eq!(0_u64.wrapping_add(bias), 0x5555_5555_5000);
+    #[test]
+    fn test_find_load_contribution_rejects_cross_bucket_ambiguity() {
+        let segs = vec![
+            seg(0, 0x3000, 0x3000, 0),
+            seg(0x1000, 0x1000, 0x1000, 0x5000),
+        ];
+
+        assert!(find_load_contribution_for_file_range_with_page_size(
+            &segs, 0x1000, 0x1000, 0x1000,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_find_load_contribution_accepts_non_pf_x_mapping_made_executable() {
+        let mut segment = seg(0x2000, 0x1000, 0x1000, 0x3000);
+        segment.p_flags = 0x6;
+        let segments = [segment];
+
+        let matched =
+            find_load_contribution_for_file_range_with_page_size(&segments, 0x2000, 0x1000, 0x1000)
+                .unwrap();
+
+        assert_eq!(matched.p_offset, 0x2000);
+    }
+
+    #[test]
+    fn test_find_load_contribution_ignores_zero_file_size_segments() {
+        let segs = vec![
+            seg(0x1000, 0x1000, 0x1000, 0x2000),
+            seg(0x1000, 0, 0x1000, 0x5000),
+        ];
+
+        let matched =
+            find_load_contribution_for_file_range_with_page_size(&segs, 0x1000, 0x1000, 0x1000)
+                .unwrap();
+
+        assert_eq!(matched.p_vaddr, 0x2000);
+    }
+
+    #[test]
+    fn test_find_load_contribution_rejects_overflowing_file_ranges() {
+        let segment_start = u64::MAX - 0xfff;
+        let segs = vec![seg(segment_start, 0x2000, 0x2000, segment_start)];
+
+        assert!(find_load_contribution_for_file_range_with_page_size(
+            &segs,
+            segment_start,
+            0x1000,
+            0x1000,
+        )
+        .is_none());
     }
 
     #[test]
@@ -478,10 +530,7 @@ mod tests {
 
     #[test]
     fn test_find_load_contribution_for_large_zero_offset_mapping() {
-        let segs = vec![
-            seg(0x0, 0x1661_3000, 0x1661_3000, 0x0),
-            seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
-        ];
+        let segs = vec![seg(0x0, 0x1661_3000, 0x1661_3000, 0x0)];
 
         let matched = find_load_contribution_for_file_range(&segs, 0x0, 0x1661_3000).unwrap();
         assert_eq!(matched.p_offset, 0x0);
@@ -493,10 +542,7 @@ mod tests {
 
     #[test]
     fn test_image_relative_address_matches_mapping_relative_address() {
-        let segs = vec![
-            seg(0x0, 0x1661_3000, 0x1661_3000, 0x0),
-            seg(0x15e3_d000, 0x1000, 0x1000, 0x15e3_e000),
-        ];
+        let segs = vec![seg(0x0, 0x1661_3000, 0x1661_3000, 0x0)];
         let mapping_start = 0x7f61_4879_9000;
         let sampled_ip = mapping_start + 0x8ce_4ea0;
 
@@ -531,14 +577,13 @@ mod tests {
     }
 
     #[test]
-    fn test_find_load_contribution_keeps_first_segment_on_64k_zero_mapping() {
+    fn test_find_load_contribution_rejects_ambiguous_64k_shared_page() {
         let segs = rust_pie_segments();
 
-        let matched =
-            find_load_contribution_for_file_range_with_page_size(&segs, 0x0, 0x10000, 0x10000)
-                .unwrap();
-
-        assert_eq!(matched.p_offset, 0x0);
+        assert!(find_load_contribution_for_file_range_with_page_size(
+            &segs, 0x10000, 0x10000, 0x10000,
+        )
+        .is_none());
     }
 
     #[test]
@@ -562,7 +607,21 @@ mod tests {
     }
 
     #[test]
-    fn test_find_load_contribution_rejects_shared_page_tail_guess() {
+    fn test_find_load_contribution_accepts_page_rounded_tail_shared_with_next_segment() {
+        let executable = seg(0, 0x6a65248, 0x6a65248, 0x400000);
+        let mut read_write = seg(0x6a65380, 0x1000, 0x2000, 0x6aa6380);
+        read_write.p_flags = 0x6;
+        let segs = vec![executable, read_write];
+
+        let matched =
+            find_load_contribution_for_file_range_with_page_size(&segs, 0x6a64000, 0x2000, 0x1000)
+                .unwrap();
+
+        assert_eq!(matched.p_offset, 0);
+    }
+
+    #[test]
+    fn test_find_load_contribution_rejects_ambiguous_executable_shared_page_head() {
         let segs = rust_pie_segments();
 
         assert!(find_load_contribution_for_file_range_with_page_size(

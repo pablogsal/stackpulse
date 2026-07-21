@@ -883,7 +883,7 @@ pub(crate) fn module_for_frame_unbounded<'a>(
         .iter()
         .rev()
         .find(|module| module_owns_frame(module, process_id, frame))?;
-    Some(frame_module_ref(module, frame))
+    frame_module_ref(module, frame)
 }
 
 pub(crate) fn module_for_frame_with_context<'a>(
@@ -914,7 +914,7 @@ pub(crate) fn module_for_frame_with_context<'a>(
             }
             module_owns_frame(module, process_id, frame).then_some(module)
         })?;
-    Some(frame_module_ref(module, frame))
+    frame_module_ref(module, frame)
 }
 
 fn module_owns_frame(module: &ModuleRecord, process_id: i32, frame: &FrameRecord) -> bool {
@@ -926,14 +926,17 @@ fn module_owns_frame(module: &ModuleRecord, process_id: i32, frame: &FrameRecord
     owned_by && module.start <= frame.abs_ip && frame.abs_ip < module.end
 }
 
-fn frame_module_ref<'a>(module: &'a ModuleRecord, frame: &FrameRecord) -> FrameModuleRef<'a> {
-    FrameModuleRef {
+fn frame_module_ref<'a>(
+    module: &'a ModuleRecord,
+    frame: &FrameRecord,
+) -> Option<FrameModuleRef<'a>> {
+    Some(FrameModuleRef {
         module,
         file_relative_ip: frame
             .abs_ip
-            .saturating_sub(module.start)
-            .saturating_add(module.file_offset),
-    }
+            .checked_sub(module.start)?
+            .checked_add(module.file_offset)?,
+    })
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -2154,6 +2157,56 @@ mod tests {
         assert_ne!(right.module_id, Some(replacement));
         assert_eq!(left.file_relative_ip, 0x8800);
         assert_eq!(right.file_relative_ip, 0xa800);
+    }
+
+    #[test]
+    fn module_table_does_not_overflow_file_relative_ip() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        let mut mapped = module(7, 0, 2, "/overflow.so", false);
+        mapped.file_offset = u64::MAX;
+        table.intern_module(mapped, &mut writer).unwrap();
+
+        let resolved = table.resolve_frame(7, 1, FrameMode::User);
+
+        assert_eq!(resolved.module_id, None);
+        assert_eq!(resolved.file_relative_ip, 1);
+    }
+
+    #[test]
+    fn moduleless_frame_lookup_does_not_overflow_file_relative_ip() {
+        let path = temp_spool_path("moduleless-overflow");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 0).unwrap();
+        let mut mapped = module(7, 0, 2, "/overflow.so", false);
+        mapped.id = 0;
+        mapped.file_offset = u64::MAX;
+        writer.write_module(&mapped).unwrap();
+        let stack_id = writer
+            .write_sample_frames(
+                1,
+                7,
+                7,
+                [FrameRecord {
+                    module_id: None,
+                    file_relative_ip: 1,
+                    abs_ip: 1,
+                    mode: FrameMode::User,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let context = reader
+            .stack_frame_contexts(7, stack_id)
+            .unwrap()
+            .next()
+            .unwrap();
+
+        assert!(context.module.is_none());
     }
 
     #[test]

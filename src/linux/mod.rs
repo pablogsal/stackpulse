@@ -1524,12 +1524,15 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     let Some(pid) = u32::try_from(sample.meta.pid).ok() else {
         return Ok(());
     };
-    let Some(pc) = sample
+    let register_pc = sample
         .user_regs
         .as_deref()
         .and_then(ConvertRegsNative::convert_regs)
-        .map(|(pc, _, _)| pc)
-    else {
+        .map(|(pc, _, _)| pc);
+    let sampled_user_pc = matches!(sample.privilege, Priv::User)
+        .then_some(sample.code_addr)
+        .flatten();
+    let Some(pc) = register_pc.or(sampled_user_pc) else {
         return Ok(());
     };
     if ctx.modules.covers_user_pc(sample.meta.pid, pc) {
@@ -2436,6 +2439,82 @@ mod tests {
         assert!(unwinder.should_refresh_for_uncovered_pc(page_size + 1));
         assert!(!unwinder.should_refresh_for_uncovered_pc(page_size + 2));
         assert!(unwinder.should_refresh_for_uncovered_pc(page_size * 2));
+    }
+
+    #[test]
+    fn uncovered_user_sample_ip_refreshes_without_unwind_registers() {
+        let pid_u32 = std::process::id();
+        let pid = i32::try_from(pid_u32).unwrap();
+        let pc = uncovered_user_sample_ip_refreshes_without_unwind_registers as *const () as u64;
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            processes: &mut processes,
+            writer: &mut writer,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            lifecycle_actions: &mut lifecycle_actions,
+            inherit_child_processes: false,
+        };
+        let sample = PreparedSample {
+            meta: PreparedSampleMeta {
+                timestamp_ns: 0,
+                pid,
+                tid: u64::from(pid_u32),
+            },
+            privilege: Priv::User,
+            code_addr: Some(pc),
+            user_regs: None,
+            user_stack: None,
+            callchain_stack: Vec::new(),
+        };
+
+        refresh_maps_for_uncovered_user_pc(&mut ctx, &sample).unwrap();
+
+        assert!(ctx.modules.covers_user_pc(pid, pc));
+    }
+
+    #[test]
+    fn hypervisor_sample_ip_does_not_refresh_user_maps() {
+        let pid_u32 = std::process::id();
+        let pid = i32::try_from(pid_u32).unwrap();
+        let pc = hypervisor_sample_ip_does_not_refresh_user_maps as *const () as u64;
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            processes: &mut processes,
+            writer: &mut writer,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            lifecycle_actions: &mut lifecycle_actions,
+            inherit_child_processes: false,
+        };
+        let sample = PreparedSample {
+            meta: PreparedSampleMeta {
+                timestamp_ns: 0,
+                pid,
+                tid: u64::from(pid_u32),
+            },
+            privilege: Priv::Hv,
+            code_addr: Some(pc),
+            user_regs: None,
+            user_stack: None,
+            callchain_stack: Vec::new(),
+        };
+
+        refresh_maps_for_uncovered_user_pc(&mut ctx, &sample).unwrap();
+
+        assert!(!ctx.modules.covers_user_pc(pid, pc));
     }
 
     #[test]
