@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 - 2026-07-21
+
+### Fixed
+
+- ELF image-base correlation preserves valid page-rounded executable mapping tails when a following `PT_LOAD` begins in the shared file page, retains mappings made executable with `mprotect`, and rejects ambiguous shared-page heads.
+- Empty or overflowing ELF file ranges no longer participate in load-segment correlation, and overflowing module-relative addresses remain unassociated during both recording and spool replay.
+- User samples without usable unwind registers can recover missed mappings from their sampled instruction pointer without treating hypervisor or guest addresses as host user addresses.
+
 ## 0.5.0 - 2026-07-20
 
 ### Changed

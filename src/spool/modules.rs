@@ -267,13 +267,14 @@ impl ModuleTable {
             .index
             .find(process_id, abs_ip, mode)
             .and_then(|id| self.slots.get(id as usize).map(|slot| (id, &slot.module)));
-        let (module_id, file_relative_ip) = match module {
-            Some((id, module)) => (
-                Some(id),
-                abs_ip.saturating_sub(module.start) + module.file_offset,
-            ),
-            None => (None, abs_ip),
-        };
+        let (module_id, file_relative_ip) = module
+            .and_then(|(id, module)| {
+                abs_ip
+                    .checked_sub(module.start)?
+                    .checked_add(module.file_offset)
+                    .map(|file_relative_ip| (Some(id), file_relative_ip))
+            })
+            .unwrap_or((None, abs_ip));
         FrameRecord {
             module_id,
             file_relative_ip,
