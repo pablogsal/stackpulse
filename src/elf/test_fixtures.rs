@@ -8,6 +8,8 @@ use std::sync::Arc;
 /// matching the samply hard-case test scenario.
 pub(crate) fn fake_hard_case_section_info() -> Arc<ElfSectionInfo> {
     Arc::new(ElfSectionInfo {
+        build_id: None,
+        file_data: None,
         base_svma: 0,
         text_svma: Some(0x14be0c0..(0x14be0c0 + 0xf5bf60)),
         text_file_range: Some(0x14bd0c0..(0x14bd0c0 + 0xf5bf60)),

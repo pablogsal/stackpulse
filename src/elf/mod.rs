@@ -345,6 +345,8 @@ mod tests {
         load_segments: Vec<LoadSegment>,
     ) -> ElfSectionInfo {
         ElfSectionInfo {
+            build_id: None,
+            file_data: None,
             base_svma: 0,
             text_svma,
             text_file_range,

@@ -186,7 +186,10 @@ impl From<&ModuleRecord> for NativeFileIdentity {
 
 fn sym_module_for_mapping(module: &ModuleRecord, loaded: &LoadedElfMapping) -> SymModule {
     SymModule {
-        path: module.path.as_path().to_path_buf(),
+        path: module.path.symbol_source().map_or_else(
+            || module.path.as_path().to_path_buf(),
+            |source| Path::new(source.path.as_ref()).to_path_buf(),
+        ),
         avma_range: module.start..module.end,
         image_base: loaded.image_base,
         is_executable: true,

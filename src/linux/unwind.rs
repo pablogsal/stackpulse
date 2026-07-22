@@ -20,6 +20,14 @@ pub(super) struct ProcessUnwinder {
 }
 
 impl ProcessUnwinder {
+    pub(super) fn seed_elf_sections(
+        &mut self,
+        module_id: u32,
+        sections: std::sync::Arc<ElfSectionInfo>,
+    ) {
+        self.elf_sections.insert(module_id, sections);
+    }
+
     /// Copy inherited module state while resetting per-process unwind caches.
     pub(super) fn inherit_for_fork(&self) -> Self {
         Self {

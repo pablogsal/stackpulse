@@ -109,14 +109,18 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
         }
     }
 
-    let object_file = unwind_sections_have_compressed_data(&elf)
-        .then(|| object::File::parse(bytes).ok())
-        .flatten();
+    let object_file = object::File::parse(bytes).ok();
+    let build_id = object_file
+        .as_ref()
+        .and_then(|file| file.build_id().ok().flatten())
+        .map(Arc::<[u8]>::from);
     let text = find_unwind_section_data(".text", &elf, object_file.as_ref(), &data);
     let eh_frame = find_unwind_section_data(".eh_frame", &elf, object_file.as_ref(), &data);
     let eh_frame_hdr = find_unwind_section_data(".eh_frame_hdr", &elf, object_file.as_ref(), &data);
 
     Ok(ElfSectionInfo {
+        build_id,
+        file_data: data.section(0..bytes.len()),
         base_svma: calculate_base_svma(&elf),
         text_svma: find_section_range(".text", &elf),
         text_file_range: find_section_file_range(".text", &elf),
@@ -192,13 +196,6 @@ fn find_unwind_section_data(
 
     let (addr, range) = section_range_in_file(section)?;
     data.section(range).map(|data| (addr, data))
-}
-
-fn unwind_sections_have_compressed_data(elf: &Elf) -> bool {
-    [".eh_frame", ".eh_frame_hdr"]
-        .into_iter()
-        .filter_map(|name| find_section_header(name, elf))
-        .any(section_has_compressed_data)
 }
 
 fn section_has_compressed_data(section: &goblin::elf::SectionHeader) -> bool {

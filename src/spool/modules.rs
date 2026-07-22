@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::model::ModuleSymbolSource;
 use super::{next_spool_id, FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfSpoolWriter};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -15,6 +16,7 @@ struct ModuleIdentity {
     device_minor: u32,
     inode_generation: u64,
     path: ModulePath,
+    symbol_source: Option<ModuleSymbolSource>,
     is_kernel: bool,
 }
 
@@ -30,6 +32,7 @@ impl From<&ModuleRecord> for ModuleIdentity {
             device_minor: module.device_minor,
             inode_generation: module.inode_generation,
             path: module.path.clone(),
+            symbol_source: module.path.symbol_source().cloned(),
             is_kernel: module.is_kernel,
         }
     }
@@ -311,6 +314,7 @@ fn same_mapping_except_inode_generation(left: &ModuleRecord, right: &ModuleRecor
         && left.device_major == right.device_major
         && left.device_minor == right.device_minor
         && left.path == right.path
+        && left.path.symbol_source() == right.path.symbol_source()
         && left.is_kernel == right.is_kernel
 }
 
@@ -325,12 +329,14 @@ fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<Mo
     }
     if replacement.end < old.end {
         let start = replacement.end.max(old.start);
-        fragments.push(ModuleRecord {
+        let mut fragment = ModuleRecord {
             id: 0,
             start,
             file_offset: old.file_offset.saturating_add(start - old.start),
             ..old.clone()
-        });
+        };
+        fragment.path.advance_symbol_source(start - old.start);
+        fragments.push(fragment);
     }
     fragments
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2 - 2026-07-22
+
+### Fixed
+
+- Deleted executable mappings created by libhugetlbfs reuse a byte-validated, identity-pinned main-executable image for live DWARF unwinding and, while its original UTF-8 executable path remains available, replay symbolization. This retains the original `PT_LOAD` offset discarded by the hugepage copy.
+
+### Changed
+
+- New profiles use spool format `SPULSE4` to retain separate mapped and symbol-source identities. The 0.5.2 reader remains compatible with `SPULSE1`, `SPULSE2`, and `SPULSE3` profiles; older readers cannot open `SPULSE4` profiles.
+
 ## 0.5.1 - 2026-07-21
 
 ### Fixed

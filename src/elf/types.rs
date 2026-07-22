@@ -84,6 +84,12 @@ impl Eq for ElfSectionData {}
 /// library share storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ElfSectionInfo {
+    /// GNU build ID, when present.
+    pub(crate) build_id: Option<Arc<[u8]>>,
+
+    /// Complete ELF file data used for bounded executable-segment validation.
+    pub(crate) file_data: Option<ElfSectionData>,
+
     /// Base stated virtual address from the first PT_LOAD segment.
     pub(crate) base_svma: u64,
 

@@ -10,7 +10,23 @@ pub(crate) const VDSO_PATH: &str = "[vdso]";
 
 /// File path or display name for a recorded module.
 #[derive(Clone)]
-pub struct ModulePath(ModulePathStorage);
+pub struct ModulePath {
+    storage: ModulePathStorage,
+    symbol_source: Option<ModuleSymbolSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ModuleSymbolSource {
+    pub(crate) path: Arc<str>,
+    pub(crate) build_id: Option<Arc<[u8]>>,
+    pub(crate) file_offset: u64,
+    pub(crate) svma: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+}
 
 #[derive(Clone)]
 enum ModulePathStorage {
@@ -26,7 +42,7 @@ impl ModulePath {
     /// served directly out of the memory-mapped spool.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        match &self.0 {
+        match &self.storage {
             ModulePathStorage::Owned(path) => path,
             ModulePathStorage::Mmap { mmap, range } => std::str::from_utf8(&mmap[range.clone()])
                 .expect("mmap-backed module path was validated while reading the spool"),
@@ -59,10 +75,29 @@ impl ModulePath {
         self.as_str() == VDSO_PATH
     }
 
+    pub(crate) fn symbol_source(&self) -> Option<&ModuleSymbolSource> {
+        self.symbol_source.as_ref()
+    }
+
+    pub(crate) fn set_symbol_source(&mut self, source: ModuleSymbolSource) {
+        self.symbol_source = Some(source);
+    }
+
+    pub(crate) fn advance_symbol_source(&mut self, delta: u64) {
+        let Some(source) = &mut self.symbol_source else {
+            return;
+        };
+        source.file_offset = source.file_offset.saturating_add(delta);
+        source.svma = source.svma.saturating_add(delta);
+    }
+
     pub(super) fn from_mmap(mmap: Arc<Mmap>, range: Range<usize>) -> io::Result<Self> {
         std::str::from_utf8(&mmap[range.clone()])
             .map_err(|err| super::invalid_data(err.to_string()))?;
-        Ok(Self(ModulePathStorage::Mmap { mmap, range }))
+        Ok(Self {
+            storage: ModulePathStorage::Mmap { mmap, range },
+            symbol_source: None,
+        })
     }
 }
 
@@ -100,13 +135,19 @@ impl std::borrow::Borrow<str> for ModulePath {
 
 impl From<String> for ModulePath {
     fn from(path: String) -> Self {
-        Self(ModulePathStorage::Owned(Arc::from(path.into_boxed_str())))
+        Self {
+            storage: ModulePathStorage::Owned(Arc::from(path.into_boxed_str())),
+            symbol_source: None,
+        }
     }
 }
 
 impl From<&str> for ModulePath {
     fn from(path: &str) -> Self {
-        Self(ModulePathStorage::Owned(Arc::from(path)))
+        Self {
+            storage: ModulePathStorage::Owned(Arc::from(path)),
+            symbol_source: None,
+        }
     }
 }
 

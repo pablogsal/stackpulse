@@ -10,6 +10,7 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+pub(crate) use model::ModuleSymbolSource;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
@@ -20,7 +21,8 @@ pub(crate) use modules::ModuleUpdate;
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
 const MAGIC_V3: &[u8; 8] = b"SPULSE3\0";
-pub(crate) const CURRENT_MAGIC: &[u8; 8] = MAGIC_V3;
+const MAGIC_V4: &[u8; 8] = b"SPULSE4\0";
+pub(crate) const CURRENT_MAGIC: &[u8; 8] = MAGIC_V4;
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -28,6 +30,8 @@ const REC_THREAD: u8 = 4;
 const REC_SAMPLE: u8 = 5;
 const REC_PYTHON_RUNTIME: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
+const MAX_SYMBOL_SOURCE_PATH_SIZE: usize = 4096;
+pub(crate) const MAX_BUILD_ID_SIZE: usize = 1024;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
 // Pinned frames use even tags and unpinned frames use 1 or 3, leaving 5 as a
 // distinct marker outside both frame encodings.
@@ -97,6 +101,18 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 
     pub fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
+        if let Some(source) = module.path.symbol_source() {
+            if source.path.len() > MAX_SYMBOL_SOURCE_PATH_SIZE {
+                return Err(invalid_input("module symbol-source path is too long"));
+            }
+            if source
+                .build_id
+                .as_ref()
+                .is_some_and(|build_id| build_id.len() > MAX_BUILD_ID_SIZE)
+            {
+                return Err(invalid_input("module symbol-source build ID is too long"));
+            }
+        }
         self.writer.write_all(&[REC_MODULE])?;
         self.writer.write_varint(module.id as u64)?;
         self.writer.write_varint(module.process_id as i64)?;
@@ -109,6 +125,23 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(module.inode_generation)?;
         self.writer.write_all(&[u8::from(module.is_kernel)])?;
         write_bytes(&mut self.writer, module.path.as_bytes())?;
+        if let Some(source) = module.path.symbol_source() {
+            self.writer.write_all(&[1])?;
+            write_bytes(&mut self.writer, source.path.as_bytes())?;
+            write_bytes(
+                &mut self.writer,
+                source.build_id.as_deref().unwrap_or_default(),
+            )?;
+            self.writer.write_varint(source.file_offset)?;
+            self.writer.write_varint(source.svma)?;
+            self.writer.write_varint(source.device)?;
+            self.writer.write_varint(source.inode)?;
+            self.writer.write_varint(source.size)?;
+            self.writer.write_varint(source.ctime)?;
+            self.writer.write_varint(source.ctime_nsec)?;
+        } else {
+            self.writer.write_all(&[0])?;
+        }
         self.unpinned_frame_cache.clear();
         Ok(())
     }
@@ -705,7 +738,8 @@ impl MmapSpoolCursor {
         match &magic {
             magic if magic == MAGIC_V1 => Ok(1),
             magic if magic == MAGIC_V2 => Ok(2),
-            magic if magic == CURRENT_MAGIC => Ok(3),
+            magic if magic == MAGIC_V3 => Ok(3),
+            magic if magic == CURRENT_MAGIC => Ok(4),
             _ => Err(invalid_data("invalid stackpulse spool magic")),
         }
     }
@@ -817,7 +851,60 @@ fn read_module_mmap(
     let len = usize::try_from(reader.read_varint::<u64>()?)
         .map_err(|_| invalid_data("module path length too large"))?;
     let range = reader.read_bytes_range(len)?;
-    let path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
+    let mut path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
+    if spool_version >= 4 {
+        let mut present = [0_u8; 1];
+        reader.read_exact_spool(&mut present)?;
+        match present[0] {
+            0 => {}
+            1 => {
+                let source_len = usize::try_from(reader.read_varint::<u64>()?)
+                    .map_err(|_| invalid_data("module symbol-source path length too large"))?;
+                if source_len == 0 {
+                    return Err(invalid_data("module symbol-source path is empty"));
+                }
+                if source_len > MAX_SYMBOL_SOURCE_PATH_SIZE {
+                    return Err(invalid_data("module symbol-source path is too long"));
+                }
+                let source_range = reader.read_bytes_range(source_len)?;
+                let source_path: Arc<str> = Arc::from(
+                    std::str::from_utf8(&reader.mmap[source_range])
+                        .map_err(|err| invalid_data(err.to_string()))?,
+                );
+                let build_id_len = usize::try_from(reader.read_varint::<u64>()?)
+                    .map_err(|_| invalid_data("module symbol-source build ID length too large"))?;
+                if build_id_len > MAX_BUILD_ID_SIZE {
+                    return Err(invalid_data("module symbol-source build ID is too long"));
+                }
+                let build_id_range = reader.read_bytes_range(build_id_len)?;
+                let build_id =
+                    (build_id_len != 0).then(|| Arc::<[u8]>::from(&reader.mmap[build_id_range]));
+                let file_offset = reader.read_varint::<u64>()?;
+                let svma = reader.read_varint::<u64>()?;
+                let device = reader.read_varint::<u64>()?;
+                let inode = reader.read_varint::<u64>()?;
+                let size = reader.read_varint::<u64>()?;
+                let ctime = reader.read_varint::<i64>()?;
+                let ctime_nsec = reader.read_varint::<i64>()?;
+                path.set_symbol_source(model::ModuleSymbolSource {
+                    path: source_path,
+                    build_id,
+                    file_offset,
+                    svma,
+                    device,
+                    inode,
+                    size,
+                    ctime,
+                    ctime_nsec,
+                });
+            }
+            value => {
+                return Err(invalid_data(format!(
+                    "invalid module symbol-source presence flag {value}"
+                )));
+            }
+        }
+    }
     Ok(ModuleRecord {
         id,
         process_id,
@@ -1189,6 +1276,84 @@ mod tests {
         path.push(format!("stackpulse-{name}-{}.spool", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn stable_module_symbol_source_round_trips() {
+        let path = temp_spool_path("module-symbol-source");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 0).unwrap();
+        let mut mapped = module(
+            7,
+            0x5c18_2a80_0000,
+            0x5c18_2ae0_0000,
+            "/hugetlbfs/libhugetlbfs.tmp.abc (deleted)",
+            false,
+        );
+        mapped.path.set_symbol_source(ModuleSymbolSource {
+            path: Arc::from("/opt/app/bin/program"),
+            build_id: Some(Arc::from([0xaa_u8, 0xbb, 0xcc].as_slice())),
+            file_offset: 0x400000,
+            svma: 0x400000,
+            device: 0x103,
+            inode: 42,
+            size: 0x1000000,
+            ctime: 123,
+            ctime_nsec: 456,
+        });
+        writer.write_module(&mapped).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let loaded = &reader.modules()[0];
+        assert_eq!(loaded.path.as_str(), mapped.path.as_str());
+        let source = loaded.path.symbol_source().unwrap();
+        assert_eq!(source.path.as_ref(), "/opt/app/bin/program");
+        assert_eq!(
+            source.build_id.as_deref(),
+            Some([0xaa, 0xbb, 0xcc].as_slice())
+        );
+        assert_eq!(source.file_offset, 0x400000);
+        assert_eq!(source.svma, 0x400000);
+        assert_eq!(source.device, 0x103);
+        assert_eq!(source.inode, 42);
+        assert_eq!(source.size, 0x1000000);
+        assert_eq!(source.ctime, 123);
+        assert_eq!(source.ctime_nsec, 456);
+    }
+
+    #[test]
+    fn writer_rejects_oversized_module_symbol_source_fields() {
+        let mut mapped = module(7, 0x1000, 0x2000, "/tmp/program (deleted)", false);
+        let source = ModuleSymbolSource {
+            path: Arc::from("x".repeat(MAX_SYMBOL_SOURCE_PATH_SIZE + 1)),
+            build_id: None,
+            file_offset: 0,
+            svma: 0,
+            device: 1,
+            inode: 2,
+            size: 3,
+            ctime: 4,
+            ctime_nsec: 5,
+        };
+        mapped.path.set_symbol_source(source.clone());
+        assert_invalid_input_contains(
+            writer().write_module(&mapped),
+            "symbol-source path is too long",
+            "writer must not emit a source path its reader rejects",
+        );
+
+        mapped.path.set_symbol_source(ModuleSymbolSource {
+            path: Arc::from("/tmp/program"),
+            build_id: Some(Arc::from(vec![0_u8; MAX_BUILD_ID_SIZE + 1])),
+            ..source
+        });
+        assert_invalid_input_contains(
+            writer().write_module(&mapped),
+            "symbol-source build ID is too long",
+            "writer must not emit a build ID its reader rejects",
+        );
     }
 
     #[test]

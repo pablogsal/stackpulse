@@ -26,6 +26,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::state::{process_is_alive, try_new_exit_watcher, ProcessExitWatcher};
 use crate::{SampleErrorKind, SampleErrorStats};
@@ -36,7 +37,9 @@ use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
+use crate::spool::{
+    FrameMode, FrameRecord, ModuleRecord, ModuleSymbolSource, ModuleTable, PerfSpoolWriter,
+};
 use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
 use perf_event::{
@@ -182,6 +185,7 @@ struct ProcessState {
     tracking: ProcessTracking,
     unwinder: Option<ProcessUnwinder>,
     image: Option<ProcessImageIdentity>,
+    executable: Option<PinnedExecutable>,
     start_time: Option<u64>,
     // Per-exec probe result. `None` means it has not been probed; `Some(false)`
     // deliberately avoids re-reading /proc for every runtime-looking mmap.
@@ -192,6 +196,7 @@ struct ProcessState {
 #[derive(Default)]
 struct ForkInheritance {
     image: Option<ProcessImageIdentity>,
+    executable: Option<PinnedExecutable>,
     python_perf_support: Option<bool>,
     python_runtime: bool,
     unwinder: ProcessUnwinder,
@@ -200,6 +205,18 @@ struct ForkInheritance {
 #[derive(Default)]
 struct ProcessTable {
     states: FxHashMap<i32, ProcessState>,
+}
+
+#[derive(Clone)]
+struct PinnedExecutable {
+    _file: Arc<std::fs::File>,
+    path: Arc<str>,
+    sections: Arc<crate::elf::ElfSectionInfo>,
+    device: u64,
+    inode: u64,
+    size: u64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 impl ProcessTable {
@@ -212,6 +229,7 @@ impl ProcessTable {
             .get(&parent_pid)
             .map_or_else(ForkInheritance::default, |state| ForkInheritance {
                 image: state.image.clone(),
+                executable: state.executable.clone(),
                 python_perf_support: state.python_perf_support,
                 python_runtime: state.python_runtime,
                 unwinder: state
@@ -230,6 +248,9 @@ impl ProcessTable {
         let child = self.state_mut(child_pid);
         if let Some(image) = inheritance.image {
             child.image = Some(image);
+        }
+        if let Some(executable) = inheritance.executable {
+            child.executable = Some(executable);
         }
         if let Some(start_time) = start_time {
             child.start_time = Some(start_time);
@@ -330,27 +351,98 @@ impl ProcessTable {
         let Ok(proc_pid) = u32::try_from(pid) else {
             return;
         };
-        let image = read_process_image_identity(proc_pid)
-            .ok()
-            .map(|(identity, _)| identity);
-        let start_time = read_process_start_time(proc_pid).ok();
+        let Ok(start_time) = read_process_start_time(proc_pid) else {
+            return;
+        };
+        let Ok((image, _)) = read_process_image_identity(proc_pid) else {
+            return;
+        };
+        let executable = pin_process_executable(proc_pid);
+        let generation_is_stable = read_process_start_time(proc_pid).ok() == Some(start_time)
+            && read_process_image_identity(proc_pid)
+                .ok()
+                .is_some_and(|(current, _)| current == image)
+            && executable
+                .as_ref()
+                .is_none_or(|pinned| pinned.device == image.device && pinned.inode == image.inode);
+        if !generation_is_stable {
+            return;
+        }
         let Some(state) = self.states.get_mut(&pid) else {
             return;
         };
-        if let Some(image) = image {
-            state.image = Some(image);
+        state.image = Some(image);
+        if let Some(executable) = executable {
+            state.executable = Some(executable);
         }
-        if let Some(start_time) = start_time {
-            state.start_time = Some(start_time);
-        }
+        state.start_time = Some(start_time);
     }
 
     fn forget_generation(&mut self, pid: i32) {
         if let Some(state) = self.states.get_mut(&pid) {
             state.image = None;
+            state.executable = None;
             state.start_time = None;
         }
     }
+
+    fn associate_deleted_executable(
+        &self,
+        module: &mut ModuleRecord,
+    ) -> Option<Arc<crate::elf::ElfSectionInfo>> {
+        if !module.path.as_str().ends_with(" (deleted)") {
+            return None;
+        }
+        let executable = self.states.get(&module.process_id)?.executable.as_ref()?;
+        let anchor =
+            crate::native_module::deleted_mapping_source_anchor(module, &executable.sections)?;
+        module.path.set_symbol_source(ModuleSymbolSource {
+            path: Arc::clone(&executable.path),
+            build_id: executable
+                .sections
+                .build_id
+                .clone()
+                .filter(|build_id| build_id.len() <= crate::spool::MAX_BUILD_ID_SIZE),
+            file_offset: anchor.file_offset,
+            svma: anchor.svma,
+            device: executable.device,
+            inode: executable.inode,
+            size: executable.size,
+            ctime: executable.ctime,
+            ctime_nsec: executable.ctime_nsec,
+        });
+        Some(Arc::clone(&executable.sections))
+    }
+}
+
+fn pin_process_executable(pid: u32) -> Option<PinnedExecutable> {
+    let proc_path = format!("/proc/{pid}/exe");
+    let file = std::fs::File::open(&proc_path).ok()?;
+    let pinned_metadata = file.metadata().ok()?;
+    let path = std::fs::read_link(&proc_path).ok();
+    let stable_path = path.as_ref().and_then(|path| {
+        let stable_metadata = std::fs::metadata(path).ok()?;
+        if pinned_metadata.dev() != stable_metadata.dev()
+            || pinned_metadata.ino() != stable_metadata.ino()
+        {
+            return None;
+        }
+        Some(Arc::from(path.to_str()?))
+    });
+    let source_path = stable_path.unwrap_or_else(|| Arc::from(proc_path.as_str()));
+    let file = Arc::new(file);
+    let parse_path = path.as_deref().unwrap_or_else(|| Path::new(&proc_path));
+    let sections = crate::elf::load_elf_sections_from_file(&file, parse_path).ok()?;
+    Some(PinnedExecutable {
+        _file: file,
+        path: source_path,
+        sections: Arc::new(sections),
+        device: pinned_metadata.dev(),
+        inode: pinned_metadata.ino(),
+        size: pinned_metadata.size(),
+        ctime: pinned_metadata.ctime(),
+        ctime_nsec: pinned_metadata.ctime_nsec(),
+    })
 }
 
 fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
@@ -686,6 +778,8 @@ impl PerfRecorder {
                     let Ok(child_u32) = u32::try_from(child) else {
                         continue;
                     };
+                    processes.ensure_tracked(child);
+                    processes.capture_available_generation(child);
                     let python_perf_support = process_has_python_perf_support(child_u32, processes);
                     match register_existing_maps(child_u32, modules, processes, writer) {
                         Ok(true) if python_perf_support => {
@@ -706,8 +800,6 @@ impl PerfRecorder {
                             break;
                         }
                     }
-                    processes.ensure_tracked(child);
-                    processes.capture_available_generation(child);
                     if let Ok(parent_u32) = u32::try_from(parent) {
                         recovered_process_forks.push(RecoveredProcessFork {
                             pid: child_u32,
@@ -981,9 +1073,11 @@ fn handle_non_sample_record<W: std::io::Write>(
             cleanup_process_modules(pid, ctx.modules, ctx.processes, ctx.writer)?;
             if let Some(state) = ctx.processes.states.get_mut(&pid) {
                 state.python_perf_support = None;
+                state.executable = None;
             }
             end_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
             ctx.processes.state_mut(pid).image = current.map(|(identity, _)| identity);
+            ctx.processes.capture_available_generation(pid);
             Ok(())
         }
         Record::Exit(exit) => {
@@ -1111,11 +1205,18 @@ fn reconcile_process_image<W: std::io::Write>(
         return Ok(true);
     }
 
+    let generation_changed = !image_matches || !start_time_matches;
     cleanup_process_modules(pid_i32, modules, processes, writer)?;
     if let Some(state) = processes.states.get_mut(&pid_i32) {
         state.python_perf_support = None;
+        if generation_changed {
+            state.executable = None;
+        }
     }
     end_python_runtime_process(processes, writer, timestamp_ns, pid_i32)?;
+    if current_identity.is_some() {
+        processes.capture_available_generation(pid_i32);
+    }
 
     match register_existing_modules(snapshot, modules, processes, writer) {
         Ok(saw_python_runtime) => {
@@ -1595,11 +1696,12 @@ fn record_module<W: std::io::Write>(
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
-    module: ModuleRecord,
+    mut module: ModuleRecord,
 ) -> io::Result<()> {
     if module.path.is_empty() {
         return Ok(());
     }
+    let pinned_sections = processes.associate_deleted_executable(&mut module);
     let update = modules.apply_module(module, writer)?;
     if update.active.is_empty() {
         return Ok(());
@@ -1607,11 +1709,14 @@ fn record_module<W: std::io::Write>(
     for activation in &update.active {
         let module = &activation.module;
         if !module.is_kernel {
-            processes
+            let unwinder = processes
                 .state_mut(module.process_id)
                 .unwinder
-                .get_or_insert_default()
-                .apply_module_update(&update);
+                .get_or_insert_default();
+            if let (Some(sections), Some(replacement)) = (pinned_sections, update.active.last()) {
+                unwinder.seed_elf_sections(replacement.module.id, sections);
+            }
+            unwinder.apply_module_update(&update);
             break;
         }
     }
