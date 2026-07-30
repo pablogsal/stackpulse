@@ -29,6 +29,7 @@ const REC_SAMPLE: u8 = 5;
 const REC_PYTHON_RUNTIME: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
+const MAX_REPLAY_SAMPLE_RANGES: usize = 512 * 1024;
 // Pinned frames use even tags and unpinned frames use 1 or 3, leaving 5 as a
 // distinct marker outside both frame encodings.
 const TRUNCATED_STACK_MARKER_TAG: u64 = 5;
@@ -249,19 +250,86 @@ impl<W: Write> PerfSpoolWriter<W> {
 
 /// Reader for spool files written by [`crate::PerfRecorder`].
 pub struct PerfSpoolReader {
+    definitions: SpoolDefinitions,
+    samples: Vec<SampleRecord>,
+}
+
+/// Sequential replay reader for spool files written by [`crate::PerfRecorder`].
+///
+/// Unlike [`PerfSpoolReader`], this reader validates sample metadata without
+/// retaining it. Iteration decodes samples again from the memory-mapped spool.
+pub struct PerfSpoolReplayReader {
+    definitions: SpoolDefinitions,
+    threads: Vec<(i32, u64)>,
+    mmap: Arc<Mmap>,
+    sample_ranges: Box<[Range<usize>]>,
+    scan_start: Option<ReplayScanStart>,
+    sample_count: usize,
+    first_sample_timestamp_ns: Option<u64>,
+}
+
+struct SpoolDefinitions {
     start_timestamp_us: u64,
     sample_interval_us: u64,
     modules: Vec<ModuleRecord>,
     frames: Vec<FrameRecord>,
     frame_contexts: SpoolFrameModuleContexts,
     stack_nodes: Vec<StackNodeRecord>,
-    samples: Vec<SampleRecord>,
     python_runtime_records: Vec<PythonRuntimeRecord>,
     truncated_tail: bool,
 }
 
+impl SpoolDefinitions {
+    fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
+        let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
+            invalid_data(format!("sample references missing stack node {stack_id}"))
+        })?;
+        Ok(StackFrameRefs {
+            frames: &self.frames,
+            stack_nodes: &self.stack_nodes,
+            current: Some(stack_id),
+            remaining: node.depth,
+        })
+    }
+
+    fn replay_sample_stack(&self, sample: SampleRecord) -> ReplaySampleStack<'_> {
+        let frames = self
+            .stack_frame_refs(sample.stack_id)
+            .expect("sample stack ids were validated while opening the spool");
+        ReplaySampleStack { sample, frames }
+    }
+
+    fn module_for_frame(
+        &self,
+        process_id: i32,
+        frame_id: u32,
+        frame: &FrameRecord,
+    ) -> Option<FrameModuleRef<'_>> {
+        let context = self.frame_contexts.for_frame_id(frame_id)?;
+        module_for_frame_with_context(
+            &self.modules,
+            &self.frame_contexts,
+            context,
+            process_id,
+            frame,
+        )
+    }
+
+    fn frame_context<'a>(
+        &'a self,
+        process_id: i32,
+        frame_id: u32,
+        frame: &'a FrameRecord,
+    ) -> FrameContext<'a> {
+        FrameContext {
+            frame,
+            module: self.module_for_frame(process_id, frame_id, frame),
+        }
+    }
+}
+
 /// Recorded module context for a raw frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameModuleRef<'a> {
     /// Recorded module that contains the frame.
     pub module: &'a ModuleRecord,
@@ -319,7 +387,7 @@ impl SpoolFrameModuleContexts {
 }
 
 /// Raw frame plus its recorded module context, when Stackpulse had one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameContext<'a> {
     /// Raw frame from the interned stack.
     pub frame: &'a FrameRecord,
@@ -329,12 +397,12 @@ pub struct FrameContext<'a> {
 
 /// Borrowed raw frames with recorded module context for one interned stack.
 pub struct StackFrameContexts<'a> {
-    reader: &'a PerfSpoolReader,
+    definitions: &'a SpoolDefinitions,
     process_id: i32,
     frames: StackFrameRefs<'a>,
 }
 
-/// Borrowed sample and its no-copy raw stack iterator.
+/// Sample metadata and its no-copy raw stack iterator.
 pub struct SampleStack<'a> {
     /// Sample metadata.
     pub sample: &'a SampleRecord,
@@ -346,6 +414,42 @@ pub struct SampleStack<'a> {
 pub struct SampleStacks<'a> {
     reader: &'a PerfSpoolReader,
     samples: std::slice::Iter<'a, SampleRecord>,
+}
+
+/// Sequentially decoded sample metadata and its no-copy raw stack iterator.
+pub struct ReplaySampleStack<'a> {
+    /// Sample metadata.
+    pub sample: SampleRecord,
+    /// Borrowed raw frames for `sample.stack_id`.
+    pub frames: StackFrameRefs<'a>,
+}
+
+struct ReplaySamples<'a> {
+    reader: &'a PerfSpoolReplayReader,
+    cursor: MmapSpoolCursor,
+    last_timestamp_ns: u64,
+    remaining: usize,
+    mode: ReplayMode,
+}
+
+enum ReplayMode {
+    Ranges { index: usize },
+    Records(ReplayRecordState),
+}
+
+#[derive(Clone, Copy)]
+struct ReplayScanStart {
+    position: usize,
+    state: ReplayRecordState,
+}
+
+#[derive(Clone, Copy)]
+struct ReplayRecordState {
+    spool_version: u8,
+    module_count: usize,
+    frame_count: usize,
+    stack_count: usize,
+    thread_count: usize,
 }
 
 /// Borrowed raw frames for one interned stack.
@@ -400,7 +504,7 @@ impl<'a> Iterator for StackFrameContexts<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let frame_ref = self.frames.next_with_id()?;
         Some(
-            self.reader
+            self.definitions
                 .frame_context(self.process_id, frame_ref.id, frame_ref.frame),
         )
     }
@@ -439,140 +543,110 @@ impl ExactSizeIterator for SampleStacks<'_> {
     }
 }
 
+impl Iterator for ReplaySamples<'_> {
+    type Item = SampleRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let tag = 'sample: loop {
+            match &mut self.mode {
+                ReplayMode::Ranges { index } => {
+                    let range = &self.reader.sample_ranges[*index];
+                    if self.cursor.position == range.end {
+                        if *index + 1 < self.reader.sample_ranges.len() {
+                            *index += 1;
+                            self.cursor.position = self.reader.sample_ranges[*index].start;
+                        } else {
+                            let scan_start = self
+                                .reader
+                                .scan_start
+                                .expect("remaining samples require a replay scan");
+                            self.cursor.position = scan_start.position;
+                            self.mode = ReplayMode::Records(scan_start.state);
+                        }
+                        continue;
+                    }
+                    break 'sample self
+                        .cursor
+                        .read_tag()
+                        .expect("validated sample tag")
+                        .expect("validated sample record");
+                }
+                ReplayMode::Records(state) => loop {
+                    let tag = self
+                        .cursor
+                        .read_tag()
+                        .expect("validated record tag")
+                        .expect("validated sample record");
+                    if tag == REC_SAMPLE {
+                        break 'sample tag;
+                    }
+                    consume_validated_record(
+                        &mut self.cursor,
+                        tag,
+                        &self.reader.definitions,
+                        state,
+                    )
+                    .expect("validated spool record");
+                },
+            }
+        };
+        assert_eq!(tag, REC_SAMPLE, "validated replay record");
+        let sample = read_sample(
+            &mut self.cursor,
+            &self.reader.threads,
+            self.reader.definitions.stack_nodes.len(),
+            &mut self.last_timestamp_ns,
+        )
+        .expect("validated sample record");
+        self.remaining -= 1;
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ReplaySamples<'_> {
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
 impl PerfSpoolReader {
     /// Open and read a spool file.
     ///
     /// The reader borrows path strings from a memory map of the file. The file
     /// must not be truncated or mutated while the reader is alive.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-        let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
-        let spool_version = reader.check_magic()?;
-        let start_timestamp_us = reader.read_varint::<u64>()?;
-        let sample_interval_us = reader.read_varint::<u64>()?;
-        let (
-            mut modules,
-            mut module_deactivated_at,
-            mut frames,
-            mut frame_module_limits,
-            mut stack_nodes,
-            mut threads,
-            mut samples,
-            mut python_runtime_records,
-        ) = (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let mut last_timestamp_ns = 0_u64;
-        let mut truncated_tail = false;
-        while let Some(tag) = reader.read_tag()? {
-            // Each record's reads run before any push, so a record truncated by
-            // a crash mid-write leaves the accumulated state untouched. Stop at
-            // such a tail and keep the prefix (records only reference earlier
-            // ones); still surface real corruption (bad tag, invalid data).
-            let parsed = (|| -> io::Result<()> {
-                match tag {
-                    REC_MODULE => {
-                        modules.push(read_module_mmap(&mut reader, modules.len(), spool_version)?);
-                        module_deactivated_at.push(None);
-                    }
-                    REC_FRAME => {
-                        let module_limit = modules.len();
-                        frames.push(read_frame(&mut reader, &modules, frames.len())?);
-                        frame_module_limits.push(module_limit);
-                    }
-                    REC_STACK => {
-                        stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
-                    }
-                    REC_THREAD => threads.push(read_thread(&mut reader, threads.len())?),
-                    REC_SAMPLE => samples.push(read_sample(
-                        &mut reader,
-                        &threads,
-                        stack_nodes.len(),
-                        &mut last_timestamp_ns,
-                    )?),
-                    REC_PYTHON_RUNTIME => {
-                        python_runtime_records.push(read_python_runtime(&mut reader)?)
-                    }
-                    REC_MODULE_DEACTIVATE => {
-                        let process_id = read_process_id(&mut reader)?;
-                        let deactivated_at = frames.len();
-                        for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at)
-                        {
-                            if module.process_id == process_id && !module.is_kernel {
-                                deactivated.get_or_insert(deactivated_at);
-                            }
-                        }
-                    }
-                    REC_MODULE_DEACTIVATE_ONE => {
-                        if spool_version < 2 {
-                            return Err(invalid_data(
-                                "targeted module deactivation requires spool version 2",
-                            ));
-                        }
-                        let module_id =
-                            read_index_within(&mut reader, modules.len(), "module deactivation")?;
-                        module_deactivated_at[module_id].get_or_insert(frames.len());
-                    }
-                    other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
-                }
-                Ok(())
-            })();
-            if let Err(err) = parsed {
-                // A record cut off by a crash leaves the cursor at EOF (see
-                // MmapSpoolCursor). UnexpectedEof with bytes still left is
-                // corruption, not a truncated tail.
-                if err.kind() == io::ErrorKind::UnexpectedEof && reader.at_eof() {
-                    truncated_tail = true;
-                    tracing::warn!(
-                        "spool tail truncated mid-record; keeping {} samples",
-                        samples.len()
-                    );
-                    break;
-                }
-                return Err(err);
-            }
-        }
-        let frame_contexts =
-            SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
+        let opened = open_spool(path, SampleStorage::Retain)?;
         Ok(Self {
-            start_timestamp_us,
-            sample_interval_us,
-            modules,
-            frames,
-            frame_contexts,
-            stack_nodes,
-            samples,
-            python_runtime_records,
-            truncated_tail,
+            definitions: opened.definitions,
+            samples: opened.samples,
         })
     }
 
     /// Return the profile timeline anchor in microseconds.
     pub fn start_timestamp_us(&self) -> u64 {
-        self.start_timestamp_us
+        self.definitions.start_timestamp_us
     }
 
     /// Return the optional sample interval metadata in microseconds.
     pub fn sample_interval_us(&self) -> u64 {
-        self.sample_interval_us
+        self.definitions.sample_interval_us
     }
 
     /// Return code areas recorded in the profile.
     pub fn modules(&self) -> &[ModuleRecord] {
-        &self.modules
+        &self.definitions.modules
     }
 
     /// Return all interned raw frame records.
     pub fn frames(&self) -> &[FrameRecord] {
-        &self.frames
+        &self.definitions.frames
     }
 
     /// Return samples recorded in the profile.
@@ -582,65 +656,30 @@ impl PerfSpoolReader {
 
     /// Return recorded Python-runtime status changes.
     pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
-        &self.python_runtime_records
+        &self.definitions.python_runtime_records
     }
 
     /// Whether the file ended mid-record (e.g. the recorder crashed while
     /// writing) and the reader recovered by keeping only the intact prefix.
     pub fn recovered_from_truncated_tail(&self) -> bool {
-        self.truncated_tail
+        self.definitions.truncated_tail
     }
 
     /// Return absolute kernel instruction pointers present in interned frame records.
     pub fn kernel_frame_addresses(&self) -> impl Iterator<Item = u64> + '_ {
-        self.frames
+        self.definitions
+            .frames
             .iter()
             .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip))
     }
 
-    pub(crate) fn module_for_frame(
-        &self,
-        process_id: i32,
-        frame_id: u32,
-        frame: &FrameRecord,
-    ) -> Option<FrameModuleRef<'_>> {
-        let context = self.frame_contexts.for_frame_id(frame_id)?;
-        module_for_frame_with_context(
-            &self.modules,
-            &self.frame_contexts,
-            context,
-            process_id,
-            frame,
-        )
-    }
-
-    fn frame_context<'a>(
-        &'a self,
-        process_id: i32,
-        frame_id: u32,
-        frame: &'a FrameRecord,
-    ) -> FrameContext<'a> {
-        FrameContext {
-            frame,
-            module: self.module_for_frame(process_id, frame_id, frame),
-        }
-    }
-
     pub(crate) fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
-        self.frame_contexts.clone()
+        self.definitions.frame_contexts.clone()
     }
 
     /// Borrow raw frames for `stack_id` without copying them.
     pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
-        let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
-            invalid_data(format!("sample references missing stack node {stack_id}"))
-        })?;
-        Ok(StackFrameRefs {
-            frames: &self.frames,
-            stack_nodes: &self.stack_nodes,
-            current: Some(stack_id),
-            remaining: node.depth,
-        })
+        self.definitions.stack_frame_refs(stack_id)
     }
 
     /// Borrow raw frame contexts for `stack_id` without copying them.
@@ -650,7 +689,7 @@ impl PerfSpoolReader {
         stack_id: u32,
     ) -> io::Result<StackFrameContexts<'_>> {
         Ok(StackFrameContexts {
-            reader: self,
+            definitions: &self.definitions,
             process_id,
             frames: self.stack_frame_refs(stack_id)?,
         })
@@ -679,9 +718,304 @@ impl PerfSpoolReader {
             .samples
             .first()
             .map_or(sample.timestamp_ns, |s| s.timestamp_ns);
-        self.start_timestamp_us
+        self.definitions
+            .start_timestamp_us
             .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
     }
+}
+
+impl PerfSpoolReplayReader {
+    /// Open and validate a spool for bounded-memory sequential replay.
+    ///
+    /// Definitions and a bounded sample byte-range index are retained in
+    /// memory. If that index reaches its limit, iteration scans validated
+    /// records instead. Sample metadata is validated during open and decoded
+    /// again during iteration. The file must not be truncated or mutated while
+    /// the reader is alive.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let opened = open_spool(path, SampleStorage::Replay)?;
+        Ok(Self::from_opened(opened))
+    }
+
+    fn from_opened(opened: OpenedSpool) -> Self {
+        Self {
+            definitions: opened.definitions,
+            threads: opened.threads,
+            mmap: opened.mmap,
+            sample_ranges: opened.sample_ranges,
+            scan_start: opened.scan_start,
+            sample_count: opened.sample_count,
+            first_sample_timestamp_ns: opened.first_sample_timestamp_ns,
+        }
+    }
+
+    /// Return the profile timeline anchor in microseconds.
+    pub fn start_timestamp_us(&self) -> u64 {
+        self.definitions.start_timestamp_us
+    }
+
+    /// Return the optional sample interval metadata in microseconds.
+    pub fn sample_interval_us(&self) -> u64 {
+        self.definitions.sample_interval_us
+    }
+
+    /// Return code areas recorded in the profile.
+    pub fn modules(&self) -> &[ModuleRecord] {
+        &self.definitions.modules
+    }
+
+    /// Return all interned raw frame records.
+    pub fn frames(&self) -> &[FrameRecord] {
+        &self.definitions.frames
+    }
+
+    /// Return the number of samples in the validated spool prefix.
+    pub fn sample_count(&self) -> usize {
+        self.sample_count
+    }
+
+    /// Return recorded Python-runtime status changes.
+    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
+        &self.definitions.python_runtime_records
+    }
+
+    /// Whether the file ended mid-record and the reader kept its intact prefix.
+    pub fn recovered_from_truncated_tail(&self) -> bool {
+        self.definitions.truncated_tail
+    }
+
+    pub(crate) fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.definitions.frame_contexts.clone()
+    }
+
+    /// Borrow raw frames for `stack_id` without copying them.
+    pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
+        self.definitions.stack_frame_refs(stack_id)
+    }
+
+    /// Borrow raw frame contexts for `stack_id` without copying them.
+    pub fn stack_frame_contexts(
+        &self,
+        process_id: i32,
+        stack_id: u32,
+    ) -> io::Result<StackFrameContexts<'_>> {
+        Ok(StackFrameContexts {
+            definitions: &self.definitions,
+            process_id,
+            frames: self.stack_frame_refs(stack_id)?,
+        })
+    }
+
+    /// Decode samples sequentially without retaining them.
+    pub fn samples(&self) -> impl ExactSizeIterator<Item = SampleRecord> + '_ {
+        self.replay_samples()
+    }
+
+    fn replay_samples(&self) -> ReplaySamples<'_> {
+        let (start, mode) = if let Some(range) = self.sample_ranges.first() {
+            (range.start, ReplayMode::Ranges { index: 0 })
+        } else if let Some(scan_start) = self.scan_start {
+            (scan_start.position, ReplayMode::Records(scan_start.state))
+        } else {
+            (self.mmap.len(), ReplayMode::Ranges { index: 0 })
+        };
+        ReplaySamples {
+            reader: self,
+            cursor: MmapSpoolCursor::at_position(Arc::clone(&self.mmap), start),
+            last_timestamp_ns: 0,
+            remaining: self.sample_count,
+            mode,
+        }
+    }
+
+    /// Decode samples and borrow their raw frames sequentially.
+    pub fn sample_stacks(&self) -> impl ExactSizeIterator<Item = ReplaySampleStack<'_>> + '_ {
+        self.replay_samples()
+            .map(|sample| self.definitions.replay_sample_stack(sample))
+    }
+
+    /// Convert a sample timestamp to the profile timeline in microseconds.
+    pub fn timestamp_us(&self, sample: &SampleRecord) -> u64 {
+        let first = self
+            .first_sample_timestamp_ns
+            .unwrap_or(sample.timestamp_ns);
+        self.definitions
+            .start_timestamp_us
+            .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
+    }
+}
+
+struct OpenedSpool {
+    definitions: SpoolDefinitions,
+    samples: Vec<SampleRecord>,
+    threads: Vec<(i32, u64)>,
+    mmap: Arc<Mmap>,
+    sample_ranges: Box<[Range<usize>]>,
+    scan_start: Option<ReplayScanStart>,
+    sample_count: usize,
+    first_sample_timestamp_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampleStorage {
+    Retain,
+    Replay,
+}
+
+fn open_spool(path: impl AsRef<Path>, sample_storage: SampleStorage) -> io::Result<OpenedSpool> {
+    open_spool_with_range_limit(path, sample_storage, MAX_REPLAY_SAMPLE_RANGES)
+}
+
+fn open_spool_with_range_limit(
+    path: impl AsRef<Path>,
+    sample_storage: SampleStorage,
+    range_limit: usize,
+) -> io::Result<OpenedSpool> {
+    let file = File::open(path)?;
+    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+    let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
+    let spool_version = reader.check_magic()?;
+    let start_timestamp_us = reader.read_varint::<u64>()?;
+    let sample_interval_us = reader.read_varint::<u64>()?;
+    let (
+        mut modules,
+        mut module_deactivated_at,
+        mut frames,
+        mut frame_module_limits,
+        mut stack_nodes,
+        mut threads,
+        mut samples,
+        mut python_runtime_records,
+    ) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut sample_count = 0_usize;
+    let mut sample_ranges =
+        (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
+    let mut scan_start = None;
+    let mut first_sample_timestamp_ns = None;
+    let mut last_timestamp_ns = 0_u64;
+    let mut truncated_tail = false;
+    loop {
+        let record_start = reader.position;
+        let Some(tag) = reader.read_tag()? else {
+            break;
+        };
+        // Each record's reads run before any push, so a record truncated by a
+        // crash leaves the accumulated state untouched. Stop at such a tail
+        // and keep the prefix; still surface real corruption.
+        let parsed = (|| -> io::Result<()> {
+            match tag {
+                REC_MODULE => {
+                    modules.push(read_module_mmap(&mut reader, modules.len(), spool_version)?);
+                    module_deactivated_at.push(None);
+                }
+                REC_FRAME => {
+                    let module_limit = modules.len();
+                    frames.push(read_frame(&mut reader, &modules, frames.len())?);
+                    frame_module_limits.push(module_limit);
+                }
+                REC_STACK => {
+                    stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
+                }
+                REC_THREAD => threads.push(read_thread(&mut reader, threads.len())?),
+                REC_SAMPLE => {
+                    let sample = read_sample(
+                        &mut reader,
+                        &threads,
+                        stack_nodes.len(),
+                        &mut last_timestamp_ns,
+                    )?;
+                    first_sample_timestamp_ns.get_or_insert(sample.timestamp_ns);
+                    sample_count = sample_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("sample count exceeds address space"))?;
+                    if sample_storage == SampleStorage::Retain {
+                        samples.push(sample);
+                    }
+                }
+                REC_PYTHON_RUNTIME => {
+                    python_runtime_records.push(read_python_runtime(&mut reader)?)
+                }
+                REC_MODULE_DEACTIVATE => {
+                    let process_id = read_process_id(&mut reader)?;
+                    let deactivated_at = frames.len();
+                    for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at) {
+                        if module.process_id == process_id && !module.is_kernel {
+                            deactivated.get_or_insert(deactivated_at);
+                        }
+                    }
+                }
+                REC_MODULE_DEACTIVATE_ONE => {
+                    if spool_version < 2 {
+                        return Err(invalid_data(
+                            "targeted module deactivation requires spool version 2",
+                        ));
+                    }
+                    let module_id =
+                        read_index_within(&mut reader, modules.len(), "module deactivation")?;
+                    module_deactivated_at[module_id].get_or_insert(frames.len());
+                }
+                other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
+            }
+            Ok(())
+        })();
+        if let Err(err) = parsed {
+            if err.kind() == io::ErrorKind::UnexpectedEof && reader.at_eof() {
+                truncated_tail = true;
+                tracing::warn!("spool tail truncated mid-record; keeping {sample_count} samples");
+                break;
+            }
+            return Err(err);
+        }
+        if tag == REC_SAMPLE && scan_start.is_none() {
+            if let Some(ranges) = &mut sample_ranges {
+                if let Some(range) = ranges.last_mut().filter(|range| range.end == record_start) {
+                    range.end = reader.position;
+                } else if ranges.len() < range_limit {
+                    ranges.push(record_start..reader.position);
+                } else {
+                    scan_start = Some(ReplayScanStart {
+                        position: record_start,
+                        state: ReplayRecordState {
+                            spool_version,
+                            module_count: modules.len(),
+                            frame_count: frames.len(),
+                            stack_count: stack_nodes.len(),
+                            thread_count: threads.len(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    let frame_contexts = SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
+    Ok(OpenedSpool {
+        definitions: SpoolDefinitions {
+            start_timestamp_us,
+            sample_interval_us,
+            modules,
+            frames,
+            frame_contexts,
+            stack_nodes,
+            python_runtime_records,
+            truncated_tail,
+        },
+        samples,
+        threads,
+        mmap,
+        sample_ranges: sample_ranges.unwrap_or_default().into_boxed_slice(),
+        scan_start,
+        sample_count,
+        first_sample_timestamp_ns,
+    })
 }
 
 struct MmapSpoolCursor {
@@ -697,6 +1031,10 @@ trait SpoolRead {
 impl MmapSpoolCursor {
     fn new(mmap: Arc<Mmap>) -> Self {
         Self { mmap, position: 0 }
+    }
+
+    fn at_position(mmap: Arc<Mmap>, position: usize) -> Self {
+        Self { mmap, position }
     }
 
     fn check_magic(&mut self) -> io::Result<u8> {
@@ -787,6 +1125,55 @@ impl SpoolRead for &[u8] {
     fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
         VarIntReader::read_varint(self)
     }
+}
+
+fn consume_validated_record(
+    reader: &mut MmapSpoolCursor,
+    tag: u8,
+    definitions: &SpoolDefinitions,
+    state: &mut ReplayRecordState,
+) -> io::Result<()> {
+    match tag {
+        REC_MODULE => {
+            read_module_mmap(reader, state.module_count, state.spool_version)?;
+            state.module_count += 1;
+        }
+        REC_FRAME => {
+            read_frame(
+                reader,
+                &definitions.modules[..state.module_count],
+                state.frame_count,
+            )?;
+            state.frame_count += 1;
+        }
+        REC_STACK => {
+            read_stack_node(
+                reader,
+                &definitions.stack_nodes[..state.stack_count],
+                state.frame_count,
+            )?;
+            state.stack_count += 1;
+        }
+        REC_THREAD => {
+            read_thread(reader, state.thread_count)?;
+            state.thread_count += 1;
+        }
+        REC_PYTHON_RUNTIME => {
+            read_python_runtime(reader)?;
+        }
+        REC_MODULE_DEACTIVATE => {
+            read_process_id(reader)?;
+        }
+        REC_MODULE_DEACTIVATE_ONE => {
+            read_index_within(reader, state.module_count, "module deactivation")?;
+        }
+        other => {
+            return Err(invalid_data(format!(
+                "unexpected replay record tag {other}"
+            )))
+        }
+    }
+    Ok(())
 }
 
 fn read_module_mmap(
@@ -1213,9 +1600,14 @@ mod tests {
             .unwrap();
 
         let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
+        let replay =
+            PerfSpoolReplayReader::open(&path).expect("truncated replay spool still opens");
         let _ = std::fs::remove_file(&path);
         assert!(!reader.samples().is_empty());
         assert!(reader.recovered_from_truncated_tail());
+        assert_eq!(replay.sample_count(), reader.samples().len());
+        assert!(replay.recovered_from_truncated_tail());
+        assert_eq!(replay.samples().collect::<Vec<_>>(), reader.samples());
     }
 
     #[test]
@@ -1277,6 +1669,102 @@ mod tests {
         };
         let _ = std::fs::remove_file(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_reader_matches_eager_reader_across_record_types() {
+        let path = temp_spool_path("replay-reader-parity");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_module(&module(7, 0x1000, 0x2000, "/first", false))
+            .unwrap();
+        writer
+            .write_sample_frames(
+                1_000,
+                7,
+                11,
+                [
+                    FrameRecord {
+                        module_id: Some(0),
+                        file_relative_ip: 0x20,
+                        abs_ip: 0x1020,
+                        mode: FrameMode::User,
+                    },
+                    frame(0x3000),
+                ],
+            )
+            .unwrap();
+        writer.write_python_runtime(1_500, 7, true).unwrap();
+        writer.write_module_deactivation_one(0).unwrap();
+        let mut second_module = module(7, 0x3000, 0x4000, "/second", false);
+        second_module.id = 1;
+        writer.write_module(&second_module).unwrap();
+        writer
+            .write_sample_frames(2_000, 7, 12, [frame(0x3020)])
+            .unwrap();
+        writer.write_python_runtime(2_250, 7, false).unwrap();
+        writer.write_module_deactivation_one(1).unwrap();
+        let mut third_module = module(7, 0x5000, 0x6000, "/third", false);
+        third_module.id = 2;
+        writer.write_module(&third_module).unwrap();
+        writer
+            .write_sample_frames(2_500, 7, 13, [frame(0x5020)])
+            .unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        writer
+            .write_sample_frames(3_000, 7, 13, [frame(0x5020)])
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let eager = PerfSpoolReader::open(&path).unwrap();
+        let replay = PerfSpoolReplayReader::open(&path).unwrap();
+        let scanned = PerfSpoolReplayReader::from_opened(
+            open_spool_with_range_limit(&path, SampleStorage::Replay, 1).unwrap(),
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(replay.start_timestamp_us(), eager.start_timestamp_us());
+        assert_eq!(replay.sample_interval_us(), eager.sample_interval_us());
+        assert_eq!(replay.modules(), eager.modules());
+        assert_eq!(replay.frames(), eager.frames());
+        assert_eq!(
+            replay.python_runtime_records(),
+            eager.python_runtime_records()
+        );
+        assert_eq!(replay.sample_ranges.len(), 4);
+        assert_eq!(scanned.sample_ranges.len(), 1);
+        assert!(scanned.scan_start.is_some());
+        assert_eq!(replay.sample_count(), eager.samples().len());
+        assert_eq!(replay.samples().collect::<Vec<_>>(), eager.samples());
+        assert_eq!(scanned.samples().collect::<Vec<_>>(), eager.samples());
+        for sample in replay.samples() {
+            let replay_contexts: Vec<_> = replay
+                .stack_frame_contexts(sample.process_id, sample.stack_id)
+                .unwrap()
+                .collect();
+            let eager_contexts: Vec<_> = eager
+                .stack_frame_contexts(sample.process_id, sample.stack_id)
+                .unwrap()
+                .collect();
+            assert_eq!(replay_contexts, eager_contexts);
+        }
+
+        let eager_stacks: Vec<_> = eager
+            .sample_stacks()
+            .map(|stack| stack.frames.copied().collect::<Vec<_>>())
+            .collect();
+        let replay_stacks: Vec<_> = replay
+            .sample_stacks()
+            .map(|stack| stack.frames.copied().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(replay_stacks, eager_stacks);
+        for (replay_sample, eager_sample) in replay.samples().zip(eager.samples()) {
+            assert_eq!(
+                replay.timestamp_us(&replay_sample),
+                eager.timestamp_us(eager_sample)
+            );
+        }
     }
 
     #[test]
@@ -1523,6 +2011,7 @@ mod tests {
 
         assert_eq!(frame_ref.frame.module_id, None);
         assert!(reader
+            .definitions
             .module_for_frame(7, frame_ref.id, frame_ref.frame)
             .is_none());
         assert!(reader
@@ -1556,6 +2045,7 @@ mod tests {
         let frame_ref = frames.next_with_id().unwrap();
 
         assert!(reader
+            .definitions
             .module_for_frame(7, frame_ref.id, frame_ref.frame)
             .is_none());
         assert!(reader
@@ -2070,6 +2560,85 @@ mod tests {
         assert_eq!(reader.modules()[0].device_major, 0);
         assert_eq!(reader.modules()[0].device_minor, 0);
         assert_eq!(reader.modules()[0].inode_generation, 0);
+    }
+
+    #[test]
+    fn replay_reader_decodes_samples_from_older_spool_versions() {
+        for (label, magic) in [("v1", MAGIC_V1), ("v2", MAGIC_V2)] {
+            let path = temp_spool_path(&format!("replay-{label}"));
+            let mut bytes = magic.to_vec();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(10_u64).unwrap();
+            bytes.push(REC_MODULE);
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(7_i64).unwrap();
+            bytes.write_varint(0x1000_u64).unwrap();
+            bytes.write_varint(0x2000_u64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(99_u64).unwrap();
+            bytes.push(0);
+            write_bytes(&mut bytes, b"/module").unwrap();
+            bytes.push(REC_FRAME);
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(0x10_u64).unwrap();
+            bytes.push(REC_STACK);
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(u64::from(NONE_U32)).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.push(REC_THREAD);
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(7_i64).unwrap();
+            bytes.write_varint(11_u64).unwrap();
+            bytes.push(REC_SAMPLE);
+            bytes.write_varint(1_000_i64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.push(REC_MODULE);
+            bytes.write_varint(1_u64).unwrap();
+            bytes.write_varint(7_i64).unwrap();
+            bytes.write_varint(0x3000_u64).unwrap();
+            bytes.write_varint(0x4000_u64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(100_u64).unwrap();
+            bytes.push(0);
+            write_bytes(&mut bytes, b"/second").unwrap();
+            bytes.push(REC_FRAME);
+            bytes.write_varint(1_u64).unwrap();
+            bytes.write_varint(2_u64).unwrap();
+            bytes.write_varint(0x10_u64).unwrap();
+            bytes.push(REC_STACK);
+            bytes.write_varint(1_u64).unwrap();
+            bytes.write_varint(u64::from(NONE_U32)).unwrap();
+            bytes.write_varint(1_u64).unwrap();
+            bytes.push(REC_SAMPLE);
+            bytes.write_varint(1_000_i64).unwrap();
+            bytes.write_varint(0_u64).unwrap();
+            bytes.write_varint(1_u64).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+
+            let reader = PerfSpoolReplayReader::open(&path).unwrap();
+            let scanned = PerfSpoolReplayReader::from_opened(
+                open_spool_with_range_limit(&path, SampleStorage::Replay, 0).unwrap(),
+            );
+            let _ = std::fs::remove_file(path);
+            let expected = vec![
+                SampleRecord {
+                    timestamp_ns: 1_000,
+                    process_id: 7,
+                    thread_id: 11,
+                    stack_id: 0,
+                },
+                SampleRecord {
+                    timestamp_ns: 2_000,
+                    process_id: 7,
+                    thread_id: 11,
+                    stack_id: 1,
+                },
+            ];
+            assert_eq!(reader.samples().collect::<Vec<_>>(), expected);
+            assert_eq!(scanned.samples().collect::<Vec<_>>(), expected);
+        }
     }
 
     #[test]

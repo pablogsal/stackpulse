@@ -143,7 +143,7 @@ impl Hash for ModulePath {
 }
 
 /// One executable memory mapping recorded in a spool file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleRecord {
     /// Stable module id within the spool.
     pub id: u32,
@@ -217,7 +217,7 @@ impl FrameRecord {
 }
 
 /// A sample record loaded from a spool file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
@@ -225,12 +225,12 @@ pub struct SampleRecord {
     pub process_id: i32,
     /// Thread id for the sample.
     pub thread_id: u64,
-    /// Stack id used with [`crate::PerfSpoolReader::stack_frames`].
+    /// Stack id used with spool-reader stack accessors.
     pub stack_id: u32,
 }
 
 /// Marker for a process's Python-runtime status during recording.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PythonRuntimeRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,

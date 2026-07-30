@@ -9,7 +9,8 @@ The crate root re-exports the recording, reading, and symbolization types:
 
 ```rust,no_run
 use stackpulse::{
-    AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
+    AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
+    PerfSpoolReplayReader, PerfSymbolizer,
 };
 ```
 
@@ -112,6 +113,31 @@ file-offset coordinate space as `FrameRecord::file_relative_ip`; external symbol
 combine it with the recorded module mapping however their own lookup API
 requires.
 
+### [`PerfSpoolReplayReader`]
+
+`PerfSpoolReplayReader::open(path)` validates the complete spool and retains
+definitions but not sample metadata. Samples are decoded sequentially during
+iteration. A bounded range index accelerates replay; if it fills, the reader
+scans validated records with constant additional memory.
+
+| Method | What it returns |
+| --- | --- |
+| `start_timestamp_us()` | Profile timeline anchor stored in the spool header. |
+| `sample_interval_us()` | Optional sample interval metadata stored in the spool header. |
+| `modules()` | Recorded executable memory ranges. |
+| `frames()` | Interned raw frame records. |
+| `sample_count()` | Number of samples in the validated spool prefix. |
+| `samples()` | Sequential iterator of owned [`SampleRecord`] values. |
+| `sample_stacks()` | Sequential iterator of [`ReplaySampleStack`] values with borrowed raw frames. |
+| `python_runtime_records()` | Python-runtime status changes. |
+| `recovered_from_truncated_tail()` | Whether the spool ended mid-record and only the intact prefix is available. |
+| `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`]s for an interned stack without copying. |
+| `stack_frame_contexts(pid, stack_id)` | Borrow raw frames with their recorded module context. |
+| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds. |
+
+The spool file must not be truncated or modified while either reader is alive.
+Use [`PerfSpoolReader`] when sample random access is required.
+
 ### [`ModuleRecord`]
 
 | Field | Meaning |
@@ -164,13 +190,17 @@ Resolves raw frames into displayable ones. One per profile, reused.
 | --- | --- |
 | `new(modules)` | Default: ELF, kernel symbols, plus Python perf maps for any PID. |
 | `for_spool(reader)` | Create a symbolizer for a loaded spool, including sparse kernel-symbol loading. |
+| `for_replay(reader)` | Create a symbolizer for a sequential replay reader. |
 | `PerfSymbolizerBuilder::for_modules(modules)` | Configure symbolization for module records. |
 | `PerfSymbolizerBuilder::for_spool(reader)` | Configure symbolization with spool metadata. |
+| `PerfSymbolizerBuilder::for_replay(reader)` | Configure symbolization with sequential replay metadata. |
 | `disable_perf_maps()` | Disable Python perf-map lookup. |
 | `perf_maps_for(pids)` | Allow perf maps only for the listed PIDs. |
 | `native_symbolizer_factory(factory)` | Replace the bundled native symbolizer. |
 | `for_each_sample_stack(stack, visit)` | Resolve a [`SampleStack`] from `sample_stacks()` and stream borrowed resolved frames to `visit`. |
 | `for_each_sample_stack_without_stack_cache(stack, visit)` | Resolve a [`SampleStack`] without retaining a stack-cache entry when the caller already deduplicates `(process_id, stack_id)` pairs. |
+| `for_each_replay_sample_stack(stack, visit)` | Resolve a [`ReplaySampleStack`] from sequential replay. |
+| `for_each_replay_sample_stack_without_stack_cache(stack, visit)` | Resolve a [`ReplaySampleStack`] without retaining a stack-cache entry. |
 | `for_each_resolved_frame_slice(pid, frames, visit)` | Resolve a caller-supplied raw-frame slice and stream borrowed resolved frames to `visit`. |
 
 Use `perf_maps_for` with IDs from `python_runtime_records()` when perf-map
