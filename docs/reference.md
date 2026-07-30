@@ -170,6 +170,7 @@ Resolves raw frames into displayable ones. One per profile, reused.
 | `perf_maps_for(pids)` | Allow perf maps only for the listed PIDs. |
 | `native_symbolizer_factory(factory)` | Replace the bundled native symbolizer. |
 | `for_each_sample_stack(stack, visit)` | Resolve a [`SampleStack`] from `sample_stacks()` and stream borrowed resolved frames to `visit`. |
+| `for_each_sample_stack_without_stack_cache(stack, visit)` | Resolve a [`SampleStack`] without retaining a stack-cache entry when the caller already deduplicates `(process_id, stack_id)` pairs. |
 | `for_each_resolved_frame_slice(pid, frames, visit)` | Resolve a caller-supplied raw-frame slice and stream borrowed resolved frames to `visit`. |
 
 Use `perf_maps_for` with IDs from `python_runtime_records()` when perf-map
