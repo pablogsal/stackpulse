@@ -26,8 +26,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{
-    self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader, SampleStack,
-    SpoolFrameModuleContexts, StackFrameRefs,
+    self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader,
+    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts,
+    StackFrameRefs,
 };
 
 mod kernel;
@@ -58,7 +59,41 @@ pub struct PerfSymbolizer {
 
 enum SymbolizerInput<'a> {
     Modules(&'a [ModuleRecord]),
-    Spool(&'a PerfSpoolReader),
+    Spool(&'a dyn SpoolSymbolizationInput),
+}
+
+trait SpoolSymbolizationInput {
+    fn modules(&self) -> &[ModuleRecord];
+    fn frames(&self) -> &[FrameRecord];
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts;
+}
+
+impl SpoolSymbolizationInput for PerfSpoolReader {
+    fn modules(&self) -> &[ModuleRecord] {
+        self.modules()
+    }
+
+    fn frames(&self) -> &[FrameRecord] {
+        self.frames()
+    }
+
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.frame_module_contexts()
+    }
+}
+
+impl SpoolSymbolizationInput for PerfSpoolReplayReader {
+    fn modules(&self) -> &[ModuleRecord] {
+        self.modules()
+    }
+
+    fn frames(&self) -> &[FrameRecord] {
+        self.frames()
+    }
+
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.frame_module_contexts()
+    }
 }
 
 /// Configures a [`PerfSymbolizer`].
@@ -82,6 +117,16 @@ impl<'a> PerfSymbolizerBuilder<'a> {
     /// Configure symbolization for a loaded spool.
     #[must_use]
     pub fn for_spool(reader: &'a PerfSpoolReader) -> Self {
+        Self {
+            input: SymbolizerInput::Spool(reader),
+            perf_map_processes: PerfMapProcesses::All,
+            native_factory: None,
+        }
+    }
+
+    /// Configure symbolization for a sequential spool replay.
+    #[must_use]
+    pub fn for_replay(reader: &'a PerfSpoolReplayReader) -> Self {
         Self {
             input: SymbolizerInput::Spool(reader),
             perf_map_processes: PerfMapProcesses::All,
@@ -205,8 +250,13 @@ impl PerfSymbolizer {
         PerfSymbolizerBuilder::for_spool(reader).build()
     }
 
+    /// Create a resolver for a sequential spool replay.
+    pub fn for_replay(reader: &PerfSpoolReplayReader) -> Self {
+        PerfSymbolizerBuilder::for_replay(reader).build()
+    }
+
     fn for_spool_inner(
-        reader: &PerfSpoolReader,
+        reader: &dyn SpoolSymbolizationInput,
         perf_map_processes: PerfMapProcesses,
         native_factory: NativeSymbolizerFactory,
     ) -> Self {
@@ -216,7 +266,10 @@ impl PerfSymbolizer {
             native_factory,
         );
         symbolizer.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
-            reader.kernel_frame_addresses(),
+            reader
+                .frames()
+                .iter()
+                .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip)),
             reader.modules(),
         ));
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
@@ -328,6 +381,34 @@ impl PerfSymbolizer {
     pub fn for_each_sample_stack_without_stack_cache(
         &mut self,
         stack: SampleStack<'_>,
+        mut visit: impl FnMut(&ResolvedFrame),
+    ) -> usize {
+        self.for_each_resolved_frame_id(
+            stack.sample.process_id,
+            stack.frames,
+            |symbolizer, frame_id| visit(&symbolizer.resolved_frames[frame_id]),
+        )
+    }
+
+    /// Resolve one sequentially decoded sample stack and visit each frame.
+    pub fn for_each_replay_sample_stack(
+        &mut self,
+        stack: ReplaySampleStack<'_>,
+        visit: impl FnMut(&ResolvedFrame),
+    ) -> usize {
+        self.for_each_resolved_frame(
+            stack.sample.process_id,
+            stack.sample.stack_id,
+            stack.frames,
+            visit,
+        )
+    }
+
+    /// Resolve one sequentially decoded sample stack without retaining its
+    /// resolved stack.
+    pub fn for_each_replay_sample_stack_without_stack_cache(
+        &mut self,
+        stack: ReplaySampleStack<'_>,
         mut visit: impl FnMut(&ResolvedFrame),
     ) -> usize {
         self.for_each_resolved_frame_id(
@@ -1733,6 +1814,26 @@ mod tests {
             .disable_perf_maps()
             .build();
         assert_future_module_unresolved(&reader, symbolizer, stack_id);
+    }
+
+    #[test]
+    fn replay_symbolizer_keeps_recorded_frame_module_context() {
+        let (path, _) = write_future_module_spool("replay-future-module");
+        let reader = PerfSpoolReplayReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let mut symbolizer = PerfSymbolizerBuilder::for_replay(&reader)
+            .disable_perf_maps()
+            .build();
+        let stack = reader.sample_stacks().next().expect("sample");
+        let mut resolved = None;
+        symbolizer.for_each_replay_sample_stack(stack, |frame| {
+            resolved = Some(frame.clone());
+        });
+        let ResolvedFrame::Native(frame) = resolved.expect("resolved frame") else {
+            panic!("expected native address-only frame");
+        };
+        assert_eq!(frame.origin, SymbolOrigin::AddressOnly);
+        assert!(frame.symbol.is_none());
     }
 
     #[test]

@@ -47,6 +47,7 @@ for stack in reader.sample_stacks() {
 | --- | --- |
 | [`PerfRecorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
 | [`PerfSpoolReader`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
+| [`PerfSpoolReplayReader`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
 | [`PerfSymbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`NativeSymbolizer`]. |
 | [`NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`PerfSymbolizer`] still handles kernel and perf-map frames. |
 | [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
@@ -78,6 +79,33 @@ for sample in reader.samples() {
 
 `stack_frame_contexts` does not symbolize. It only binds borrowed raw frames to
 the module mapping stackpulse recorded at capture time.
+
+# Sequential replay
+
+For large profiles, use [`PerfSpoolReplayReader`] to avoid retaining every
+[`SampleRecord`] in memory:
+
+```rust,no_run
+use stackpulse::{PerfSpoolReplayReader, PerfSymbolizer};
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let reader = PerfSpoolReplayReader::open("profile.spool")?;
+let mut symbolizer = PerfSymbolizer::for_replay(&reader);
+
+for stack in reader.sample_stacks() {
+    symbolizer.for_each_replay_sample_stack(stack, |frame| {
+        println!("{}", frame.func_name());
+    });
+}
+# Ok(())
+# }
+```
+
+Opening still validates the complete spool and retains modules, frames,
+interned stacks, threads, and runtime markers. Samples are decoded again as
+the iterator advances. The file must remain unchanged while the reader is
+alive. External symbolizers can use `stack_frame_contexts` to retain the
+recorded module generation across remaps. Use [`PerfSpoolReader`] when random
+access to `samples()` is needed.
 
 # Plugging in an external native symbolizer
 
