@@ -273,7 +273,23 @@ impl PerfSymbolizer {
         }
 
         let start = self.resolved_stack_frame_ids.len();
-        let mut frames = frames;
+        self.for_each_resolved_frame_id(process_id, frames, |symbolizer, frame_id| {
+            visit(&symbolizer.resolved_frames[frame_id]);
+            symbolizer.resolved_stack_frame_ids.push(frame_id);
+        });
+        let frame_ids = start..self.resolved_stack_frame_ids.len();
+        let count = frame_ids.end - frame_ids.start;
+        self.stack_cache.insert(cache_key, frame_ids);
+        count
+    }
+
+    fn for_each_resolved_frame_id(
+        &mut self,
+        process_id: i32,
+        mut frames: StackFrameRefs<'_>,
+        mut visit: impl FnMut(&mut Self, usize),
+    ) -> usize {
+        let mut count = 0;
         while let Some(frame_ref) = frames.next_with_id() {
             let resolved_ids = self.resolve_cached_frame_ids(
                 process_id,
@@ -282,13 +298,10 @@ impl PerfSymbolizer {
                 Some(frame_ref.id),
             );
             for frame_id in resolved_ids {
-                visit(&self.resolved_frames[frame_id]);
-                self.resolved_stack_frame_ids.push(frame_id);
+                visit(self, frame_id);
+                count += 1;
             }
         }
-        let frame_ids = start..self.resolved_stack_frame_ids.len();
-        let count = frame_ids.end - frame_ids.start;
-        self.stack_cache.insert(cache_key, frame_ids);
         count
     }
 
@@ -303,6 +316,24 @@ impl PerfSymbolizer {
             stack.sample.stack_id,
             stack.frames,
             visit,
+        )
+    }
+
+    /// Resolve one borrowed [`SampleStack`] without retaining its resolved
+    /// stack, and visit each resolved frame.
+    ///
+    /// Frame and symbol results remain cached. Use this when the caller
+    /// already deduplicates `(process_id, stack_id)` pairs and will not ask
+    /// this symbolizer to resolve the same stack again.
+    pub fn for_each_sample_stack_without_stack_cache(
+        &mut self,
+        stack: SampleStack<'_>,
+        mut visit: impl FnMut(&ResolvedFrame),
+    ) -> usize {
+        self.for_each_resolved_frame_id(
+            stack.sample.process_id,
+            stack.frames,
+            |symbolizer, frame_id| visit(&symbolizer.resolved_frames[frame_id]),
         )
     }
 
@@ -1609,6 +1640,41 @@ mod tests {
             panic!("expected native kernel frame");
         };
         assert_wireguard_kernel_frame(frame);
+    }
+
+    #[test]
+    fn sample_stack_without_stack_cache_keeps_per_process_frame_cache() {
+        let path = temp_symbolize_spool_path("sample-stack-without-stack-cache");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        let first_stack_id = writer
+            .write_sample_frames(1_000, 7, 11, [frame(0x1500)])
+            .unwrap()
+            .unwrap();
+        let second_stack_id = writer
+            .write_sample_frames(2_000, 8, 12, [frame(0x1500)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_stack_id, second_stack_id);
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = PerfSpoolReader::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+            .disable_perf_maps()
+            .build();
+
+        for stack in reader.sample_stacks() {
+            assert_eq!(
+                symbolizer.for_each_sample_stack_without_stack_cache(stack, |_| {}),
+                1
+            );
+        }
+
+        assert_eq!(symbolizer.frame_cache.len(), 2);
+        assert_eq!(symbolizer.resolved_frames.len(), 2);
+        assert!(symbolizer.stack_cache.is_empty());
+        assert!(symbolizer.resolved_stack_frame_ids.is_empty());
     }
 
     fn write_future_module_spool(label: &str) -> (std::path::PathBuf, u32) {

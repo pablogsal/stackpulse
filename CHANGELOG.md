@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0 - 2026-07-30
+
+### Added
+
+- `PerfSymbolizer::for_each_sample_stack_without_stack_cache` resolves spool-backed frames while retaining frame and symbol caches without retaining a redundant resolved-stack cache.
+
 ## 0.5.1 - 2026-07-21
 
 ### Fixed
