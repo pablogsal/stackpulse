@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 - 2026-07-30
+
+### Added
+
+- `PerfSpoolReplayReader` validates spool files while retaining definitions instead of every sample, then decodes samples and raw stacks sequentially.
+- Replay readers expose recorded frame-module contexts, and `PerfSymbolizer::for_replay` plus its builder and stack methods preserve mapping-generation-aware symbolization.
+
+### Performance
+
+- Sequential replay uses a bounded 8 MiB sample-range index and switches to allocation-free record scanning for any unindexed suffix.
+
 ## 0.6.0 - 2026-07-30
 
 ### Added
