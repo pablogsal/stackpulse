@@ -26,7 +26,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader,
-    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts,
+    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts, SpoolRecord,
     StackFrameRefs,
 };
 
@@ -59,6 +59,7 @@ pub struct PerfSymbolizer {
 enum SymbolizerInput<'a> {
     Modules(&'a [ModuleRecord]),
     Spool(&'a dyn SpoolSymbolizationInput),
+    Stream,
 }
 
 trait SpoolSymbolizationInput {
@@ -133,6 +134,16 @@ impl<'a> PerfSymbolizerBuilder<'a> {
         }
     }
 
+    /// Configure a symbolizer that grows from an ordered semantic stream.
+    #[must_use]
+    pub fn for_stream() -> Self {
+        Self {
+            input: SymbolizerInput::Stream,
+            perf_map_processes: PerfMapProcesses::All,
+            native_factory: None,
+        }
+    }
+
     /// Disable Python perf-map lookup.
     #[must_use]
     pub fn disable_perf_maps(mut self) -> Self {
@@ -171,6 +182,9 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             ),
             SymbolizerInput::Spool(reader) => {
                 PerfSymbolizer::for_spool_inner(reader, self.perf_map_processes, native_factory)
+            }
+            SymbolizerInput::Stream => {
+                PerfSymbolizer::for_stream_inner(self.perf_map_processes, native_factory)
             }
         }
     }
@@ -254,6 +268,11 @@ impl PerfSymbolizer {
         PerfSymbolizerBuilder::for_replay(reader).build()
     }
 
+    /// Create an empty resolver for an ordered semantic record stream.
+    pub fn for_stream() -> Self {
+        PerfSymbolizerBuilder::for_stream().build()
+    }
+
     fn for_spool_inner(
         reader: &dyn SpoolSymbolizationInput,
         perf_map_processes: PerfMapProcesses,
@@ -273,6 +292,48 @@ impl PerfSymbolizer {
         ));
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
         symbolizer
+    }
+
+    fn for_stream_inner(
+        perf_map_processes: PerfMapProcesses,
+        native_factory: NativeSymbolizerFactory,
+    ) -> Self {
+        let mut symbolizer =
+            Self::with_perf_map_processes_inner(&[], perf_map_processes, native_factory);
+        symbolizer.kernel_symbols = Some(kernel::load_shared_kernel_symbols());
+        symbolizer.spool_frame_contexts = Some(SpoolFrameModuleContexts::default());
+        symbolizer
+    }
+
+    /// Apply one ordered stream record to module and frame-position state.
+    pub fn apply_record(&mut self, record: &SpoolRecord) {
+        let Some(contexts) = self.spool_frame_contexts.as_mut() else {
+            return;
+        };
+        match record {
+            SpoolRecord::Module(module) => {
+                let index = self.modules.len();
+                let mut module = module.clone();
+                module.id = u32::try_from(index).unwrap_or(u32::MAX);
+                if self.module_index_by_id.insert(module.id, index).is_some() {
+                    self.module_index_by_id.remove(&module.id);
+                }
+                self.modules.push(module);
+                contexts.push_module();
+            }
+            SpoolRecord::Frame(_) => contexts.push_frame(self.modules.len()),
+            SpoolRecord::DeactivateModule { module_id } => {
+                contexts.deactivate_module(*module_id as usize);
+            }
+            SpoolRecord::DeactivateProcessModules { process_id } => {
+                contexts.deactivate_process_modules(&self.modules, *process_id);
+            }
+            SpoolRecord::Header { .. }
+            | SpoolRecord::Stack { .. }
+            | SpoolRecord::Thread { .. }
+            | SpoolRecord::Sample { .. }
+            | SpoolRecord::PythonRuntime(_) => {}
+        }
     }
 
     fn with_perf_map_processes_inner(
@@ -436,6 +497,29 @@ impl PerfSymbolizer {
                 self.resolve_cached_frame_ids(process_id, frame, FrameCacheKey::Raw(*frame), None);
             for frame_id in resolved_ids {
                 visit(&self.resolved_frames[frame_id]);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Resolve streamed frames while preserving their positional spool ids.
+    pub fn for_each_streamed_frame_slice(
+        &mut self,
+        process_id: i32,
+        frames: &[(u32, FrameRecord)],
+        mut visit: impl FnMut(&ResolvedFrame),
+    ) -> usize {
+        let mut count = 0;
+        for &(frame_id, ref frame) in frames {
+            let resolved_ids = self.resolve_cached_frame_ids(
+                process_id,
+                frame,
+                FrameCacheKey::Spool(frame_id),
+                Some(frame_id),
+            );
+            for resolved_id in resolved_ids {
+                visit(&self.resolved_frames[resolved_id]);
                 count += 1;
             }
         }
@@ -1072,6 +1156,33 @@ mod tests {
         assert_eq!(sym_module.image_base, Some(image_base));
         assert!(sym_module.is_executable);
         assert!(!sym_module.is_python_runtime);
+    }
+
+    #[test]
+    fn streaming_symbolizer_preserves_frame_position_across_remap() {
+        let old = module_with_path(0, 42, 0x1000, "/tmp/old.so");
+        let new = module_with_path(1, 42, 0x1000, "/tmp/new.so");
+        let sampled = frame(0x1100);
+        let mut symbolizer = PerfSymbolizerBuilder::for_stream()
+            .disable_perf_maps()
+            .build();
+
+        symbolizer.apply_record(&SpoolRecord::Module(old));
+        symbolizer.apply_record(&SpoolRecord::Frame(crate::StreamedFrame::Unpinned {
+            abs_ip: sampled.abs_ip,
+            is_kernel: false,
+        }));
+        symbolizer.apply_record(&SpoolRecord::DeactivateModule { module_id: 0 });
+        symbolizer.apply_record(&SpoolRecord::Module(new));
+        symbolizer.apply_record(&SpoolRecord::Frame(crate::StreamedFrame::Unpinned {
+            abs_ip: sampled.abs_ip,
+            is_kernel: false,
+        }));
+
+        let before = symbolizer.module_for_frame(42, &sampled, Some(0)).unwrap();
+        let after = symbolizer.module_for_frame(42, &sampled, Some(1)).unwrap();
+        assert_eq!(before.module.path.as_str(), "/tmp/old.so");
+        assert_eq!(after.module.path.as_str(), "/tmp/new.so");
     }
 
     #[test]

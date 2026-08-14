@@ -108,6 +108,8 @@ pub struct PerfSummary {
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
+    /// Whether the semantic record sink abandoned the stream.
+    pub record_sink_abandoned: bool,
     /// Recovery passes triggered by one or more lost records.
     pub lifecycle_gaps: u64,
     /// Whether kernel frame capture remained enabled after attach.
@@ -134,11 +136,33 @@ pub struct PerfSummary {
 pub struct PerfRecorder {
     perf: perf_group::PerfGroup,
     event_sorter: EventSorter<RawFd, u64, PreparedEvent>,
-    writer: PerfSpoolWriter<std::io::BufWriter<std::fs::File>>,
+    writer: PerfSpoolWriter<RecorderOutput>,
     modules: ModuleTable,
     processes: ProcessTable,
     stack_scratch: Vec<StackFrame>,
     summary: PerfSummary,
+    strict_record_sink: bool,
+}
+
+enum RecorderOutput {
+    File(std::io::BufWriter<std::fs::File>),
+    Discard(std::io::Sink),
+}
+
+impl std::io::Write for RecorderOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(writer) => writer.write(buf),
+            Self::Discard(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(writer) => writer.flush(),
+            Self::Discard(writer) => writer.flush(),
+        }
+    }
 }
 
 struct EventContext<'a, W: std::io::Write> {
@@ -476,14 +500,76 @@ impl PerfRecorder {
         attach_mode: AttachMode,
         options: PerfRecorderOptions,
     ) -> io::Result<Self> {
+        Self::attach_inner(
+            pid,
+            RecorderOutput::File(std::io::BufWriter::new(std::fs::File::create(output)?)),
+            attach_mode,
+            options,
+            None,
+            false,
+        )
+    }
+
+    /// Attach with an authoritative spool and a best-effort semantic observer.
+    ///
+    /// Sink abandonment is reported in [`PerfSummary::record_sink_abandoned`]
+    /// but does not interrupt capture or damage the spool.
+    pub fn attach_with_sink<P: AsRef<Path>>(
+        pid: u32,
+        output: P,
+        attach_mode: AttachMode,
+        options: PerfRecorderOptions,
+        sink: Box<dyn crate::SpoolRecordSink>,
+    ) -> io::Result<Self> {
+        Self::attach_inner(
+            pid,
+            RecorderOutput::File(std::io::BufWriter::new(std::fs::File::create(output)?)),
+            attach_mode,
+            options,
+            Some(sink),
+            false,
+        )
+    }
+
+    /// Attach with no spool file and a required semantic sink.
+    ///
+    /// Encoded spool bytes are discarded. Sink abandonment makes attachment,
+    /// consumption, or finishing fail with [`io::ErrorKind::BrokenPipe`].
+    pub fn attach_streaming(
+        pid: u32,
+        attach_mode: AttachMode,
+        options: PerfRecorderOptions,
+        sink: Box<dyn crate::SpoolRecordSink>,
+    ) -> io::Result<Self> {
+        Self::attach_inner(
+            pid,
+            RecorderOutput::Discard(io::sink()),
+            attach_mode,
+            options,
+            Some(sink),
+            true,
+        )
+    }
+
+    fn attach_inner(
+        pid: u32,
+        output: RecorderOutput,
+        attach_mode: AttachMode,
+        options: PerfRecorderOptions,
+        sink: Option<Box<dyn crate::SpoolRecordSink>>,
+        strict_record_sink: bool,
+    ) -> io::Result<Self> {
         let mut perf = open_perf_group(pid, attach_mode, &options)?;
         let kernel_enabled = perf.kernel_enabled();
-        let mut writer = PerfSpoolWriter::create(
+        let mut writer = PerfSpoolWriter::from_writer(
             output,
             options.start_timestamp_us,
             options.sample_interval_us,
         )
         .map_err(|err| perf.resume_error_or(err))?;
+        if let Some(sink) = sink {
+            writer.set_record_sink(sink);
+        }
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
@@ -503,6 +589,10 @@ impl PerfRecorder {
         })()
         .map_err(|err| perf.resume_error_or(err))?;
 
+        let record_sink_abandoned = writer.record_sink_abandoned();
+        if strict_record_sink && record_sink_abandoned {
+            return Err(perf.resume_error_or(record_sink_abandoned_error()));
+        }
         let mut recorder = Self {
             perf,
             event_sorter: EventSorter::new(),
@@ -512,8 +602,10 @@ impl PerfRecorder {
             stack_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
+                record_sink_abandoned,
                 ..PerfSummary::default()
             },
+            strict_record_sink,
         };
         if attach_mode == AttachMode::StopAttachEnableResume {
             recorder.perf.enable()?;
@@ -523,7 +615,8 @@ impl PerfRecorder {
 
     /// Drain currently readable events into the spool file.
     pub fn consume_available(&mut self) -> io::Result<()> {
-        self.drain_events(DrainMode::Consume)
+        self.drain_events(DrainMode::Consume)?;
+        self.check_record_sink()
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -540,6 +633,7 @@ impl PerfRecorder {
             stack_scratch,
             writer,
             summary,
+            ..
         } = self;
         let mut lifecycle_actions = Vec::new();
         let mut recovered_process_forks = Vec::new();
@@ -738,6 +832,7 @@ impl PerfRecorder {
             }
         }
         summary.kernel_enabled &= perf.kernel_enabled();
+        summary.record_sink_abandoned |= writer.record_sink_abandoned();
         result
     }
 
@@ -808,7 +903,8 @@ impl PerfRecorder {
             }
         }
         self.summary.kernel_enabled &= self.perf.kernel_enabled();
-        Ok(())
+        self.summary.record_sink_abandoned |= self.writer.record_sink_abandoned();
+        self.check_record_sink()
     }
 
     /// Discover newly-created threads for `pid` when needed.
@@ -847,12 +943,38 @@ impl PerfRecorder {
         self.processes.active_process_count()
     }
 
+    /// Attach or replace a best-effort observer after recorder construction.
+    ///
+    /// Prefer [`Self::attach_with_sink`] when the observer needs attach-time
+    /// module records as part of a complete stream.
+    pub fn set_record_sink(&mut self, sink: Box<dyn crate::SpoolRecordSink>) {
+        self.writer.set_record_sink(sink);
+        self.summary.record_sink_abandoned |= self.writer.record_sink_abandoned();
+    }
+
+    /// Whether a semantic sink is currently attached.
+    #[must_use]
+    pub fn has_record_sink(&self) -> bool {
+        self.writer.has_record_sink()
+    }
+
     /// Flush the spool file and return the final counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.perf.disable()?;
         self.drain_events(DrainMode::Flush)?;
+        self.check_record_sink()?;
         self.writer.flush()?;
         Ok(self.summary)
+    }
+
+    fn check_record_sink(&mut self) -> io::Result<()> {
+        let abandoned = self.summary.record_sink_abandoned || self.writer.record_sink_abandoned();
+        self.summary.record_sink_abandoned |= abandoned;
+        if self.strict_record_sink && abandoned {
+            Err(record_sink_abandoned_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn rollback_open_process(
@@ -873,6 +995,13 @@ impl PerfRecorder {
         }
         error
     }
+}
+
+fn record_sink_abandoned_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "required semantic record sink abandoned the stream",
+    )
 }
 
 fn prepare_event(event_ref: EventRef, summary: &mut PerfSummary) -> Option<PreparedEvent> {
