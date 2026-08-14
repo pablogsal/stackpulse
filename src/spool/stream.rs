@@ -214,7 +214,7 @@ impl StreamReplayState {
                 };
                 self.first_sample_timestamp_ns.get_or_insert(timestamp_ns);
                 if retain_sample {
-                    self.samples.push(sample.clone());
+                    self.samples.push(sample);
                 }
                 return Ok(Some(sample));
             }
