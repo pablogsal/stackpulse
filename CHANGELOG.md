@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-08-20
+
+### Fixed
+
+- Prefer the `PT_LOAD` segment at an executable mapping's starting file offset when resolving ELF image bases for coarse mappings.
+
 ## 0.7.0 - 2026-07-30
 
 ### Added
