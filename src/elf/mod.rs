@@ -135,6 +135,13 @@ impl FileRange {
     fn page_ceil_end(self, page_size: PageSize) -> Option<u64> {
         self.end().and_then(|end| page_size.align_up(end))
     }
+
+    fn page_rounded_contains_value(self, value: u64, page_size: PageSize) -> bool {
+        self.size != 0
+            && self
+                .page_ceil_end(page_size)
+                .is_some_and(|end| self.page_floor_start(page_size) <= value && value < end)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -185,9 +192,10 @@ fn find_load_contribution_for_file_range_with_page_size(
 ) -> Option<&LoadSegment> {
     let page_size = PageSize::new(page_size)?;
     let mapping = FileRange::new(file_off, mapping_span);
+    let start_is_page_aligned = file_off.is_multiple_of(page_size.0);
     let mut exact = None;
-    let mut exact_bias = None;
-    let mut exact_ambiguous = false;
+    let mut start_bias = None;
+    let mut start_ambiguous = false;
     let mut fallback = None;
     let mut fallback_bias = None;
     let mut fallback_ambiguous = false;
@@ -200,33 +208,45 @@ fn find_load_contribution_for_file_range_with_page_size(
             continue;
         }
 
-        // Different PT_LOAD entries may both be contained by one coarse
-        // mapping. They are interchangeable only when they describe the same
-        // image-wide SVMA/file-offset relationship.
         let bias = i128::from(segment.p_vaddr) - i128::from(segment.p_offset);
-        let is_exact = segment.p_offset == file_off && segment.file_range().contains(mapping);
-        let (candidate, candidate_bias, ambiguous) = if is_exact {
-            (&mut exact, &mut exact_bias, &mut exact_ambiguous)
-        } else {
-            (&mut fallback, &mut fallback_bias, &mut fallback_ambiguous)
-        };
-        match *candidate_bias {
-            None => {
-                *candidate = Some(segment);
-                *candidate_bias = Some(bias);
+        let is_exact = segment.p_offset == file_off;
+        let is_start_candidate = is_exact
+            || (start_is_page_aligned
+                && segment
+                    .file_range()
+                    .page_rounded_contains_value(file_off, page_size));
+        if is_start_candidate {
+            match start_bias {
+                None => start_bias = Some(bias),
+                Some(previous_bias) if previous_bias != bias => start_ambiguous = true,
+                Some(_) => {}
             }
-            Some(previous_bias) if previous_bias != bias => *ambiguous = true,
+        }
+        if is_exact {
+            exact.get_or_insert(segment);
+            continue;
+        }
+        match fallback_bias {
+            None => {
+                fallback = Some(segment);
+                fallback_bias = Some(bias);
+            }
+            Some(previous_bias) if previous_bias != bias => fallback_ambiguous = true,
             Some(_) => {}
         }
     }
 
-    let cross_bucket_ambiguous = exact_bias
-        .zip(fallback_bias)
-        .is_some_and(|(exact, fallback)| exact != fallback);
-    if exact_ambiguous || fallback_ambiguous || cross_bucket_ambiguous {
+    // Page rounding can make another segment describe the mapping's first file
+    // page. Conflicting biases there are ambiguous; later coarse-map pages are
+    // irrelevant to the mapping start.
+    if let Some(exact) = exact {
+        if start_ambiguous {
+            None
+        } else {
+            Some(exact)
+        }
+    } else if fallback_ambiguous {
         None
-    } else if exact.is_some() {
-        exact
     } else {
         fallback
     }
@@ -436,10 +456,23 @@ mod tests {
     }
 
     #[test]
-    fn test_find_load_contribution_rejects_cross_bucket_ambiguity() {
+    fn test_find_load_contribution_rejects_conflict_at_mapping_start() {
         let segs = vec![
             seg(0, 0x3000, 0x3000, 0),
             seg(0x1000, 0x1000, 0x1000, 0x5000),
+        ];
+
+        assert!(find_load_contribution_for_file_range_with_page_size(
+            &segs, 0x1000, 0x1000, 0x1000,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_find_load_contribution_rejects_conflicting_exact_candidates() {
+        let segs = vec![
+            seg(0x1000, 0x1000, 0x1000, 0x2000),
+            seg(0x1000, 0x1000, 0x1000, 0x3000),
         ];
 
         assert!(find_load_contribution_for_file_range_with_page_size(
@@ -538,6 +571,20 @@ mod tests {
         let mapping_start = 0x7f61_4879_9000;
         let bias = compute_vma_bias(matched.p_offset, matched.p_vaddr, 0x0, mapping_start);
         assert_eq!(0_u64.wrapping_add(bias), mapping_start);
+    }
+
+    #[test]
+    fn test_find_load_contribution_prefers_mapping_start_for_coarse_mapping() {
+        let segs = vec![
+            seg(0, 0x1eda_9a68, 0x1eda_9a68, 0),
+            seg(0x1eda_a000, 0x4d_19a8, 0x82_bf10, 0x1eda_b000),
+        ];
+
+        let matched =
+            find_load_contribution_for_file_range_with_page_size(&segs, 0, 0x1f5d_7000, 0x1000)
+                .unwrap();
+
+        assert_eq!(matched, &segs[0]);
     }
 
     #[test]
