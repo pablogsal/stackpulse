@@ -16,8 +16,9 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, ExitStatus};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,7 +30,6 @@ use fxprof_processed_profile::{
     Timestamp,
 };
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
-use nix::sys::wait::WaitStatus;
 use stackpulse::process::SuspendedLaunchedProcess;
 use stackpulse::{
     AttachMode, FrameFlags, FrameKind, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
@@ -138,7 +138,7 @@ fn record_until_exit(
     spool: &Path,
     suspended: SuspendedLaunchedProcess,
     started_at_us: u64,
-) -> Result<(PerfSummary, WaitStatus), Box<dyn std::error::Error>> {
+) -> Result<(PerfSummary, ExitStatus), Box<dyn std::error::Error>> {
     let pid = suspended.pid();
     let mut recorder = PerfRecorder::attach(
         pid,
@@ -169,33 +169,35 @@ fn record_until_exit(
     Ok((summary, command_status))
 }
 
-fn propagate_wait_status(status: WaitStatus) -> io::Result<ExitCode> {
-    match status {
-        WaitStatus::Exited(_, code) => u8::try_from(code).map(ExitCode::from).map_err(|_| {
+fn propagate_wait_status(status: ExitStatus) -> io::Result<ExitCode> {
+    if let Some(code) = status.code() {
+        return u8::try_from(code).map(ExitCode::from).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid command exit code {code}"),
             )
-        }),
-        WaitStatus::Signaled(_, signal, _) => {
-            if signal != Signal::SIGKILL {
-                let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-                // SAFETY: installing the default disposition adds no signal handler
-                // that could call into Rust; the signal is raised immediately below.
-                unsafe { signal::sigaction(signal, &action) }?;
-            }
-            let mut mask = SigSet::empty();
-            mask.add(signal);
-            signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None)?;
-            signal::raise(signal)?;
-            Err(io::Error::other(format!(
-                "command signal {signal:?} did not terminate the profiler"
-            )))
+        });
+    }
+    if let Some(signal_number) = status.signal() {
+        let signal = Signal::try_from(signal_number).map_err(io::Error::from)?;
+        if signal != Signal::SIGKILL {
+            let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            // SAFETY: installing the default disposition adds no signal handler
+            // that could call into Rust; the signal is raised immediately below.
+            unsafe { signal::sigaction(signal, &action) }?;
         }
-        status => Err(io::Error::new(
+        let mut mask = SigSet::empty();
+        mask.add(signal);
+        signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None)?;
+        signal::raise(signal)?;
+        Err(io::Error::other(format!(
+            "command signal {signal:?} did not terminate the profiler"
+        )))
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("command returned a nonterminal wait status: {status:?}"),
-        )),
+            format!("command returned an unknown exit status: {status:?}"),
+        ))
     }
 }
 
@@ -585,12 +587,13 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::unistd::{fork, ForkResult, Pid};
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::{fork, ForkResult};
     use stackpulse::{LocationInfo, PythonFrame};
 
     #[test]
     fn command_exit_code_is_preserved() {
-        let status = WaitStatus::Exited(Pid::from_raw(42), 7);
+        let status = ExitStatus::from_raw(7 << 8);
 
         assert_eq!(
             propagate_wait_status(status).expect("propagate exit status"),
@@ -604,11 +607,7 @@ mod tests {
         // if that unexpectedly returns; it does not resume the test harness.
         match unsafe { fork() }.expect("fork signal propagation test") {
             ForkResult::Child => {
-                let _ = propagate_wait_status(WaitStatus::Signaled(
-                    Pid::this(),
-                    Signal::SIGTERM,
-                    false,
-                ));
+                let _ = propagate_wait_status(ExitStatus::from_raw(libc::SIGTERM));
                 unsafe { libc::_exit(1) }
             }
             ForkResult::Parent { child } => {

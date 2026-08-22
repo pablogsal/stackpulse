@@ -97,7 +97,10 @@ make coverage CARGO_FLAGS="--features debuginfod"
 
 ## Feature flags
 
-`debuginfod` enables debuginfod lookup in the default native symbolizer when
+`builtin-wholesym` is enabled by default and provides native symbolization.
+Consumers that set `PerfSymbolizerBuilder::native_symbolizer_factory` can
+disable default features to omit Wholesym and Tokio. `debuginfod` enables
+debuginfod lookup in the default native symbolizer when
 `DEBUGINFOD_URLS` is set. `STACKPULSE_DEBUG_DIRS` overrides local debug-file
 search roots, and `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod
 cache directory.

@@ -202,10 +202,10 @@ per non-overlapping module group. The default is the bundled wholesym
 backend, configured from `STACKPULSE_DEBUG_DIRS`, `DEBUGINFOD_URLS`, and
 related environment variables. Embedders with their own debuginfod,
 debug-dir, or source-info pipeline can swap that backend through
-`PerfSymbolizerBuilder::native_symbolizer_factory`, and `PerfSymbolizer` keeps owning
-kernel-frame and perf-map resolution. Each `SymModule` handed to the plug-in
-already carries a resolved `ModuleImageBase`, so the plug-in only needs to
-parse ELF for symbol lookup, not for layout.
+`PerfSymbolizerBuilder::native_symbolizer_factory`, and `PerfSymbolizer`
+keeps owning kernel-frame and perf-map resolution. Each `SymModule` handed to
+the plug-in already carries a resolved `ModuleImageBase`, so the plug-in only
+needs to parse ELF for symbol lookup, not for layout.
 
 ## Why spool files are small
 

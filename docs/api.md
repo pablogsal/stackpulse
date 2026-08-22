@@ -112,10 +112,10 @@ access to `samples()` is needed.
 Callers with their own debuginfod, debug-dir, or source-info pipeline can keep
 using [`PerfSymbolizer`] for kernel and perf-map frames while substituting a
 different backend for native ELF modules. Implement [`NativeSymbolizer`] and
-hand a factory to [`PerfSymbolizerBuilder::native_symbolizer_factory`]. stackpulse parses each
-module's ELF, computes its image base, and calls `set_modules` whenever the
-module set for a process group changes; you then receive `symbolize_one(addr)`
-for every native frame:
+hand a factory to [`PerfSymbolizerBuilder::native_symbolizer_factory`].
+stackpulse parses each module's ELF, computes its image base, and calls
+`set_modules` whenever the module set for a process group changes; you then
+receive `symbolize_one(addr)` for every native frame:
 
 ```rust,no_run
 use std::rc::Rc;
@@ -151,7 +151,8 @@ let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
 Kernel frames (`/proc/kallsyms`) and Python or JIT perf maps
 (`/tmp/perf-PID.map`) stay inside `PerfSymbolizer`; the plug-in only sees
 native module addresses. The default constructors install the bundled
-wholesym backend.
+wholesym backend. Consumers that always supply a native symbolizer can disable
+Stackpulse's default features to omit wholesym and Tokio.
 
 # Vocabulary
 

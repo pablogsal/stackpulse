@@ -18,10 +18,9 @@ use crate::profile::{
     FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
     SourceLocation, SymbolOrigin,
 };
-use crate::symbols::{
-    default_native_symbolizer_factory, NativeSymbolizer, NativeSymbolizerFactory, SymModule,
-    SymbolsRc,
-};
+#[cfg(feature = "builtin-wholesym")]
+use crate::symbols::default_native_symbolizer_factory;
+use crate::symbols::{NativeSymbolizer, NativeSymbolizerFactory, SymModule, SymbolsRc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
@@ -54,7 +53,7 @@ pub struct PerfSymbolizer {
     resolved_frames: Vec<ResolvedFrame>,
     resolved_stack_frame_ids: Vec<usize>,
     stack_cache: FxHashMap<(i32, u32), Range<usize>>,
-    native_factory: NativeSymbolizerFactory,
+    native_factory: Option<NativeSymbolizerFactory>,
 }
 
 enum SymbolizerInput<'a> {
@@ -161,9 +160,9 @@ impl<'a> PerfSymbolizerBuilder<'a> {
     /// Build the configured symbolizer.
     #[must_use]
     pub fn build(self) -> PerfSymbolizer {
-        let native_factory = self
-            .native_factory
-            .unwrap_or_else(default_native_symbolizer_factory);
+        let native_factory = self.native_factory;
+        #[cfg(feature = "builtin-wholesym")]
+        let native_factory = native_factory.or_else(|| Some(default_native_symbolizer_factory()));
         match self.input {
             SymbolizerInput::Modules(modules) => PerfSymbolizer::with_perf_map_processes_inner(
                 modules,
@@ -258,7 +257,7 @@ impl PerfSymbolizer {
     fn for_spool_inner(
         reader: &dyn SpoolSymbolizationInput,
         perf_map_processes: PerfMapProcesses,
-        native_factory: NativeSymbolizerFactory,
+        native_factory: Option<NativeSymbolizerFactory>,
     ) -> Self {
         let mut symbolizer = Self::with_perf_map_processes_inner(
             reader.modules(),
@@ -279,7 +278,7 @@ impl PerfSymbolizer {
     fn with_perf_map_processes_inner(
         modules: &[ModuleRecord],
         perf_map_processes: PerfMapProcesses,
-        native_factory: NativeSymbolizerFactory,
+        native_factory: Option<NativeSymbolizerFactory>,
     ) -> Self {
         let mut module_index_by_id = FxHashMap::default();
         let mut duplicate_ids = FxHashSet::default();
@@ -704,6 +703,7 @@ impl PerfSymbolizer {
     }
 
     fn create_native_symbolizer_for_module(&mut self, module: &ModuleRecord) -> Option<()> {
+        self.native_factory.as_ref()?;
         let Some(loaded) = self.elf_sections.load_mapping(module) else {
             self.unsupported_native_modules.insert(module.id);
             return None;
@@ -783,7 +783,8 @@ impl PerfSymbolizer {
             .iter()
             .map(|(_, module)| module.info.clone())
             .collect();
-        let mut symbolizer = (self.native_factory)(module.process_id);
+        let mut symbolizer =
+            self.native_factory.as_mut().expect("factory checked above")(module.process_id);
         symbolizer.set_modules(modules.clone());
         let idx = self.native_symbolizers.len();
         self.native_symbolizers.push(NativeSymbolizerGroup {
@@ -1045,6 +1046,16 @@ mod tests {
         }
     }
 
+    struct EmptyNativeSymbolizer;
+
+    impl NativeSymbolizer for EmptyNativeSymbolizer {
+        fn set_modules(&mut self, _modules: Vec<SymModule>) {}
+
+        fn symbolize_one(&mut self, _addr: u64) -> SymbolsRc {
+            Rc::from([])
+        }
+    }
+
     #[test]
     fn sym_module_mapping_preserves_the_previous_linux_defaults() {
         let module = module_with_path(7, 42, 0x1000, "/tmp/libpython3.12.so");
@@ -1070,7 +1081,7 @@ mod tests {
         let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
             .native_symbolizer_factory(move |pid| {
                 observed_pids.borrow_mut().push(pid);
-                default_native_symbolizer_factory()(pid)
+                Box::new(EmptyNativeSymbolizer)
             })
             .build();
         let first = executable_module(1, 42, 0x1000);
@@ -1169,7 +1180,9 @@ mod tests {
 
     #[test]
     fn native_symbolizer_reuses_only_same_file_identity() {
-        let mut symbolizer = PerfSymbolizer::new(&[]);
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+            .native_symbolizer_factory(|_| Box::new(EmptyNativeSymbolizer))
+            .build();
         let mut first = executable_module(1, 42, 0x1000);
         let metadata = std::fs::metadata(first.path.as_path()).unwrap();
         first.inode = metadata.ino();
@@ -1208,12 +1221,15 @@ mod tests {
         let second = executable_module(2, 42, 0x3000);
         let overlapping = executable_module(3, 42, 0x1800);
         let other_process = executable_module(4, 43, 0x5000);
-        let mut symbolizer = PerfSymbolizer::new(&[
+        let modules = [
             first.clone(),
             second.clone(),
             overlapping.clone(),
             other_process.clone(),
-        ]);
+        ];
+        let mut symbolizer = PerfSymbolizerBuilder::for_modules(&modules)
+            .native_symbolizer_factory(|_| Box::new(EmptyNativeSymbolizer))
+            .build();
 
         assert!(symbolizer
             .ensure_native_symbolizer_for_module(&first)
@@ -1821,9 +1837,7 @@ mod tests {
         let (path, _) = write_future_module_spool("replay-future-module");
         let reader = PerfSpoolReplayReader::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
-        let mut symbolizer = PerfSymbolizerBuilder::for_replay(&reader)
-            .disable_perf_maps()
-            .build();
+        let mut symbolizer = PerfSymbolizer::for_replay(&reader);
         let stack = reader.sample_stacks().next().expect("sample");
         let mut resolved = None;
         symbolizer.for_each_replay_sample_stack(stack, |frame| {

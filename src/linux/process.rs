@@ -2,9 +2,11 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::raw::c_char;
 use std::os::unix::prelude::OsStrExt;
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitStatus;
 
 use libc::execvp;
 use nix::errno::Errno;
@@ -100,7 +102,7 @@ impl SuspendedLaunchedProcess {
         // Loop to handle EINTR. The child closes execerr on exec success.
         loop {
             let mut bytes = [0; 8];
-            match read(exec_error_rx.as_raw_fd(), &mut bytes) {
+            match read(&exec_error_rx, &mut bytes) {
                 Ok(0) => break, // exec succeeded; pipe closed
                 Ok(8) => {
                     let (errno_bytes, footer) = bytes.split_first_chunk::<4>().unwrap();
@@ -140,7 +142,7 @@ impl SuspendedLaunchedProcess {
         // Wait for the parent to signal us to exec. The loop handles EINTR.
         loop {
             let mut buf = [0];
-            match read(recv_end_of_resume_pipe.as_raw_fd(), &mut buf) {
+            match read(&recv_end_of_resume_pipe, &mut buf) {
                 // Parent gave up (closed pipe without signaling); exit silently.
                 // Use _exit: this is a forked child that must not run the
                 // parent's atexit handlers or flush its inherited stdio buffers.
@@ -184,6 +186,22 @@ fn reap(pid: Pid) {
     let _ = waitpid_retry(pid, None);
 }
 
+fn process_exit_status(status: WaitStatus) -> io::Result<ExitStatus> {
+    // ExitStatusExt expects the status word returned by waitpid.
+    let raw = match status {
+        WaitStatus::Exited(_, code) => code << 8,
+        WaitStatus::Signaled(_, signal, dumped_core) => {
+            signal as i32 | if dumped_core { 0x80 } else { 0 }
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "unexpected child status: {status:?}"
+            )))
+        }
+    };
+    Ok(ExitStatus::from_raw(raw))
+}
+
 impl Drop for SuspendedLaunchedProcess {
     fn drop(&mut self) {
         if self.pipes.take().is_none() {
@@ -211,13 +229,13 @@ pub struct RunningProcess {
 #[derive(Clone, Copy)]
 enum ChildState {
     Running(Pid),
-    Exited(WaitStatus),
+    Exited(ExitStatus),
     Waited,
 }
 
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
-    pub fn try_wait(&self) -> io::Result<Option<WaitStatus>> {
+    pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         let pid = match self.state.get() {
             ChildState::Running(pid) => pid,
             ChildState::Exited(status) => return Ok(Some(status)),
@@ -226,6 +244,7 @@ impl RunningProcess {
         match waitpid_retry(pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => Ok(None),
             Ok(status) => {
+                let status = process_exit_status(status)?;
                 self.state.set(ChildState::Exited(status));
                 Ok(Some(status))
             }
@@ -234,9 +253,9 @@ impl RunningProcess {
     }
 
     /// Wait until the process exits.
-    pub fn wait(self) -> io::Result<WaitStatus> {
+    pub fn wait(self) -> io::Result<ExitStatus> {
         match self.state.replace(ChildState::Waited) {
-            ChildState::Running(pid) => waitpid_retry(pid, None).map_err(Into::into),
+            ChildState::Running(pid) => process_exit_status(waitpid_retry(pid, None)?),
             ChildState::Exited(status) => Ok(status),
             ChildState::Waited => Err(io::Error::other("process was already waited")),
         }
@@ -284,6 +303,7 @@ fn build_env(env_vars: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    use nix::sys::signal::Signal;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
     use std::thread;
@@ -357,7 +377,7 @@ mod tests {
         let running = launched.unsuspend_and_run().expect("resume child");
         let status = running.wait().expect("wait child");
 
-        assert!(matches!(status, WaitStatus::Exited(_, 0)));
+        assert!(status.success());
     }
 
     #[test]
@@ -392,7 +412,7 @@ mod tests {
             .wait()
             .expect("wait for PATH test helper");
 
-        assert!(matches!(status, WaitStatus::Exited(_, 0)));
+        assert!(status.success());
     }
 
     #[test]
@@ -409,6 +429,38 @@ mod tests {
     }
 
     #[test]
+    fn exit_status_preserves_signal_and_core_dump() {
+        let pid = Pid::from_raw(42);
+        let status = process_exit_status(WaitStatus::Signaled(pid, Signal::SIGTERM, true))
+            .expect("convert wait status");
+
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(status.core_dumped());
+    }
+
+    #[test]
+    fn exit_status_rejects_nonterminal_wait_status() {
+        assert_eq!(
+            process_exit_status(WaitStatus::StillAlive)
+                .unwrap_err()
+                .to_string(),
+            "unexpected child status: StillAlive"
+        );
+    }
+
+    #[test]
+    fn try_wait_reports_missing_child() {
+        let process = RunningProcess {
+            state: Cell::new(ChildState::Running(Pid::from_raw(i32::MAX))),
+        };
+
+        let error = process.try_wait().expect_err("missing child should fail");
+        process.state.set(ChildState::Waited);
+
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
     fn try_wait_caches_exited_process_status() {
         let command = current_test_binary();
         let args = ignored_test_args(EXIT_HELPER);
@@ -420,15 +472,15 @@ mod tests {
 
         loop {
             if let Some(status) = running.try_wait().expect("try wait child") {
-                assert!(matches!(status, WaitStatus::Exited(_, 7)));
-                assert!(matches!(
-                    running.try_wait().expect("try wait reaped child"),
-                    Some(WaitStatus::Exited(_, 7))
-                ));
-                assert!(matches!(
-                    running.wait().expect("wait reaped child"),
-                    WaitStatus::Exited(_, 7)
-                ));
+                assert_eq!(status.code(), Some(7));
+                assert_eq!(
+                    running
+                        .try_wait()
+                        .expect("try wait reaped child")
+                        .and_then(|status| status.code()),
+                    Some(7)
+                );
+                assert_eq!(running.wait().expect("wait reaped child").code(), Some(7));
                 return;
             }
             if Instant::now() >= deadline {
@@ -488,6 +540,6 @@ mod tests {
             .wait()
             .expect("wait for child PATH executable");
 
-        assert!(matches!(status, WaitStatus::Exited(_, 7)));
+        assert_eq!(status.code(), Some(7));
     }
 }

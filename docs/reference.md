@@ -267,6 +267,7 @@ expose [`SymbolOrigin`] in a details view.
 
 | Feature | Effect |
 | --- | --- |
+| `builtin-wholesym` (default) | Includes the Wholesym native symbolizer and its Tokio runtime. |
 | `debuginfod` | Enables the default native symbolizer to query debuginfod when `DEBUGINFOD_URLS` is set. |
 
 `STACKPULSE_DEBUG_DIRS` overrides local debug-file search roots. With
