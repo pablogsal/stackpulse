@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
 license = "MIT"
@@ -25,7 +25,7 @@ workspace = true
 
 [dependencies]
 bitflags = "2.4"
-framehop = "0.16.0"
+framehop = { version = "0.16.0", default-features = false, features = ["std"] }
 gimli = { version = "0.33", default-features = false, features = ["read"] }
 goblin = "0.9"
 integer-encoding = { version = "4.1.0", default-features = false }
@@ -33,19 +33,20 @@ libc = "0.2"
 memchr = "2.7"
 memmap2 = "0.9"
 mio = { version = "1", features = ["os-ext", "os-poll"] }
-nix = { version = "0.29", features = ["fs", "process", "signal"] }
+nix = { version = "0.31", features = ["fs", "process", "signal"] }
 object = { version = "0.39", default-features = false, features = ["std", "read_core", "elf", "compression"] }
 perf-event-open = { version = "0.5", features = ["linux-6.0"] }
 perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
-tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"] }
+tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"], optional = true }
 tracing = "0.1"
-wholesym = "0.8.1"
+wholesym = { version = "0.8.1", optional = true }
 
 [features]
-default = []
+default = ["builtin-wholesym"]
 bench-support = []
-debuginfod = []
+builtin-wholesym = ["dep:tokio", "dep:wholesym"]
+debuginfod = ["builtin-wholesym"]
 
 [dev-dependencies]
 criterion = { version = "4.7.0", package = "codspeed-criterion-compat" }
@@ -57,6 +58,10 @@ serde_json = "1"
 name = "stackpulse_suite"
 harness = false
 required-features = ["bench-support"]
+
+[[test]]
+name = "integration"
+required-features = ["builtin-wholesym"]
 
 [workspace.lints.clippy]
 # Enable lint groups (priority -1 so specific lints take precedence)

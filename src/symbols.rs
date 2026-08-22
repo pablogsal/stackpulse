@@ -3,20 +3,28 @@
 //! This module provides address-to-symbol resolution for native stack frames.
 //! It handles caching and batch symbolization.
 
-use crate::{ModuleImageBase, NativeSymbol, SourceLocation};
+#[cfg(feature = "builtin-wholesym")]
+use crate::SourceLocation;
+use crate::{ModuleImageBase, NativeSymbol};
 
+#[cfg(feature = "builtin-wholesym")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+#[cfg(feature = "builtin-wholesym")]
 use wholesym::CodeId;
+#[cfg(feature = "builtin-wholesym")]
 use wholesym::{
     FramesLookupResult, LookupAddress, SymbolManager, SymbolManagerConfig,
     SymbolMap as WholeSymbolMap,
 };
 
+#[cfg(feature = "builtin-wholesym")]
 use std::collections::HashMap;
 use std::ops::Range;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "builtin-wholesym"))]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "builtin-wholesym")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Module information for symbolization.
@@ -45,8 +53,10 @@ pub struct SymModule {
     pub is_python_runtime: bool,
 }
 
+#[cfg(feature = "builtin-wholesym")]
 type SymModuleLayoutKey = (Range<u64>, Option<ModuleImageBase>, bool, bool);
 
+#[cfg(feature = "builtin-wholesym")]
 fn sym_module_layout_key(module: &SymModule) -> SymModuleLayoutKey {
     (
         module.avma_range.clone(),
@@ -56,6 +66,7 @@ fn sym_module_layout_key(module: &SymModule) -> SymModuleLayoutKey {
     )
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn sym_module_layouts_by_path(modules: &[SymModule]) -> HashMap<&Path, Vec<SymModuleLayoutKey>> {
     let mut layouts = HashMap::new();
     for module in modules {
@@ -67,6 +78,7 @@ fn sym_module_layouts_by_path(modules: &[SymModule]) -> HashMap<&Path, Vec<SymMo
     layouts
 }
 
+#[cfg(feature = "builtin-wholesym")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     dev: u64,
@@ -78,7 +90,7 @@ struct FileIdentity {
     ctime_nsec: i64,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "builtin-wholesym"))]
 fn file_identity(path: &Path) -> Option<FileIdentity> {
     let metadata = std::fs::metadata(path).ok()?;
     Some(FileIdentity {
@@ -92,6 +104,7 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
     })
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn module_file_identities(modules: &[SymModule]) -> HashMap<PathBuf, Option<FileIdentity>> {
     let mut identities = HashMap::new();
     for module in modules {
@@ -102,6 +115,7 @@ fn module_file_identities(modules: &[SymModule]) -> HashMap<PathBuf, Option<File
     identities
 }
 
+#[cfg(feature = "builtin-wholesym")]
 #[derive(Clone, Copy)]
 struct ModuleAddressIndexEntry {
     start: u64,
@@ -109,6 +123,7 @@ struct ModuleAddressIndexEntry {
     module_index: usize,
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn build_module_address_index(modules: &[SymModule]) -> Box<[ModuleAddressIndexEntry]> {
     let mut index: Vec<_> = modules
         .iter()
@@ -130,6 +145,7 @@ fn build_module_address_index(modules: &[SymModule]) -> Box<[ModuleAddressIndexE
 /// Cached symbols - wrapped in Rc for cheap cloning
 pub type SymbolsRc = Rc<[NativeSymbol]>;
 
+#[cfg(feature = "builtin-wholesym")]
 fn symbols_rc(symbols: Vec<NativeSymbol>) -> SymbolsRc {
     Rc::from(symbols.into_boxed_slice())
 }
@@ -139,7 +155,7 @@ fn symbols_rc(symbols: Vec<NativeSymbol>) -> SymbolsRc {
 /// `PerfSymbolizer` owns kernel-frame resolution (via `/proc/kallsyms`) and
 /// JIT/Python perf-map resolution (via `/tmp/perf-PID.map`). Native module
 /// symbolization is delegated to an implementor of this trait, allowing
-/// callers (e.g. Chronon) to supply their own debug-info/debuginfod policy
+/// callers to supply their own debug-info/debuginfod policy
 /// instead of stackpulse's bundled wholesym-backed `SymbolizerWrapper`.
 ///
 /// One implementor is created per non-overlapping process module group via
@@ -159,6 +175,7 @@ pub trait NativeSymbolizer {
     fn symbolize_one(&mut self, addr: u64) -> SymbolsRc;
 }
 
+#[cfg(feature = "builtin-wholesym")]
 impl NativeSymbolizer for SymbolizerWrapper {
     fn set_modules(&mut self, modules: Vec<SymModule>) {
         SymbolizerWrapper::set_modules(self, modules);
@@ -173,8 +190,8 @@ impl NativeSymbolizer for SymbolizerWrapper {
 /// `PerfSymbolizer` calls this once per non-overlapping module group.
 pub(crate) type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolizer>>;
 
-/// Default factory: returns stackpulse's bundled wholesym-backed
-/// `SymbolizerWrapper`, configured from `STACKPULSE_*` env vars.
+/// Default factory for Stackpulse's Wholesym backend.
+#[cfg(feature = "builtin-wholesym")]
 #[must_use]
 pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
     Box::new(|_pid: i32| -> Box<dyn NativeSymbolizer> { Box::new(SymbolizerWrapper::new()) })
@@ -192,6 +209,7 @@ pub(crate) fn is_eval_frame(func_name: &str) -> bool {
         && func_name.contains(".llvm.")
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn mark_python_runtime_modules(modules: &mut [SymModule]) {
     for module in modules {
         module.is_python_runtime = crate::is_python_runtime_module_path(&module.path);
@@ -199,10 +217,12 @@ fn mark_python_runtime_modules(modules: &mut [SymModule]) {
 }
 
 /// Standard system debug directory on Linux.
+#[cfg(feature = "builtin-wholesym")]
 const DEFAULT_DEBUG_DIR: &str = "/usr/lib/debug";
 
 /// Parse debug directories from environment.
 /// Priority: `STACKPULSE_DEBUG_DIRS` (runtime) > `STACKPULSE_DEFAULT_DEBUG_DIRS` (build-time) > /usr/lib/debug
+#[cfg(feature = "builtin-wholesym")]
 fn parse_debug_dirs() -> Vec<PathBuf> {
     let dirs_str = std::env::var("STACKPULSE_DEBUG_DIRS")
         .ok()
@@ -234,6 +254,7 @@ fn parse_debug_dirs() -> Vec<PathBuf> {
 ///
 /// Returns a concrete debug file path if one of the configured roots contains
 /// a `.build-id/<xx>/<rest>.debug` entry for the build ID.
+#[cfg(feature = "builtin-wholesym")]
 fn lookup_local_debug_file(build_id: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
     let expected_relative_path = standard_build_id_debug_path(build_id)?;
 
@@ -271,6 +292,7 @@ fn lookup_local_debug_file(build_id: &str, search_dirs: &[PathBuf]) -> Option<Pa
     None
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn standard_build_id_debug_path(build_id: &str) -> Option<PathBuf> {
     if build_id.len() <= 2 {
         return None;
@@ -301,6 +323,7 @@ fn default_debuginfod_cache_dir() -> PathBuf {
     std::env::temp_dir().join("stackpulse-debuginfod")
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn build_symbol_manager_config(
     debug_dirs: &[PathBuf],
     redirect_paths: &[(PathBuf, PathBuf)],
@@ -324,6 +347,7 @@ fn build_symbol_manager_config(
     config
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn discover_linux_debug_file_redirect(
     runtime: &TokioRuntime,
     path: &Path,
@@ -355,6 +379,7 @@ fn discover_linux_debug_file_redirect(
     (actual_path != standard_path).then_some((standard_path, actual_path))
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn linux_build_id_string(info: &wholesym::LibraryInfo) -> Option<String> {
     match &info.code_id {
         Some(CodeId::ElfBuildId(build_id)) => Some(build_id.to_string()),
@@ -365,6 +390,7 @@ fn linux_build_id_string(info: &wholesym::LibraryInfo) -> Option<String> {
 /// Wrapper around symbolization with caching.
 ///
 /// Note: NOT thread-safe. Each thread needs its own `SymbolizerWrapper` instance.
+#[cfg(feature = "builtin-wholesym")]
 pub struct SymbolizerWrapper {
     /// Loaded modules for symbolization
     modules: Vec<SymModule>,
@@ -401,6 +427,7 @@ pub struct SymbolizerWrapper {
     runtime: std::mem::ManuallyDrop<TokioRuntime>,
 }
 
+#[cfg(feature = "builtin-wholesym")]
 impl Drop for SymbolizerWrapper {
     fn drop(&mut self) {
         let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
@@ -412,6 +439,7 @@ impl Drop for SymbolizerWrapper {
 /// the calling thread is already driving a tokio runtime (e.g. a consumer
 /// symbolizing from inside an async task); in that case run the blocking wait
 /// on a temporary OS thread instead.
+#[cfg(feature = "builtin-wholesym")]
 fn block_on_runtime<F>(runtime: &TokioRuntime, future: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -429,10 +457,12 @@ where
 }
 
 /// Extract a short module name from a path (file name, or full path as fallback).
+#[cfg(feature = "builtin-wholesym")]
 fn module_name_rc(path: &Path) -> Rc<str> {
     crate::path_to_name(path).into()
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn build_native_symbol(
     name: String,
     source: SourceLocation,
@@ -452,11 +482,13 @@ fn build_native_symbol(
     }
 }
 
+#[cfg(feature = "builtin-wholesym")]
 #[inline]
 fn inline_depth_for_frame(frame_count: usize, index: usize) -> u16 {
     u16::try_from(frame_count.saturating_sub(index + 1)).unwrap_or(u16::MAX)
 }
 
+#[cfg(feature = "builtin-wholesym")]
 fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
@@ -513,6 +545,7 @@ fn build_native_symbols_from_wholesym_parts(
     symbols
 }
 
+#[cfg(feature = "builtin-wholesym")]
 impl SymbolizerWrapper {
     /// Create a symbolizer with the configured debug-file search paths.
     #[must_use]
@@ -790,7 +823,7 @@ impl SymbolizerWrapper {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "builtin-wholesym"))]
 mod tests {
     use super::*;
 

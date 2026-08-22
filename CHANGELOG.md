@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-08-22
+
+### Added
+
+- Consumers that provide a `native_symbolizer_factory` can omit Stackpulse's Wholesym and Tokio dependencies by disabling the default `builtin-wholesym` feature.
+
+### Changed
+
+- `RunningProcess` returns `std::process::ExitStatus` instead of Nix's `WaitStatus`, and Stackpulse now uses Nix 0.31 internally.
+- Framehop is built without Mach-O and PE unwind support.
+
 ## 0.7.1 - 2026-08-20
 
 ### Fixed
