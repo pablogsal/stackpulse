@@ -59,6 +59,12 @@ impl ElfSectionCache {
         self.by_module.remove(&module_id);
     }
 
+    pub(crate) fn image_base(&self, module: &ModuleRecord) -> Option<ModuleImageBase> {
+        self.by_module
+            .get(&module.id)
+            .and_then(|sections| resolve_image_base(module, sections))
+    }
+
     pub(crate) fn contains(&self, module_id: u32) -> bool {
         self.by_module.contains_key(&module_id)
     }

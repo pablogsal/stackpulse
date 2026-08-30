@@ -3,7 +3,7 @@ use std::io;
 use super::sorter::EventSorter;
 use super::{
     finish_prepared_event, perf_event, prepare_event, record_module, ConvertRegs,
-    ConvertRegsNative, EventContext, PerfSummary, PreparedEvent, ProcessTable,
+    ConvertRegsNative, EventContext, PerfSummary, PreparedEvent, ProcessTable, RecorderOutput,
 };
 use crate::spool::{ModuleRecord, ModuleTable, PerfSpoolWriter};
 
@@ -62,15 +62,16 @@ pub(crate) fn bench_replay_live_perf_ring_records(
 ) -> io::Result<usize> {
     let mut checksum = 0usize;
     for round in 0..rounds {
-        let mut writer = PerfSpoolWriter::from_writer(
+        let writer = PerfSpoolWriter::from_writer(
             Vec::with_capacity(fixture.spool_capacity),
             1_700_000_000_000_000 + round,
             1_000,
         )?;
+        let mut output = RecorderOutput::Spool(writer);
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         for module in &fixture.modules {
-            record_module(&mut modules, &mut processes, &mut writer, module.clone())?;
+            record_module(&mut modules, &mut processes, &mut output, module.clone())?;
         }
 
         let mut summary = PerfSummary::default();
@@ -82,7 +83,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
             let mut ctx = EventContext {
                 modules: &mut modules,
                 processes: &mut processes,
-                writer: &mut writer,
+                output: &mut output,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
                 lifecycle_actions: &mut lifecycle_actions,
@@ -130,6 +131,9 @@ pub(crate) fn bench_replay_live_perf_ring_records(
             "synthetic ring replay did not write every generated sample"
         );
 
+        let RecorderOutput::Spool(mut writer) = output else {
+            unreachable!("benchmark output changed variant")
+        };
         writer.flush()?;
         let bytes = writer.into_inner();
         checksum = checksum

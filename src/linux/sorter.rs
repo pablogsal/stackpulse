@@ -7,6 +7,11 @@ struct EventHeapItem<K: Ord, V> {
     value: V,
 }
 
+pub(super) struct SortCheckpoint<K> {
+    key: K,
+    next_sequence: u64,
+}
+
 // Invert ordering to make `BinaryHeap` a min-heap, preserving insertion order
 // for records with identical timestamps.
 impl<K: Ord, V> PartialEq for EventHeapItem<K, V> {
@@ -59,6 +64,20 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
     /// events are still held back waiting for later rounds.
     pub fn has_more(&self) -> bool {
         !self.heap.is_empty()
+    }
+
+    pub(super) fn checkpoint(&self) -> Option<SortCheckpoint<K>> {
+        self.max_key.clone().map(|key| SortCheckpoint {
+            key,
+            next_sequence: self.next_sequence,
+        })
+    }
+
+    pub(super) fn has_pending_through(&self, checkpoint: &SortCheckpoint<K>) -> bool {
+        self.heap.peek().is_some_and(|event| {
+            event.key < checkpoint.key
+                || (event.key == checkpoint.key && event.sequence < checkpoint.next_sequence)
+        })
     }
 
     /// Start a new round after the largest-identifier group has been read.

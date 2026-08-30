@@ -1,7 +1,5 @@
 use std::fs::File;
-#[cfg(any(test, feature = "bench-support"))]
-use std::io::BufWriter;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,14 +10,12 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
-mod stream;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
 };
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
-pub use stream::{SinkOutcome, SpoolRecord, SpoolRecordSink, StreamReplayState, StreamedFrame};
 
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
@@ -59,13 +55,46 @@ pub struct PerfSpoolWriter<W: Write> {
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
     thread_cache: FxHashMap<(i32, u64), u32>,
-    start_timestamp_us: u64,
-    sample_interval_us: u64,
-    record_sink: Option<Box<dyn SpoolRecordSink>>,
-    record_sink_abandoned: bool,
 }
 
-#[cfg(any(test, feature = "bench-support"))]
+pub(crate) trait PerfRecordWriter {
+    fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()>;
+
+    fn write_python_runtime(
+        &mut self,
+        timestamp_ns: u64,
+        process_id: i32,
+        is_python_runtime: bool,
+    ) -> io::Result<()>;
+
+    fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()>;
+
+    fn write_module_deactivation_one(&mut self, module_id: u32) -> io::Result<()>;
+}
+
+impl<W: Write> PerfRecordWriter for PerfSpoolWriter<W> {
+    fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
+        PerfSpoolWriter::write_module(self, module)
+    }
+
+    fn write_python_runtime(
+        &mut self,
+        timestamp_ns: u64,
+        process_id: i32,
+        is_python_runtime: bool,
+    ) -> io::Result<()> {
+        PerfSpoolWriter::write_python_runtime(self, timestamp_ns, process_id, is_python_runtime)
+    }
+
+    fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()> {
+        PerfSpoolWriter::write_module_deactivation(self, process_id)
+    }
+
+    fn write_module_deactivation_one(&mut self, module_id: u32) -> io::Result<()> {
+        PerfSpoolWriter::write_module_deactivation_one(self, module_id)
+    }
+}
+
 impl PerfSpoolWriter<BufWriter<File>> {
     pub fn create<P: AsRef<Path>>(
         path: P,
@@ -94,45 +123,11 @@ impl<W: Write> PerfSpoolWriter<W> {
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
             last_timestamp_ns: 0,
-            start_timestamp_us,
-            sample_interval_us,
-            record_sink: None,
-            record_sink_abandoned: false,
         };
         writer.writer.write_all(CURRENT_MAGIC)?;
         writer.writer.write_varint(start_timestamp_us)?;
         writer.writer.write_varint(sample_interval_us)?;
         Ok(writer)
-    }
-
-    pub(crate) fn set_record_sink(&mut self, sink: Box<dyn SpoolRecordSink>) {
-        self.record_sink = Some(sink);
-        self.record_sink_abandoned = false;
-        let start_timestamp_us = self.start_timestamp_us;
-        let sample_interval_us = self.sample_interval_us;
-        self.notify(|| SpoolRecord::Header {
-            start_timestamp_us,
-            sample_interval_us,
-        });
-    }
-
-    pub(crate) fn has_record_sink(&self) -> bool {
-        self.record_sink.is_some()
-    }
-
-    pub(crate) fn record_sink_abandoned(&self) -> bool {
-        self.record_sink_abandoned
-    }
-
-    #[inline]
-    fn notify(&mut self, record: impl FnOnce() -> SpoolRecord) {
-        let Some(sink) = self.record_sink.as_mut() else {
-            return;
-        };
-        if sink.on_record(record()) == SinkOutcome::Abandon {
-            self.record_sink = None;
-            self.record_sink_abandoned = true;
-        }
     }
 
     #[cfg(any(test, feature = "bench-support"))]
@@ -154,7 +149,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[u8::from(module.is_kernel)])?;
         write_bytes(&mut self.writer, module.path.as_bytes())?;
         self.unpinned_frame_cache.clear();
-        self.notify(|| SpoolRecord::Module(module.clone()));
         Ok(())
     }
 
@@ -186,11 +180,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         // Advance the delta baseline only after the record is written; a failed
         // write would otherwise skew every later sample's timestamp.
         self.last_timestamp_ns = timestamp_ns;
-        self.notify(|| SpoolRecord::Sample {
-            timestamp_ns,
-            thread_index: thread_id,
-            stack_id,
-        });
         Ok(Some(stack_id))
     }
 
@@ -203,22 +192,13 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[REC_PYTHON_RUNTIME])?;
         self.writer.write_varint(timestamp_ns)?;
         self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_all(&[u8::from(is_python_runtime)])?;
-        self.notify(|| {
-            SpoolRecord::PythonRuntime(PythonRuntimeRecord {
-                timestamp_ns,
-                process_id,
-                is_python_runtime,
-            })
-        });
-        Ok(())
+        self.writer.write_all(&[u8::from(is_python_runtime)])
     }
 
     pub(crate) fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE])?;
         self.writer.write_varint(i64::from(process_id))?;
         self.unpinned_frame_cache.clear();
-        self.notify(|| SpoolRecord::DeactivateProcessModules { process_id });
         Ok(())
     }
 
@@ -226,7 +206,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE_ONE])?;
         self.writer.write_varint(u64::from(module_id))?;
         self.unpinned_frame_cache.clear();
-        self.notify(|| SpoolRecord::DeactivateModule { module_id });
         Ok(())
     }
 
@@ -245,10 +224,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(i64::from(process_id))?;
         self.writer.write_varint(thread_id)?;
         self.thread_cache.insert(key, id);
-        self.notify(|| SpoolRecord::Thread {
-            process_id,
-            thread_id,
-        });
         Ok(id)
     }
 
@@ -258,8 +233,6 @@ impl<W: Write> PerfSpoolWriter<W> {
             pinned_frame_cache,
             unpinned_frame_cache,
             next_frame_id,
-            record_sink,
-            record_sink_abandoned,
             ..
         } = self;
         // Truncated-stack markers resolve context-free on the read side, so
@@ -283,14 +256,6 @@ impl<W: Write> PerfSpoolWriter<W> {
         *next_frame_id = next_frame_id
             .checked_add(1)
             .ok_or_else(|| invalid_input("frame id space exhausted"))?;
-        if let Some(sink) = record_sink.as_mut() {
-            if sink.on_record(SpoolRecord::Frame(StreamedFrame::from_frame(frame)))
-                == SinkOutcome::Abandon
-            {
-                *record_sink = None;
-                *record_sink_abandoned = true;
-            }
-        }
         Ok(id)
     }
 
@@ -315,11 +280,6 @@ impl<W: Write> PerfSpoolWriter<W> {
             self.writer.write_varint(u64::from(prefix))?;
             self.writer.write_varint(u64::from(frame_id))?;
             self.stack_cache.insert(key, stack_id);
-            let node_prefix = (prefix != NONE_U32).then_some(prefix);
-            self.notify(|| SpoolRecord::Stack {
-                prefix: node_prefix,
-                frame_id,
-            });
             prefix = stack_id;
         }
         Ok(saw_frame.then_some(prefix))
@@ -430,42 +390,15 @@ pub(crate) struct FrameLookupContext {
 
 #[derive(Clone, Default)]
 pub(crate) struct SpoolFrameModuleContexts {
-    frame_module_limits: Arc<Vec<usize>>,
-    module_deactivated_at: Arc<Vec<Option<usize>>>,
+    frame_module_limits: Arc<[usize]>,
+    module_deactivated_at: Arc<[Option<usize>]>,
 }
 
 impl SpoolFrameModuleContexts {
     fn new(frame_module_limits: Vec<usize>, module_deactivated_at: Vec<Option<usize>>) -> Self {
         Self {
-            frame_module_limits: Arc::new(frame_module_limits),
-            module_deactivated_at: Arc::new(module_deactivated_at),
-        }
-    }
-
-    pub(crate) fn push_module(&mut self) {
-        Arc::make_mut(&mut self.module_deactivated_at).push(None);
-    }
-
-    pub(crate) fn push_frame(&mut self, module_limit: usize) {
-        Arc::make_mut(&mut self.frame_module_limits).push(module_limit);
-    }
-
-    pub(crate) fn deactivate_module(&mut self, module_index: usize) {
-        let at = self.frame_module_limits.len();
-        if let Some(slot) = Arc::make_mut(&mut self.module_deactivated_at).get_mut(module_index) {
-            slot.get_or_insert(at);
-        }
-    }
-
-    pub(crate) fn deactivate_process_modules(&mut self, modules: &[ModuleRecord], process_id: i32) {
-        let at = self.frame_module_limits.len();
-        let deactivated = Arc::make_mut(&mut self.module_deactivated_at);
-        for (index, module) in modules.iter().enumerate() {
-            if module.process_id == process_id && !module.is_kernel {
-                if let Some(slot) = deactivated.get_mut(index) {
-                    slot.get_or_insert(at);
-                }
-            }
+            frame_module_limits: frame_module_limits.into(),
+            module_deactivated_at: module_deactivated_at.into(),
         }
     }
 
@@ -1648,10 +1581,6 @@ mod tests {
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
-            start_timestamp_us: 0,
-            sample_interval_us: 0,
-            record_sink: None,
-            record_sink_abandoned: false,
         }
     }
 
@@ -2297,6 +2226,32 @@ mod tests {
     }
 
     #[test]
+    fn sample_module_reclamation_stays_bounded_across_process_churn() {
+        let mut table = ModuleTable::default();
+        let mut spool = PerfSpoolWriter::from_writer(io::sink(), 0, 0).unwrap();
+        let kernel = table
+            .intern_module(module(0, 0x8000, 0x9000, "[kernel]", true), &mut spool)
+            .unwrap();
+
+        for process_id in 1..=2 {
+            let id = table
+                .intern_module(
+                    module(process_id, 0x1000, 0x2000, "/short-lived", false),
+                    &mut spool,
+                )
+                .unwrap();
+            assert_eq!(id, 1);
+            table
+                .deactivate_process_modules(process_id, &mut spool)
+                .unwrap();
+            table.release_retired_process_modules(process_id);
+            assert!(table.get(id).is_none());
+        }
+
+        assert!(table.get(kernel).is_some());
+    }
+
+    #[test]
     fn reader_rejects_non_sequential_module_ids() {
         let path = temp_spool_path("bad-module-id");
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
@@ -2557,6 +2512,14 @@ mod tests {
         assert_eq!(second.active[0].module.id, 1);
         assert_eq!(duplicate.active[0].module.id, 1);
         assert!(!duplicate.mapping_changed);
+        assert_eq!(table.process_generation(7), 2);
+        assert_eq!(
+            table
+                .process_modules(7)
+                .map(|module| module.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/first", "/second"]
+        );
     }
 
     #[test]

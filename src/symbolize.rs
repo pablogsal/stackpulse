@@ -1,5 +1,4 @@
-//! Resolves stack frames recorded in perf spool files into displayable profile
-//! frames.
+//! Resolves captured or spooled stack frames into displayable profile frames.
 //!
 //! Spool records mostly contain process ids, raw instruction pointers (program
 //! counters), and module mappings, not final symbol names. This module chooses
@@ -11,8 +10,10 @@
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::profile::{
     FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
@@ -20,13 +21,15 @@ use crate::profile::{
 };
 #[cfg(feature = "builtin-wholesym")]
 use crate::symbols::default_native_symbolizer_factory;
-use crate::symbols::{NativeSymbolizer, NativeSymbolizerFactory, SymModule, SymbolsRc};
+use crate::symbols::{
+    file_identity, FileIdentity, NativeSymbolizer, NativeSymbolizerFactory, SymModule, SymbolsRc,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader,
-    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts, SpoolRecord,
+    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts,
     StackFrameRefs,
 };
 
@@ -41,12 +44,11 @@ use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 pub struct PerfSymbolizer {
     modules: Vec<ModuleRecord>,
     module_index_by_id: FxHashMap<u32, usize>,
-    perf_map_processes: PerfMapProcesses,
+    perf_maps: PerfMapResolver,
     elf_sections: ElfSectionCache,
     native_symbolizers: Vec<NativeSymbolizerGroup>,
     native_symbolizer_by_module: FxHashMap<u32, usize>,
     unsupported_native_modules: FxHashSet<u32>,
-    perf_map_cache: FxHashMap<i32, Option<Vec<PerfMapSymbol>>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
     frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
@@ -56,10 +58,24 @@ pub struct PerfSymbolizer {
     native_factory: Option<NativeSymbolizerFactory>,
 }
 
+/// Resolves live Python JIT addresses published through `/tmp/perf-PID.map`.
+pub struct PerfMapResolver {
+    all_processes: bool,
+    probe_on_resolve: bool,
+    processes: FxHashMap<i32, PerfMapProcess>,
+}
+
+#[derive(Default)]
+struct PerfMapProcess {
+    symbols: Option<Vec<PerfMapSymbol>>,
+    load_attempted: bool,
+    observed_file: Option<Option<FileIdentity>>,
+    last_probe: Option<Instant>,
+}
+
 enum SymbolizerInput<'a> {
     Modules(&'a [ModuleRecord]),
     Spool(&'a dyn SpoolSymbolizationInput),
-    Stream,
 }
 
 trait SpoolSymbolizationInput {
@@ -134,16 +150,6 @@ impl<'a> PerfSymbolizerBuilder<'a> {
         }
     }
 
-    /// Configure a symbolizer that grows from an ordered semantic stream.
-    #[must_use]
-    pub fn for_stream() -> Self {
-        Self {
-            input: SymbolizerInput::Stream,
-            perf_map_processes: PerfMapProcesses::All,
-            native_factory: None,
-        }
-    }
-
     /// Disable Python perf-map lookup.
     #[must_use]
     pub fn disable_perf_maps(mut self) -> Self {
@@ -183,9 +189,6 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             SymbolizerInput::Spool(reader) => {
                 PerfSymbolizer::for_spool_inner(reader, self.perf_map_processes, native_factory)
             }
-            SymbolizerInput::Stream => {
-                PerfSymbolizer::for_stream_inner(self.perf_map_processes, native_factory)
-            }
         }
     }
 }
@@ -202,9 +205,10 @@ pub(crate) enum PerfMapProcesses {
 struct PerfMapSymbol {
     start: u64,
     end: u64,
-    name: String,
+    name: Rc<str>,
 }
 
+const PERF_MAP_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum FrameCacheKey {
     Spool(u32),
@@ -268,11 +272,6 @@ impl PerfSymbolizer {
         PerfSymbolizerBuilder::for_replay(reader).build()
     }
 
-    /// Create an empty resolver for an ordered semantic record stream.
-    pub fn for_stream() -> Self {
-        PerfSymbolizerBuilder::for_stream().build()
-    }
-
     fn for_spool_inner(
         reader: &dyn SpoolSymbolizationInput,
         perf_map_processes: PerfMapProcesses,
@@ -294,48 +293,6 @@ impl PerfSymbolizer {
         symbolizer
     }
 
-    fn for_stream_inner(
-        perf_map_processes: PerfMapProcesses,
-        native_factory: NativeSymbolizerFactory,
-    ) -> Self {
-        let mut symbolizer =
-            Self::with_perf_map_processes_inner(&[], perf_map_processes, native_factory);
-        symbolizer.kernel_symbols = Some(kernel::load_shared_kernel_symbols());
-        symbolizer.spool_frame_contexts = Some(SpoolFrameModuleContexts::default());
-        symbolizer
-    }
-
-    /// Apply one ordered stream record to module and frame-position state.
-    pub fn apply_record(&mut self, record: &SpoolRecord) {
-        let Some(contexts) = self.spool_frame_contexts.as_mut() else {
-            return;
-        };
-        match record {
-            SpoolRecord::Module(module) => {
-                let index = self.modules.len();
-                let mut module = module.clone();
-                module.id = u32::try_from(index).unwrap_or(u32::MAX);
-                if self.module_index_by_id.insert(module.id, index).is_some() {
-                    self.module_index_by_id.remove(&module.id);
-                }
-                self.modules.push(module);
-                contexts.push_module();
-            }
-            SpoolRecord::Frame(_) => contexts.push_frame(self.modules.len()),
-            SpoolRecord::DeactivateModule { module_id } => {
-                contexts.deactivate_module(*module_id as usize);
-            }
-            SpoolRecord::DeactivateProcessModules { process_id } => {
-                contexts.deactivate_process_modules(&self.modules, *process_id);
-            }
-            SpoolRecord::Header { .. }
-            | SpoolRecord::Stack { .. }
-            | SpoolRecord::Thread { .. }
-            | SpoolRecord::Sample { .. }
-            | SpoolRecord::PythonRuntime(_) => {}
-        }
-    }
-
     fn with_perf_map_processes_inner(
         modules: &[ModuleRecord],
         perf_map_processes: PerfMapProcesses,
@@ -354,12 +311,11 @@ impl PerfSymbolizer {
         Self {
             modules: modules.to_vec(),
             module_index_by_id,
-            perf_map_processes,
+            perf_maps: PerfMapResolver::new(perf_map_processes),
             elf_sections: ElfSectionCache::default(),
             native_symbolizers: Vec::new(),
             native_symbolizer_by_module: FxHashMap::default(),
             unsupported_native_modules: FxHashSet::default(),
-            perf_map_cache: FxHashMap::default(),
             kernel_symbols: None,
             spool_frame_contexts: None,
             frame_cache: FxHashMap::default(),
@@ -503,29 +459,6 @@ impl PerfSymbolizer {
         count
     }
 
-    /// Resolve streamed frames while preserving their positional spool ids.
-    pub fn for_each_streamed_frame_slice(
-        &mut self,
-        process_id: i32,
-        frames: &[(u32, FrameRecord)],
-        mut visit: impl FnMut(&ResolvedFrame),
-    ) -> usize {
-        let mut count = 0;
-        for &(frame_id, ref frame) in frames {
-            let resolved_ids = self.resolve_cached_frame_ids(
-                process_id,
-                frame,
-                FrameCacheKey::Spool(frame_id),
-                Some(frame_id),
-            );
-            for resolved_id in resolved_ids {
-                visit(&self.resolved_frames[resolved_id]);
-                count += 1;
-            }
-        }
-        count
-    }
-
     #[cfg(test)]
     fn resolve_cached_frame_ref(&mut self, process_id: i32, frame: &FrameRecord) -> &ResolvedFrame {
         let frame_ids =
@@ -578,12 +511,11 @@ impl PerfSymbolizer {
                 .collect();
         }
 
-        let perf_map_symbol =
-            if self.perf_maps_allowed_for(process_id) && frame.mode == FrameMode::User {
-                self.lookup_perf_map_symbol(process_id, frame.abs_ip)
-            } else {
-                None
-            };
+        let perf_map_symbol = if frame.mode == FrameMode::User {
+            self.perf_maps.lookup_symbol(process_id, frame.abs_ip)
+        } else {
+            None
+        };
 
         if let Some(symbol) = perf_map_symbol.as_ref() {
             let blocked_module = self
@@ -676,35 +608,10 @@ impl PerfSymbolizer {
 
         match (is_kernel_frame, module) {
             (false, None) => vec![NativeFrame::from_address(frame.abs_ip)],
-            (true, _) => {
-                // Unresolved kernel frames get offset 0: the fallback name
-                // already embeds the absolute PC.
-                let (symbol_name, module_name, offset) = match self.resolve_kernel(frame.abs_ip) {
-                    Some(symbol) => (symbol.name, symbol.module, symbol.offset),
-                    None => (
-                        format!("[kernel]+0x{:x}", frame.abs_ip),
-                        "[kernel]".to_owned(),
-                        0,
-                    ),
-                };
-                let symbol = NativeSymbol::new(
-                    symbol_name,
-                    SourceLocation::default(),
-                    module_name,
-                    offset,
-                    false,
-                    false,
-                );
-                vec![NativeFrame {
-                    pc: frame.abs_ip,
-                    sp: 0,
-                    symbol: Some(symbol),
-                    is_python_runtime: false,
-                    kind: FrameKind::Kernel,
-                    origin: SymbolOrigin::KernelSymbols,
-                    flags: FrameFlags::empty(),
-                }]
-            }
+            (true, _) => vec![kernel_frame(
+                frame.abs_ip,
+                self.resolve_kernel(frame.abs_ip),
+            )],
             (false, Some((module, file_relative_ip))) => {
                 if let Some(symbols) = self.resolve_module_symbols(&module, frame.abs_ip) {
                     return symbols
@@ -891,25 +798,150 @@ impl PerfSymbolizer {
             .get_or_insert_with(kernel::load_shared_kernel_symbols);
         kernel::resolve_kernel_symbol(symbols, abs_ip)
     }
+}
 
-    fn perf_maps_allowed_for(&self, process_id: i32) -> bool {
-        match &self.perf_map_processes {
-            PerfMapProcesses::All => true,
-            PerfMapProcesses::Pids(processes) => processes.contains(&process_id),
+/// Resolve one live kernel address through StackPulse's process-wide kallsyms cache.
+#[must_use]
+pub fn resolve_kernel_frame(abs_ip: u64) -> ResolvedFrame {
+    let symbols = kernel::load_shared_kernel_symbols();
+    ResolvedFrame::Native(kernel_frame(
+        abs_ip,
+        kernel::resolve_kernel_symbol(&symbols, abs_ip),
+    ))
+}
+
+fn kernel_frame(abs_ip: u64, resolved: Option<ResolvedKernelSymbol>) -> NativeFrame {
+    let (symbol_name, module_name, offset) = match resolved {
+        Some(symbol) => (symbol.name, symbol.module, symbol.offset),
+        None => (format!("[kernel]+0x{abs_ip:x}"), "[kernel]".to_owned(), 0),
+    };
+    NativeFrame {
+        pc: abs_ip,
+        sp: 0,
+        symbol: Some(NativeSymbol::new(
+            symbol_name,
+            SourceLocation::default(),
+            module_name,
+            offset,
+            false,
+            false,
+        )),
+        is_python_runtime: false,
+        kind: FrameKind::Kernel,
+        origin: SymbolOrigin::KernelSymbols,
+        flags: FrameFlags::empty(),
+    }
+}
+
+impl PerfMapResolver {
+    fn new(processes: PerfMapProcesses) -> Self {
+        match processes {
+            PerfMapProcesses::All => Self {
+                all_processes: true,
+                probe_on_resolve: false,
+                processes: FxHashMap::default(),
+            },
+            PerfMapProcesses::Pids(processes) => Self {
+                all_processes: false,
+                probe_on_resolve: true,
+                processes: processes
+                    .into_iter()
+                    .map(|process_id| (process_id, PerfMapProcess::default()))
+                    .collect(),
+            },
         }
     }
 
-    fn lookup_perf_map_symbol(&mut self, process_id: i32, abs_ip: u64) -> Option<PerfMapSymbol> {
-        self.perf_map_cache
-            .entry(process_id)
-            .or_insert_with(|| load_perf_map(process_id))
+    /// Create a resolver whose eligible processes are supplied as samples arrive.
+    /// Call [`Self::update_process`] before resolving each live sample.
+    #[must_use]
+    pub fn for_live() -> Self {
+        let mut resolver = Self::new(PerfMapProcesses::Pids(FxHashSet::default()));
+        resolver.probe_on_resolve = false;
+        resolver
+    }
+
+    /// Update whether one live process may publish Python perf-map symbols.
+    ///
+    /// Returns whether symbol state changed since the previous call.
+    pub fn update_process(&mut self, process_id: i32, eligible: bool) -> bool {
+        if self.all_processes {
+            debug_assert!(eligible, "dynamic eligibility requires a live resolver");
+            return false;
+        }
+        if eligible {
+            let newly_eligible = !self.processes.contains_key(&process_id);
+            self.processes.entry(process_id).or_default();
+            let file_changed = self.refresh_file_if_due(process_id);
+            newly_eligible || file_changed
+        } else {
+            self.processes.remove(&process_id).is_some()
+        }
+    }
+
+    /// Resolve one address after the caller has established that its mapping
+    /// may contain JIT code.
+    pub fn resolve_address(&mut self, process_id: i32, abs_ip: u64) -> Option<ResolvedFrame> {
+        if self.probe_on_resolve && self.allowed_for(process_id) {
+            self.refresh_file_if_due(process_id);
+        }
+        self.lookup_symbol(process_id, abs_ip)
+            .as_ref()
+            .map(|symbol| perf_map_symbol_to_frame(process_id, abs_ip, symbol))
+    }
+
+    /// Release cached perf-map state for one retired process.
+    pub fn retire_process(&mut self, process_id: i32) {
+        self.processes.remove(&process_id);
+    }
+
+    fn allowed_for(&self, process_id: i32) -> bool {
+        self.all_processes || self.processes.contains_key(&process_id)
+    }
+
+    fn lookup_symbol(&mut self, process_id: i32, abs_ip: u64) -> Option<PerfMapSymbol> {
+        if !self.allowed_for(process_id) {
+            return None;
+        }
+        let process = self.processes.entry(process_id).or_default();
+        if !process.load_attempted {
+            process.symbols = load_perf_map(process_id);
+            process.load_attempted = true;
+        }
+        process
+            .symbols
             .as_ref()
             .and_then(|symbols| find_perf_map_symbol(symbols, abs_ip))
             .cloned()
     }
+
+    fn refresh_file(&mut self, process_id: i32) -> bool {
+        let process = self.processes.entry(process_id).or_default();
+        process.last_probe = Some(Instant::now());
+        let identity = perf_map_file_identity(process_id);
+        if process.observed_file.as_ref() == Some(&identity) {
+            return false;
+        }
+        process.observed_file = Some(identity);
+        process.symbols = None;
+        process.load_attempted = false;
+        true
+    }
+
+    fn refresh_file_if_due(&mut self, process_id: i32) -> bool {
+        if self
+            .processes
+            .get(&process_id)
+            .and_then(|process| process.last_probe)
+            .is_some_and(|last| last.elapsed() < PERF_MAP_PROBE_INTERVAL)
+        {
+            return false;
+        }
+        self.refresh_file(process_id)
+    }
 }
 
-fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
+pub(crate) fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
     is_perf_map_mapping(&module.path)
 }
 
@@ -1037,6 +1069,10 @@ fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
     Some(symbols)
 }
 
+fn perf_map_file_identity(process_id: i32) -> Option<FileIdentity> {
+    file_identity(Path::new(&format!("/tmp/perf-{process_id}.map")))
+}
+
 fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
     let (start, rest) = take_ascii_field(line)?;
     let (len, name) = take_ascii_field(rest)?;
@@ -1052,7 +1088,7 @@ fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
     Some(PerfMapSymbol {
         start,
         end,
-        name: name.to_string(),
+        name: Rc::from(name),
     })
 }
 
@@ -1156,33 +1192,6 @@ mod tests {
         assert_eq!(sym_module.image_base, Some(image_base));
         assert!(sym_module.is_executable);
         assert!(!sym_module.is_python_runtime);
-    }
-
-    #[test]
-    fn streaming_symbolizer_preserves_frame_position_across_remap() {
-        let old = module_with_path(0, 42, 0x1000, "/tmp/old.so");
-        let new = module_with_path(1, 42, 0x1000, "/tmp/new.so");
-        let sampled = frame(0x1100);
-        let mut symbolizer = PerfSymbolizerBuilder::for_stream()
-            .disable_perf_maps()
-            .build();
-
-        symbolizer.apply_record(&SpoolRecord::Module(old));
-        symbolizer.apply_record(&SpoolRecord::Frame(crate::StreamedFrame::Unpinned {
-            abs_ip: sampled.abs_ip,
-            is_kernel: false,
-        }));
-        symbolizer.apply_record(&SpoolRecord::DeactivateModule { module_id: 0 });
-        symbolizer.apply_record(&SpoolRecord::Module(new));
-        symbolizer.apply_record(&SpoolRecord::Frame(crate::StreamedFrame::Unpinned {
-            abs_ip: sampled.abs_ip,
-            is_kernel: false,
-        }));
-
-        let before = symbolizer.module_for_frame(42, &sampled, Some(0)).unwrap();
-        let after = symbolizer.module_for_frame(42, &sampled, Some(1)).unwrap();
-        assert_eq!(before.module.path.as_str(), "/tmp/old.so");
-        assert_eq!(after.module.path.as_str(), "/tmp/new.so");
     }
 
     #[test]
@@ -1389,6 +1398,94 @@ mod tests {
     }
 
     #[test]
+    fn live_perf_map_probe_is_rate_limited() {
+        let process_id = -(std::process::id() as i32) - 27;
+        let mut resolver = PerfMapResolver::for_live();
+        assert!(resolver.update_process(process_id, true));
+        resolver.resolve_address(process_id, 0x7304);
+        let first_probe = resolver.processes[&process_id].last_probe;
+
+        assert!(!resolver.update_process(process_id, true));
+        resolver.resolve_address(process_id, 0x7404);
+
+        assert_eq!(resolver.processes[&process_id].last_probe, first_probe);
+    }
+
+    #[test]
+    fn live_perf_map_resolver_refreshes_growing_file_and_cached_misses() {
+        let process_id = -(std::process::id() as i32) - 21;
+        let path = temp_perf_map_path(process_id);
+        let _ = fs::remove_file(&path);
+        let mut resolver = PerfMapResolver::for_live();
+
+        assert!(resolver.update_process(process_id, true));
+        assert!(resolver.resolve_address(process_id, 0x7004).is_none());
+
+        fs::write(&path, "7000 10 py::first:/tmp/live.py\n").expect("write initial perf map");
+        resolver.processes.get_mut(&process_id).unwrap().last_probe = None;
+        assert!(resolver.update_process(process_id, true));
+        assert!(!resolver.update_process(process_id, true));
+        assert_eq!(
+            resolver
+                .resolve_address(process_id, 0x7004)
+                .unwrap()
+                .func_name(),
+            "first"
+        );
+
+        fs::write(
+            &path,
+            "7000 10 py::replaced:/tmp/live.py\n7100 10 py::second:/tmp/live.py\n",
+        )
+        .expect("grow perf map");
+        resolver.processes.get_mut(&process_id).unwrap().last_probe = None;
+        assert!(resolver.update_process(process_id, true));
+        assert_eq!(
+            resolver
+                .resolve_address(process_id, 0x7004)
+                .unwrap()
+                .func_name(),
+            "replaced"
+        );
+        let name = resolver
+            .resolve_address(process_id, 0x7104)
+            .unwrap()
+            .func_name()
+            .to_owned();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(name, "second");
+    }
+
+    #[test]
+    fn live_perf_map_resolver_discards_cache_on_process_retirement() {
+        let process_id = -(std::process::id() as i32) - 22;
+        let path = temp_perf_map_path(process_id);
+        fs::write(&path, "7200 10 py::first:/tmp/live.py\n").expect("write first perf map");
+        let mut resolver = PerfMapResolver::for_live();
+        resolver.update_process(process_id, true);
+        assert_eq!(
+            resolver
+                .resolve_address(process_id, 0x7204)
+                .unwrap()
+                .func_name(),
+            "first"
+        );
+
+        fs::write(&path, "7200 10 py::other:/tmp/live.py\n").expect("replace perf map");
+        resolver.retire_process(process_id);
+        resolver.update_process(process_id, true);
+        let name = resolver
+            .resolve_address(process_id, 0x7204)
+            .unwrap()
+            .func_name()
+            .to_owned();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(name, "other");
+    }
+
+    #[test]
     fn python_perf_map_symbols_respect_declared_ranges() {
         let process_id = -(std::process::id() as i32) - 9;
         let path = temp_perf_map_path(process_id);
@@ -1507,7 +1604,7 @@ mod tests {
             let symbol = parse_perf_map_line(line).expect("valid perf-map entry");
             assert_eq!(symbol.start, 0x1000);
             assert_eq!(symbol.end, 0x1010);
-            assert_eq!(symbol.name, expected_name);
+            assert_eq!(symbol.name.as_ref(), expected_name);
         }
     }
 

@@ -142,10 +142,10 @@ impl Hash for ModulePath {
     }
 }
 
-/// One executable memory mapping recorded in a spool file.
+/// One executable memory mapping captured from a profiled process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleRecord {
-    /// Stable module id within the spool.
+    /// Module id, stable within a spool or until live process retirement.
     pub id: u32,
     /// Process that owned this code area, or a kernel marker for kernel code.
     pub process_id: i32,
@@ -181,10 +181,11 @@ pub enum FrameMode {
     TruncatedStackMarker,
 }
 
-/// A raw frame stored in a spool file.
+/// A raw captured frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRecord {
-    /// Module id when the frame was matched to a module.
+    /// Module id when the frame was matched to a module. During a live callback,
+    /// resolve it through the sample's module snapshot before the callback returns.
     pub module_id: Option<u32>,
     /// Address in the matched module's file-offset coordinate space.
     pub file_relative_ip: u64,

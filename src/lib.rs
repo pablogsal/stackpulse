@@ -44,7 +44,10 @@ mod test_support;
 
 pub use linux::perf_event::PerfFrequencyLimit;
 pub use linux::perf_event::MAX_SAMPLE_USER_STACK;
-pub use linux::{process, AttachMode, PerfRecorder, PerfRecorderOptions, PerfSummary};
+pub use linux::{
+    process, AttachMode, CapturedModule, CapturedModuleBacking, CapturedModules,
+    CapturedPerfSample, PerfRecorder, PerfRecorderOptions, PerfSampleSink, PerfSummary,
+};
 pub use module_base::ModuleImageBase;
 pub use profile::{
     FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
@@ -53,11 +56,10 @@ pub use profile::{
 pub use spool::{
     FrameContext, FrameMode, FrameModuleRef, FrameRecord, ModulePath, ModuleRecord,
     PerfSpoolReader, PerfSpoolReplayReader, PythonRuntimeRecord, ReplaySampleStack, SampleRecord,
-    SampleStack, SampleStacks, SinkOutcome, SpoolRecord, SpoolRecordSink, StackFrameContexts,
-    StackFrameRefs, StreamReplayState, StreamedFrame,
+    SampleStack, SampleStacks, StackFrameContexts, StackFrameRefs,
 };
 pub use stats::{ErrorStatsFormatter, SampleErrorKind, SampleErrorStats};
-pub use symbolize::{PerfSymbolizer, PerfSymbolizerBuilder};
+pub use symbolize::{resolve_kernel_frame, PerfMapResolver, PerfSymbolizer, PerfSymbolizerBuilder};
 pub use symbols::{NativeSymbolizer, SymModule, SymbolsRc};
 
 /// Read the kernel's current maximum perf sample rate, in samples per second.

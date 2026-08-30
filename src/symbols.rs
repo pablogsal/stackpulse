@@ -20,9 +20,7 @@ use wholesym::{
 #[cfg(feature = "builtin-wholesym")]
 use std::collections::HashMap;
 use std::ops::Range;
-#[cfg(all(unix, feature = "builtin-wholesym"))]
 use std::os::unix::fs::MetadataExt;
-#[cfg(feature = "builtin-wholesym")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -78,9 +76,8 @@ fn sym_module_layouts_by_path(modules: &[SymModule]) -> HashMap<&Path, Vec<SymMo
     layouts
 }
 
-#[cfg(feature = "builtin-wholesym")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     dev: u64,
     ino: u64,
     size: u64,
@@ -90,8 +87,7 @@ struct FileIdentity {
     ctime_nsec: i64,
 }
 
-#[cfg(all(unix, feature = "builtin-wholesym"))]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     let metadata = std::fs::metadata(path).ok()?;
     Some(FileIdentity {
         dev: metadata.dev(),

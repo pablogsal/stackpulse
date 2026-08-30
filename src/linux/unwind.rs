@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::elf::{ElfSectionData, ElfSectionInfo};
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{ModuleRecord, ModuleUpdate};
+use crate::ModuleImageBase;
 
 type UnwindPolicy = framehop::MayAllocateDuringUnwind;
 pub(super) type NativeUnwinder = framehop::UnwinderNative<ElfSectionData, UnwindPolicy>;
@@ -76,6 +77,10 @@ impl ProcessUnwinder {
 
     pub(super) fn should_refresh_for_uncovered_pc(&mut self, pc: u64) -> bool {
         self.refreshed_uncovered_pages.insert(refresh_page(pc))
+    }
+
+    pub(super) fn module_image_base(&self, module: &ModuleRecord) -> Option<ModuleImageBase> {
+        self.elf_sections.image_base(module)
     }
 }
 

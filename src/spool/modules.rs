@@ -1,8 +1,8 @@
-use std::io::{self, Write};
+use std::io;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{next_spool_id, FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfSpoolWriter};
+use super::{next_spool_id, FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfRecordWriter};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ModuleIdentity {
@@ -36,7 +36,7 @@ impl From<&ModuleRecord> for ModuleIdentity {
 }
 
 struct ModuleSlot {
-    module: ModuleRecord,
+    module: Option<ModuleRecord>,
     active: bool,
 }
 
@@ -44,8 +44,10 @@ struct ModuleSlot {
 pub(crate) struct ModuleTable {
     slots: Vec<ModuleSlot>,
     active_by_key: FxHashMap<ModuleIdentity, u32>,
+    reusable_ids: Vec<u32>,
     index: ModuleIndex,
     index_dirty: bool,
+    process_generations: FxHashMap<i32, u64>,
 }
 
 #[derive(Default)]
@@ -61,11 +63,29 @@ pub(crate) struct ModuleActivation {
 }
 
 impl ModuleTable {
+    pub(crate) fn get(&self, id: u32) -> Option<&ModuleRecord> {
+        self.slots.get(id as usize)?.module.as_ref()
+    }
+
+    pub(crate) fn process_generation(&self, process_id: i32) -> u64 {
+        self.process_generations
+            .get(&process_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn process_modules(&self, process_id: i32) -> impl Iterator<Item = &ModuleRecord> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.module.as_ref().filter(|_| slot.active))
+            .filter(move |module| !module.is_kernel && module.process_id == process_id)
+    }
+
     #[cfg(test)]
-    pub(crate) fn intern_module<W: Write>(
+    pub(crate) fn intern_module(
         &mut self,
         module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
+        writer: &mut impl PerfRecordWriter,
     ) -> io::Result<u32> {
         Ok(self
             .apply_module(module, writer)?
@@ -75,13 +95,7 @@ impl ModuleTable {
     }
 
     pub(crate) fn process_modules_match(&self, process_id: i32, snapshot: &[ModuleRecord]) -> bool {
-        let active_count = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                slot.active && !slot.module.is_kernel && slot.module.process_id == process_id
-            })
-            .count();
+        let active_count = self.process_modules(process_id).count();
         let matched: FxHashSet<_> = snapshot
             .iter()
             .filter_map(|module| self.find_compatible_active(module))
@@ -89,10 +103,10 @@ impl ModuleTable {
         active_count == snapshot.len() && matched.len() == snapshot.len()
     }
 
-    pub(crate) fn apply_module<W: Write>(
+    pub(crate) fn apply_module(
         &mut self,
         module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
+        writer: &mut impl PerfRecordWriter,
     ) -> io::Result<ModuleUpdate> {
         if module.end <= module.start {
             return Ok(ModuleUpdate::default());
@@ -100,13 +114,18 @@ impl ModuleTable {
         if let Some(id) = self.find_compatible_active(&module) {
             return Ok(ModuleUpdate {
                 active: vec![ModuleActivation {
-                    module: self.slots[id as usize].module.clone(),
+                    module: self.slots[id as usize]
+                        .module
+                        .as_ref()
+                        .expect("active module has a record")
+                        .clone(),
                     source_module_id: None,
                 }],
                 ..ModuleUpdate::default()
             });
         }
 
+        let process_id = (!module.is_kernel).then_some(module.process_id);
         let mut update = ModuleUpdate {
             mapping_changed: true,
             ..ModuleUpdate::default()
@@ -117,15 +136,9 @@ impl ModuleTable {
         // fragments before activating the replacement.
         if !module.is_kernel {
             let overlapping: Vec<_> = self
-                .slots
-                .iter()
-                .filter(|slot| {
-                    slot.active
-                        && !slot.module.is_kernel
-                        && slot.module.process_id == module.process_id
-                        && module_ranges_overlap(&slot.module, &module)
-                })
-                .map(|slot| (slot.module.id, slot.module.clone()))
+                .process_modules(module.process_id)
+                .filter(|known| module_ranges_overlap(known, &module))
+                .map(|known| (known.id, known.clone()))
                 .collect();
             if !overlapping.is_empty() {
                 let survivors: Vec<_> = overlapping
@@ -148,7 +161,10 @@ impl ModuleTable {
                 for (source_id, survivor) in survivors {
                     let id = self.intern_without_overlap(survivor, writer)?;
                     update.active.push(ModuleActivation {
-                        module: self.slots[id as usize].module.clone(),
+                        module: self
+                            .get(id)
+                            .expect("newly interned module has a record")
+                            .clone(),
                         source_module_id: Some(source_id),
                     });
                 }
@@ -157,9 +173,18 @@ impl ModuleTable {
 
         let id = self.intern_without_overlap(module, writer)?;
         update.active.push(ModuleActivation {
-            module: self.slots[id as usize].module.clone(),
+            module: self
+                .get(id)
+                .expect("newly interned module has a record")
+                .clone(),
             source_module_id: None,
         });
+        if let Some(process_id) = process_id {
+            let generation = self.process_generations.entry(process_id).or_default();
+            *generation = generation
+                .checked_add(1)
+                .expect("process module generation exhausted");
+        }
         Ok(update)
     }
 
@@ -171,48 +196,59 @@ impl ModuleTable {
             }
             self.slots
                 .iter()
-                .find(|slot| {
-                    slot.active
-                        && slot.module.inode_generation != 0
-                        && same_mapping_except_inode_generation(&slot.module, module)
+                .filter_map(|slot| slot.module.as_ref().filter(|_| slot.active))
+                .find(|known| {
+                    known.inode_generation != 0
+                        && same_mapping_except_inode_generation(known, module)
                 })
-                .map(|slot| slot.module.id)
+                .map(|known| known.id)
         })
     }
 
-    fn intern_without_overlap<W: Write>(
+    fn intern_without_overlap(
         &mut self,
         mut module: ModuleRecord,
-        writer: &mut PerfSpoolWriter<W>,
+        writer: &mut impl PerfRecordWriter,
     ) -> io::Result<u32> {
         let key = ModuleIdentity::from(&module);
         if let Some(&id) = self.active_by_key.get(&key) {
             return Ok(id);
         }
-        let id = next_spool_id(self.slots.len(), "module")?;
+        let reusable_id = self.reusable_ids.last().copied();
+        let id = reusable_id.map_or_else(|| next_spool_id(self.slots.len(), "module"), Ok)?;
         module.id = id;
         writer.write_module(&module)?;
+        if reusable_id.is_some() {
+            self.reusable_ids.pop();
+        }
         self.active_by_key.insert(key, id);
-        self.slots.push(ModuleSlot {
-            module,
+        let slot = ModuleSlot {
+            module: Some(module),
             active: true,
-        });
+        };
+        if id as usize == self.slots.len() {
+            self.slots.push(slot);
+        } else {
+            self.slots[id as usize] = slot;
+        }
         self.index_dirty = true;
         Ok(id)
     }
 
-    pub(crate) fn deactivate_process_modules<W: Write>(
+    pub(crate) fn deactivate_process_modules(
         &mut self,
         process_id: i32,
-        writer: &mut PerfSpoolWriter<W>,
+        writer: &mut impl PerfRecordWriter,
     ) -> io::Result<()> {
         let mut changed = false;
         for slot in &mut self.slots {
-            if slot.module.process_id == process_id && !slot.module.is_kernel && slot.active {
+            let Some(module) = slot.module.as_ref() else {
+                continue;
+            };
+            if module.process_id == process_id && !module.is_kernel && slot.active {
                 changed = true;
                 slot.active = false;
-                self.active_by_key
-                    .remove(&ModuleIdentity::from(&slot.module));
+                self.active_by_key.remove(&ModuleIdentity::from(module));
             }
         }
         self.index_dirty |= changed;
@@ -222,25 +258,44 @@ impl ModuleTable {
         Ok(())
     }
 
-    pub(crate) fn clone_process_modules<W: Write>(
+    pub(crate) fn release_retired_process_modules(&mut self, process_id: i32) {
+        self.process_generations.remove(&process_id);
+        let mut reclaimed = false;
+        for (id, slot) in self.slots.iter_mut().enumerate() {
+            if slot.active
+                || !slot
+                    .module
+                    .as_ref()
+                    .is_some_and(|module| module.process_id == process_id && !module.is_kernel)
+            {
+                continue;
+            }
+            slot.module = None;
+            reclaimed = true;
+            self.reusable_ids
+                .push(u32::try_from(id).expect("module slot ids fit in u32"));
+        }
+        if reclaimed {
+            self.index.by_process.remove(&process_id);
+            self.index_dirty = true;
+        }
+    }
+
+    pub(crate) fn clone_process_modules(
         &mut self,
         parent_process_id: i32,
         child_process_id: i32,
-        writer: &mut PerfSpoolWriter<W>,
+        writer: &mut impl PerfRecordWriter,
     ) -> io::Result<Vec<ModuleUpdate>> {
         let inherited: Vec<_> = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                slot.active && slot.module.process_id == parent_process_id && !slot.module.is_kernel
-            })
-            .map(|slot| {
+            .process_modules(parent_process_id)
+            .map(|module| {
                 (
-                    slot.module.id,
+                    module.id,
                     ModuleRecord {
                         id: 0,
                         process_id: child_process_id,
-                        ..slot.module.clone()
+                        ..module.clone()
                     },
                 )
             })
@@ -263,10 +318,13 @@ impl ModuleTable {
         mode: FrameMode,
     ) -> FrameRecord {
         self.rebuild_index_if_needed();
-        let module = self
-            .index
-            .find(process_id, abs_ip, mode)
-            .and_then(|id| self.slots.get(id as usize).map(|slot| (id, &slot.module)));
+        let module = self.index.find(process_id, abs_ip, mode).and_then(|id| {
+            self.slots
+                .get(id as usize)?
+                .module
+                .as_ref()
+                .map(|module| (id, module))
+        });
         let (module_id, file_relative_ip) = module
             .and_then(|(id, module)| {
                 abs_ip
@@ -344,8 +402,10 @@ struct ModuleIndex {
 impl ModuleIndex {
     fn build(slots: &[ModuleSlot]) -> Self {
         let mut index = Self::default();
-        for slot in slots.iter().filter(|slot| slot.active) {
-            let module = &slot.module;
+        for module in slots
+            .iter()
+            .filter_map(|slot| slot.module.as_ref().filter(|_| slot.active))
+        {
             let entry = ModuleIndexEntry {
                 start: module.start,
                 end: module.end,

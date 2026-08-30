@@ -36,7 +36,9 @@ use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
+use crate::spool::{
+    FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfRecordWriter, PerfSpoolWriter,
+};
 use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
 use perf_event::{
@@ -45,7 +47,7 @@ use perf_event::{
 };
 pub use perf_group::AttachMode;
 use perf_group::{EventConsumer, PerfGroupOptions, ProcessFork, RecoveredProcessFork, ThreadFork};
-use sorter::EventSorter;
+use sorter::{EventSorter, SortCheckpoint};
 use types::{StackFrame, StackMode};
 use unwind::{NativeUnwinder, ProcessUnwinder};
 
@@ -93,9 +95,9 @@ pub struct PerfRecorderOptions {
     pub include_kernel: bool,
     /// Follow child processes created after recording starts.
     pub inherit_child_processes: bool,
-    /// Timestamp anchor stored in the spool file.
+    /// Timestamp anchor stored in spool output or used by a live consumer.
     pub start_timestamp_us: u64,
-    /// Optional sampling interval metadata stored in the spool file.
+    /// Sampling interval stored in spool output or used by a live consumer.
     pub sample_interval_us: u64,
 }
 
@@ -104,12 +106,10 @@ pub struct PerfRecorderOptions {
 pub struct PerfSummary {
     /// Raw sample events seen by the recorder.
     pub sample_events: u64,
-    /// Samples written to the spool file.
+    /// Samples written to the spool or delivered to the sample sink.
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
-    /// Whether the semantic record sink abandoned the stream.
-    pub record_sink_abandoned: bool,
     /// Recovery passes triggered by one or more lost records.
     pub lifecycle_gaps: u64,
     /// Whether kernel frame capture remained enabled after attach.
@@ -132,35 +132,206 @@ pub struct PerfSummary {
     pub error_stats: SampleErrorStats,
 }
 
+/// One completely unwound perf sample borrowed from the recorder.
+///
+/// The sample and its module references are valid only for the duration of
+/// [`PerfSampleSink::on_sample`]. A consumer that queues work must copy them
+/// before returning.
+pub struct CapturedPerfSample<'a> {
+    /// Monotonic perf timestamp in nanoseconds.
+    pub timestamp_ns: u64,
+    /// Process id that owned the sampled thread.
+    pub process_id: i32,
+    /// Native thread id.
+    pub thread_id: u64,
+    /// Nonempty frames ordered from the sampled leaf toward the root. At most
+    /// one truncation marker may appear, and it is always the final frame.
+    pub frames: &'a [FrameRecord],
+    /// Whether Python perf-map support was detected for this process.
+    pub python_perf_map_eligible: bool,
+    /// Active user-space executable mappings used to interpret frame module ids.
+    pub modules: CapturedModules<'a>,
+}
+
+/// One versioned snapshot of a process's active executable mappings.
+#[derive(Clone, Copy)]
+pub struct CapturedModules<'a> {
+    generation: u64,
+    process_id: i32,
+    modules: &'a ModuleTable,
+    module_unwinder: Option<&'a ProcessUnwinder>,
+}
+
+impl<'a> CapturedModules<'a> {
+    /// Identifies this process's active mapping set until it is retired.
+    /// Equal values before retirement produce identical [`Self::iter`] output;
+    /// values are opaque and may repeat after retirement.
+    #[must_use]
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Iterate over every active executable mapping for this process.
+    pub fn iter(self) -> impl Iterator<Item = CapturedModule<'a>> {
+        let module_unwinder = self.module_unwinder;
+        self.modules
+            .process_modules(self.process_id)
+            .map(move |record| CapturedModule {
+                record,
+                image_base: module_unwinder.and_then(|unwinder| unwinder.module_image_base(record)),
+            })
+    }
+}
+
+/// Module metadata prepared during capture and borrowed by a sample callback.
+#[derive(Clone, Copy, Debug)]
+pub struct CapturedModule<'a> {
+    record: &'a ModuleRecord,
+    image_base: Option<crate::ModuleImageBase>,
+}
+
+/// How the file behind a captured mapping is exposed by the target process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CapturedModuleBacking {
+    /// The mapping still names a linked file.
+    Linked,
+    /// The file was unlinked after it was mapped.
+    Deleted,
+}
+
+impl<'a> CapturedModule<'a> {
+    /// The captured mapping record.
+    #[must_use]
+    pub fn record(self) -> &'a ModuleRecord {
+        self.record
+    }
+
+    /// The path used to open or symbolize this mapping.
+    ///
+    /// Linux appends ` (deleted)` to unlinked mappings in `/proc`; that marker
+    /// is represented by [`Self::backing`] instead of being part of this path.
+    #[must_use]
+    pub fn path(self) -> &'a std::path::Path {
+        let path = self.record.path.as_str();
+        std::path::Path::new(path.strip_suffix(" (deleted)").unwrap_or(path))
+    }
+
+    /// Whether the mapping's file is still linked into the filesystem.
+    #[must_use]
+    pub fn backing(self) -> CapturedModuleBacking {
+        if self.record.path.as_str().ends_with(" (deleted)") {
+            CapturedModuleBacking::Deleted
+        } else {
+            CapturedModuleBacking::Linked
+        }
+    }
+
+    /// The image base already established while loading unwind metadata.
+    #[must_use]
+    pub fn image_base(self) -> Option<crate::ModuleImageBase> {
+        self.image_base
+    }
+
+    /// Whether Python JIT symbols may legitimately cover this mapping.
+    #[must_use]
+    pub fn may_contain_jit_code(self) -> bool {
+        crate::symbolize::perf_map_module_allowed(self.record)
+    }
+
+    /// Whether this mapping belongs to the CPython runtime.
+    #[must_use]
+    pub fn is_python_runtime(self) -> bool {
+        crate::is_python_runtime_module_path(&self.record.path)
+    }
+}
+
+/// Synchronous destination for fully unwound perf samples.
+///
+/// Returning an error stops event consumption. [`PerfRecorder::consume_available`]
+/// and [`PerfRecorder::finish`] return that error without wrapping it. Samples
+/// are delivered in nondecreasing timestamp order. Queue capacity and sample
+/// dropping remain consumer policy.
+pub trait PerfSampleSink: Send {
+    /// Consume one borrowed sample before the recorder reuses its frame buffer.
+    fn on_sample(&mut self, sample: CapturedPerfSample<'_>) -> io::Result<()>;
+
+    /// Retire one process after all preceding samples have been delivered.
+    ///
+    /// This is emitted before samples from a replacement image or reused process
+    /// id. Consumers must release process-scoped symbolization state here.
+    fn on_process_retired(&mut self, process_id: i32) -> io::Result<()>;
+
+    /// Flush samples delivered by the current recorder drain.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Flush the final samples after capture has stopped.
+    fn finish(mut self: Box<Self>) -> io::Result<()> {
+        self.flush()
+    }
+}
+
 /// Records stack samples for one or more Linux processes.
 pub struct PerfRecorder {
     perf: perf_group::PerfGroup,
     event_sorter: EventSorter<RawFd, u64, PreparedEvent>,
-    writer: PerfSpoolWriter<RecorderOutput>,
+    output: RecorderOutput<std::io::BufWriter<std::fs::File>>,
     modules: ModuleTable,
     processes: ProcessTable,
+    pending_process_retirements: Vec<PendingProcessRetirement>,
     stack_scratch: Vec<StackFrame>,
     summary: PerfSummary,
-    strict_record_sink: bool,
 }
 
-enum RecorderOutput {
-    File(std::io::BufWriter<std::fs::File>),
-    Discard(std::io::Sink),
+struct PendingProcessRetirement {
+    process_id: i32,
+    state_id: u64,
+    runtime_end_timestamp_ns: u64,
+    through: SortCheckpoint<u64>,
 }
 
-impl std::io::Write for RecorderOutput {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+enum RecorderOutput<W: std::io::Write> {
+    Spool(PerfSpoolWriter<W>),
+    Samples {
+        sink: Box<dyn PerfSampleSink>,
+        resolved_stack_scratch: Vec<FrameRecord>,
+    },
+}
+
+impl<W: std::io::Write> PerfRecordWriter for RecorderOutput<W> {
+    fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
         match self {
-            Self::File(writer) => writer.write(buf),
-            Self::Discard(writer) => writer.write(buf),
+            Self::Spool(writer) => writer.write_module(module),
+            Self::Samples { .. } => Ok(()),
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn write_python_runtime(
+        &mut self,
+        timestamp_ns: u64,
+        process_id: i32,
+        is_python_runtime: bool,
+    ) -> io::Result<()> {
         match self {
-            Self::File(writer) => writer.flush(),
-            Self::Discard(writer) => writer.flush(),
+            Self::Spool(writer) => {
+                writer.write_python_runtime(timestamp_ns, process_id, is_python_runtime)
+            }
+            Self::Samples { .. } => Ok(()),
+        }
+    }
+
+    fn write_module_deactivation(&mut self, process_id: i32) -> io::Result<()> {
+        match self {
+            Self::Spool(writer) => writer.write_module_deactivation(process_id),
+            Self::Samples { .. } => Ok(()),
+        }
+    }
+
+    fn write_module_deactivation_one(&mut self, module_id: u32) -> io::Result<()> {
+        match self {
+            Self::Spool(writer) => writer.write_module_deactivation_one(module_id),
+            Self::Samples { .. } => Ok(()),
         }
     }
 }
@@ -168,7 +339,7 @@ impl std::io::Write for RecorderOutput {
 struct EventContext<'a, W: std::io::Write> {
     modules: &'a mut ModuleTable,
     processes: &'a mut ProcessTable,
-    writer: &'a mut PerfSpoolWriter<W>,
+    output: &'a mut RecorderOutput<W>,
     summary: &'a mut PerfSummary,
     stack_scratch: &'a mut Vec<StackFrame>,
     lifecycle_actions: &'a mut Vec<LifecycleAction>,
@@ -203,6 +374,7 @@ impl ProcessTracking {
 
 #[derive(Default)]
 struct ProcessState {
+    state_id: u64,
     tracking: ProcessTracking,
     unwinder: Option<ProcessUnwinder>,
     image: Option<ProcessImageIdentity>,
@@ -224,11 +396,29 @@ struct ForkInheritance {
 #[derive(Default)]
 struct ProcessTable {
     states: FxHashMap<i32, ProcessState>,
+    next_state_id: u64,
 }
 
 impl ProcessTable {
     fn state_mut(&mut self, pid: i32) -> &mut ProcessState {
-        self.states.entry(pid).or_default()
+        let Self {
+            states,
+            next_state_id,
+        } = self;
+        states.entry(pid).or_insert_with(|| ProcessState {
+            state_id: take_state_id(next_state_id),
+            ..ProcessState::default()
+        })
+    }
+
+    fn advance_state_id(&mut self, pid: i32) -> Option<&mut ProcessState> {
+        let Self {
+            states,
+            next_state_id,
+        } = self;
+        let state = states.get_mut(&pid)?;
+        state.state_id = take_state_id(next_state_id);
+        Some(state)
     }
 
     fn snapshot_for_fork(&self, parent_pid: i32) -> ForkInheritance {
@@ -299,11 +489,15 @@ impl ProcessTable {
             .collect()
     }
 
-    fn dead_or_reused_pids(&mut self) -> Vec<i32> {
+    fn dead_or_reused_pids(&mut self, poll_untracked: bool) -> Vec<i32> {
         self.states
             .iter_mut()
             .filter_map(|(&pid, state)| {
-                let dead = !state.tracking.poll_alive(pid)?;
+                let dead = match state.tracking.poll_alive(pid) {
+                    Some(alive) => !alive,
+                    None if poll_untracked => !process_is_alive(&mut None, pid),
+                    None => return None,
+                };
                 let generation_changed = u32::try_from(pid)
                     .ok()
                     .and_then(|pid| read_process_start_time(pid).ok())
@@ -314,13 +508,9 @@ impl ProcessTable {
             .collect()
     }
 
-    fn tracked_process_is_stale(
-        &mut self,
-        pid: i32,
-        current_start_time: Option<u64>,
-    ) -> Option<bool> {
+    fn process_is_stale(&mut self, pid: i32, current_start_time: Option<u64>) -> Option<bool> {
         let state = self.states.get_mut(&pid)?;
-        let alive = state.tracking.poll_alive(pid)?;
+        let alive = state.tracking.poll_alive(pid).unwrap_or(false);
         Some(
             !alive
                 || state
@@ -377,6 +567,14 @@ impl ProcessTable {
     }
 }
 
+fn take_state_id(next_state_id: &mut u64) -> u64 {
+    let state_id = *next_state_id;
+    *next_state_id = next_state_id
+        .checked_add(1)
+        .expect("process state id exhausted");
+    state_id
+}
+
 fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
     let exe = format!("/proc/{pid}/exe");
     let metadata = std::fs::metadata(exe)?;
@@ -420,6 +618,7 @@ struct PreparedSampleMeta {
 struct DrainSink<'a, W: std::io::Write> {
     ctx: EventContext<'a, W>,
     sorter: &'a mut EventSorter<RawFd, u64, PreparedEvent>,
+    pending_process_retirements: &'a mut Vec<PendingProcessRetirement>,
     result: io::Result<()>,
     last_finished_timestamp_ns: u64,
 }
@@ -459,6 +658,10 @@ impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
 impl<W: std::io::Write> DrainSink<'_, W> {
     fn drain_sorter(&mut self, force: bool) {
         loop {
+            self.finish_ready_process_retirements();
+            if self.result.is_err() {
+                break;
+            }
             let prepared = if force {
                 self.sorter.force_pop()
             } else {
@@ -468,6 +671,48 @@ impl<W: std::io::Write> DrainSink<'_, W> {
             self.finish_event(prepared);
             if self.result.is_err() {
                 break;
+            }
+        }
+    }
+
+    fn finish_ready_process_retirements(&mut self) {
+        let mut index = 0;
+        while index < self.pending_process_retirements.len() {
+            if self
+                .sorter
+                .has_pending_through(&self.pending_process_retirements[index].through)
+            {
+                index += 1;
+                continue;
+            }
+            let retirement = self.pending_process_retirements.remove(index);
+            if self
+                .ctx
+                .processes
+                .states
+                .get(&retirement.process_id)
+                .map(|state| state.state_id)
+                != Some(retirement.state_id)
+            {
+                continue;
+            }
+            let result = end_python_runtime_process(
+                self.ctx.processes,
+                self.ctx.output,
+                retirement.runtime_end_timestamp_ns,
+                retirement.process_id,
+            )
+            .and_then(|()| {
+                cleanup_process(
+                    retirement.process_id,
+                    self.ctx.modules,
+                    self.ctx.processes,
+                    self.ctx.output,
+                )
+            });
+            if let Err(error) = result {
+                self.result = Err(error);
+                return;
             }
         }
     }
@@ -500,76 +745,53 @@ impl PerfRecorder {
         attach_mode: AttachMode,
         options: PerfRecorderOptions,
     ) -> io::Result<Self> {
+        let output = output.as_ref().to_path_buf();
         Self::attach_inner(
             pid,
-            RecorderOutput::File(std::io::BufWriter::new(std::fs::File::create(output)?)),
             attach_mode,
             options,
-            None,
-            false,
+            move |start_timestamp_us, sample_interval_us| {
+                Ok(RecorderOutput::Spool(PerfSpoolWriter::create(
+                    output,
+                    start_timestamp_us,
+                    sample_interval_us,
+                )?))
+            },
         )
     }
 
-    /// Attach with an authoritative spool and a best-effort semantic observer.
+    /// Attach to `pid` and deliver fully unwound samples without creating a spool file.
     ///
-    /// Sink abandonment is reported in [`PerfSummary::record_sink_abandoned`]
-    /// but does not interrupt capture or damage the spool.
-    pub fn attach_with_sink<P: AsRef<Path>>(
+    /// Use [`AttachMode::StopAttachEnableResume`] for a process that is already
+    /// running. Use [`AttachMode::AttachWithEnableOnExec`] with
+    /// [`process::SuspendedLaunchedProcess`] when launching a new process.
+    pub fn attach_with_sample_sink(
         pid: u32,
-        output: P,
         attach_mode: AttachMode,
         options: PerfRecorderOptions,
-        sink: Box<dyn crate::SpoolRecordSink>,
+        sink: Box<dyn PerfSampleSink>,
     ) -> io::Result<Self> {
-        Self::attach_inner(
-            pid,
-            RecorderOutput::File(std::io::BufWriter::new(std::fs::File::create(output)?)),
-            attach_mode,
-            options,
-            Some(sink),
-            false,
-        )
+        Self::attach_inner(pid, attach_mode, options, move |_, _| {
+            Ok(RecorderOutput::Samples {
+                sink,
+                resolved_stack_scratch: Vec::with_capacity(128),
+            })
+        })
     }
 
-    /// Attach with no spool file and a required semantic sink.
-    ///
-    /// Encoded spool bytes are discarded. Sink abandonment makes attachment,
-    /// consumption, or finishing fail with [`io::ErrorKind::BrokenPipe`].
-    pub fn attach_streaming(
+    fn attach_inner<F>(
         pid: u32,
         attach_mode: AttachMode,
         options: PerfRecorderOptions,
-        sink: Box<dyn crate::SpoolRecordSink>,
-    ) -> io::Result<Self> {
-        Self::attach_inner(
-            pid,
-            RecorderOutput::Discard(io::sink()),
-            attach_mode,
-            options,
-            Some(sink),
-            true,
-        )
-    }
-
-    fn attach_inner(
-        pid: u32,
-        output: RecorderOutput,
-        attach_mode: AttachMode,
-        options: PerfRecorderOptions,
-        sink: Option<Box<dyn crate::SpoolRecordSink>>,
-        strict_record_sink: bool,
-    ) -> io::Result<Self> {
+        open_output: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(u64, u64) -> io::Result<RecorderOutput<std::io::BufWriter<std::fs::File>>>,
+    {
         let mut perf = open_perf_group(pid, attach_mode, &options)?;
         let kernel_enabled = perf.kernel_enabled();
-        let mut writer = PerfSpoolWriter::from_writer(
-            output,
-            options.start_timestamp_us,
-            options.sample_interval_us,
-        )
-        .map_err(|err| perf.resume_error_or(err))?;
-        if let Some(sink) = sink {
-            writer.set_record_sink(sink);
-        }
+        let mut output = open_output(options.start_timestamp_us, options.sample_interval_us)
+            .map_err(|err| perf.resume_error_or(err))?;
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         if let Some(pid_i32) = i32_from_u32(pid) {
@@ -579,33 +801,28 @@ impl PerfRecorder {
         let python_perf_support = process_has_python_perf_support(pid, &mut processes);
         (|| {
             let registered_existing_maps = attach_mode == AttachMode::StopAttachEnableResume
-                && register_existing_maps(pid, &mut modules, &mut processes, &mut writer)?;
+                && register_existing_maps(pid, &mut modules, &mut processes, &mut output)?;
             if let Some(pid_i32) =
                 i32_from_u32(pid).filter(|_| registered_existing_maps && python_perf_support)
             {
-                mark_python_runtime_process(&mut processes, &mut writer, 0, pid_i32)?;
+                mark_python_runtime_process(&mut processes, &mut output, 0, pid_i32)?;
             }
             Ok::<_, io::Error>(())
         })()
         .map_err(|err| perf.resume_error_or(err))?;
 
-        let record_sink_abandoned = writer.record_sink_abandoned();
-        if strict_record_sink && record_sink_abandoned {
-            return Err(perf.resume_error_or(record_sink_abandoned_error()));
-        }
         let mut recorder = Self {
             perf,
             event_sorter: EventSorter::new(),
-            writer,
+            output,
             modules,
             processes,
+            pending_process_retirements: Vec::new(),
             stack_scratch: Vec::with_capacity(128),
             summary: PerfSummary {
                 kernel_enabled,
-                record_sink_abandoned,
                 ..PerfSummary::default()
             },
-            strict_record_sink,
         };
         if attach_mode == AttachMode::StopAttachEnableResume {
             recorder.perf.enable()?;
@@ -613,10 +830,9 @@ impl PerfRecorder {
         Ok(recorder)
     }
 
-    /// Drain currently readable events into the spool file.
+    /// Drain currently readable events into the configured output.
     pub fn consume_available(&mut self) -> io::Result<()> {
-        self.drain_events(DrainMode::Consume)?;
-        self.check_record_sink()
+        self.drain_events(DrainMode::Consume)
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -630,10 +846,10 @@ impl PerfRecorder {
             event_sorter,
             modules,
             processes,
+            pending_process_retirements,
             stack_scratch,
-            writer,
+            output,
             summary,
-            ..
         } = self;
         let mut lifecycle_actions = Vec::new();
         let mut recovered_process_forks = Vec::new();
@@ -643,7 +859,7 @@ impl PerfRecorder {
             let ctx = EventContext {
                 modules,
                 processes,
-                writer,
+                output,
                 summary,
                 stack_scratch,
                 lifecycle_actions: &mut lifecycle_actions,
@@ -652,6 +868,7 @@ impl PerfRecorder {
             let mut sink = DrainSink {
                 ctx,
                 sorter: event_sorter,
+                pending_process_retirements,
                 result: Ok(()),
                 last_finished_timestamp_ns: 0,
             };
@@ -704,8 +921,15 @@ impl PerfRecorder {
             }
         }
         if result.is_ok() {
-            let dead_processes = processes.dead_or_reused_pids();
+            let dead_processes =
+                processes.dead_or_reused_pids(matches!(output, RecorderOutput::Samples { .. }));
             for pid in dead_processes {
+                if pending_process_retirements
+                    .iter()
+                    .any(|retirement| retirement.process_id == pid)
+                {
+                    continue;
+                }
                 if let Ok(pid_u32) = u32::try_from(pid) {
                     if let Err(err) = perf.remove_process(pid_u32) {
                         result = Err(err);
@@ -724,11 +948,28 @@ impl PerfRecorder {
                     })
                     .max()
                     .unwrap_or(recovery_timestamp_ns);
-                if let Err(err) = end_python_runtime_process(processes, writer, timestamp_ns, pid) {
+                if let Some(through) = event_sorter
+                    .checkpoint()
+                    .filter(|checkpoint| event_sorter.has_pending_through(checkpoint))
+                {
+                    let state_id = processes
+                        .states
+                        .get(&pid)
+                        .expect("dead process came from the process table")
+                        .state_id;
+                    pending_process_retirements.push(PendingProcessRetirement {
+                        process_id: pid,
+                        state_id,
+                        runtime_end_timestamp_ns: timestamp_ns,
+                        through,
+                    });
+                    continue;
+                }
+                if let Err(err) = end_python_runtime_process(processes, output, timestamp_ns, pid) {
                     result = Err(err);
                     break;
                 }
-                if let Err(err) = cleanup_process(pid, modules, processes, writer) {
+                if let Err(err) = cleanup_process(pid, modules, processes, output) {
                     result = Err(err);
                     break;
                 }
@@ -745,7 +986,7 @@ impl PerfRecorder {
                     recovery_timestamp_ns,
                     modules,
                     processes,
-                    writer,
+                    output,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -753,7 +994,7 @@ impl PerfRecorder {
                             result = Err(err);
                             break;
                         }
-                        if let Err(err) = cleanup_process(pid, modules, processes, writer) {
+                        if let Err(err) = cleanup_process(pid, modules, processes, output) {
                             result = Err(err);
                             break;
                         }
@@ -781,11 +1022,11 @@ impl PerfRecorder {
                         continue;
                     };
                     let python_perf_support = process_has_python_perf_support(child_u32, processes);
-                    match register_existing_maps(child_u32, modules, processes, writer) {
+                    match register_existing_maps(child_u32, modules, processes, output) {
                         Ok(true) if python_perf_support => {
                             if let Err(err) = mark_python_runtime_process(
                                 processes,
-                                writer,
+                                output,
                                 recovery_timestamp_ns,
                                 child,
                             ) {
@@ -832,7 +1073,11 @@ impl PerfRecorder {
             }
         }
         summary.kernel_enabled &= perf.kernel_enabled();
-        summary.record_sink_abandoned |= writer.record_sink_abandoned();
+        if result.is_ok() && matches!(mode, DrainMode::Consume) {
+            if let RecorderOutput::Samples { sink, .. } = output {
+                result = sink.flush();
+            }
+        }
         result
     }
 
@@ -846,6 +1091,20 @@ impl PerfRecorder {
 
     /// Add another process to this recording.
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
+        if let Some(pid_i32) = i32_from_u32(pid).filter(|pid| {
+            self.pending_process_retirements
+                .iter()
+                .any(|retirement| retirement.process_id == *pid)
+        }) {
+            self.drain_events(DrainMode::Consume)?;
+            if self
+                .pending_process_retirements
+                .iter()
+                .any(|retirement| retirement.process_id == pid_i32)
+            {
+                return Err(io::Error::other("pending process retirement did not drain"));
+            }
+        }
         if let Some(pid_i32) = i32_from_u32(pid).filter(|pid| self.processes.is_tracked(*pid)) {
             let current_start_time = self
                 .processes
@@ -855,7 +1114,7 @@ impl PerfRecorder {
                 .and_then(|_| read_process_start_time(pid).ok());
             let stale = self
                 .processes
-                .tracked_process_is_stale(pid_i32, current_start_time)
+                .process_is_stale(pid_i32, current_start_time)
                 .expect("filtered to a tracked process");
             // Reopen only after proving that the old process is gone or
             // that this numeric PID now identifies a new generation.
@@ -867,7 +1126,7 @@ impl PerfRecorder {
                 pid_i32,
                 &mut self.modules,
                 &mut self.processes,
-                &mut self.writer,
+                &mut self.output,
             )?;
         }
         let opened = self.perf.open_process(pid, attach_mode)?;
@@ -879,12 +1138,12 @@ impl PerfRecorder {
                 pid,
                 &mut self.modules,
                 &mut self.processes,
-                &mut self.writer,
+                &mut self.output,
             ) {
                 Ok(true) if python_perf_support => {
                     if let Err(err) = mark_python_runtime_process(
                         &mut self.processes,
-                        &mut self.writer,
+                        &mut self.output,
                         0,
                         pid_i32,
                     ) {
@@ -903,8 +1162,7 @@ impl PerfRecorder {
             }
         }
         self.summary.kernel_enabled &= self.perf.kernel_enabled();
-        self.summary.record_sink_abandoned |= self.writer.record_sink_abandoned();
-        self.check_record_sink()
+        Ok(())
     }
 
     /// Discover newly-created threads for `pid` when needed.
@@ -943,38 +1201,16 @@ impl PerfRecorder {
         self.processes.active_process_count()
     }
 
-    /// Attach or replace a best-effort observer after recorder construction.
-    ///
-    /// Prefer [`Self::attach_with_sink`] when the observer needs attach-time
-    /// module records as part of a complete stream.
-    pub fn set_record_sink(&mut self, sink: Box<dyn crate::SpoolRecordSink>) {
-        self.writer.set_record_sink(sink);
-        self.summary.record_sink_abandoned |= self.writer.record_sink_abandoned();
-    }
-
-    /// Whether a semantic sink is currently attached.
-    #[must_use]
-    pub fn has_record_sink(&self) -> bool {
-        self.writer.has_record_sink()
-    }
-
-    /// Flush the spool file and return the final counters.
+    /// Drain remaining events, flush spool output when present, and return counters.
     pub fn finish(mut self) -> io::Result<PerfSummary> {
         self.perf.disable()?;
         self.drain_events(DrainMode::Flush)?;
-        self.check_record_sink()?;
-        self.writer.flush()?;
-        Ok(self.summary)
-    }
-
-    fn check_record_sink(&mut self) -> io::Result<()> {
-        let abandoned = self.summary.record_sink_abandoned || self.writer.record_sink_abandoned();
-        self.summary.record_sink_abandoned |= abandoned;
-        if self.strict_record_sink && abandoned {
-            Err(record_sink_abandoned_error())
-        } else {
-            Ok(())
+        let summary = self.summary;
+        match self.output {
+            RecorderOutput::Spool(mut writer) => writer.flush()?,
+            RecorderOutput::Samples { sink, .. } => sink.finish()?,
         }
+        Ok(summary)
     }
 
     fn rollback_open_process(
@@ -990,18 +1226,11 @@ impl PerfRecorder {
                 pid,
                 &mut self.modules,
                 &mut self.processes,
-                &mut self.writer,
+                &mut self.output,
             );
         }
         error
     }
-}
-
-fn record_sink_abandoned_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        "required semantic record sink abandoned the stream",
-    )
 }
 
 fn prepare_event(event_ref: EventRef, summary: &mut PerfSummary) -> Option<PreparedEvent> {
@@ -1026,13 +1255,13 @@ fn handle_non_sample_record<W: std::io::Write>(
 ) -> io::Result<()> {
     match record {
         Record::Mmap(mmap) => {
-            record_mmap(ctx.modules, ctx.processes, ctx.writer, &mmap, privilege)?;
+            record_mmap(ctx.modules, ctx.processes, ctx.output, &mmap, privilege)?;
             record_python_runtime_mmap(
                 &mmap,
                 privilege,
                 event_timestamp_ns,
                 ctx.processes,
-                ctx.writer,
+                ctx.output,
             )
         }
         Record::Fork(fork) if fork.task.pid != fork.parent_task.pid => {
@@ -1052,19 +1281,19 @@ fn handle_non_sample_record<W: std::io::Write>(
             let current_start_time = read_process_start_time(fork.task.pid).ok();
             let reused_pid = ctx
                 .processes
-                .tracked_process_is_stale(pid, current_start_time)
+                .process_is_stale(pid, current_start_time)
                 .unwrap_or(false);
             if reused_pid {
-                end_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
-                cleanup_process(pid, ctx.modules, ctx.processes, ctx.writer)?;
+                end_python_runtime_process(ctx.processes, ctx.output, event_timestamp_ns, pid)?;
+                cleanup_process(pid, ctx.modules, ctx.processes, ctx.output)?;
                 ctx.lifecycle_actions
                     .push(LifecycleAction::ProcessRetire { pid: fork.task.pid });
             }
             ctx.processes.ensure_tracked(pid);
             if inheritance.python_runtime {
-                mark_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
+                mark_python_runtime_process(ctx.processes, ctx.output, event_timestamp_ns, pid)?;
             }
-            let updates = ctx.modules.clone_process_modules(ppid, pid, ctx.writer)?;
+            let updates = ctx.modules.clone_process_modules(ppid, pid, ctx.output)?;
             for update in &updates {
                 inheritance.unwinder.apply_module_update(update);
             }
@@ -1107,11 +1336,12 @@ fn handle_non_sample_record<W: std::io::Write>(
 
             // A confirmed exec is an epoch boundary. Do not read current maps
             // here: the subsequent MMAP records retain their proper ordering.
-            cleanup_process_modules(pid, ctx.modules, ctx.processes, ctx.writer)?;
+            notify_process_retired(ctx.output, pid)?;
+            retire_process_modules(pid, ctx.modules, ctx.processes, ctx.output)?;
             if let Some(state) = ctx.processes.states.get_mut(&pid) {
                 state.python_perf_support = None;
             }
-            end_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
+            end_python_runtime_process(ctx.processes, ctx.output, event_timestamp_ns, pid)?;
             ctx.processes.state_mut(pid).image = current.map(|(identity, _)| identity);
             Ok(())
         }
@@ -1155,26 +1385,40 @@ fn i32_from_u32(value: u32) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-fn cleanup_process(
+fn cleanup_process<W: std::io::Write>(
     pid: i32,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<impl std::io::Write>,
+    output: &mut RecorderOutput<W>,
 ) -> io::Result<()> {
-    let result = cleanup_process_modules(pid, modules, processes, writer);
+    notify_process_retired(output, pid)?;
+    let result = retire_process_modules(pid, modules, processes, output);
     processes.states.remove(&pid);
     result
 }
 
-fn cleanup_process_modules<W: std::io::Write>(
+fn notify_process_retired<W: std::io::Write>(
+    output: &mut RecorderOutput<W>,
+    process_id: i32,
+) -> io::Result<()> {
+    match output {
+        RecorderOutput::Samples { sink, .. } => sink.on_process_retired(process_id),
+        RecorderOutput::Spool(_) => Ok(()),
+    }
+}
+
+fn retire_process_modules<W: std::io::Write>(
     pid: i32,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    output: &mut RecorderOutput<W>,
 ) -> io::Result<()> {
-    modules.deactivate_process_modules(pid, writer)?;
-    if let Some(state) = processes.states.get_mut(&pid) {
+    modules.deactivate_process_modules(pid, output)?;
+    if let Some(state) = processes.advance_state_id(pid) {
         state.unwinder = None;
+    }
+    if matches!(output, RecorderOutput::Samples { .. }) {
+        modules.release_retired_process_modules(pid);
     }
     Ok(())
 }
@@ -1184,7 +1428,7 @@ fn reconcile_process_image<W: std::io::Write>(
     timestamp_ns: u64,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    output: &mut RecorderOutput<W>,
 ) -> io::Result<bool> {
     let Some(pid_i32) = i32_from_u32(pid) else {
         return Ok(false);
@@ -1240,13 +1484,14 @@ fn reconcile_process_image<W: std::io::Write>(
         return Ok(true);
     }
 
-    cleanup_process_modules(pid_i32, modules, processes, writer)?;
+    notify_process_retired(output, pid_i32)?;
+    retire_process_modules(pid_i32, modules, processes, output)?;
     if let Some(state) = processes.states.get_mut(&pid_i32) {
         state.python_perf_support = None;
     }
-    end_python_runtime_process(processes, writer, timestamp_ns, pid_i32)?;
+    end_python_runtime_process(processes, output, timestamp_ns, pid_i32)?;
 
-    match register_existing_modules(snapshot, modules, processes, writer) {
+    match register_existing_modules(snapshot, modules, processes, output) {
         Ok(saw_python_runtime) => {
             let should_mark_python =
                 saw_python_runtime && process_has_python_perf_support(pid, processes);
@@ -1256,7 +1501,7 @@ fn reconcile_process_image<W: std::io::Write>(
             }
             state.start_time = Some(current_start_time);
             if should_mark_python {
-                mark_python_runtime_process(processes, writer, timestamp_ns, pid_i32)?;
+                mark_python_runtime_process(processes, output, timestamp_ns, pid_i32)?;
             }
             Ok(true)
         }
@@ -1324,9 +1569,9 @@ fn process_has_python_perf_support(pid: u32, processes: &mut ProcessTable) -> bo
     supported
 }
 
-fn mark_python_runtime_process<W: std::io::Write>(
+fn mark_python_runtime_process<W: PerfRecordWriter>(
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
     timestamp_ns: u64,
     pid: i32,
 ) -> io::Result<()> {
@@ -1337,9 +1582,9 @@ fn mark_python_runtime_process<W: std::io::Write>(
     Ok(())
 }
 
-fn end_python_runtime_process<W: std::io::Write>(
+fn end_python_runtime_process<W: PerfRecordWriter>(
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
     timestamp_ns: u64,
     pid: i32,
 ) -> io::Result<()> {
@@ -1354,12 +1599,12 @@ fn end_python_runtime_process<W: std::io::Write>(
     Ok(())
 }
 
-fn record_python_runtime_mmap<W: std::io::Write>(
+fn record_python_runtime_mmap<W: PerfRecordWriter>(
     mmap: &Mmap,
     privilege: Priv,
     timestamp_ns: u64,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
 ) -> io::Result<()> {
     if is_kernel_mode(privilege) || !mmap_is_executable(mmap) {
         return Ok(());
@@ -1620,29 +1865,62 @@ fn record_prepared_sample<W: std::io::Write>(
         &sample.callchain_stack,
         ctx.summary,
     );
-    let stack_id = {
-        let modules = &mut *ctx.modules;
-        let summary = &mut *ctx.summary;
-        ctx.writer.write_sample_frames(
-            sample.meta.timestamp_ns,
-            pid,
-            sample.meta.tid,
-            ctx.stack_scratch
-                .iter()
-                .copied()
-                .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
-        )
-    };
-    match stack_id {
-        Ok(None) => {
-            bump(&mut ctx.summary.empty_stack_samples);
+    match ctx.output {
+        RecorderOutput::Spool(writer) => {
+            let stack_id = {
+                let modules = &mut *ctx.modules;
+                let summary = &mut *ctx.summary;
+                writer.write_sample_frames(
+                    sample.meta.timestamp_ns,
+                    pid,
+                    sample.meta.tid,
+                    ctx.stack_scratch
+                        .iter()
+                        .copied()
+                        .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
+                )
+            }?;
+            if stack_id.is_some() {
+                bump(&mut ctx.summary.samples);
+            } else {
+                bump(&mut ctx.summary.empty_stack_samples);
+            }
             Ok(())
         }
-        Ok(Some(_)) => {
+        RecorderOutput::Samples {
+            sink,
+            resolved_stack_scratch,
+        } => {
+            resolved_stack_scratch.clear();
+            for frame in ctx.stack_scratch.iter().copied() {
+                if let Some(frame) = resolve_stack_frame(ctx.modules, ctx.summary, pid, frame) {
+                    resolved_stack_scratch.push(frame);
+                }
+            }
+            if resolved_stack_scratch.is_empty() {
+                bump(&mut ctx.summary.empty_stack_samples);
+                return Ok(());
+            }
+            let process = ctx.processes.states.get(&pid);
+            let python_perf_map_eligible = process
+                .is_some_and(|state| state.python_perf_support.unwrap_or(state.python_runtime));
+            let module_unwinder = process.and_then(|state| state.unwinder.as_ref());
+            sink.on_sample(CapturedPerfSample {
+                timestamp_ns: sample.meta.timestamp_ns,
+                process_id: pid,
+                thread_id: sample.meta.tid,
+                frames: resolved_stack_scratch,
+                python_perf_map_eligible,
+                modules: CapturedModules {
+                    generation: ctx.modules.process_generation(pid),
+                    process_id: pid,
+                    modules: ctx.modules,
+                    module_unwinder,
+                },
+            })?;
             bump(&mut ctx.summary.samples);
             Ok(())
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -1676,11 +1954,11 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     {
         return Ok(());
     }
-    match register_existing_maps(pid, ctx.modules, ctx.processes, ctx.writer) {
+    match register_existing_maps(pid, ctx.modules, ctx.processes, ctx.output) {
         Ok(true) if process_has_python_perf_support(pid, ctx.processes) => {
             mark_python_runtime_process(
                 ctx.processes,
-                ctx.writer,
+                ctx.output,
                 sample.meta.timestamp_ns,
                 sample.meta.pid,
             )
@@ -1720,10 +1998,10 @@ fn is_kernel_mode(privilege: Priv) -> bool {
     matches!(privilege, Priv::Kernel | Priv::GuestKernel)
 }
 
-fn record_module<W: std::io::Write>(
+fn record_module<W: PerfRecordWriter>(
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
     module: ModuleRecord,
 ) -> io::Result<()> {
     if module.path.is_empty() {
@@ -1761,10 +2039,10 @@ struct MmapEvent<'a> {
     inode_generation: u64,
 }
 
-fn record_mmap_event<W: std::io::Write>(
+fn record_mmap_event<W: PerfRecordWriter>(
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
     event: MmapEvent<'_>,
 ) -> io::Result<()> {
     let is_kernel = is_kernel_mode(event.privilege);
@@ -1791,10 +2069,10 @@ fn record_mmap_event<W: std::io::Write>(
     )
 }
 
-fn record_mmap<W: std::io::Write>(
+fn record_mmap<W: PerfRecordWriter>(
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
     mmap: &Mmap,
     privilege: Priv,
 ) -> io::Result<()> {
@@ -1861,22 +2139,22 @@ fn open_perf_group(
     )
 }
 
-fn register_existing_maps<W: std::io::Write>(
+fn register_existing_maps<W: PerfRecordWriter>(
     pid: u32,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
 ) -> io::Result<bool> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
     register_existing_maps_snapshot(pid, &maps, modules, processes, writer)
 }
 
-fn register_existing_maps_snapshot<W: std::io::Write>(
+fn register_existing_maps_snapshot<W: PerfRecordWriter>(
     pid: u32,
     maps: &str,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
 ) -> io::Result<bool> {
     register_existing_modules(
         executable_modules_from_maps(pid, maps),
@@ -1905,11 +2183,11 @@ fn executable_modules_from_maps(pid: u32, maps: &str) -> Vec<ModuleRecord> {
         .collect()
 }
 
-fn register_existing_modules<W: std::io::Write>(
+fn register_existing_modules<W: PerfRecordWriter>(
     snapshot: Vec<ModuleRecord>,
     modules: &mut ModuleTable,
     processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
+    writer: &mut W,
 ) -> io::Result<bool> {
     let mut saw_python_runtime = false;
     for module in snapshot {
@@ -2108,12 +2386,369 @@ mod tests {
     use perf_event_open::sample::record::lost::{LostRecords, LostSamples};
     use perf_event_open::sample::record::task::{Exit, Fork};
     use perf_event_open::sample::record::Task;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct OwnedCapturedSample {
+        timestamp_ns: u64,
+        process_id: i32,
+        thread_id: u64,
+        frames: Vec<FrameRecord>,
+        module: Option<ModuleRecord>,
+        python_perf_map_eligible: bool,
+    }
+
+    struct RecordingSampleSink(Arc<Mutex<Vec<OwnedCapturedSample>>>);
+
+    impl PerfSampleSink for RecordingSampleSink {
+        fn on_sample(&mut self, sample: CapturedPerfSample<'_>) -> io::Result<()> {
+            let module = sample
+                .modules
+                .iter()
+                .next()
+                .map(|module| module.record().clone());
+            self.0.lock().unwrap().push(OwnedCapturedSample {
+                timestamp_ns: sample.timestamp_ns,
+                process_id: sample.process_id,
+                thread_id: sample.thread_id,
+                frames: sample.frames.to_vec(),
+                module,
+                python_perf_map_eligible: sample.python_perf_map_eligible,
+            });
+            Ok(())
+        }
+
+        fn on_process_retired(&mut self, _process_id: i32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingSampleSink;
+
+    impl PerfSampleSink for FailingSampleSink {
+        fn on_sample(&mut self, _sample: CapturedPerfSample<'_>) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "worker stopped"))
+        }
+
+        fn on_process_retired(&mut self, _process_id: i32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SinkEvent {
+        Sample,
+        Retired(i32),
+    }
+
+    struct LifecycleSampleSink(Arc<Mutex<Vec<SinkEvent>>>);
+
+    impl PerfSampleSink for LifecycleSampleSink {
+        fn on_sample(&mut self, _sample: CapturedPerfSample<'_>) -> io::Result<()> {
+            self.0.lock().unwrap().push(SinkEvent::Sample);
+            Ok(())
+        }
+
+        fn on_process_retired(&mut self, process_id: i32) -> io::Result<()> {
+            self.0.lock().unwrap().push(SinkEvent::Retired(process_id));
+            Ok(())
+        }
+    }
 
     #[test]
     fn perf_recorder_is_send() {
         fn assert_send<T: Send>() {}
 
         assert_send::<PerfRecorder>();
+    }
+
+    #[test]
+    fn sample_sink_receives_normalized_frames_and_process_metadata() {
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut module = test_module(0x1000, 0x2000);
+        module.is_kernel = true;
+        let module_id = modules.intern_module(module, &mut writer).unwrap();
+        let state = processes.state_mut(7);
+        state.start_time = Some(11);
+        state.image = Some(ProcessImageIdentity {
+            device: 12,
+            inode: 13,
+        });
+        state.python_perf_support = Some(true);
+        state.python_runtime = true;
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut output = RecorderOutput::<Vec<u8>>::Samples {
+            sink: Box::new(RecordingSampleSink(Arc::clone(&captured))),
+            resolved_stack_scratch: Vec::new(),
+        };
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            processes: &mut processes,
+            output: &mut output,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            lifecycle_actions: &mut lifecycle_actions,
+            inherit_child_processes: false,
+        };
+
+        record_prepared_sample(
+            &mut ctx,
+            PreparedSample {
+                meta: PreparedSampleMeta {
+                    timestamp_ns: 17,
+                    pid: 7,
+                    tid: 19,
+                },
+                privilege: Priv::Kernel,
+                code_addr: None,
+                user_regs: None,
+                user_stack: None,
+                callchain_stack: vec![
+                    StackFrame::InstructionPointer(0x1010, StackMode::Kernel),
+                    StackFrame::ReturnAddress(0x1020, StackMode::Kernel),
+                ],
+            },
+        )
+        .unwrap();
+
+        record_prepared_sample(
+            &mut ctx,
+            PreparedSample {
+                meta: PreparedSampleMeta {
+                    timestamp_ns: 18,
+                    pid: 7,
+                    tid: 19,
+                },
+                privilege: Priv::Kernel,
+                code_addr: None,
+                user_regs: None,
+                user_stack: None,
+                callchain_stack: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let samples = captured.lock().unwrap();
+        let [sample] = samples.as_slice() else {
+            panic!("expected one captured sample");
+        };
+        assert_eq!(sample.timestamp_ns, 17);
+        assert_eq!(sample.process_id, 7);
+        assert_eq!(sample.thread_id, 19);
+        assert_eq!(sample.frames[0].abs_ip, 0x1010);
+        assert_eq!(sample.frames[1].abs_ip, 0x101f);
+        assert!(sample
+            .frames
+            .iter()
+            .all(|frame| frame.module_id == Some(module_id)));
+        assert_eq!(sample.module, None);
+        assert!(sample.python_perf_map_eligible);
+        assert_eq!(summary.samples, 1);
+        assert_eq!(summary.empty_stack_samples, 1);
+    }
+
+    #[test]
+    fn captured_module_exposes_symbolization_metadata() {
+        let mut record = test_module(0x1000, 0x2000);
+        record.path = "/tmp/libtest.so (deleted)".into();
+        record.device_major = 8;
+        record.device_minor = 1;
+        record.inode = 42;
+        record.inode_generation = 7;
+        let module = CapturedModule {
+            record: &record,
+            image_base: Some(crate::ModuleImageBase {
+                avma: 0x1000,
+                svma: 0,
+            }),
+        };
+
+        assert_eq!(module.path(), std::path::Path::new("/tmp/libtest.so"));
+        assert_eq!(module.backing(), CapturedModuleBacking::Deleted);
+        assert_eq!(
+            module.image_base(),
+            Some(crate::ModuleImageBase {
+                avma: 0x1000,
+                svma: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn sample_sink_error_stops_before_counting_the_sample() {
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut output = RecorderOutput::<Vec<u8>>::Samples {
+            sink: Box::new(FailingSampleSink),
+            resolved_stack_scratch: Vec::new(),
+        };
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let error = {
+            let mut ctx = EventContext {
+                modules: &mut modules,
+                processes: &mut processes,
+                output: &mut output,
+                summary: &mut summary,
+                stack_scratch: &mut stack_scratch,
+                lifecycle_actions: &mut lifecycle_actions,
+                inherit_child_processes: false,
+            };
+            record_prepared_sample(
+                &mut ctx,
+                PreparedSample {
+                    meta: PreparedSampleMeta {
+                        timestamp_ns: 17,
+                        pid: 7,
+                        tid: 19,
+                    },
+                    privilege: Priv::Kernel,
+                    code_addr: Some(0xffff_1000),
+                    user_regs: None,
+                    user_stack: None,
+                    callchain_stack: Vec::new(),
+                },
+            )
+            .unwrap_err()
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(summary.samples, 0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReusePlacement {
+        BeforeCheckpoint,
+        AfterCheckpoint,
+    }
+
+    fn deferred_retirement_case(placement: ReusePlacement) -> (Vec<SinkEvent>, u64, u64) {
+        let child_pid = i32::MAX;
+        let parent_pid = i32::MAX - 1;
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let retired_state_id = processes.state_mut(child_pid).state_id;
+        processes.state_mut(parent_pid);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut output = RecorderOutput::<Vec<u8>>::Samples {
+            sink: Box::new(LifecycleSampleSink(Arc::clone(&events))),
+            resolved_stack_scratch: Vec::new(),
+        };
+        let mut summary = PerfSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut sorter = EventSorter::new();
+        let mut pending_process_retirements = Vec::new();
+
+        sorter.begin_group(1);
+        if matches!(placement, ReusePlacement::BeforeCheckpoint) {
+            sorter.push_current_group(16, reused_process_fork(child_pid, parent_pid, 16));
+        }
+        sorter.push_current_group(
+            17,
+            PreparedEvent::Sample(PreparedSample {
+                meta: PreparedSampleMeta {
+                    timestamp_ns: 17,
+                    pid: if matches!(placement, ReusePlacement::BeforeCheckpoint) {
+                        parent_pid
+                    } else {
+                        child_pid
+                    },
+                    tid: 19,
+                },
+                privilege: Priv::Kernel,
+                code_addr: Some(0xffff_1000),
+                user_regs: None,
+                user_stack: None,
+                callchain_stack: Vec::new(),
+            }),
+        );
+        sorter.advance_round();
+        let through = sorter.checkpoint().unwrap();
+        assert!(sorter.has_pending_through(&through));
+        pending_process_retirements.push(PendingProcessRetirement {
+            process_id: child_pid,
+            state_id: retired_state_id,
+            runtime_end_timestamp_ns: 17,
+            through,
+        });
+        if matches!(placement, ReusePlacement::AfterCheckpoint) {
+            sorter.begin_group(1);
+            sorter.push_current_group(17, reused_process_fork(child_pid, parent_pid, 17));
+        }
+        sorter.advance_round();
+        {
+            let ctx = EventContext {
+                modules: &mut modules,
+                processes: &mut processes,
+                output: &mut output,
+                summary: &mut summary,
+                stack_scratch: &mut stack_scratch,
+                lifecycle_actions: &mut lifecycle_actions,
+                inherit_child_processes: true,
+            };
+            let mut sink = DrainSink {
+                ctx,
+                sorter: &mut sorter,
+                pending_process_retirements: &mut pending_process_retirements,
+                result: Ok(()),
+                last_finished_timestamp_ns: 0,
+            };
+            sink.drain_sorter(false);
+            sink.result.unwrap();
+        }
+
+        assert!(pending_process_retirements.is_empty());
+        let replacement_state_id = processes.states[&child_pid].state_id;
+        assert!(lifecycle_actions.iter().any(|action| {
+            matches!(action, LifecycleAction::ProcessFork { pid, .. } if *pid == child_pid as u32)
+        }));
+        let events = events.lock().unwrap().clone();
+        (events, retired_state_id, replacement_state_id)
+    }
+
+    fn reused_process_fork(child_pid: i32, parent_pid: i32, timestamp_ns: u64) -> PreparedEvent {
+        PreparedEvent::Record {
+            timestamp_ns,
+            privilege: Priv::User,
+            record: Record::Fork(Box::new(Fork {
+                record_id: None,
+                task: Task {
+                    pid: child_pid as u32,
+                    tid: child_pid as u32,
+                },
+                parent_task: Task {
+                    pid: parent_pid as u32,
+                    tid: parent_pid as u32,
+                },
+                time: timestamp_ns,
+            })),
+        }
+    }
+
+    #[test]
+    fn deferred_retirement_precedes_same_timestamp_pid_reuse() {
+        let (events, retired_state_id, replacement_state_id) =
+            deferred_retirement_case(ReusePlacement::AfterCheckpoint);
+
+        assert_eq!(events, [SinkEvent::Sample, SinkEvent::Retired(i32::MAX)]);
+        assert_ne!(replacement_state_id, retired_state_id);
+    }
+
+    #[test]
+    fn stale_deferred_retirement_does_not_remove_reused_pid() {
+        let (events, retired_state_id, replacement_state_id) =
+            deferred_retirement_case(ReusePlacement::BeforeCheckpoint);
+
+        assert_eq!(events, [SinkEvent::Retired(i32::MAX), SinkEvent::Sample]);
+        assert_ne!(replacement_state_id, retired_state_id);
     }
 
     #[test]
@@ -2132,8 +2767,9 @@ mod tests {
 
         assert!(!processes.is_tracked(pid));
         assert!(processes.tracked_pids().is_empty());
-        assert!(processes.dead_or_reused_pids().is_empty());
-        assert_eq!(processes.tracked_process_is_stale(pid, Some(3)), None);
+        assert!(processes.dead_or_reused_pids(false).is_empty());
+        assert_eq!(processes.dead_or_reused_pids(true), [pid]);
+        assert_eq!(processes.process_is_stale(pid, Some(3)), Some(true));
         assert!(!processes.process_is_active(pid));
         assert!(!processes.has_active_processes_except(0));
         assert_eq!(processes.active_process_count(), 0);
@@ -2155,20 +2791,14 @@ mod tests {
         let mut tracked = processes.tracked_pids();
         tracked.sort_unstable();
         assert_eq!(tracked, [live_pid, missing_pid]);
-        assert_eq!(
-            processes.tracked_process_is_stale(live_pid, None),
-            Some(false)
-        );
-        assert_eq!(
-            processes.tracked_process_is_stale(missing_pid, None),
-            Some(true)
-        );
+        assert_eq!(processes.process_is_stale(live_pid, None), Some(false));
+        assert_eq!(processes.process_is_stale(missing_pid, None), Some(true));
         assert!(processes.process_is_active(live_pid));
         assert!(!processes.process_is_active(missing_pid));
         assert!(processes.has_active_processes_except(missing_pid));
         assert!(!processes.has_active_processes_except(live_pid));
         assert_eq!(processes.active_process_count(), 1);
-        assert_eq!(processes.dead_or_reused_pids(), [missing_pid]);
+        assert_eq!(processes.dead_or_reused_pids(false), [missing_pid]);
     }
 
     #[test]
@@ -2210,19 +2840,20 @@ mod tests {
         let pid_i32 = i32::try_from(pid).unwrap();
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
-        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut output =
+            RecorderOutput::Spool(PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap());
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut module = test_module(0x1000, 0x2000);
         module.process_id = pid_i32;
-        modules.intern_module(module, &mut writer).unwrap();
+        modules.intern_module(module, &mut output).unwrap();
 
         {
             let mut ctx = EventContext {
                 modules: &mut modules,
                 processes: &mut processes,
-                writer: &mut writer,
+                output: &mut output,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
                 lifecycle_actions: &mut lifecycle_actions,
@@ -2258,14 +2889,15 @@ mod tests {
         let tid = pid.saturating_add(1);
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
-        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut output =
+            RecorderOutput::Spool(PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap());
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2326,11 +2958,12 @@ mod tests {
         let mut module = test_module(0x1000, 0x2000);
         module.process_id = pid;
         modules.intern_module(module, &mut writer).unwrap();
+        let mut output = RecorderOutput::Spool(writer);
 
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2412,9 +3045,10 @@ mod tests {
         let state = processes.state_mut(pid_i32);
         state.image = Some(read_process_image_identity(pid).unwrap().0);
         state.start_time = Some(read_process_start_time(pid).unwrap());
+        let mut output = RecorderOutput::Spool(writer);
 
         assert!(
-            reconcile_process_image(pid, 123, &mut modules, &mut processes, &mut writer,).unwrap()
+            reconcile_process_image(pid, 123, &mut modules, &mut processes, &mut output,).unwrap()
         );
         assert_eq!(
             modules
@@ -2439,11 +3073,12 @@ mod tests {
         let mut module = test_module(0x1000, 0x2000);
         module.process_id = pid;
         let module_id = modules.intern_module(module, &mut writer).unwrap();
+        let mut output = RecorderOutput::Spool(writer);
 
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2466,7 +3101,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            modules
+            ctx.modules
                 .resolve_frame(pid, 0x1800, FrameMode::User)
                 .module_id,
             Some(module_id)
@@ -2493,11 +3128,12 @@ mod tests {
         let mut module = test_module(0x1000, 0x2000);
         module.process_id = parent_pid;
         modules.intern_module(module, &mut writer).unwrap();
+        let mut output = RecorderOutput::Spool(writer);
 
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2536,6 +3172,7 @@ mod tests {
             .resolve_frame(child_pid, 0x1800, FrameMode::User)
             .module_id
             .is_some());
+        let child_state_id = ctx.processes.states[&child_pid].state_id;
 
         handle_non_sample_record(
             101,
@@ -2553,6 +3190,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_ne!(ctx.processes.states[&child_pid].state_id, child_state_id);
         assert!(ctx
             .modules
             .resolve_frame(child_pid, 0x1800, FrameMode::User)
@@ -2577,14 +3215,15 @@ mod tests {
         let pc = uncovered_user_sample_ip_refreshes_without_unwind_registers as *const () as u64;
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
-        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut output =
+            RecorderOutput::Spool(PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap());
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2615,14 +3254,15 @@ mod tests {
         let pc = hypervisor_sample_ip_does_not_refresh_user_maps as *const () as u64;
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
-        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let mut output =
+            RecorderOutput::Spool(PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap());
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
@@ -2676,7 +3316,9 @@ mod tests {
     fn sample_prepare_defers_unwind_until_finish() {
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
-        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).expect("spool writer");
+        let mut output = RecorderOutput::Spool(
+            PerfSpoolWriter::from_writer(Vec::new(), 0, 0).expect("spool writer"),
+        );
         let mut summary = PerfSummary::default();
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
@@ -2705,7 +3347,7 @@ mod tests {
         let mut ctx = EventContext {
             modules: &mut modules,
             processes: &mut processes,
-            writer: &mut writer,
+            output: &mut output,
             summary: &mut summary,
             stack_scratch: &mut stack_scratch,
             lifecycle_actions: &mut lifecycle_actions,
