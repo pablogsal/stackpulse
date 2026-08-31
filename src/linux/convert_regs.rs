@@ -1,5 +1,5 @@
 #[cfg(target_arch = "aarch64")]
-use framehop::aarch64::UnwindRegsAarch64;
+use framehop::aarch64::{PtrAuthMask, UnwindRegsAarch64};
 #[cfg(target_arch = "x86_64")]
 use framehop::x86_64::UnwindRegsX86_64;
 #[cfg(target_arch = "aarch64")]
@@ -57,7 +57,12 @@ impl ConvertRegs for ConvertRegsAarch64 {
             reg_value(regs, regs_mask, PERF_REG_ARM64_SP)?,
             reg_value(regs, regs_mask, PERF_REG_ARM64_X29)?,
         );
-        Some((ip, sp, UnwindRegsAarch64::new(lr, sp, fp)))
+        let ptr_auth_mask = PtrAuthMask::from_max_known_address(ip.max(sp).max(fp));
+        Some((
+            ip,
+            sp,
+            UnwindRegsAarch64::new_with_ptr_auth_mask(ptr_auth_mask, lr, sp, fp),
+        ))
     }
     fn regs_mask() -> u64 {
         (1_u64 << PERF_REG_ARM64_PC)
