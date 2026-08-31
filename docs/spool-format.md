@@ -1,20 +1,23 @@
 # SPULSE spool format
 
-StackPulse records samples in an append-only binary stream. Recording emits
-small writes. Readers recover the complete prefix after an interrupted final
-write and offer mmap-backed access or bounded-memory replay.
+A spool file is the on-disk profile that `Recorder` produces: an
+append-only binary stream designed so that recording only ever issues small
+writes. If recording dies partway through the final record, readers keep the
+complete prefix that precedes it. A finished file can be read fully in memory
+through `Snapshot` or replayed sequentially with bounded memory through
+`Replay`.
 
-## Compatibility promise
+## Compatibility
 
-`PerfSpoolReader` and `PerfSpoolReplayReader` read every released SPULSE
+`Snapshot` and `Replay` read every released SPULSE
 version. StackPulse 0.8 writes SPULSE3 and continues to read SPULSE1 and
-SPULSE2. A future writer may add a new magic version when an existing record
-cannot express the required data. Existing record meanings do not change in
+SPULSE2. When existing records cannot express new data, a future writer adds
+a new magic version; the meaning of an existing record never changes in
 place.
 
 A reader accepts a file that ends partway through its final record. It retains
 the complete prefix and reports recovery through
-`PerfSpoolReader::recovered_from_truncated_tail`. Corruption within the
+`Snapshot::recovered_from_truncated_tail`. Corruption within the
 complete prefix remains an error.
 
 ## Stream header
@@ -58,9 +61,10 @@ which prevents stale symbol reuse across remapped files.
 
 ## Frame encoding
 
-Pinned frames store a module id and file-relative address. Unpinned frames
-store an absolute address and a user/kernel mode bit. A reserved tag encodes a
-truncated-stack marker with a zero payload.
+A frame matched to a known module stores that module's id and a file-relative
+address. A frame with no matching module stores an absolute address and a
+user/kernel mode bit. A reserved tag encodes a truncated-stack marker with a
+zero payload.
 
 Return addresses are normalized to the calling instruction before a frame is
 written. Module-relative addresses use checked subtraction and addition;
@@ -68,8 +72,8 @@ overflow or an address outside the mapping is rejected.
 
 ## Replay and resource bounds
 
-`PerfSpoolReader` retains decoded samples for random access.
-`PerfSpoolReplayReader` retains definitions and a bounded sample-range index,
+`Snapshot` retains decoded samples for random access.
+`Replay` retains definitions and a bounded sample-range index,
 then decodes sample records sequentially. Once the range index reaches its
 configured limit, replay scans the validated suffix without retaining one
 index entry per sample.

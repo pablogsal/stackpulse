@@ -1,7 +1,6 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/pablogsal/stackpulse/main/.github/pages/stackpulse-logo.jpg" alt="StackPulse crab serving a stack of pancakes" width="325"><br>
-  Linux <code>perf_event</code> stack sampling, native unwinding, symbolization,
-  and compact profile spooling.<br>
+  <img src="https://raw.githubusercontent.com/pablogsal/stackpulse/main/.github/pages/stackpulse-logo.png" alt="StackPulse crab serving a stack of pancakes" width="325"><br>
+  A Rust library for building Linux profilers with <code>perf_event</code>.<br>
   <a href="https://pablogsal.com/stackpulse/"><strong>Documentation</strong></a><br><br>
   <a href="https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml"><img src="https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml/badge.svg?branch=main" alt="Checks"></a>
   <a href="https://app.codecov.io/github/pablogsal/stackpulse"><img src="https://codecov.io/gh/pablogsal/stackpulse/graph/badge.svg?branch=main" alt="Coverage"></a>
@@ -10,11 +9,12 @@
   <a href="https://docs.rs/stackpulse"><img src="https://docs.rs/stackpulse/badge.svg" alt="docs.rs"></a>
 </div>
 
-`stackpulse` samples a Linux process over time and writes the raw stacks to a
-compact file. Read that file later to resolve native, Python, JIT, and kernel
-frames into names and source locations suitable for a profiler UI.
+StackPulse records CPU stack samples from Linux processes and writes them to a
+compact file. After capture, it resolves native, Python, JIT, and kernel frames
+into names and source locations for your profiler.
 
-The library requires Linux 6.0 or newer. It is not a command-line tool.
+StackPulse is a library, not a command-line tool, and it requires Linux 6.0 or
+newer.
 
 ## Install
 
@@ -23,59 +23,44 @@ The library requires Linux 6.0 or newer. It is not a command-line tool.
 stackpulse = "0.8"
 ```
 
-## How recording works
+## Record a profile
 
-Attach to a process, sample it while it runs, then read the saved profile back.
-The profile can include regular application code, Python frames, child
-processes, and kernel frames when the machine allows them.
+Attach to a running process or launch one under the recorder. While the target
+runs, call `poll` to drain samples into a spool file. Open that file with
+`Snapshot`, then pass its stacks to `Symbolizer`. The resulting frames are
+ready for your aggregator, UI, or exporter.
 
-The flow has five steps:
-
-1. Start or attach to a process.
-2. Record samples into a spool file.
-3. Read the file back.
-4. Convert the recorded frames into readable names.
-5. Build your own report, flame graph, UI, or export format on top.
-
-## Example
-
-Record briefly, then read back one stack:
+For example, to record for ten seconds and read back one stack:
 
 ```rust,no_run
 use std::time::{Duration, Instant};
 
-use stackpulse::{
-    AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer,
-};
+use stackpulse::{AttachMode, Pid, Recorder, RecorderOptions, SampleRate, Snapshot};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pid = std::env::args().nth(1).expect("pid").parse()?;
+    let raw_pid: u32 = std::env::args().nth(1).expect("pid").parse()?;
+    let pid = Pid::try_from(raw_pid)?;
 
-    let mut rec = PerfRecorder::attach(
+    let mut recorder = Recorder::attach(
         pid,
         "profile.spool",
-        AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions {
-            frequency: 99,
-            stack_size: 60 * 1024,
-            ..PerfRecorderOptions::default()
-        },
+        AttachMode::StopWhileAttaching,
+        RecorderOptions::new(SampleRate::hz(99)?).stack_size(60 * 1024),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && rec.process_is_active(pid as i32) {
-        rec.wait()?;
-        rec.consume_available()?;
+    while Instant::now() < deadline && recorder.process_is_active(pid) {
+        recorder.poll(Duration::from_millis(100))?;
     }
-    rec.finish()?;
+    recorder.finish()?;
 
-    let reader = PerfSpoolReader::open("profile.spool")?;
-    let mut symbols = PerfSymbolizer::for_spool(&reader);
+    let reader = Snapshot::open("profile.spool")?;
+    let mut symbolizer = reader.symbolizer().build();
 
-    if let Some(stack) = reader.sample_stacks().next() {
-        symbols.for_each_sample_stack(stack, |frame| {
-            println!("{}", frame.func_name());
-        });
+    if let Some(stack) = reader.stacks().next() {
+        for frame in symbolizer.resolve(stack)? {
+            println!("{}", frame.display_name());
+        }
     }
 
     Ok(())
@@ -92,7 +77,7 @@ locally with `make doc`.
 | Operating system | Linux 6.0 or newer |
 | Architectures | x86-64 and AArch64 |
 | Native stacks | DWARF and frame-pointer unwinding through Framehop |
-| Native symbols | Bundled Wholesym backend or a caller-supplied symbolizer |
+| Native symbols | Bundled `wholesym` backend or a caller-supplied symbolizer |
 | Dynamic runtimes | Python perf maps and Python runtime frames |
 | Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
 | Profile files | Writes SPULSE3; reads SPULSE1, SPULSE2, and SPULSE3 |
@@ -124,12 +109,14 @@ make coverage CARGO_FLAGS="--features debuginfod"
 
 | Feature | Default | Provides |
 | --- | --- | --- |
-| `builtin-wholesym` | Yes | Native symbolization through Wholesym and Tokio |
+| `builtin-wholesym` | Yes | Native symbolization through `wholesym` and Tokio |
 | `debuginfod` | No | Remote debug-file lookup when `DEBUGINFOD_URLS` is set |
 | `bench-support` | No | Hidden synthetic fixtures used by the benchmark suite |
 
-Consumers that supply `PerfSymbolizerBuilder::native_symbolizer_factory` can
-disable default features to omit Wholesym and Tokio. `STACKPULSE_DEBUG_DIRS`
+Consumers that supply `SymbolizerBuilder::native` can disable default features
+to omit `wholesym` and Tokio.
+
+Two environment variables tune the default backend: `STACKPULSE_DEBUG_DIRS`
 overrides local debug-file search roots, and
 `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod cache directory.
 

@@ -1,21 +1,21 @@
-//! Task-oriented StackPulse documentation.
+#![doc = include_str!("../docs/tutorials.md")]
+#![doc = include_str!("../docs/how-to.md")]
+#![doc = include_str!("../docs/reference.md")]
+#![doc = include_str!("../docs/explanation.md")]
+#![doc = include_str!("../docs/spool-format.md")]
 
-/// Tutorials for attaching, startup capture, and stack aggregation.
-#[doc = include_str!("../docs/tutorials.md")]
+// Preserve the old documentation paths without listing them as API modules.
+#[doc(hidden)]
 pub mod tutorials {}
 
-/// Recipes for configuration, child processes, symbols, and diagnostics.
-#[doc = include_str!("../docs/how-to.md")]
+#[doc(hidden)]
 pub mod how_to {}
 
-/// Complete type, option, feature, and format-invariant reference.
-#[doc = include_str!("../docs/reference.md")]
+#[doc(hidden)]
 pub mod reference {}
 
-/// Design rationale for sampling, unwinding, module tracking, and overhead.
-#[doc = include_str!("../docs/explanation.md")]
+#[doc(hidden)]
 pub mod explanation {}
 
-/// The stable SPULSE file-format contract and compatibility policy.
-#[doc = include_str!("../docs/spool-format.md")]
+#[doc(hidden)]
 pub mod spool_format {}

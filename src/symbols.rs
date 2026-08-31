@@ -1,7 +1,4 @@
-//! Native stack frame symbolization.
-//!
-//! This module provides address-to-symbol resolution for native stack frames.
-//! It handles caching and batch symbolization.
+//! Native address-to-symbol resolution.
 
 #[cfg(feature = "builtin-wholesym")]
 use crate::SourceLocation;
@@ -29,11 +26,10 @@ use std::rc::Rc;
 
 /// Module information for symbolization.
 ///
-/// Each `SymModule` represents a single memory mapping with a mapping-specific
-/// `avma_range` and an optional resolved image base.
-/// Symbolization computes the address form required by the active backend from
-/// that shared image base (`SVMA` on Linux, `Relative` on macOS). Unresolved
-/// mappings are skipped.
+/// Each `SymModule` describes one memory mapping with its `avma_range` and
+/// optional image base. The backend derives its address from that image base:
+/// `SVMA` on Linux or `Relative` on macOS. Mappings without an image base are
+/// skipped.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SymModule {
@@ -142,7 +138,7 @@ fn build_module_address_index(modules: &[SymModule]) -> Box<[ModuleAddressIndexE
     index.into_boxed_slice()
 }
 
-/// Cached symbols - wrapped in Rc for cheap cloning
+/// Cached symbols behind `Rc` for inexpensive clones.
 pub type SymbolsRc = Rc<[NativeSymbol]>;
 
 #[cfg(feature = "builtin-wholesym")]
@@ -150,19 +146,13 @@ fn symbols_rc(symbols: Vec<NativeSymbol>) -> SymbolsRc {
     Rc::from(symbols.into_boxed_slice())
 }
 
-/// Plug-in interface for native (ELF/Mach-O) module symbolization.
+/// Plug-in interface for native ELF or Mach-O symbolization.
 ///
-/// `PerfSymbolizer` owns kernel-frame resolution (via `/proc/kallsyms`) and
-/// JIT/Python perf-map resolution (via `/tmp/perf-PID.map`). Native module
-/// symbolization is delegated to an implementor of this trait, allowing
-/// callers to supply their own debug-info/debuginfod policy
-/// instead of stackpulse's bundled wholesym-backed `SymbolizerWrapper`.
-///
-/// One implementor is created per non-overlapping process module group via
-/// the factory passed to [`crate::PerfSymbolizerBuilder::native_symbolizer_factory`].
-/// Implementors keep their own per-module symbol-map cache; stackpulse calls
-/// `set_modules` whenever the module set changes and `symbolize_one` for
-/// each native frame address.
+/// [`crate::PerfSymbolizer`] handles kernel and perf-map frames itself. It
+/// creates one `NativeSymbolizer` per non-overlapping process module group,
+/// calls `set_modules` when that group changes, and passes each native frame
+/// address to `symbolize_one`. Implementations own their symbol-map caches and
+/// debug-file policy.
 pub trait NativeSymbolizer {
     /// Replace the module set this symbolizer should resolve against.
     /// Implementors should invalidate per-module caches for paths no longer
@@ -190,7 +180,7 @@ impl NativeSymbolizer for SymbolizerWrapper {
 /// `PerfSymbolizer` calls this once per non-overlapping module group.
 pub(crate) type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolizer>>;
 
-/// Default factory for Stackpulse's Wholesym backend.
+/// Factory for StackPulse's bundled Wholesym backend.
 #[cfg(feature = "builtin-wholesym")]
 #[must_use]
 pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {

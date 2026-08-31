@@ -6,12 +6,9 @@
 #[cfg(any(test, feature = "bench-support"))]
 #[doc(hidden)]
 pub mod bench_support;
-/// Helpers for discovering and following child processes spawned by a target.
-///
-/// Used when the caller asks the recorder to capture not just the supplied
-/// PID but the descendants it spawns after attach.
+/// Child-process discovery for recorded targets.
 pub mod children;
-/// Guides for recording, replay, symbolization, and the spool format.
+/// Recording and integration guide.
 pub mod docs;
 mod elf;
 mod error;
@@ -19,13 +16,7 @@ mod linux;
 mod module_base;
 mod native_module;
 mod proc_maps;
-/// Post-symbolization frame model returned by [`PerfSymbolizer`].
-///
-/// Each [`ResolvedFrame`] carries either a [`NativeFrame`] or a
-/// [`PythonFrame`] plus a [`FrameFlags`] bitset describing how it was
-/// recovered. Use these types to build flame graphs, format reports, or
-/// feed downstream profile encoders. Consumers that prefer raw IPs can
-/// skip symbolization entirely and read [`FrameRecord`]s from the spool.
+/// Resolved frames and symbol metadata returned by [`PerfSymbolizer`].
 pub mod profile;
 mod spool;
 /// Process liveness checks, exit watching, and signal helpers.

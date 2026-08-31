@@ -43,7 +43,7 @@ jobs:
           make doc
           install -m 0644 .github/pages/index.html target/doc/index.html
           install -m 0644 .github/pages/style.css target/doc/stackpulse-pages.css
-          install -m 0644 .github/pages/stackpulse-logo.jpg target/doc/stackpulse-logo.jpg
+          install -m 0644 .github/pages/stackpulse-logo.png target/doc/stackpulse-logo.png
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

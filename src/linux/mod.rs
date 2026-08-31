@@ -6,12 +6,7 @@ mod cpu;
 mod module_tracking;
 pub(crate) mod perf_event;
 mod perf_group;
-/// Spawn and attach helpers for the target process.
-///
-/// Provides [`process::SuspendedLaunchedProcess`] for launching a child in a
-/// suspended state, used together with [`AttachMode::AttachWithEnableOnExec`]
-/// so a recorder can be wired up before the target executes its first
-/// instruction, and unsuspended afterwards.
+/// Launch a process suspended and attach recording before `execve`.
 pub mod process;
 mod sorter;
 mod types;

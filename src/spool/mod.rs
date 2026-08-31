@@ -390,7 +390,7 @@ impl SpoolFrameModuleContexts {
     }
 }
 
-/// Raw frame plus its recorded module context, when Stackpulse had one.
+/// Raw frame plus its recorded module context, when StackPulse had one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameContext<'a> {
     /// Raw frame from the interned stack.

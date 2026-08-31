@@ -1,4 +1,8 @@
-# Tutorials
+# Tutorial
+
+This tutorial walks through a minimal profiler in three steps: attach to a
+running process, capture a second process from its first instruction, and
+aggregate the recorded stacks into a histogram.
 
 ## Attach to an existing process
 
@@ -20,57 +24,59 @@ Attach to that PID, drain for ten seconds, then read the spool file back:
 
 ```rust,no_run
 use std::time::{Duration, Instant};
-use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer};
+use stackpulse::{AttachMode, Pid, Recorder, RecorderOptions, SampleRate, Snapshot};
 
-fn record(pid: u32) -> std::io::Result<()> {
-    let mut recorder = PerfRecorder::attach(
+fn record(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let pid = Pid::try_from(pid)?;
+    let mut recorder = Recorder::attach(
         pid,
         "profile.spool",
-        AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions { frequency: 99, stack_size: 60 * 1024, ..Default::default() },
+        AttachMode::StopWhileAttaching,
+        RecorderOptions::new(SampleRate::hz(99)?).stack_size(60 * 1024),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && recorder.process_is_active(pid as i32) {
-        recorder.wait()?;
-        recorder.consume_available()?;
+    while Instant::now() < deadline && recorder.process_is_active(pid) {
+        recorder.poll(Duration::from_millis(100))?;
     }
     recorder.finish()?;
 
-    let reader = PerfSpoolReader::open("profile.spool")?;
-    let mut symbolizer = PerfSymbolizer::for_spool(&reader);
+    let reader = Snapshot::open("profile.spool")?;
+    let mut symbolizer = reader.symbolizer().build();
 
-    for stack in reader.sample_stacks().take(10) {
-        println!("pid={} tid={}", stack.sample.process_id, stack.sample.thread_id);
-        symbolizer.for_each_sample_stack(stack, |f| {
-            println!("  {}", f.func_name());
-        });
+    for stack in reader.stacks().take(10) {
+        println!("pid={} tid={}", stack.pid(), stack.tid());
+        for frame in symbolizer.resolve(stack)? {
+            println!("  {}", frame.display_name());
+        }
     }
     Ok(())
 }
 ```
 
-The `wait`/`consume_available` pair is the recording loop. `wait` blocks
-until a ring buffer is readable; `consume_available` drains the queued
-records, unwinds the samples it finds, and writes them to the spool. If you
-skip the pair the kernel buffers fill up and subsequent samples are dropped,
-showing up as `lost_events` in the summary.
+`poll` is the recording loop. It waits for at most the supplied timeout, then
+drains queued records, unwinds their samples, and writes them to the spool. If
+you stop polling, the kernel buffers fill and subsequent samples appear as
+`lost_events` in the summary.
 
 Samples reference stack IDs, not inline frame data, which is why profiles
 stay small when hot code keeps producing the same stacks. It is also why you
-should reuse a single [`PerfSymbolizer`](crate::PerfSymbolizer): it caches resolved frames keyed by
+should reuse a single [`Symbolizer`](crate::Symbolizer): it caches resolved frames keyed by
 `(process_id, stack_id)`.
 
 ## Capture process startup
 
 Attaching to a running process misses early startup. To profile from the
 first instruction, launch the child suspended, attach with
-`AttachWithEnableOnExec`, and let it run:
+`OnExec`, and let it run:
 
 ```rust,no_run
 use std::ffi::{OsStr, OsString};
 use std::time::{Duration, Instant};
-use stackpulse::{process::SuspendedLaunchedProcess, AttachMode, PerfRecorder, PerfRecorderOptions};
+use stackpulse::{
+    process::SuspendedLaunchedProcess, AttachMode, Pid, Recorder, RecorderOptions,
+    SampleRate,
+};
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let args = [OsString::from("-X"), OsString::from("perf"), OsString::from("-c"),
     OsString::from("v = 0\nfor _ in range(50_000_000):\n    v = (v + 1) % 1009\n")];
@@ -80,11 +86,11 @@ let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
     OsStr::new("python3"), &args, &env,
 )?;
 
-let mut recorder = PerfRecorder::attach(
-    launched.pid(),
+let mut recorder = Recorder::attach(
+    Pid::try_from(launched.pid())?,
     "startup.spool",
-    AttachMode::AttachWithEnableOnExec,
-    PerfRecorderOptions { frequency: 199, stack_size: 60 * 1024, ..Default::default() },
+    AttachMode::OnExec,
+    RecorderOptions::new(SampleRate::hz(199)?).stack_size(60 * 1024),
 )?;
 
 let running = launched.unsuspend_and_run()?;
@@ -93,14 +99,12 @@ let timeout = Instant::now() + Duration::from_secs(30);
 let status = loop {
     if let Some(status) = running.try_wait()? { break status; }
     if Instant::now() >= timeout {
-        recorder.disable();
+        recorder.disable()?;
         return Err("child did not exit before timeout".into());
     }
-    recorder.wait()?;
-    recorder.consume_available()?;
+    recorder.poll(Duration::from_millis(100))?;
 };
 
-recorder.consume_available()?;
 let summary = recorder.finish()?;
 println!("status={status:?} samples={}", summary.samples);
 # Ok(())
@@ -112,23 +116,22 @@ the child has loaded its binary, and nothing is missed once it starts running.
 
 ## Aggregate into a stack histogram
 
-Printing each frame is a debugging mode. A real exporter counts how often
-each stack appears. This snippet is the kernel of any flame-graph or
-top-functions report:
+To build a flame graph or top-functions report, count how often each stack
+appears:
 
 ```rust,no_run
 use std::collections::BTreeMap;
-use stackpulse::{PerfSpoolReader, PerfSymbolizer};
+use stackpulse::Snapshot;
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = PerfSpoolReader::open("profile.spool")?;
-let mut symbolizer = PerfSymbolizer::for_spool(&reader);
+let reader = Snapshot::open("profile.spool")?;
+let mut symbolizer = reader.symbolizer().build();
 let mut counts = BTreeMap::<String, u64>::new();
 
-for stack in reader.sample_stacks() {
+for stack in reader.stacks() {
     let mut names = Vec::new();
-    symbolizer.for_each_sample_stack(stack, |f| {
-        names.push(f.func_name());
-    });
+    for frame in symbolizer.resolve(stack)? {
+        names.push(frame.display_name().to_owned());
+    }
     let key = names.join(";");
     *counts.entry(key).or_default() += 1;
 }
@@ -142,7 +145,8 @@ for (stack, count) in rows.iter().take(20) {
 # }
 ```
 
-A production exporter keeps more metadata around: process and thread IDs,
-timestamps, [`FrameKind`](crate::FrameKind), [`SymbolOrigin`](crate::SymbolOrigin), file names, and line numbers.
-Most exporters also hide frames flagged with [`FrameFlags::HIDDEN_DEFAULT`](crate::FrameFlags::HIDDEN_DEFAULT)
-in their default view.
+Keep process and thread IDs when the output needs per-process or per-thread
+views. [`FrameKind`](crate::profile::FrameKind), [`SymbolOrigin`](crate::profile::SymbolOrigin),
+file names, and line numbers are available on resolved frames. Frames marked
+with [`FrameFlags::HIDDEN_DEFAULT`](crate::profile::FrameFlags::HIDDEN_DEFAULT) identify
+interpreter internals that a profiler may hide by default.

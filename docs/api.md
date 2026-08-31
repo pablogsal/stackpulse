@@ -1,41 +1,37 @@
-A library for recording Linux CPU stack samples into a compact spool file and,
-when you want them, resolving the recorded addresses into displayable frames.
-Built to drop into profilers, capture agents, benchmark harnesses, and
-developer tooling.
-
-The crate covers two phases: capture and replay. Recording always runs;
-symbolization is opt-in. Embedders that already have their own symbol
-pipeline can read raw instruction pointers straight from the spool and never
-touch [`PerfSymbolizer`]. stackpulse does not aggregate stacks, render flame
-graphs, or pick an output format. Those decisions stay with the caller.
+StackPulse is a Rust library for building Linux profilers with `perf_event`.
+[`Recorder`] captures CPU stack samples from running processes and writes
+them to a compact spool file. [`Snapshot`] loads that file back, and
+[`Symbolizer`] resolves the recorded addresses into frames with names and
+source locations, ready for whatever aggregation or output your profiler does
+with them.
 
 # Quick example
 
 ```rust,no_run
 use std::time::{Duration, Instant};
-use stackpulse::{AttachMode, PerfRecorder, PerfRecorderOptions, PerfSpoolReader, PerfSymbolizer};
+use stackpulse::{AttachMode, Pid, Recorder, RecorderOptions, SampleRate, Snapshot};
 # fn run(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-let mut recorder = PerfRecorder::attach(
+let pid = Pid::try_from(pid)?;
+let mut recorder = Recorder::attach(
     pid,
     "profile.spool",
-    AttachMode::StopAttachEnableResume,
-    PerfRecorderOptions { frequency: 99, stack_size: 60 * 1024, ..Default::default() },
+    AttachMode::StopWhileAttaching,
+    RecorderOptions::new(SampleRate::hz(99)?).stack_size(60 * 1024),
 )?;
 
 let deadline = Instant::now() + Duration::from_secs(10);
-while Instant::now() < deadline && recorder.process_is_active(pid as i32) {
-    recorder.wait()?;
-    recorder.consume_available()?;
+while Instant::now() < deadline && recorder.process_is_active(pid) {
+    recorder.poll(Duration::from_millis(100))?;
 }
 recorder.finish()?;
 
-let reader = PerfSpoolReader::open("profile.spool")?;
-let mut symbolizer = PerfSymbolizer::for_spool(&reader);
+let reader = Snapshot::open("profile.spool")?;
+let mut symbolizer = reader.symbolizer().build();
 
-for stack in reader.sample_stacks() {
-    symbolizer.for_each_sample_stack(stack, |frame| {
-        println!("{}", frame.func_name());
-    });
+for stack in reader.stacks() {
+    for frame in symbolizer.resolve(stack)? {
+        println!("{}", frame.display_name());
+    }
 }
 # Ok(())
 # }
@@ -45,25 +41,36 @@ for stack in reader.sample_stacks() {
 
 | Type | Role |
 | --- | --- |
-| [`PerfRecorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
-| [`PerfSpoolReader`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
-| [`PerfSpoolReplayReader`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
-| [`PerfSymbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`NativeSymbolizer`]. |
-| [`NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`PerfSymbolizer`] still handles kernel and perf-map frames. |
+| [`Recorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
+| [`Snapshot`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
+| [`Replay`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
+| [`Symbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`NativeSymbolizer`]. |
+| [`NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`Symbolizer`] still handles kernel and perf-map frames. |
 | [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
 
-Recording and symbolization are deliberately separate. The recorder writes a
-self-contained spool file; symbolization happens later, off the hot path, and
-can run on a different host as long as the binaries and perf maps are
-preserved.
+The recorder writes a self-contained spool file. Symbolization reads it later
+and can run on another host if the same binaries and perf maps are available.
+
+# Vocabulary
+
+- A sample is one timestamped observation of one thread.
+- A module is an executable memory range: a binary, shared object,
+  anonymous JIT mapping, or kernel range.
+- A raw frame is an address recorded in the spool file.
+- A resolved frame is a displayable [`ResolvedFrame`] produced by
+  [`Symbolizer`].
+- A spool file is the compact on-disk profile written by [`Recorder`].
 
 # Raw replay
 
-For integrations with an existing symbolizer, consume raw frames directly:
+Recording never depends on symbolization: the spool stores raw instruction
+pointers together with the module mappings observed at capture time. An
+application that already has its own symbol pipeline can skip
+[`Symbolizer`] and consume those raw frames directly:
 
 ```rust,no_run
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = stackpulse::PerfSpoolReader::open("profile.spool")?;
+let reader = stackpulse::Snapshot::open("profile.spool")?;
 
 for sample in reader.samples() {
     for context in reader.stack_frame_contexts(sample.process_id, sample.stack_id)? {
@@ -77,97 +84,84 @@ for sample in reader.samples() {
 # }
 ```
 
-`stack_frame_contexts` does not symbolize. It only binds borrowed raw frames to
-the module mapping stackpulse recorded at capture time.
+`stack_frame_contexts` does not symbolize anything. It binds each borrowed raw
+frame to the module mapping StackPulse recorded at capture time, which is what
+an external symbolizer needs to translate the address, even across remaps.
 
 # Sequential replay
 
-For large profiles, use [`PerfSpoolReplayReader`] to avoid retaining every
+For large profiles, use [`Replay`] to avoid retaining every
 [`SampleRecord`] in memory:
 
 ```rust,no_run
-use stackpulse::{PerfSpoolReplayReader, PerfSymbolizer};
+use stackpulse::Replay;
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = PerfSpoolReplayReader::open("profile.spool")?;
-let mut symbolizer = PerfSymbolizer::for_replay(&reader);
+let reader = Replay::open("profile.spool")?;
+let mut symbolizer = reader.symbolizer().build();
 
-for stack in reader.sample_stacks() {
-    symbolizer.for_each_replay_sample_stack(stack, |frame| {
-        println!("{}", frame.func_name());
-    });
+for stack in reader.stacks() {
+    for frame in symbolizer.resolve(stack)? {
+        println!("{}", frame.display_name());
+    }
 }
 # Ok(())
 # }
 ```
 
 Opening still validates the complete spool and retains modules, frames,
-interned stacks, threads, and runtime markers. Samples are decoded again as
-the iterator advances. The file must remain unchanged while the reader is
-alive. External symbolizers can use `stack_frame_contexts` to retain the
-recorded module generation across remaps. Use [`PerfSpoolReader`] when random
-access to `samples()` is needed.
+interned stacks, threads, and runtime markers; only the samples themselves are
+decoded on the fly as the iterator advances. The file must remain unchanged
+while the reader is alive. Use [`Snapshot`] instead when you need
+random access to `samples()`.
 
 # Plugging in an external native symbolizer
 
-Callers with their own debuginfod, debug-dir, or source-info pipeline can keep
-using [`PerfSymbolizer`] for kernel and perf-map frames while substituting a
-different backend for native ELF modules. Implement [`NativeSymbolizer`] and
-hand a factory to [`PerfSymbolizerBuilder::native_symbolizer_factory`].
-stackpulse parses each module's ELF, computes its image base, and calls
-`set_modules` whenever the module set for a process group changes; you then
-receive `symbolize_one(addr)` for every native frame:
+The default constructors install the bundled `wholesym` backend for native
+ELF symbol lookup. To replace it, implement [`NativeSymbolizer`] and pass a
+factory to [`SymbolizerBuilder::native`]. StackPulse groups native lookups by
+process and passes them to the backend in batches. Each [`NativeLookup`]
+contains the selected module and the absolute, relative, and image addresses:
 
 ```rust,no_run
-use std::rc::Rc;
-use stackpulse::{
-    NativeSymbolizer, PerfSpoolReader, PerfSymbolizerBuilder, SymModule, SymbolsRc,
-};
+use stackpulse::symbolize::{NativeLookup, NativeSymbolizer, NativeSymbols};
+use stackpulse::Snapshot;
 
 struct MySymbolizer { /* your wholesym / debuginfod / dwarf state */ }
 
 impl NativeSymbolizer for MySymbolizer {
-    fn set_modules(&mut self, modules: Vec<SymModule>) {
-        // modules carries path, avma_range, and ModuleImageBase already
-        // resolved from ELF. No /proc or /maps work needed here.
-    }
-    fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
-        // Convert addr -> SVMA via the SymModule's image_base, then look up.
-        Rc::from([])
+    type Error = std::convert::Infallible;
+
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Self::Error> {
+        for request in requests {
+            let _ = (request.module().path(), request.image_address());
+            output.push(NativeSymbols::unresolved());
+        }
+        Ok(())
     }
 }
 
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = PerfSpoolReader::open("profile.spool")?;
-let factory = |_pid: i32| -> Box<dyn NativeSymbolizer> {
-    Box::new(MySymbolizer { /* ... */ })
-};
-let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
-    .native_symbolizer_factory(factory)
+let reader = Snapshot::open("profile.spool")?;
+let mut symbolizer = reader.symbolizer()
+    .native(|_pid| MySymbolizer { /* ... */ })
     .build();
 # Ok(())
 # }
 ```
 
 Kernel frames (`/proc/kallsyms`) and Python or JIT perf maps
-(`/tmp/perf-PID.map`) stay inside `PerfSymbolizer`; the plug-in only sees
-native module addresses. The default constructors install the bundled
-wholesym backend. Consumers that always supply a native symbolizer can disable
-Stackpulse's default features to omit wholesym and Tokio.
-
-# Vocabulary
-
-- A sample is one timestamped observation of one thread.
-- A module is an executable memory range: a binary, shared object,
-  anonymous JIT mapping, or kernel range.
-- A raw frame is an address recorded in the spool file.
-- A resolved frame is a displayable [`ResolvedFrame`] produced by
-  [`PerfSymbolizer`].
-- A spool file is the compact on-disk profile written by [`PerfRecorder`].
+(`/tmp/perf-<pid>.map`) stay inside [`Symbolizer`]; the plug-in only sees
+native module addresses. Consumers that always supply a native symbolizer can
+disable StackPulse's default features to omit `wholesym` and Tokio.
 
 # Runtime requirements
 
-Linux only. Uses `perf_event_open`, `/proc`, ELF metadata, optional
-`/proc/kallsyms`, and optional Python perf maps under `/tmp`.
+StackPulse runs on Linux and uses `perf_event_open`, `/proc`, ELF metadata,
+optional `/proc/kallsyms`, and optional Python perf maps under `/tmp`.
 
 User-space recording works as the same user that owns the target. Kernel
 frames, containers, hardened systems, and aggressive sample rates may need
@@ -175,10 +169,7 @@ extra capabilities (typically `CAP_PERFMON`) or a relaxed
 `perf_event_paranoid` setting. See the Permissions section in the
 explanation chapter for the full breakdown.
 
-# Guides
+# Guide
 
-- [`docs::tutorials`]: attach to a process, capture startup, and aggregate stacks.
-- [`docs::how_to`]: focused recipes for recording, symbols, and diagnostics.
-- [`docs::reference`]: the complete API and configuration reference.
-- [`docs::explanation`]: how sampling, unwinding, and module tracking work.
-- [`docs::spool_format`]: the SPULSE compatibility and on-disk format contract.
+The [guide](crate::docs) walks through process attachment, startup capture,
+configuration, symbolization, diagnostics, and the SPULSE file format.

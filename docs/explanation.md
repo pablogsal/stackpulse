@@ -1,14 +1,12 @@
 # How it works
 
-This chapter explains the mental model behind stackpulse: how the kernel
-samples threads, what ends up in the spool, why recording and symbolization
-are separate phases, and where overhead and dropped frames come from. Read
-it when something looks off in your profiles and you need to know whether
-to blame the kernel, the symbolizer, or your own configuration.
+StackPulse uses `perf_event` to capture CPU stack samples and resolves symbols
+after recording. This chapter explains the kernel interface, native unwinding,
+module tracking, symbol lookup, and recording overhead.
 
-## Sampling, not tracing
+## Statistical sampling
 
-`stackpulse` is a statistical sampler. It doesn't record every function
+StackPulse is a statistical sampler. It does not record every function
 call. The kernel periodically interrupts threads, snapshots enough state to
 describe where they were, and drops records into perf ring buffers.
 
@@ -17,31 +15,28 @@ was observed in or below that function about 20% of sampled time", not a
 call count. Short functions can be invisible, and brief spikes can be missed
 if no sample lands on them.
 
-## The pipeline
+## Recording flow
 
 ```text
 target threads
   → perf_event_open ring buffers
-  → PerfRecorder::consume_available
+  → Recorder::poll
   → native unwinding + module tracking
   → compact spool file
-  → PerfSpoolReader
-  → PerfSymbolizer
+  → Snapshot
+  → Symbolizer
   → your aggregator / UI / exporter
 ```
 
-The split is deliberate. Recording does only what's needed to preserve the
-profile. Expensive optional work (symbol lookup, aggregation) happens
-after the data is safely written.
+Recording writes addresses and mapping metadata to the spool. Symbol lookup
+and aggregation happen after capture.
 
-## A short tour of perf events
+## Perf events
 
-`perf_event_open` is the Linux syscall that exposes the kernel's
-Performance Monitoring Unit (PMU) and a handful of software event sources
-to user space. You ask the kernel "tell me about this event for this task
-on these CPUs" and get back a file descriptor. The kernel keeps a counter
-behind that fd and, if you asked it to, also emits a stream of records
-into a shared ring buffer whenever the event fires.
+`perf_event_open` exposes the kernel's Performance Monitoring Unit (PMU) and
+software event sources to user space. A call describes the event, target task,
+and CPUs. The returned file descriptor owns a counter and, for sampled events,
+a shared ring buffer of records.
 
 Two event families matter here:
 
@@ -53,21 +48,20 @@ Two event families matter here:
   CPU clock, a monotonic per-task timer. It doesn't need PMU hardware, so
   it works inside containers and VMs where the PMU is hidden.
 
-`stackpulse` tries hardware CPU cycles first and falls back to the software
+StackPulse tries hardware CPU cycles first and falls back to the software
 CPU clock if the kernel refuses or the hardware event isn't available. Both
 are CPU-time sources: they tick when a thread is actually on a CPU, so they
 under-represent time spent blocked on I/O, locks, or sleep. Off-CPU
 attribution is out of scope here; that needs a different sampling
 discipline (sched switches, eBPF, or wallclock samplers).
 
-Sampling vs. counting: when you set `freq` and a sample period, the kernel
-treats the counter as a target rate and writes one record every time the
-counter overflows the period. That's how a frequency-based profiler gets
-roughly N samples per second per CPU without you knowing the exact cycle
-count. The kernel adjusts the period over time to keep the rate near the
-requested frequency.
+Sampling vs. counting: in frequency mode the kernel picks a sample period
+itself and writes one record each time the counter overflows that period,
+adjusting the period over time to keep the record rate near the requested
+frequency. That's how a frequency-based profiler gets roughly N samples per
+second per CPU without knowing the exact cycle count in advance.
 
-For each target, `stackpulse` configures the event to emit:
+For each target, StackPulse configures the event to emit:
 
 - frequency-based sampling at the requested rate;
 - monotonic timestamps, so records from different ring buffers can be
@@ -86,42 +80,39 @@ For each target, `stackpulse` configures the event to emit:
 
 Each event has its own mmap'd ring buffer. The kernel is the producer, we
 are the consumer, and the two sides coordinate through head/tail pointers
-in a header page. Because samples can be generated on any CPU, on many
-CPUs in parallel, records from different buffers don't arrive in global
-timestamp order. `wait` blocks (via `epoll` on the event fds) until at
-least one buffer looks readable; `consume_available` then drains every
-ready buffer, merges records across them by timestamp, updates the
-recorder's view of processes and modules, runs the native unwinder on
-sample records, and writes the resulting compact records to the spool.
+in a header page. Because samples are generated on many CPUs in parallel,
+records from different buffers don't arrive in global timestamp order.
+`poll` waits up to the caller's timeout, drains every ready buffer, merges
+records by timestamp, updates the recorder's process and module state, runs
+the native unwinder, and writes compact records to the spool.
 
 If the consumer can't keep up, the ring buffer fills, the kernel starts
 dropping samples, and emits a `LOST` record so we can count what was lost
-in `PerfSummary.lost_events`. That's the single most important
-back-pressure signal during recording.
+in `RecordingSummary.lost_events`.
 
 ## Attach modes
 
 Two modes cover the practical cases:
 
-`StopAttachEnableResume` is for an existing process. The recorder briefly
+`StopWhileAttaching` is for an existing process. The recorder briefly
 `SIGSTOP`s the target, opens the perf events, registers the executable
 mappings from `/proc/<pid>/maps`, enables the events, and resumes the
 target. The short stop window keeps the initial view of threads and
 mappings consistent with what perf will see going forward.
 
-`AttachWithEnableOnExec` is for a forked-but-not-yet-`execve`d child:
+`OnExec` is for a forked-but-not-yet-`execve`d child:
 create the events first, let the kernel turn them on at `execve`, and
 nothing is missed during startup.
 
 ## Threads vs. child processes
 
-Perf events open against tasks. `stackpulse` tracks the process leader plus
+Perf events open against tasks. StackPulse tracks the process leader plus
 known threads and asks perf to inherit events for new threads. When
 inheritance isn't an option, `refresh_threads` scans `/proc/<pid>/task` and
 opens missing ones.
 
-Child processes are not threads. Use `inherit_child_processes` to follow
-forks after recording starts. The recorder watches for fork events, clones
+Child processes are not threads. Use `RecorderOptions::inherit_children` to
+follow forks after recording starts. The recorder watches for fork events, clones
 the relevant module state from the parent, and opens the child. Pre-existing
 descendants need explicit attachment.
 
@@ -129,18 +120,18 @@ descendants need explicit attachment.
 
 For user frames, perf hands us the interrupted thread's user registers plus
 a bounded byte copy of the user stack. `framehop` unwinds from there. As with
-`perf record --call-graph=dwarf`, the perf event excludes user callchains so
-there is only one authoritative user unwind.
+`perf record --call-graph=dwarf`, the perf event excludes user callchains to
+prevent duplicate user frames.
 
 Stack-copy size is a trade-off. Too small and unwinding stops short, and
-`PerfSummary.error_stats` shows truncation. Too large and every sample
+`RecordingSummary.error_stats` shows truncation. Too large and every sample
 copies more memory than necessary, which raises overhead at the same
-sampling rate. Starting around `60 * 1024` and adjusting based on the
-summary counters works for most workloads.
+sampling rate. The examples use `60 * 1024`; adjust it when the summary
+counters show truncation.
 
 Return-address frames are normalized: each return address is rewound to the
-instruction before the return target so symbol lookup lands on the call
-site, not the next instruction after.
+instruction before the return target, so symbol lookup lands on the call
+site instead of the instruction after it.
 
 ## Kernel frames
 
@@ -175,37 +166,38 @@ possible, so symbolization doesn't need the target process to still exist.
 
 ## Symbolization
 
-`PerfSymbolizer` resolves frames after the fact, from several sources:
+`Symbolizer` resolves frames after the fact, from several sources:
 
 | Source | Used for | Result |
 | --- | --- | --- |
 | Python perf maps (`/tmp/perf-<pid>.map`) | Python frames and JIT-like symbols emitted by runtimes. | `PythonFrame`, or `NativeFrame` with `SymbolOrigin::PerfMap`. |
-| ELF + debug data | Native user-space modules. Routed through a pluggable [`NativeSymbolizer`](crate::NativeSymbolizer); default is wholesym. | `NativeFrame` with `SymbolOrigin::Elf`. |
+| ELF + debug data | Native user-space modules. Routed through a pluggable [`NativeSymbolizer`](crate::symbolize::NativeSymbolizer); default is `wholesym`. | `NativeFrame` with `SymbolOrigin::Elf`. |
 | `/proc/kallsyms` | Kernel frames. | `NativeFrame` with `FrameKind::Kernel`. |
 | Address fallback | No symbols or mapping unknown. | `NativeFrame` with `SymbolOrigin::AddressOnly`. |
 
 Python frames exist only when the runtime emits perf-map entries. For
-modern CPython, `-X perf` or `PYTHONPERFSUPPORT=1`. The recorder writes
+modern CPython that means running with `-X perf` or
+`PYTHONPERFSUPPORT=1`. The recorder writes
 Python-runtime records so readers can restrict perf-map lookup to PIDs that
 actually looked like Python runtimes during recording.
 
-The spool file does not embed perf-map content. Symbolization reads the
-on-disk `/tmp/perf-<pid>.map`. If you'll analyze later, on another host, or
-after the process exits, preserve those map files next to the spool.
+The spool file does not embed perf-map content. Symbolization reads
+`/tmp/perf-<pid>.map` by default. For later or remote analysis, preserve those
+files and select their directory with `SymbolizerBuilder::perf_map_dir`.
 
 Native frames inside the Python runtime get `FrameFlags::PYTHON_RUNTIME` and
 `FrameFlags::HIDDEN_DEFAULT` when the symbolizer can identify them. UIs can
 hide interpreter machinery by default while still letting users dig in.
 
 Native symbolization is delegated to a `NativeSymbolizer` implementor, one
-per non-overlapping module group. The default is the bundled wholesym
+per non-overlapping module group. The default is the bundled `wholesym`
 backend, configured from `STACKPULSE_DEBUG_DIRS`, `DEBUGINFOD_URLS`, and
-related environment variables. Embedders with their own debuginfod,
-debug-dir, or source-info pipeline can swap that backend through
-`PerfSymbolizerBuilder::native_symbolizer_factory`, and `PerfSymbolizer`
-keeps owning kernel-frame and perf-map resolution. Each `SymModule` handed to
-the plug-in already carries a resolved `ModuleImageBase`, so the plug-in only
-needs to parse ELF for symbol lookup, not for layout.
+related environment variables. Applications with their own debuginfod,
+debug-directory, or source-info setup can replace that backend through
+`SymbolizerBuilder::native`; `Symbolizer` still handles kernel and perf-map
+resolution. Each `NativeLookup` contains the module selected by StackPulse and
+the absolute, relative, and image addresses needed by a backend. Requests are
+batched per process.
 
 ## Why spool files are small
 
@@ -219,7 +211,7 @@ many times. The format exploits that:
 - samples point to a thread ID and a stack ID;
 - timestamps are stored as deltas.
 
-Writes stay small and repeated stacks are cheap. `PerfSpoolReader` expands
+Writes stay small and repeated stacks are cheap. `Snapshot` expands
 stack IDs back into frame records when an analysis needs them.
 
 ## Accuracy and bias
@@ -237,10 +229,8 @@ Sampling has predictable limits:
 - PID reuse makes stale `/tmp/perf-<pid>.map` files dangerous unless lookup
   is restricted to PIDs whose latest runtime record marks them as Python.
 
-The `PerfSummary` counters exist to make those limits visible. A profile is
-only as trustworthy as those numbers say it is: check sample count, lost
-events, empty stacks, truncation markers, and error stats before drawing
-conclusions from a recording.
+Check `RecordingSummary` before interpreting a profile. It reports the sample count,
+lost events, empty stacks, truncation markers, and unwind errors.
 
 ## Overhead
 
@@ -249,14 +239,14 @@ Recording costs:
 - kernel interrupt + sample collection at the requested frequency;
 - copied user stack bytes per sample;
 - ring buffer traffic;
-- native unwinding in `consume_available`;
+- native unwinding in `poll`;
 - spool writes;
 - extra events for many threads, CPUs, or inherited children.
 
 Symbolization is intentionally off the hot path. ELF data, debug info,
 kernel symbols, and perf maps are read lazily after recording.
 
-To trim overhead: lower `frequency`, lower `stack_size`, skip kernel frames
+To trim overhead: lower the sample rate or stack size, skip kernel frames
 unless you need them, limit child-process inheritance, and drain often
 enough from a dedicated worker that you don't lose events.
 
@@ -272,6 +262,6 @@ gates:
 - `/proc/<pid>` visibility inside containers and PID namespaces;
 - read access to `/proc/kallsyms` for kernel symbol names.
 
-Plan for graceful degradation. User-space capture without kernel frames is
-usually still useful, and address-only frames remain useful as long as you
-can symbolize them later against the same binaries.
+If kernel capture is denied, attach retries with user-space frames only and
+sets `kernel_enabled` to `false`. Address-only frames can still be symbolized
+later against the same binaries.
