@@ -3,6 +3,7 @@ mod attach;
 mod bench;
 mod convert_regs;
 mod cpu;
+mod module_tracking;
 pub(crate) mod perf_event;
 mod perf_group;
 /// Spawn and attach helpers for the target process.
@@ -30,15 +31,23 @@ use std::path::Path;
 use crate::state::{process_is_alive, try_new_exit_watcher, ProcessExitWatcher};
 use crate::{SampleErrorKind, SampleErrorStats};
 use framehop::{Error as FramehopError, FrameAddress, Unwinder};
-use perf_event_open::sample::record::mmap::{Info as MmapInfo, Mmap};
+use perf_event_open::sample::record::mmap::Mmap;
 use perf_event_open::sample::record::sample::Abi as SampleRegsAbi;
 use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
+#[cfg(test)]
+use crate::spool::ModuleRecord;
+use crate::spool::{FrameMode, FrameRecord, ModuleTable, PerfSpoolWriter};
 use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
+#[cfg(any(test, feature = "bench-support"))]
+use module_tracking::record_module;
+use module_tracking::{
+    executable_modules_from_maps, mmap_is_executable, record_mmap, register_existing_maps,
+    register_existing_modules,
+};
 use perf_event::{
     CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource,
     SampleRecordRef,
@@ -683,36 +692,20 @@ impl PerfRecorder {
                     if !discovered.insert(child) || processes.is_tracked(child) {
                         continue;
                     }
-                    let Ok(child_u32) = u32::try_from(child) else {
-                        continue;
-                    };
-                    let python_perf_support = process_has_python_perf_support(child_u32, processes);
-                    match register_existing_maps(child_u32, modules, processes, writer) {
-                        Ok(true) if python_perf_support => {
-                            if let Err(err) = mark_python_runtime_process(
-                                processes,
-                                writer,
-                                recovery_timestamp_ns,
-                                child,
-                            ) {
-                                result = Err(err);
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) if process_gone_error(&err) => continue,
+                    match register_recovered_descendant(
+                        child,
+                        parent,
+                        recovery_timestamp_ns,
+                        modules,
+                        processes,
+                        writer,
+                    ) {
+                        Ok(Some(process_fork)) => recovered_process_forks.push(process_fork),
+                        Ok(None) => {}
                         Err(err) => {
                             result = Err(err);
                             break;
                         }
-                    }
-                    processes.ensure_tracked(child);
-                    processes.capture_available_generation(child);
-                    if let Ok(parent_u32) = u32::try_from(parent) {
-                        recovered_process_forks.push(RecoveredProcessFork {
-                            pid: child_u32,
-                            parent_pid: parent_u32,
-                        });
                     }
                 }
                 if result.is_err() {
@@ -751,29 +744,30 @@ impl PerfRecorder {
 
     /// Add another process to this recording.
     pub fn open_process(&mut self, pid: u32, attach_mode: AttachMode) -> io::Result<()> {
-        if let Some(pid_i32) = i32_from_u32(pid).filter(|pid| self.processes.is_tracked(*pid)) {
+        if let Some(pid_i32) = i32_from_u32(pid) {
             let current_start_time = self
                 .processes
                 .states
                 .get(&pid_i32)
                 .and_then(|state| state.start_time)
                 .and_then(|_| read_process_start_time(pid).ok());
-            let stale = self
+            if let Some(stale) = self
                 .processes
                 .tracked_process_is_stale(pid_i32, current_start_time)
-                .expect("filtered to a tracked process");
-            // Reopen only after proving that the old process is gone or
-            // that this numeric PID now identifies a new generation.
-            if !stale {
-                return Ok(());
+            {
+                // Reopen only after proving that the old process is gone or
+                // that this numeric PID now identifies a new generation.
+                if !stale {
+                    return Ok(());
+                }
+                self.perf.remove_process(pid)?;
+                cleanup_process(
+                    pid_i32,
+                    &mut self.modules,
+                    &mut self.processes,
+                    &mut self.writer,
+                )?;
             }
-            self.perf.remove_process(pid)?;
-            cleanup_process(
-                pid_i32,
-                &mut self.modules,
-                &mut self.processes,
-                &mut self.writer,
-            )?;
         }
         let opened = self.perf.open_process(pid, attach_mode)?;
         if let Some(pid_i32) = i32_from_u32(pid) {
@@ -1084,7 +1078,7 @@ fn reconcile_process_image<W: std::io::Write>(
         }
         Err(err) => return Err(err),
     };
-    let snapshot = executable_modules_from_maps(pid, &maps);
+    let snapshot: Vec<_> = executable_modules_from_maps(pid, &maps).collect();
     if snapshot.is_empty() {
         // A live group whose leader has exited can expose an empty maps file.
         // Without a usable replacement snapshot, preserve the last known
@@ -1137,6 +1131,37 @@ fn reconcile_process_image<W: std::io::Write>(
         }
         Err(err) => Err(err),
     }
+}
+
+fn register_recovered_descendant<W: std::io::Write>(
+    child: i32,
+    parent: i32,
+    timestamp_ns: u64,
+    modules: &mut ModuleTable,
+    processes: &mut ProcessTable,
+    writer: &mut PerfSpoolWriter<W>,
+) -> io::Result<Option<RecoveredProcessFork>> {
+    let Ok(child_pid) = u32::try_from(child) else {
+        return Ok(None);
+    };
+    let python_perf_support = process_has_python_perf_support(child_pid, processes);
+    match register_existing_maps(child_pid, modules, processes, writer) {
+        Ok(true) if python_perf_support => {
+            mark_python_runtime_process(processes, writer, timestamp_ns, child)?;
+        }
+        Ok(_) => {}
+        Err(err) if process_gone_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
+    processes.ensure_tracked(child);
+    processes.capture_available_generation(child);
+    Ok(u32::try_from(parent)
+        .ok()
+        .map(|parent_pid| RecoveredProcessFork {
+            pid: child_pid,
+            parent_pid,
+        }))
 }
 
 fn process_gone_error(err: &io::Error) -> bool {
@@ -1591,127 +1616,6 @@ fn is_kernel_mode(privilege: Priv) -> bool {
     matches!(privilege, Priv::Kernel | Priv::GuestKernel)
 }
 
-fn record_module<W: std::io::Write>(
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-    module: ModuleRecord,
-) -> io::Result<()> {
-    if module.path.is_empty() {
-        return Ok(());
-    }
-    let update = modules.apply_module(module, writer)?;
-    if update.active.is_empty() {
-        return Ok(());
-    }
-    for activation in &update.active {
-        let module = &activation.module;
-        if !module.is_kernel {
-            processes
-                .state_mut(module.process_id)
-                .unwinder
-                .get_or_insert_default()
-                .apply_module_update(&update);
-            break;
-        }
-    }
-    Ok(())
-}
-
-struct MmapEvent<'a> {
-    pid: i32,
-    privilege: Priv,
-    is_executable: bool,
-    address: u64,
-    length: u64,
-    page_offset: u64,
-    path: &'a std::ffi::CString,
-    inode: u64,
-    device_major: u32,
-    device_minor: u32,
-    inode_generation: u64,
-}
-
-fn record_mmap_event<W: std::io::Write>(
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-    event: MmapEvent<'_>,
-) -> io::Result<()> {
-    let is_kernel = is_kernel_mode(event.privilege);
-    if !is_kernel && !event.is_executable {
-        return Ok(());
-    }
-    record_module(
-        modules,
-        processes,
-        writer,
-        ModuleRecord {
-            id: 0,
-            process_id: event.pid,
-            start: event.address,
-            end: event.address.saturating_add(event.length),
-            file_offset: event.page_offset,
-            path: c_string_to_string(event.path).into(),
-            is_kernel,
-            inode: event.inode,
-            device_major: event.device_major,
-            device_minor: event.device_minor,
-            inode_generation: event.inode_generation,
-        },
-    )
-}
-
-fn record_mmap<W: std::io::Write>(
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-    mmap: &Mmap,
-    privilege: Priv,
-) -> io::Result<()> {
-    let (inode, device_major, device_minor, inode_generation) = match &mmap.ext {
-        Some(ext) => match &ext.info {
-            MmapInfo::Device {
-                major,
-                minor,
-                inode,
-                inode_gen,
-            } => (*inode, *major, *minor, *inode_gen),
-            MmapInfo::BuildId(_) => (0, 0, 0, 0),
-        },
-        None => (0, 0, 0, 0),
-    };
-    let Some(pid) = i32_from_u32(mmap.task.pid) else {
-        return Ok(());
-    };
-    record_mmap_event(
-        modules,
-        processes,
-        writer,
-        MmapEvent {
-            pid,
-            privilege,
-            is_executable: mmap_is_executable(mmap),
-            address: mmap.addr,
-            length: mmap.len,
-            page_offset: mmap.page_offset,
-            path: &mmap.file,
-            inode,
-            device_major,
-            device_minor,
-            inode_generation,
-        },
-    )
-}
-
-fn mmap_is_executable(mmap: &Mmap) -> bool {
-    const PROT_EXEC: u32 = 0b100;
-    match &mmap.ext {
-        Some(ext) => ext.prot & PROT_EXEC != 0,
-        None => mmap.executable,
-    }
-}
-
 fn open_perf_group(
     pid: u32,
     attach_mode: AttachMode,
@@ -1730,64 +1634,6 @@ fn open_perf_group(
             inherit_child_processes: options.inherit_child_processes,
         },
     )
-}
-
-fn register_existing_maps<W: std::io::Write>(
-    pid: u32,
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-) -> io::Result<bool> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
-    register_existing_maps_snapshot(pid, &maps, modules, processes, writer)
-}
-
-fn register_existing_maps_snapshot<W: std::io::Write>(
-    pid: u32,
-    maps: &str,
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-) -> io::Result<bool> {
-    register_existing_modules(
-        executable_modules_from_maps(pid, maps),
-        modules,
-        processes,
-        writer,
-    )
-}
-
-fn executable_modules_from_maps(pid: u32, maps: &str) -> Vec<ModuleRecord> {
-    crate::proc_maps::parse_iter(maps)
-        .filter(|region| region.is_executable && !region.path.is_empty())
-        .map(|region| ModuleRecord {
-            id: 0,
-            process_id: pid as i32,
-            start: region.address.start,
-            end: region.address.end,
-            file_offset: region.file_offset,
-            path: region.path.into(),
-            is_kernel: false,
-            inode: region.inode,
-            device_major: region.device_major,
-            device_minor: region.device_minor,
-            inode_generation: 0,
-        })
-        .collect()
-}
-
-fn register_existing_modules<W: std::io::Write>(
-    snapshot: Vec<ModuleRecord>,
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-) -> io::Result<bool> {
-    let mut saw_python_runtime = false;
-    for module in snapshot {
-        saw_python_runtime |= crate::is_python_runtime_module_path(&module.path);
-        record_module(modules, processes, writer, module)?;
-    }
-    Ok(saw_python_runtime)
 }
 
 #[cfg(test)]
@@ -2256,11 +2102,14 @@ mod tests {
 
     #[test]
     fn empty_maps_snapshot_cannot_replace_live_process_modules() {
-        assert!(executable_modules_from_maps(42, "").is_empty());
-        assert!(executable_modules_from_maps(42, "1000-2000 r-xp 00000000 00:00 0\n").is_empty());
+        assert_eq!(executable_modules_from_maps(42, "").count(), 0);
+        assert_eq!(
+            executable_modules_from_maps(42, "1000-2000 r-xp 00000000 00:00 0\n").count(),
+            0
+        );
         assert_eq!(
             executable_modules_from_maps(42, "1000-2000 r-xp 00000000 08:01 42 /tmp/lib.so\n")
-                .len(),
+                .count(),
             1
         );
     }
@@ -2270,7 +2119,7 @@ mod tests {
         let pid = std::process::id();
         let pid_i32 = i32::try_from(pid).unwrap();
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
-        let snapshot = executable_modules_from_maps(pid, &maps);
+        let snapshot: Vec<_> = executable_modules_from_maps(pid, &maps).collect();
         let probe_address = snapshot.first().expect("executable mapping").start;
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();

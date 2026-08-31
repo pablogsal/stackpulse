@@ -41,15 +41,11 @@ pub(super) fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
         }
     }
     symbols.sort_by_key(|s| s.address);
-    let mut deduplicated = Vec::with_capacity(symbols.len());
+    let mut deduplicated: Vec<KernelSymbol> = Vec::with_capacity(symbols.len());
     for symbol in symbols {
-        if deduplicated
-            .last()
-            .is_some_and(|previous: &KernelSymbol| previous.address == symbol.address)
-        {
-            *deduplicated.last_mut().unwrap() = symbol;
-        } else {
-            deduplicated.push(symbol);
+        match deduplicated.last_mut() {
+            Some(previous) if previous.address == symbol.address => *previous = symbol,
+            _ => deduplicated.push(symbol),
         }
     }
     deduplicated

@@ -8,15 +8,12 @@
 //! addresses. The rest of the crate consumes resolved frames without needing to
 //! know which backend produced each symbol.
 
-use std::fs;
 use std::ops::Range;
-use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
 
 use crate::profile::{
-    FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
-    SourceLocation, SymbolOrigin,
+    FrameFlags, FrameKind, NativeFrame, NativeSymbol, ResolvedFrame, SourceLocation, SymbolOrigin,
 };
 #[cfg(feature = "builtin-wholesym")]
 use crate::symbols::default_native_symbolizer_factory;
@@ -31,11 +28,16 @@ use crate::spool::{
 };
 
 mod kernel;
+mod perf_map;
 #[cfg(any(test, feature = "bench-support"))]
 pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
 #[cfg(test)]
 use kernel::KernelSymbol;
 use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
+use perf_map::{
+    find_perf_map_symbol, load_perf_map, module_display_name, perf_map_module_allowed,
+    perf_map_symbol_to_frame, PerfMapProcesses, PerfMapSymbol,
+};
 
 /// Resolves raw profile frames into displayable frames.
 pub struct PerfSymbolizer {
@@ -174,21 +176,6 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             }
         }
     }
-}
-
-/// Which processes may use Python perf-map lookups.
-pub(crate) enum PerfMapProcesses {
-    /// Allow perf-map lookup for every process.
-    All,
-    /// Allow perf-map lookup only for the listed process ids.
-    Pids(FxHashSet<i32>),
-}
-
-#[derive(Clone)]
-struct PerfMapSymbol {
-    start: u64,
-    end: u64,
-    name: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -501,7 +488,7 @@ impl PerfSymbolizer {
                 None
             };
 
-        if let Some(symbol) = perf_map_symbol.as_ref() {
+        if let Some(symbol) = perf_map_symbol {
             let blocked_module = self
                 .module_for_frame(process_id, frame, spool_frame_id)
                 .and_then(|module| {
@@ -702,6 +689,10 @@ impl PerfSymbolizer {
             .map(|group| &mut group.symbolizer)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "native_factory is checked before module loading and cannot change during this call"
+    )]
     fn create_native_symbolizer_for_module(&mut self, module: &ModuleRecord) -> Option<()> {
         self.native_factory.as_ref()?;
         let Some(loaded) = self.elf_sections.load_mapping(module) else {
@@ -779,23 +770,24 @@ impl PerfSymbolizer {
             }
         }
 
-        let modules: Vec<_> = grouped_modules
+        let symbol_modules: Vec<_> = grouped_modules
             .iter()
             .map(|(_, module)| module.info.clone())
             .collect();
-        let mut symbolizer =
-            self.native_factory.as_mut().expect("factory checked above")(module.process_id);
-        symbolizer.set_modules(modules.clone());
+        let factory = self
+            .native_factory
+            .as_mut()
+            .expect("native symbolizer factory was checked before loading modules");
+        let mut symbolizer = factory(module.process_id);
+        symbolizer.set_modules(symbol_modules);
         let idx = self.native_symbolizers.len();
+        let (module_ids, modules): (Vec<_>, Vec<_>) = grouped_modules.into_iter().unzip();
         self.native_symbolizers.push(NativeSymbolizerGroup {
             process_id: module.process_id,
-            modules: grouped_modules
-                .iter()
-                .map(|(_, module)| module.clone())
-                .collect(),
+            modules,
             symbolizer,
         });
-        for (module_id, _) in grouped_modules {
+        for module_id in module_ids {
             self.native_symbolizer_by_module.insert(module_id, idx);
         }
         Some(())
@@ -823,10 +815,6 @@ impl PerfSymbolizer {
             .and_then(|symbols| find_perf_map_symbol(symbols, abs_ip))
             .cloned()
     }
-}
-
-fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
-    is_perf_map_mapping(&module.path)
 }
 
 impl NativeSymbolizerGroup {
@@ -857,129 +845,9 @@ fn ranges_overlap(left: &std::ops::Range<u64>, right: &std::ops::Range<u64>) -> 
     left.start < right.end && right.start < left.end
 }
 
-fn find_perf_map_symbol(symbols: &[PerfMapSymbol], address: u64) -> Option<&PerfMapSymbol> {
-    symbols[..symbols.partition_point(|s| s.start <= address)]
-        .iter()
-        .rfind(|s| address < s.end)
-}
-
-fn perf_map_symbol_to_frame(process_id: i32, abs_ip: u64, symbol: &PerfMapSymbol) -> ResolvedFrame {
-    if let Some((func, file)) = parse_python_perf_map_symbol(&symbol.name) {
-        return ResolvedFrame::Python(PythonFrame::new(
-            file,
-            LocationInfo::default(),
-            func,
-            None,
-            false,
-        ));
-    }
-    let native_symbol = NativeSymbol::new(
-        symbol.name.clone(),
-        SourceLocation::default(),
-        format!("/tmp/perf-{process_id}.map"),
-        abs_ip.saturating_sub(symbol.start),
-        false,
-        false,
-    );
-    ResolvedFrame::Native(NativeFrame {
-        pc: abs_ip,
-        sp: 0,
-        symbol: Some(native_symbol),
-        is_python_runtime: false,
-        kind: FrameKind::Native,
-        origin: SymbolOrigin::PerfMap,
-        flags: FrameFlags::JIT,
-    })
-}
-
-fn parse_python_perf_map_symbol(name: &str) -> Option<(&str, &str)> {
-    let body = name.strip_prefix("py::")?.trim();
-    if body.is_empty() {
-        return None;
-    }
-
-    let colon_index = body.find(':');
-    let space_index = body.find(' ');
-    let (func, file) = match (colon_index, space_index) {
-        (Some(colon), Some(space)) if colon < space => (&body[..colon], &body[colon + 1..]),
-        (Some(colon), None) => (&body[..colon], &body[colon + 1..]),
-        (_, Some(space)) => (&body[..space], &body[space + 1..]),
-        (None, None) => (body, "~"),
-    };
-
-    let func = func.trim();
-    if func.is_empty() {
-        return None;
-    }
-
-    let file = strip_python_perf_map_line_suffix(file.trim());
-    Some((func, if file.is_empty() { "~" } else { file }))
-}
-
-fn strip_python_perf_map_line_suffix(file: &str) -> &str {
-    if let Some((path, line)) = file.rsplit_once(':') {
-        if !path.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
-            return path;
-        }
-    }
-    file
-}
-
-fn is_perf_map_mapping(path: &str) -> bool {
-    path == "//anon"
-        || path == "[anon]"
-        || path.starts_with("[anon:")
-        || path == "[heap]"
-        || path.starts_with("[stack")
-        || path.starts_with("/dev/zero")
-        || path.starts_with("/anon_hugepage")
-        || path.starts_with("/SYSV")
-}
-
-fn module_display_name(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-}
-
-fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
-    let mut symbols: Vec<PerfMapSymbol> = fs::read_to_string(format!("/tmp/perf-{process_id}.map"))
-        .ok()?
-        .lines()
-        .filter_map(parse_perf_map_line)
-        .collect();
-    symbols.sort_by_key(|s| s.start);
-    Some(symbols)
-}
-
-fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
-    let (start, rest) = take_ascii_field(line)?;
-    let (len, name) = take_ascii_field(rest)?;
-    if name.is_empty() {
-        return None;
-    }
-    let start = u64::from_str_radix(start.trim_start_matches("0x"), 16).ok()?;
-    let len = u64::from_str_radix(len.trim_start_matches("0x"), 16).ok()?;
-    if len == 0 {
-        return None;
-    }
-    let end = start.checked_add(len)?;
-    Some(PerfMapSymbol {
-        start,
-        end,
-        name: name.to_string(),
-    })
-}
-
-fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
-    let input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let end = input.find(|c: char| c.is_ascii_whitespace())?;
-    Some((&input[..end], &input[end + 1..]))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::rc::Rc;
 
@@ -1375,44 +1243,6 @@ mod tests {
         match blocked {
             ResolvedFrame::Native(frame) => assert!(frame.symbol.is_none()),
             ResolvedFrame::Python(_) => panic!("unexpected blocked Python perf-map frame"),
-        }
-    }
-
-    #[test]
-    fn overflowing_perf_map_range_does_not_match() {
-        assert!(parse_perf_map_line("1000 ffffffffffffffff overflow_symbol").is_none());
-    }
-
-    #[test]
-    fn perf_map_fields_accept_ascii_whitespace() {
-        for (line, expected_name) in [
-            ("1000 10 controlled name", "controlled name"),
-            ("1000  10 controlled name", "controlled name"),
-            ("1000\t10\tcontrolled name", "controlled name"),
-            (" \t1000 \t 10 controlled name", "controlled name"),
-            ("1000 10  controlled name", " controlled name"),
-            ("1000 10\t\tcontrolled name", "\tcontrolled name"),
-        ] {
-            let symbol = parse_perf_map_line(line).expect("valid perf-map entry");
-            assert_eq!(symbol.start, 0x1000);
-            assert_eq!(symbol.end, 0x1010);
-            assert_eq!(symbol.name, expected_name);
-        }
-    }
-
-    #[test]
-    fn malformed_perf_map_fields_are_rejected() {
-        for line in [
-            "",
-            "1000",
-            "1000 10",
-            "1000 10 ",
-            "1000 0 symbol",
-            "not-hex 10 symbol",
-            "1000 not-hex symbol",
-            "1000\u{a0}10 symbol",
-        ] {
-            assert!(parse_perf_map_line(line).is_none(), "accepted {line:?}");
         }
     }
 
