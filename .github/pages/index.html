@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Documentation for StackPulse, the Linux perf_event stack-sampling library.">
+    <meta name="theme-color" content="#15110f">
+    <title>StackPulse documentation</title>
+    <link rel="icon" href="stackpulse-logo.jpg" type="image/jpeg">
+    <link rel="stylesheet" href="stackpulse-pages.css">
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Rust library for Linux perf_event</p>
+          <h1>Record raw stacks.<br><span>Resolve them later.</span></h1>
+          <p class="intro">
+            Sample native, Python, and kernel stacks with <code>perf_event</code>.
+            Store them compactly, replay them with bounded memory, and resolve
+            symbols when the recording is complete.
+          </p>
+          <nav aria-label="Project links">
+            <a class="button primary" href="stackpulse/index.html">Open API docs</a>
+            <a class="button" href="https://github.com/pablogsal/stackpulse">GitHub</a>
+          </nav>
+        </div>
+        <div class="signal-panel" aria-label="StackPulse processing stages">
+          <img class="project-logo" src="stackpulse-logo.jpg" alt="StackPulse crab serving a stack of pancakes" width="1254" height="1254">
+          <dl>
+            <div><dt>record</dt><dd>perf rings</dd></div>
+            <div><dt>spool</dt><dd>SPULSE3</dd></div>
+            <div><dt>resolve</dt><dd>native + Python</dd></div>
+          </dl>
+        </div>
+      </header>
+
+      <section class="proof" aria-label="Supported environments">
+        <span>Linux 6.0+</span>
+        <span>x86-64</span>
+        <span>AArch64</span>
+        <span>SPULSE1–3</span>
+        <span>Rust 1.88+</span>
+      </section>
+
+      <section class="docs" aria-labelledby="documentation">
+        <div class="section-heading">
+          <p class="eyebrow">Documentation</p>
+          <h2 id="documentation">Follow a sample from perf ring to resolved frame.</h2>
+          <p>API docs, recording recipes, internals, and the SPULSE format.</p>
+        </div>
+
+        <div class="cards">
+          <article class="card card-featured">
+            <p class="card-index">01 / API</p>
+            <div>
+              <h3>Record and resolve a profile</h3>
+              <p>Types, builders, and examples for recording a process and resolving its frames.</p>
+            </div>
+            <a class="text-link" href="stackpulse/index.html">API reference <span aria-hidden="true">→</span></a>
+          </article>
+
+          <article class="card">
+            <p class="card-index">02 / Guides</p>
+            <div>
+              <h3>Configure recording and diagnose loss</h3>
+              <p>Capture startup, follow children, select symbols, diagnose loss, and aggregate stacks.</p>
+            </div>
+            <a class="text-link" href="stackpulse/docs/index.html">Guides <span aria-hidden="true">→</span></a>
+          </article>
+
+          <article class="card">
+            <p class="card-index">03 / Format</p>
+            <div>
+              <h3>Understand the spool contract</h3>
+              <p>Version compatibility, record ordering, truncation recovery, and bounded replay.</p>
+            </div>
+            <a class="text-link" href="stackpulse/docs/spool_format/index.html">SPULSE format <span aria-hidden="true">→</span></a>
+          </article>
+
+          <article class="card">
+            <p class="card-index">04 / Operations</p>
+            <div>
+              <h3>Check requirements and releases</h3>
+              <p>Kernel requirements, permissions, feature flags, diagnostics, and release history.</p>
+            </div>
+            <div class="link-row">
+              <a class="text-link" href="stackpulse/docs/explanation/index.html">How it works <span aria-hidden="true">→</span></a>
+              <a class="text-link muted" href="https://github.com/pablogsal/stackpulse/releases/latest">Latest release</a>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <footer>
+        <span>MIT</span>
+        <a href="https://crates.io/crates/stackpulse">crates.io</a>
+        <a href="https://docs.rs/stackpulse">docs.rs</a>
+        <a href="https://github.com/pablogsal/stackpulse/blob/main/README.md">README</a>
+      </footer>
+    </main>
+  </body>
+</html>

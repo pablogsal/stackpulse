@@ -1,22 +1,35 @@
-# stackpulse
+<div align="center">
+  <img src="https://raw.githubusercontent.com/pablogsal/stackpulse/main/.github/pages/stackpulse-logo.jpg" alt="StackPulse crab serving a stack of pancakes" width="325"><br>
+  Linux <code>perf_event</code> stack sampling, native unwinding, symbolization,
+  and compact profile spooling.<br>
+  <a href="https://pablogsal.com/stackpulse/"><strong>Documentation</strong></a><br><br>
+  <a href="https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml"><img src="https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml/badge.svg?branch=main" alt="Checks"></a>
+  <a href="https://app.codecov.io/github/pablogsal/stackpulse"><img src="https://codecov.io/gh/pablogsal/stackpulse/graph/badge.svg?branch=main" alt="Coverage"></a>
+  <a href="https://app.codspeed.io/pablogsal/stackpulse"><img src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json" alt="CodSpeed"></a>
+  <a href="https://crates.io/crates/stackpulse"><img src="https://img.shields.io/crates/v/stackpulse.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/stackpulse"><img src="https://docs.rs/stackpulse/badge.svg" alt="docs.rs"></a>
+</div>
 
-[![CI](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/pablogsal/stackpulse/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/pablogsal/stackpulse/branch/main/graph/badge.svg)](https://codecov.io/gh/pablogsal/stackpulse)
-
-`stackpulse` records what a Linux process is doing over time by taking regular
-stack samples and saving them to a compact file. You can read that file later
-and turn the raw frames into function names, source locations where available,
-and a shape that is easier to display in a profiler UI.
+`stackpulse` samples a Linux process over time and writes the raw stacks to a
+compact file. Read that file later to resolve native, Python, JIT, and kernel
+frames into names and source locations suitable for a profiler UI.
 
 The library requires Linux 6.0 or newer. It is not a command-line tool.
 
-## The Idea
+## Install
+
+```toml
+[dependencies]
+stackpulse = "0.8"
+```
+
+## How recording works
 
 Attach to a process, sample it while it runs, then read the saved profile back.
 The profile can include regular application code, Python frames, child
 processes, and kernel frames when the machine allows them.
 
-In practice the flow is:
+The flow has five steps:
 
 1. Start or attach to a process.
 2. Record samples into a spool file.
@@ -28,7 +41,7 @@ In practice the flow is:
 
 Record briefly, then read back one stack:
 
-```rust
+```rust,no_run
 use std::time::{Duration, Instant};
 
 use stackpulse::{
@@ -69,11 +82,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For the API reference, build the Rust docs with `make doc`.
+Read the [hosted documentation](https://pablogsal.com/stackpulse/) or build it
+locally with `make doc`.
+
+## Support
+
+| Capability | Support |
+| --- | --- |
+| Operating system | Linux 6.0 or newer |
+| Architectures | x86-64 and AArch64 |
+| Native stacks | DWARF and frame-pointer unwinding through Framehop |
+| Native symbols | Bundled Wholesym backend or a caller-supplied symbolizer |
+| Dynamic runtimes | Python perf maps and Python runtime frames |
+| Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
+| Profile files | Writes SPULSE3; reads SPULSE1, SPULSE2, and SPULSE3 |
+| Rust version | 1.88 or newer |
 
 ## Development
-
-The Makefile is intentionally plain. No banners, no wrapper scripts.
 
 ```sh
 make check          # cargo check
@@ -83,7 +108,7 @@ make fmt-check      # verify formatting
 make clippy         # lint with warnings as errors
 make coverage       # terminal coverage summary
 make coverage-html  # HTML coverage report
-make ci             # fmt-check, clippy, test
+make ci             # run the local quality gate
 ```
 
 If the coverage helper is missing, `make coverage` prints the install command.
@@ -95,20 +120,24 @@ make test CARGO_FLAGS="--features debuginfod"
 make coverage CARGO_FLAGS="--features debuginfod"
 ```
 
-## Feature flags
+## Cargo features
 
-`builtin-wholesym` is enabled by default and provides native symbolization.
-Consumers that set `PerfSymbolizerBuilder::native_symbolizer_factory` can
-disable default features to omit Wholesym and Tokio. `debuginfod` enables
-debuginfod lookup in the default native symbolizer when
-`DEBUGINFOD_URLS` is set. `STACKPULSE_DEBUG_DIRS` overrides local debug-file
-search roots, and `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod
-cache directory.
+| Feature | Default | Provides |
+| --- | --- | --- |
+| `builtin-wholesym` | Yes | Native symbolization through Wholesym and Tokio |
+| `debuginfod` | No | Remote debug-file lookup when `DEBUGINFOD_URLS` is set |
+| `bench-support` | No | Hidden synthetic fixtures used by the benchmark suite |
 
-## Notes
+Consumers that supply `PerfSymbolizerBuilder::native_symbolizer_factory` can
+disable default features to omit Wholesym and Tokio. `STACKPULSE_DEBUG_DIRS`
+overrides local debug-file search roots, and
+`STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod cache directory.
 
-Most application recordings work without special setup. Kernel frames, very high
-sample rates, or stricter system settings may need extra permissions.
+## Permissions
+
+User-space sampling often works with the default perf permissions. Kernel frames,
+high sample rates, and restrictive `perf_event_paranoid` settings may require
+`CAP_PERFMON` or a sysctl change.
 
 ## License
 

@@ -1,12 +1,4 @@
 #![doc = include_str!("../docs/api.md")]
-#![doc = "\n\n"]
-#![doc = include_str!("../docs/tutorials.md")]
-#![doc = "\n\n"]
-#![doc = include_str!("../docs/how-to.md")]
-#![doc = "\n\n"]
-#![doc = include_str!("../docs/reference.md")]
-#![doc = "\n\n"]
-#![doc = include_str!("../docs/explanation.md")]
 #![cfg(target_os = "linux")]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
@@ -19,6 +11,8 @@ pub mod bench_support;
 /// Used when the caller asks the recorder to capture not just the supplied
 /// PID but the descendants it spawns after attach.
 pub mod children;
+/// Guides for recording, replay, symbolization, and the spool format.
+pub mod docs;
 mod elf;
 mod error;
 mod linux;
@@ -94,6 +88,11 @@ pub fn path_to_name(path: &std::path::Path) -> String {
 pub fn is_python_module(name: &str) -> bool {
     is_python_executable_name(name) || lib_name_matches_libpython(name)
 }
+
+/// Compiles the README examples as doctests without rendering it twice.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
 
 /// Check if a module path is the Python runtime itself (the `python` binary or
 /// `libpythonX.Y.so`), as opposed to extension modules and third-party libs.

@@ -174,3 +174,11 @@ frames, containers, hardened systems, and aggressive sample rates may need
 extra capabilities (typically `CAP_PERFMON`) or a relaxed
 `perf_event_paranoid` setting. See the Permissions section in the
 explanation chapter for the full breakdown.
+
+# Guides
+
+- [`docs::tutorials`]: attach to a process, capture startup, and aggregate stacks.
+- [`docs::how_to`]: focused recipes for recording, symbols, and diagnostics.
+- [`docs::reference`]: the complete API and configuration reference.
+- [`docs::explanation`]: how sampling, unwinding, and module tracking work.
+- [`docs::spool_format`]: the SPULSE compatibility and on-disk format contract.

@@ -58,7 +58,7 @@ showing up as `lost_events` in the summary.
 
 Samples reference stack IDs, not inline frame data, which is why profiles
 stay small when hot code keeps producing the same stacks. It is also why you
-should reuse a single [`PerfSymbolizer`]: it caches resolved frames keyed by
+should reuse a single [`PerfSymbolizer`](crate::PerfSymbolizer): it caches resolved frames keyed by
 `(process_id, stack_id)`.
 
 ## Capture process startup
@@ -143,6 +143,6 @@ for (stack, count) in rows.iter().take(20) {
 ```
 
 A production exporter keeps more metadata around: process and thread IDs,
-timestamps, [`FrameKind`], [`SymbolOrigin`], file names, and line numbers.
-Most exporters also hide frames flagged with [`FrameFlags::HIDDEN_DEFAULT`]
+timestamps, [`FrameKind`](crate::FrameKind), [`SymbolOrigin`](crate::SymbolOrigin), file names, and line numbers.
+Most exporters also hide frames flagged with [`FrameFlags::HIDDEN_DEFAULT`](crate::FrameFlags::HIDDEN_DEFAULT)
 in their default view.

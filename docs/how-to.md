@@ -26,10 +26,10 @@ Knobs:
 | Field | When to change it | What it costs |
 | --- | --- | --- |
 | `frequency` | Need more or fewer samples per second. | Higher rates raise CPU overhead and increase the chance of lost events under load. |
-| `stack_size` | Stacks are getting truncated. | More memory copied per sample. Capped at [`MAX_SAMPLE_USER_STACK`]. |
-| `include_kernel` | Want syscall, scheduler, or kernel-lock attribution. | Usually needs extra privileges. If only kernel sampling is denied, [`PerfRecorder::attach`] retries user-only and reports `summary.kernel_enabled = false`. |
+| `stack_size` | Stacks are getting truncated. | More memory copied per sample. Capped at [`MAX_SAMPLE_USER_STACK`](crate::MAX_SAMPLE_USER_STACK). |
+| `include_kernel` | Want syscall, scheduler, or kernel-lock attribution. | Usually needs extra privileges. If only kernel sampling is denied, [`PerfRecorder::attach`](crate::PerfRecorder::attach) retries user-only and reports `summary.kernel_enabled = false`. |
 | `inherit_child_processes` | Forked children are part of the workload. | Opens more perf events and adds bookkeeping per child. |
-| `start_timestamp_us` | Aligning the profile to an external clock or trace. | Metadata only; read back through [`PerfSpoolReader::timestamp_us`]. |
+| `start_timestamp_us` | Aligning the profile to an external clock or trace. | Metadata only; read back through [`PerfSpoolReader::timestamp_us`](crate::PerfSpoolReader::timestamp_us). |
 | `sample_interval_us` | UI or export format wants an interval hint. | Metadata only; does not drive kernel sampling. |
 
 Check the kernel cap before asking for an aggressive rate:
@@ -61,7 +61,7 @@ Draining is mandatory. A recorder that you only hold onto will not write
 anything to the spool: `wait` parks the thread until perf data arrives, and
 `consume_available` is what turns that data into spool records. If you
 already have an event loop, run `wait` from a worker thread or poll
-[`PerfRecorder::has_pending_events`] from the main loop and drain when it
+[`PerfRecorder::has_pending_events`](crate::PerfRecorder::has_pending_events) from the main loop and drain when it
 returns `true`.
 
 ## Profile more than one process
@@ -142,13 +142,13 @@ symbolizer's cache. It only stores compact frame ids per repeated
 `(process_id, stack_id)`, so callers that render or aggregate inline never
 pay for materializing a full resolved-stack `Vec`.
 
-Display policy is your call. Most UIs hide [`FrameFlags::HIDDEN_DEFAULT`] by
-default, group frames by [`FrameKind`], and surface [`SymbolOrigin`] in
+Display policy is your call. Most UIs hide [`FrameFlags::HIDDEN_DEFAULT`](crate::FrameFlags::HIDDEN_DEFAULT) by
+default, group frames by [`FrameKind`](crate::FrameKind), and surface [`SymbolOrigin`](crate::SymbolOrigin) in
 detail views so users can tell ELF symbols from address-only fallbacks.
 
 ## Use your own symbolizer
 
-If your application already owns symbolization, skip [`PerfSymbolizer`] and
+If your application already owns symbolization, skip [`PerfSymbolizer`](crate::PerfSymbolizer) and
 read raw frames plus their recorded module context directly:
 
 ```rust,no_run
@@ -292,7 +292,7 @@ Reading the numbers:
 | `sample_events > samples` | Samples lacked PIDs, TIDs, timestamps, or frames. | Look at the specific skip counters. |
 | High `lost_events` | Ring buffers overran. | Lower `frequency`, drain more often, reduce fan-out. |
 | High `empty_stack_samples` | Register/stack capture failed, or unwind produced nothing. | Check `summary.error_stats`. |
-| Lots of truncation | `stack_size` too small. | Bump it, up to [`MAX_SAMPLE_USER_STACK`]. |
+| Lots of truncation | `stack_size` too small. | Bump it, up to [`MAX_SAMPLE_USER_STACK`](crate::MAX_SAMPLE_USER_STACK). |
 | Mostly address-only frames | No symbols or mappings available. | Keep the binaries; symbolize on a host that has them. |
 
 For a formatted breakdown:
@@ -318,5 +318,5 @@ for kernel frames, or reading `/proc/kallsyms`. Work down the list:
 - Relax `perf_event_paranoid` in test environments.
 
 Don't fail the whole recording on the first permission error. If kernel
-sampling alone was denied, [`PerfRecorder::attach`] has already retried in
+sampling alone was denied, [`PerfRecorder::attach`](crate::PerfRecorder::attach) has already retried in
 user-only mode and surfaced that through `summary.kernel_enabled`.

@@ -180,7 +180,7 @@ possible, so symbolization doesn't need the target process to still exist.
 | Source | Used for | Result |
 | --- | --- | --- |
 | Python perf maps (`/tmp/perf-<pid>.map`) | Python frames and JIT-like symbols emitted by runtimes. | `PythonFrame`, or `NativeFrame` with `SymbolOrigin::PerfMap`. |
-| ELF + debug data | Native user-space modules. Routed through a pluggable [`NativeSymbolizer`]; default is wholesym. | `NativeFrame` with `SymbolOrigin::Elf`. |
+| ELF + debug data | Native user-space modules. Routed through a pluggable [`NativeSymbolizer`](crate::NativeSymbolizer); default is wholesym. | `NativeFrame` with `SymbolOrigin::Elf`. |
 | `/proc/kallsyms` | Kernel frames. | `NativeFrame` with `FrameKind::Kernel`. |
 | Address fallback | No symbols or mapping unknown. | `NativeFrame` with `SymbolOrigin::AddressOnly`. |
 
