@@ -132,10 +132,11 @@ fn validated_module_file(path: &std::path::Path, module: &ModuleRecord) -> Optio
     if !metadata.is_file() {
         return None;
     }
-    if module.inode != 0 && metadata.ino() != module.inode {
-        return None;
-    }
-    if module.device_major != 0 || module.device_minor != 0 {
+    if module.inode != 0 {
+        if metadata.ino() != module.inode {
+            return None;
+        }
+    } else if module.device_major != 0 || module.device_minor != 0 {
         let device = metadata.dev();
         if libc::major(device) != module.device_major || libc::minor(device) != module.device_minor
         {
@@ -224,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn module_path_inode_mismatch_is_rejected() {
+    fn module_path_identity_is_validated() {
         let path = std::env::temp_dir().join(format!(
             "stackpulse-native-module-inode-{}",
             std::process::id()
@@ -251,6 +252,9 @@ mod tests {
         let device = std::fs::metadata(&path).unwrap().dev();
         module.device_major = libc::major(device);
         module.device_minor = libc::minor(device).saturating_add(1);
+        assert!(module_path_matches_inode(&module));
+
+        module.inode = 0;
         assert!(!module_path_matches_inode(&module));
         module.device_minor = libc::minor(device);
         assert!(module_path_matches_inode(&module));
