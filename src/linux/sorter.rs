@@ -124,6 +124,10 @@ impl<G: Ord, K: Clone + Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "emitting 2^64 events in one sorter lifetime is unreachable"
+)]
 fn take_sequence(next_sequence: &mut u64) -> u64 {
     let sequence = *next_sequence;
     *next_sequence = next_sequence

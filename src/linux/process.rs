@@ -51,6 +51,8 @@ impl SuspendedLaunchedProcess {
         let (resume_rp, resume_sp) = pipe2(OFlag::O_CLOEXEC)?;
         let (execerr_rp, execerr_sp) = pipe2(OFlag::O_CLOEXEC)?;
 
+        // SAFETY: The child branch enters run_child immediately. Before exec it
+        // performs no Rust allocation or locking and only uses pre-created FDs.
         match unsafe { fork() }? {
             ForkResult::Child => {
                 drop((resume_sp, execerr_rp));
@@ -105,7 +107,9 @@ impl SuspendedLaunchedProcess {
             match read(&exec_error_rx, &mut bytes) {
                 Ok(0) => break, // exec succeeded; pipe closed
                 Ok(8) => {
-                    let (errno_bytes, footer) = bytes.split_first_chunk::<4>().unwrap();
+                    let [a, b, c, d, e, f, g, h] = bytes;
+                    let errno_bytes = [a, b, c, d];
+                    let footer = [e, f, g, h];
                     if footer != Self::EXECERR_MSG_FOOTER {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -113,7 +117,7 @@ impl SuspendedLaunchedProcess {
                         ));
                     }
                     return Err(io::Error::from_raw_os_error(i32::from_be_bytes(
-                        *errno_bytes,
+                        errno_bytes,
                     )));
                 }
                 Ok(_) => {
@@ -144,16 +148,13 @@ impl SuspendedLaunchedProcess {
             let mut buf = [0];
             match read(&recv_end_of_resume_pipe, &mut buf) {
                 // Parent gave up (closed pipe without signaling); exit silently.
-                // Use _exit: this is a forked child that must not run the
-                // parent's atexit handlers or flush its inherited stdio buffers.
-                Ok(0) => unsafe { libc::_exit(0) },
+                Ok(0) => Self::exit_child(0),
                 Ok(_) => {
+                    // SAFETY: argv and envp are null-terminated pointer arrays.
+                    // Their C strings remain alive until exec or exit_child.
                     let _ = unsafe {
                         match envp {
                             Some(envp) => {
-                                // SAFETY: `envp` is a null-terminated pointer vector whose
-                                // C strings remain alive through this call. Only the forked
-                                // child changes its private `environ`, then it execs or exits.
                                 environ = envp.as_ptr().cast_mut().cast();
                                 execvp(argv[0], argv.as_ptr())
                             }
@@ -164,12 +165,17 @@ impl SuspendedLaunchedProcess {
                     let [a, b, c, d] = Errno::last_raw().to_be_bytes();
                     let [e, f, g, h] = Self::EXECERR_MSG_FOOTER;
                     let _ = write(send_end_of_execerr_pipe, &[a, b, c, d, e, f, g, h]);
-                    unsafe { libc::_exit(1) } // bypass at_exit destructors
+                    Self::exit_child(1)
                 }
                 Err(Errno::EINTR) => {}
-                Err(_) => unsafe { libc::_exit(1) },
+                Err(_) => Self::exit_child(1),
             }
         }
+    }
+
+    fn exit_child(status: i32) -> ! {
+        // SAFETY: _exit accepts a scalar status and does not return.
+        unsafe { libc::_exit(status) }
     }
 }
 

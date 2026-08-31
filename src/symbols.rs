@@ -430,6 +430,8 @@ pub struct SymbolizerWrapper {
 #[cfg(feature = "builtin-wholesym")]
 impl Drop for SymbolizerWrapper {
     fn drop(&mut self) {
+        // SAFETY: Drop runs once, and ManuallyDrop prevents any second drop of
+        // the runtime after ownership is moved into shutdown_background.
         let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
         runtime.shutdown_background();
     }
@@ -448,12 +450,12 @@ where
     if tokio::runtime::Handle::try_current().is_err() {
         return runtime.block_on(future);
     }
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| runtime.block_on(future))
-            .join()
-            .expect("symbolization future panicked")
-    })
+    std::thread::scope(
+        |scope| match scope.spawn(|| runtime.block_on(future)).join() {
+            Ok(output) => output,
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    )
 }
 
 /// Extract a short module name from a path (file name, or full path as fallback).
@@ -549,6 +551,10 @@ fn build_native_symbols_from_wholesym_parts(
 impl SymbolizerWrapper {
     /// Create a symbolizer with the configured debug-file search paths.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "the infallible NativeSymbolizer factory cannot report Tokio runtime construction failure"
+    )]
     pub fn new() -> Self {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()

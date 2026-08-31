@@ -75,6 +75,8 @@ impl StoppedProcess {
 
     fn send_signal(&self, signal: i32) -> io::Result<()> {
         let result = if let Some(pidfd) = &self.pidfd {
+            // SAFETY: pidfd is live, signal is scalar, and the syscall receives
+            // null pointers for the optional siginfo and flags arguments.
             unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal as libc::c_long,
@@ -85,6 +87,7 @@ impl StoppedProcess {
                 )
             }
         } else {
+            // SAFETY: kill takes scalar arguments and self.pid was validated at construction.
             unsafe { libc::kill(self.pid as libc::pid_t, signal) as libc::c_long }
         };
         if result < 0 {
@@ -152,8 +155,10 @@ impl Drop for StoppedProcess {
 }
 
 fn open_pidfd(pid: u32) -> io::Result<Option<OwnedFd>> {
+    // SAFETY: pidfd_open takes scalar arguments and pid is a positive u32 target id.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid, 0) };
     if fd >= 0 {
+        // SAFETY: a nonnegative pidfd_open result is a newly owned descriptor.
         return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as i32) }));
     }
     let err = io::Error::last_os_error();

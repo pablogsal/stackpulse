@@ -28,11 +28,13 @@ impl ProcessExitWatcher {
     /// `pidfd_open` is unavailable or denied (e.g. older kernels, sandbox).
     pub fn try_new(pid: i32) -> io::Result<Self> {
         validate_signal_pid(pid)?;
+        // SAFETY: pid was validated above and pidfd_open takes no pointer arguments.
         let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid, 0) };
         if raw_fd < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
+            // SAFETY: a nonnegative pidfd_open result is a newly owned file descriptor.
             pidfd: unsafe { OwnedFd::from_raw_fd(raw_fd as i32) },
             exited: false,
         })
@@ -50,6 +52,7 @@ impl ProcessExitWatcher {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: fds points to one initialized pollfd and the count is one.
         let rc = unsafe { libc::poll(&mut fds, 1, 0) };
         if rc < 0 {
             let err = io::Error::last_os_error();
@@ -130,6 +133,7 @@ pub fn kill_process(pid: i32) -> io::Result<()> {
 
 fn send_signal(pid: i32, signal: libc::c_int) -> io::Result<()> {
     validate_signal_pid(pid)?;
+    // SAFETY: kill takes scalar arguments and pid was validated above.
     let rc = unsafe { libc::kill(pid, signal) };
     if rc == 0 {
         Ok(())

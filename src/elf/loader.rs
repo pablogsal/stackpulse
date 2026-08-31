@@ -31,6 +31,8 @@ pub(crate) fn load_elf_sections_from_file(
     file: &std::fs::File,
     path: &Path,
 ) -> Result<ElfSectionInfo> {
+    // SAFETY: Returned sections retain the mapping. Callers rely on the mapped
+    // ELF inode not being modified or truncated while those sections are live.
     let mmap = Arc::new(unsafe { Mmap::map(file) }?);
     load_elf_sections(ElfFileData::Mmap(mmap), path)
 }

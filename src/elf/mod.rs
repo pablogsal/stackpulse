@@ -257,6 +257,7 @@ const DEFAULT_PAGE_SIZE: u64 = 0x1000;
 pub(crate) fn system_page_size() -> u64 {
     static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: _SC_PAGESIZE is a valid sysconf selector and uses no pointers.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size > 0 {
             page_size as u64

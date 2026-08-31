@@ -2,9 +2,11 @@
 name = "stackpulse"
 version = "0.8.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
 license = "MIT"
 repository = "https://github.com/pablogsal/stackpulse"
+homepage = "https://pablogsal.com/stackpulse/"
 keywords = ["profiler", "linux", "perf", "sampling", "unwind"]
 categories = ["development-tools::profiling"]
 include = [
@@ -19,6 +21,10 @@ include = [
     "src/**",
     "tests/**",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [lints]
 workspace = true
@@ -67,3 +73,6 @@ required-features = ["builtin-wholesym"]
 # Enable lint groups (priority -1 so specific lints take precedence)
 all = { level = "warn", priority = -1 }
 cognitive_complexity = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

@@ -25,6 +25,10 @@ impl ModulePath {
     /// Borrow the path as a `&str`. Free for owned paths; cheap for paths
     /// served directly out of the memory-mapped spool.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "mmap-backed paths are UTF-8 validated before ModulePath construction"
+    )]
     pub fn as_str(&self) -> &str {
         match &self.0 {
             ModulePathStorage::Owned(path) => path,

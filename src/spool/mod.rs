@@ -292,6 +292,10 @@ impl SpoolDefinitions {
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "replay sample stack ids are validated during reader construction"
+    )]
     fn replay_sample_stack(&self, sample: SampleRecord) -> ReplaySampleStack<'_> {
         let frames = self
             .stack_frame_refs(sample.stack_id)
@@ -523,6 +527,10 @@ impl ExactSizeIterator for StackFrameContexts<'_> {
 impl<'a> Iterator for SampleStacks<'a> {
     type Item = SampleStack<'a>;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "sample stack ids are validated during reader construction"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.samples.next()?;
         let frames = self
@@ -546,6 +554,10 @@ impl ExactSizeIterator for SampleStacks<'_> {
 impl Iterator for ReplaySamples<'_> {
     type Item = SampleRecord;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "replay offsets and records are fully validated before iteration"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
@@ -872,6 +884,8 @@ fn open_spool_with_range_limit(
     range_limit: usize,
 ) -> io::Result<OpenedSpool> {
     let file = File::open(path)?;
+    // SAFETY: the reader retains this read-only mapping for every borrowed
+    // range. The public reader contract requires the spool to remain unchanged.
     let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
     let spool_version = reader.check_magic()?;
