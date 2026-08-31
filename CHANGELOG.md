@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- CI now tests Linux x86-64 and AArch64, Rust 1.88, and every Cargo feature combination.
+- CI audits `Cargo.lock`, checks public API compatibility, verifies the packaged crate, and rejects undocumented unsafe blocks and unannotated explicit panics in library code.
+- Rustdoc now links tutorials, recipes, reference material, design notes, and the SPULSE format contract. GitHub Pages publishes the generated documentation.
+- Perf-map parsing moved to `symbolize::perf_map`; executable module tracking moved to `linux::module_tracking`.
+
 ## 0.8.0 - 2026-08-22
 
 ### Added
