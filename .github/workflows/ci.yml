@@ -1,291 +1,310 @@
-name: CI
+name: Checks
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  merge_group:
+  schedule:
+    - cron: "23 4 * * 1"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  fmt:
-    name: format
-    runs-on: ubuntu-latest
+  quality:
+    name: Quality / format, lint, safety, and docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
         run: make fmt-check
 
-  lint:
-    name: lint
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
-    steps:
-      - name: Install system dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            clang \
-            curl \
-            git \
-            libclang-dev \
-            make \
-            pkg-config \
-            procps \
-            python3
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Lint
+      - name: Lint every target and feature
         run: make clippy
 
-  test:
-    name: test (${{ matrix.distro }})
-    needs: [fmt, lint]
-    runs-on: ubuntu-latest
+      - name: Lint without default features
+        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+      - name: Enforce panic and unsafe boundaries in production code
+        run: make clippy-strict
+
+      - name: Build all documentation
+        run: make doc
+
+  tests:
+    name: Tests / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         include:
-          - distro: ubuntu-24.04
-            image: ubuntu:24.04
-            family: apt
-            require_python_perf: "1"
-          - distro: ubuntu-22.04
+          - platform: Linux x86-64
+            runner: ubuntu-24.04
+            test_no_default_features: true
+          - platform: Linux AArch64
+            runner: ubuntu-24.04-arm
+            test_no_default_features: false
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates clang curl git libclang-dev make \
+            pkg-config procps python3
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Relax perf restrictions when available
+        run: sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - name: Test all features
+        env:
+          STACKPULSE_REQUIRE_PYTHON_PERF: "1"
+        run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Test without default features
+        if: ${{ matrix.test_no_default_features }}
+        run: cargo test --workspace --no-default-features --locked
+
+  msrv:
+    name: Compatibility / minimum Rust version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libclang-dev pkg-config
+
+      - id: rust
+        name: Read the declared Rust version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Compile every target with the declared baseline
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  features:
+    name: Compatibility / feature combinations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2.86.0
+        with:
+          tool: cargo-hack
+
+      - name: Check every library feature combination
+        run: cargo hack check --package stackpulse --feature-powerset --locked
+
+  package:
+    name: Distribution / crates.io package
+    needs: [quality, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: List packaged files
+        run: cargo package --list --locked
+
+      - name: Build the crate exactly as published
+        run: cargo publish --dry-run --locked
+
+  semver:
+    name: Compatibility / public API
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2.86.0
+        with:
+          tool: cargo-semver-checks
+
+      - name: Check the public API against crates.io
+        run: cargo semver-checks check-release
+
+  audit:
+    name: Security / dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2.86.0
+        with:
+          tool: cargo-audit
+
+      - name: Audit the locked dependency graph
+        run: cargo audit --deny warnings
+
+  distro:
+    name: Scheduled / ${{ matrix.distro }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Ubuntu 22.04
             image: ubuntu:22.04
             family: apt
-            require_python_perf: "0"
-          - distro: debian-bookworm
+          - distro: Debian Bookworm
             image: debian:bookworm
             family: apt
-            require_python_perf: "0"
-          - distro: debian-trixie
+          - distro: Debian Trixie
             image: debian:trixie
             family: apt
-            require_python_perf: "1"
-          - distro: fedora-latest
+          - distro: Fedora
             image: fedora:latest
             family: dnf
-            require_python_perf: "1"
-          - distro: archlinux
+          - distro: Arch Linux
             image: archlinux:latest
             family: pacman
-            require_python_perf: "1"
     container:
       image: ${{ matrix.image }}
       options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - name: Install system dependencies
         run: |
-          if [ "${{ matrix.family }}" = "apt" ]; then
+          if [[ "${{ matrix.family }}" == "apt" ]]; then
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              build-essential \
-              ca-certificates \
-              clang \
-              curl \
-              git \
-              libclang-dev \
-              make \
-              pkg-config \
-              procps \
-              python3
-          elif [ "${{ matrix.family }}" = "dnf" ]; then
-            dnf install -y \
-              ca-certificates \
-              clang \
-              clang-devel \
-              curl \
-              gcc \
-              gcc-c++ \
-              git \
-              make \
-              pkgconf-pkg-config \
-              procps-ng \
-              python3
+            DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+              build-essential ca-certificates clang curl git libclang-dev make pkg-config procps python3
+          elif [[ "${{ matrix.family }}" == "dnf" ]]; then
+            dnf install --assumeyes ca-certificates clang clang-devel curl gcc gcc-c++ git make pkgconf-pkg-config procps-ng python3
           else
-            pacman -Syu --noconfirm --needed \
-              base-devel \
-              ca-certificates \
-              clang \
-              curl \
-              git \
-              make \
-              pkgconf \
-              procps-ng \
-              python
+            pacman -Syu --noconfirm --needed base-devel ca-certificates clang curl git make pkgconf procps-ng python
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Relax perf restrictions when possible
+      - name: Relax perf restrictions when available
         run: sysctl -w kernel.perf_event_paranoid=-1 || true
 
-      - name: Test
+      - name: Run the default test suite
+        run: cargo test --workspace --all-targets --locked
+
+  required:
+    name: Required checks
+    needs: [quality, tests, msrv, features, package, audit]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every required job to succeed
         env:
-          STACKPULSE_REQUIRE_PYTHON_PERF: ${{ matrix.require_python_perf }}
-        run: make test
-
-  doc-test:
-    name: doc tests
-    needs: [fmt, lint]
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
-    steps:
-      - name: Install system dependencies
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            clang \
-            curl \
-            git \
-            libclang-dev \
-            make \
-            pkg-config \
-            procps \
-            python3
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Doc tests
-        run: cargo test --doc
-
-  coverage:
-    name: coverage
-    needs: [fmt, lint]
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
-      options: --privileged --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt seccomp=unconfined
-    steps:
-      - name: Install system dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            clang \
-            curl \
-            gnupg \
-            git \
-            libclang-dev \
-            make \
-            pkg-config \
-            procps \
-            python3
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Relax perf restrictions when possible
-        run: sysctl -w kernel.perf_event_paranoid=-1 || true
-
-      - name: Install coverage tool
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Coverage
-        env:
-          STACKPULSE_REQUIRE_PYTHON_PERF: "1"
-        run: make coverage-lcov
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
-          if-no-files-found: error
-
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: rust
-          name: stackpulse-coverage
-          disable_search: true
-          fail_ci_if_error: true
-
-  package:
-    name: package dry run
-    needs: [fmt, lint]
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
-    steps:
-      - name: Install system dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            clang \
-            curl \
-            git \
-            libclang-dev \
-            make \
-            pkg-config \
-            procps \
-            python3
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Package dry run
-        run: cargo package --allow-dirty --no-verify
-
-  ci:
-    name: ci complete
-    needs: [test, doc-test, coverage, package]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Done
-        run: echo "CI complete"
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "a required job did not succeed" >&2
+              exit 1
+            fi
+          done

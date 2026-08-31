@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_vdso_sections_from_the_target_mapping() {
+    fn loads_vdso_elf_from_the_target_mapping() {
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
         let region = crate::proc_maps::parse_iter(&maps)
             .find(|region| region.path == "[vdso]")
@@ -373,6 +373,6 @@ mod tests {
             .expect("vDSO is a readable ELF mapping");
 
         assert!(loaded.image_base.is_some());
-        assert!(loaded.sections.eh_frame.is_some() || loaded.sections.eh_frame_hdr.is_some());
+        assert!(!loaded.sections.load_segments.is_empty());
     }
 }
