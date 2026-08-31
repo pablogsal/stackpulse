@@ -52,8 +52,8 @@ pub use profile::{
 };
 pub use spool::{
     FrameContext, FrameMode, FrameModuleRef, FrameRecord, ModulePath, ModuleRecord,
-    PerfSpoolReader, PerfSpoolReplayReader, PythonRuntimeRecord, ReplaySampleStack, SampleRecord,
-    SampleStack, SampleStacks, StackFrameContexts, StackFrameRefs,
+    PerfSpoolReader, PerfSpoolReplayReader, PerfSpoolTailReader, PythonRuntimeRecord,
+    ReplaySampleStack, SampleRecord, SampleStack, SampleStacks, StackFrameContexts, StackFrameRefs,
 };
 pub use stats::{ErrorStatsFormatter, SampleErrorKind, SampleErrorStats};
 pub use symbolize::{PerfSymbolizer, PerfSymbolizerBuilder};

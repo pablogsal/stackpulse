@@ -526,6 +526,14 @@ impl PerfRecorder {
         self.drain_events(DrainMode::Consume)
     }
 
+    /// Flush complete spool records written so far to the backing file.
+    ///
+    /// Once this returns, an incremental reader can decode the visible prefix
+    /// without waiting for recording to finish.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
     #[allow(clippy::cognitive_complexity)]
     fn drain_events(&mut self, mode: DrainMode) -> io::Result<()> {
         let open_new_perf_events = match mode {

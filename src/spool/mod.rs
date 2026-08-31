@@ -10,12 +10,14 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+mod tail;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
 };
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
+pub use tail::PerfSpoolTailReader;
 
 const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
 const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
@@ -1513,10 +1515,12 @@ fn read_sample(
     let timestamp_ns = last_timestamp_ns
         .checked_add_signed(delta)
         .ok_or_else(|| invalid_data(format!("sample timestamp delta {delta} out of range")))?;
-    *last_timestamp_ns = timestamp_ns;
     let thread_ref = read_index_within(reader, threads.len(), "sample thread")?;
     let (process_id, thread_id) = threads[thread_ref];
     let stack_id = read_id_within(reader, stack_count, "sample stack")?;
+    // A growing spool can end in the middle of this record. Only commit the
+    // delta after every field has been decoded.
+    *last_timestamp_ns = timestamp_ns;
     Ok(SampleRecord {
         timestamp_ns,
         process_id,

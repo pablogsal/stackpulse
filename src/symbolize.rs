@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::ops::Range;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
@@ -26,8 +27,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, PerfSpoolReader,
-    PerfSpoolReplayReader, ReplaySampleStack, SampleStack, SpoolFrameModuleContexts,
-    StackFrameRefs,
+    PerfSpoolReplayReader, PerfSpoolTailReader, ReplaySampleStack, SampleStack,
+    SpoolFrameModuleContexts, StackFrameRefs,
 };
 
 mod kernel;
@@ -47,6 +48,7 @@ pub struct PerfSymbolizer {
     native_symbolizer_by_module: FxHashMap<u32, usize>,
     unsupported_native_modules: FxHashSet<u32>,
     perf_map_cache: FxHashMap<i32, Option<Vec<PerfMapSymbol>>>,
+    perf_map_identities: FxHashMap<i32, Option<PerfMapFileIdentity>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
     frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
@@ -54,6 +56,22 @@ pub struct PerfSymbolizer {
     resolved_stack_frame_ids: Vec<usize>,
     stack_cache: FxHashMap<(i32, u32), Range<usize>>,
     native_factory: Option<NativeSymbolizerFactory>,
+    tail_state: Option<TailState>,
+}
+
+#[derive(Clone, Copy)]
+struct TailState {
+    module_count: usize,
+    frame_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PerfMapFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
 }
 
 enum SymbolizerInput<'a> {
@@ -95,11 +113,26 @@ impl SpoolSymbolizationInput for PerfSpoolReplayReader {
     }
 }
 
+impl SpoolSymbolizationInput for PerfSpoolTailReader {
+    fn modules(&self) -> &[ModuleRecord] {
+        self.modules()
+    }
+
+    fn frames(&self) -> &[FrameRecord] {
+        self.frames()
+    }
+
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.frame_module_contexts()
+    }
+}
+
 /// Configures a [`PerfSymbolizer`].
 pub struct PerfSymbolizerBuilder<'a> {
     input: SymbolizerInput<'a>,
     perf_map_processes: PerfMapProcesses,
     native_factory: Option<NativeSymbolizerFactory>,
+    tail: bool,
 }
 
 impl<'a> PerfSymbolizerBuilder<'a> {
@@ -110,6 +143,7 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             input: SymbolizerInput::Modules(modules),
             perf_map_processes: PerfMapProcesses::All,
             native_factory: None,
+            tail: false,
         }
     }
 
@@ -120,6 +154,7 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             input: SymbolizerInput::Spool(reader),
             perf_map_processes: PerfMapProcesses::All,
             native_factory: None,
+            tail: false,
         }
     }
 
@@ -130,6 +165,18 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             input: SymbolizerInput::Spool(reader),
             perf_map_processes: PerfMapProcesses::All,
             native_factory: None,
+            tail: false,
+        }
+    }
+
+    /// Configure symbolization for a growing spool.
+    #[must_use]
+    pub fn for_tail(reader: &'a PerfSpoolTailReader) -> Self {
+        Self {
+            input: SymbolizerInput::Spool(reader),
+            perf_map_processes: PerfMapProcesses::All,
+            native_factory: None,
+            tail: true,
         }
     }
 
@@ -161,9 +208,13 @@ impl<'a> PerfSymbolizerBuilder<'a> {
     #[must_use]
     pub fn build(self) -> PerfSymbolizer {
         let native_factory = self.native_factory;
+        let tail_counts = self.tail.then(|| match &self.input {
+            SymbolizerInput::Spool(reader) => (reader.modules().len(), reader.frames().len()),
+            SymbolizerInput::Modules(_) => unreachable!("tail input must be a spool"),
+        });
         #[cfg(feature = "builtin-wholesym")]
         let native_factory = native_factory.or_else(|| Some(default_native_symbolizer_factory()));
-        match self.input {
+        let mut symbolizer = match self.input {
             SymbolizerInput::Modules(modules) => PerfSymbolizer::with_perf_map_processes_inner(
                 modules,
                 self.perf_map_processes,
@@ -172,7 +223,14 @@ impl<'a> PerfSymbolizerBuilder<'a> {
             SymbolizerInput::Spool(reader) => {
                 PerfSymbolizer::for_spool_inner(reader, self.perf_map_processes, native_factory)
             }
+        };
+        if let Some((module_count, frame_count)) = tail_counts {
+            symbolizer.tail_state = Some(TailState {
+                module_count,
+                frame_count,
+            });
         }
+        symbolizer
     }
 }
 
@@ -254,6 +312,92 @@ impl PerfSymbolizer {
         PerfSymbolizerBuilder::for_replay(reader).build()
     }
 
+    /// Create a resolver for a growing spool.
+    pub fn for_tail(reader: &PerfSpoolTailReader) -> Self {
+        PerfSymbolizerBuilder::for_tail(reader).build()
+    }
+
+    /// Add definitions appended since the previous tail poll.
+    ///
+    /// Returns whether cached resolved stacks were invalidated.
+    pub fn extend_from_tail(&mut self, reader: &PerfSpoolTailReader) -> bool {
+        let state = self
+            .tail_state
+            .expect("extend_from_tail requires a tail symbolizer");
+        assert!(
+            reader.modules().len() >= state.module_count
+                && reader.frames().len() >= state.frame_count,
+            "tail definitions cannot shrink"
+        );
+        let kernel_changed = reader.modules()[state.module_count..]
+            .iter()
+            .any(|module| module.is_kernel)
+            || reader.frames()[state.frame_count..]
+                .iter()
+                .any(|frame| frame.mode == FrameMode::Kernel);
+        if reader.modules().len() != state.module_count {
+            self.modules
+                .extend_from_slice(&reader.modules()[state.module_count..]);
+            self.rebuild_module_index();
+            self.frame_cache
+                .retain(|(_, key), _| !matches!(key, FrameCacheKey::Raw(_)));
+        }
+        self.spool_frame_contexts = Some(reader.frame_module_contexts());
+        if kernel_changed {
+            self.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
+                reader
+                    .frames()
+                    .iter()
+                    .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip)),
+                reader.modules(),
+            ));
+            self.clear_resolution_caches();
+        }
+        self.tail_state = Some(TailState {
+            module_count: reader.modules().len(),
+            frame_count: reader.frames().len(),
+        });
+        kernel_changed
+    }
+
+    /// Refresh the perf map for one process in a growing spool.
+    ///
+    /// Returns whether cached resolved stacks were invalidated.
+    pub fn refresh_tail_process(&mut self, process_id: i32) -> bool {
+        assert!(
+            self.tail_state.is_some(),
+            "refresh_tail_process requires a tail symbolizer"
+        );
+        if !self.perf_maps_allowed_for(process_id) {
+            return false;
+        }
+
+        let path = perf_map_path(process_id);
+        let identity = perf_map_file_identity(&path);
+        let had_cached_map = self.perf_map_cache.contains_key(&process_id);
+        let changed = match self.perf_map_identities.insert(process_id, identity) {
+            Some(previous) => previous != identity,
+            None => had_cached_map,
+        };
+        if changed || !had_cached_map {
+            self.perf_map_cache
+                .insert(process_id, load_perf_map_path(&path));
+        }
+        if changed {
+            self.clear_resolution_caches();
+        }
+        changed
+    }
+
+    /// Release resolved-frame caches retained while tailing a growing spool.
+    pub fn reset_tail_caches(&mut self) {
+        assert!(
+            self.tail_state.is_some(),
+            "reset_tail_caches requires a tail symbolizer"
+        );
+        self.clear_resolution_caches();
+    }
+
     fn for_spool_inner(
         reader: &dyn SpoolSymbolizationInput,
         perf_map_processes: PerfMapProcesses,
@@ -299,6 +443,7 @@ impl PerfSymbolizer {
             native_symbolizer_by_module: FxHashMap::default(),
             unsupported_native_modules: FxHashSet::default(),
             perf_map_cache: FxHashMap::default(),
+            perf_map_identities: FxHashMap::default(),
             kernel_symbols: None,
             spool_frame_contexts: None,
             frame_cache: FxHashMap::default(),
@@ -306,6 +451,27 @@ impl PerfSymbolizer {
             resolved_stack_frame_ids: Vec::new(),
             stack_cache: FxHashMap::default(),
             native_factory,
+            tail_state: None,
+        }
+    }
+
+    fn clear_resolution_caches(&mut self) {
+        self.frame_cache.clear();
+        self.resolved_frames.clear();
+        self.resolved_stack_frame_ids.clear();
+        self.stack_cache.clear();
+    }
+
+    fn rebuild_module_index(&mut self) {
+        self.module_index_by_id.clear();
+        let mut duplicate_ids = FxHashSet::default();
+        for (index, module) in self.modules.iter().enumerate() {
+            if self.module_index_by_id.insert(module.id, index).is_some() {
+                duplicate_ids.insert(module.id);
+            }
+        }
+        for id in duplicate_ids {
+            self.module_index_by_id.remove(&id);
         }
     }
 
@@ -944,7 +1110,26 @@ fn module_display_name(path: &str) -> &str {
 }
 
 fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
-    let mut symbols: Vec<PerfMapSymbol> = fs::read_to_string(format!("/tmp/perf-{process_id}.map"))
+    load_perf_map_path(&perf_map_path(process_id))
+}
+
+fn perf_map_path(process_id: i32) -> std::path::PathBuf {
+    format!("/tmp/perf-{process_id}.map").into()
+}
+
+fn perf_map_file_identity(path: &Path) -> Option<PerfMapFileIdentity> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(PerfMapFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+fn load_perf_map_path(path: &Path) -> Option<Vec<PerfMapSymbol>> {
+    let mut symbols: Vec<PerfMapSymbol> = fs::read_to_string(path)
         .ok()?
         .lines()
         .filter_map(parse_perf_map_line)
@@ -1772,6 +1957,57 @@ mod tests {
         assert_eq!(symbolizer.resolved_frames.len(), 2);
         assert!(symbolizer.stack_cache.is_empty());
         assert!(symbolizer.resolved_stack_frame_ids.is_empty());
+    }
+
+    #[test]
+    fn tail_symbolizer_extends_definitions_without_dropping_frame_cache() {
+        let path = temp_symbolize_spool_path("tail-symbolizer-extension");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer.flush().unwrap();
+        let mut reader = PerfSpoolTailReader::open(&path).unwrap();
+        let mut symbolizer = PerfSymbolizerBuilder::for_tail(&reader)
+            .disable_perf_maps()
+            .native_symbolizer_factory(|_| Box::new(EmptyNativeSymbolizer))
+            .build();
+
+        writer
+            .write_module(&executable_module(0, 7, 0x1000))
+            .unwrap();
+        writer
+            .write_sample_frames(1_000, 7, 11, [pinned_frame(0, 0x1010)])
+            .unwrap();
+        writer.flush().unwrap();
+        let first = reader.poll().unwrap();
+        symbolizer.extend_from_tail(&reader);
+        let first_stack = ReplaySampleStack {
+            sample: first[0],
+            frames: reader.stack_frame_refs(first[0].stack_id).unwrap(),
+        };
+        assert_eq!(
+            symbolizer.for_each_replay_sample_stack_without_stack_cache(first_stack, |_| {}),
+            1
+        );
+        assert_eq!(symbolizer.frame_cache.len(), 1);
+
+        writer
+            .write_sample_frames(2_000, 7, 11, [pinned_frame(0, 0x1010)])
+            .unwrap();
+        writer.flush().unwrap();
+        let second = reader.poll().unwrap();
+        symbolizer.extend_from_tail(&reader);
+        let second_stack = ReplaySampleStack {
+            sample: second[0],
+            frames: reader.stack_frame_refs(second[0].stack_id).unwrap(),
+        };
+        assert_eq!(
+            symbolizer.for_each_replay_sample_stack_without_stack_cache(second_stack, |_| {}),
+            1
+        );
+        assert_eq!(symbolizer.frame_cache.len(), 1);
+
+        drop(reader);
+        drop(writer);
+        let _ = fs::remove_file(path);
     }
 
     fn write_future_module_spool(label: &str) -> (std::path::PathBuf, u32) {
