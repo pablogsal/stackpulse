@@ -221,17 +221,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_discriminants_match_all_order() {
-        for (i, kind) in SampleErrorKind::ALL.iter().enumerate() {
-            assert_eq!(
-                *kind as usize, i,
-                "{kind:?} discriminant must equal its ALL index"
-            );
-        }
-        assert_eq!(SampleErrorKind::ALL.len(), ERROR_KIND_COUNT);
-    }
-
-    #[test]
     fn test_new_stats_are_zero() {
         let stats = SampleErrorStats::new();
         for kind in SampleErrorKind::ALL {

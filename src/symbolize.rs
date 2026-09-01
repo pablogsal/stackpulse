@@ -14,7 +14,6 @@ use std::slice;
 #[cfg(test)]
 use std::sync::Arc;
 
-pub use crate::module_base::ModuleImageBase;
 use crate::profile::{
     FrameFlags, FrameKind, NativeFrame, NativeSymbol, ResolvedFrame, SourceLocation, SymbolOrigin,
 };
@@ -22,11 +21,11 @@ use crate::profile::{
 use crate::symbols::default_native_symbolizer_factory;
 use crate::symbols::{erase_native_symbolizer, ErasedNativeSymbolizer, NativeSymbolizerFactory};
 pub use crate::symbols::{
-    NativeFileIdentity, NativeLookup, NativeModule, NativeSymbolizer, NativeSymbols,
+    NativeFileIdentity, NativeImageId, NativeLookup, NativeModule, NativeSymbolizer, NativeSymbols,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::native_module::{ElfSectionCache, LoadedElfMapping};
+use crate::native_module::{ElfLoadError, ElfSectionCache};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, Replay, SampleStack, Snapshot,
     SpoolFrameModuleContexts, StackKey,
@@ -40,22 +39,20 @@ pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
 use kernel::KernelSymbol;
 use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 use perf_map::{
-    find_perf_map_symbol, load_perf_map, module_display_name, perf_map_module_allowed,
-    perf_map_symbol_to_frame, PerfMapProcesses, PerfMapSymbol,
+    find_perf_map_symbol, load_perf_map, perf_map_module_allowed, perf_map_symbol_to_frame,
+    PerfMap, PerfMapProcesses, PerfMapSymbol,
 };
 
 #[derive(Debug, thiserror::Error)]
 enum NativeContractError {
-    #[error("native lookup batch spans more than one process")]
-    MixedProcesses,
-    #[error("native symbolizer factory is missing")]
-    MissingFactory,
-    #[error("native symbolizer backend was not constructed")]
-    MissingBackend,
     #[error("native symbolizer returned {actual} results for {expected} requests")]
     ResultCount { expected: usize, actual: usize },
     #[error("resolved frame was not cached")]
     MissingCachedFrame,
+    #[error("native lookup was queued without a backend factory")]
+    MissingFactory,
+    #[error("native backend was not retained after construction")]
+    MissingBackend,
 }
 
 impl NativeContractError {
@@ -71,19 +68,23 @@ impl NativeContractError {
 /// lock.
 pub struct Symbolizer {
     source_id: Option<u64>,
-    modules: Vec<ModuleRecord>,
-    module_index_by_id: FxHashMap<u32, usize>,
+    modules: SymbolizerModules,
     perf_map_processes: PerfMapProcesses,
     perf_map_dir: PathBuf,
     elf_sections: ElfSectionCache,
     native_symbolizers: FxHashMap<i32, Box<dyn ErasedNativeSymbolizer>>,
     native_modules: FxHashMap<u32, NativeModule>,
+    native_batch_modules: FxHashMap<u32, NativeModule>,
+    retryable_native_modules: FxHashSet<u32>,
     unsupported_native_modules: FxHashSet<u32>,
     native_requests: Vec<NativeLookup>,
     native_results: Vec<NativeSymbols>,
     pending_frames: Vec<PendingFrame>,
     pending_frame_keys: FxHashSet<(i32, FrameCacheKey)>,
-    perf_map_cache: FxHashMap<i32, Option<Vec<PerfMapSymbol>>>,
+    transient_frame_keys: Vec<(i32, FrameCacheKey)>,
+    transient_frame_slots: FxHashMap<(i32, FrameCacheKey), usize>,
+    vacant_frame_slots: Vec<usize>,
+    perf_map_cache: FxHashMap<i32, Option<PerfMap>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
     frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
@@ -95,10 +96,114 @@ pub struct Symbolizer {
     native_factory: Option<NativeSymbolizerFactory>,
 }
 
+struct ModuleMetadata {
+    path: Option<std::rc::Rc<str>>,
+    basename_start: usize,
+    is_python_runtime: bool,
+}
+
+fn format_hex_suffix(prefix: &str, value: u64) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digits = (u64::BITS - value.leading_zeros()).max(1).div_ceil(4) as usize;
+    let mut output = String::with_capacity(prefix.len() + 3 + digits);
+    output.push_str(prefix);
+    output.push_str("+0x");
+    for digit in (0..digits).rev() {
+        let nibble = ((value >> (digit * 4)) & 0xf) as usize;
+        output.push(char::from(HEX[nibble]));
+    }
+    output
+}
+
+#[derive(Default)]
+struct SymbolizerModules {
+    records: Vec<ModuleRecord>,
+    metadata: Vec<ModuleMetadata>,
+    index_by_id: FxHashMap<u32, usize>,
+}
+
+impl SymbolizerModules {
+    fn new(mut records: Vec<ModuleRecord>) -> crate::Result<Self> {
+        let original_len = records.len();
+        let last = records.pop();
+        let mut metadata = Vec::with_capacity(original_len);
+        let mut index_by_id = FxHashMap::with_capacity_and_hasher(original_len, Default::default());
+        for (index, record) in records.iter().enumerate() {
+            if index_by_id.insert(record.id, index).is_some() {
+                return Err(crate::Error::message(
+                    crate::ErrorKind::InvalidInput,
+                    format!("duplicate module id {}", record.id),
+                ));
+            }
+            metadata.push(module_metadata(record));
+        }
+        let mut modules = Self {
+            records,
+            metadata,
+            index_by_id,
+        };
+        if let Some(record) = last {
+            modules.push(record)?;
+        }
+        Ok(modules)
+    }
+
+    fn push(&mut self, record: ModuleRecord) -> crate::Result<()> {
+        if self.index_by_id.contains_key(&record.id) {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                format!("duplicate module id {}", record.id),
+            ));
+        }
+        let index = self.records.len();
+        self.metadata.push(module_metadata(&record));
+        self.index_by_id.insert(record.id, index);
+        self.records.push(record);
+        Ok(())
+    }
+
+    fn records(&self) -> &[ModuleRecord] {
+        &self.records
+    }
+
+    fn get(&self, id: u32) -> Option<&ModuleRecord> {
+        self.index_by_id
+            .get(&id)
+            .and_then(|&index| self.records.get(index))
+    }
+
+    fn metadata(&self, id: u32) -> Option<&ModuleMetadata> {
+        self.index_by_id
+            .get(&id)
+            .and_then(|&index| self.metadata.get(index))
+    }
+
+    fn get_with_metadata(&self, id: u32) -> Option<(&ModuleRecord, &ModuleMetadata)> {
+        let index = *self.index_by_id.get(&id)?;
+        Some((self.records.get(index)?, self.metadata.get(index)?))
+    }
+
+    fn get_with_metadata_mut(&mut self, id: u32) -> Option<(&ModuleRecord, &mut ModuleMetadata)> {
+        let index = *self.index_by_id.get(&id)?;
+        Some((self.records.get(index)?, self.metadata.get_mut(index)?))
+    }
+}
+
+fn module_metadata(record: &ModuleRecord) -> ModuleMetadata {
+    let path = record.path.as_str();
+    let basename_start = crate::profile::basename_start(path);
+    ModuleMetadata {
+        path: None,
+        basename_start,
+        is_python_runtime: crate::is_python_module(&path[basename_start..]),
+    }
+}
+
 impl std::fmt::Debug for Symbolizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Symbolizer")
-            .field("modules", &self.modules.len())
+            .field("modules", &self.modules.records.len())
             .field("resolved_frames", &self.resolved_frames.len())
             .field("cached_stacks", &self.stack_cache.len())
             .field("stack_cache", &self.stack_cache_mode)
@@ -205,43 +310,33 @@ pub enum StackCache {
 }
 
 impl<'a> SymbolizerBuilder<'a> {
-    /// Configure symbolization for a module list.
-    #[must_use]
-    pub fn for_modules(modules: &'a [ModuleRecord]) -> Self {
+    fn with_input(input: SymbolizerInput<'a>) -> Self {
         Self {
-            input: SymbolizerInput::Modules(modules),
+            input,
             perf_map_processes: PerfMapProcesses::All,
             perf_map_dir: PathBuf::from("/tmp"),
             native_factory: None,
             kernel_symbols: KernelSymbolSource::Host,
             stack_cache: StackCache::Internal,
         }
+    }
+
+    /// Configure symbolization for a module list.
+    #[must_use]
+    pub fn for_modules(modules: &'a [ModuleRecord]) -> Self {
+        Self::with_input(SymbolizerInput::Modules(modules))
     }
 
     /// Configure symbolization for a loaded spool.
     #[must_use]
     pub(crate) fn for_spool(reader: &'a Snapshot) -> Self {
-        Self {
-            input: SymbolizerInput::Spool(reader),
-            perf_map_processes: PerfMapProcesses::All,
-            perf_map_dir: PathBuf::from("/tmp"),
-            native_factory: None,
-            kernel_symbols: KernelSymbolSource::Host,
-            stack_cache: StackCache::Internal,
-        }
+        Self::with_input(SymbolizerInput::Spool(reader))
     }
 
     /// Configure symbolization for a sequential spool replay.
     #[must_use]
     pub(crate) fn for_replay(reader: &'a Replay) -> Self {
-        Self {
-            input: SymbolizerInput::Spool(reader),
-            perf_map_processes: PerfMapProcesses::All,
-            perf_map_dir: PathBuf::from("/tmp"),
-            native_factory: None,
-            kernel_symbols: KernelSymbolSource::Host,
-            stack_cache: StackCache::Internal,
-        }
+        Self::with_input(SymbolizerInput::Spool(reader))
     }
 
     /// Disable Python perf-map lookup.
@@ -266,13 +361,38 @@ impl<'a> SymbolizerBuilder<'a> {
     }
 
     /// Use a caller-supplied native symbolizer factory.
+    ///
+    /// The factory runs lazily, at most once per process id, when a resolve
+    /// call first needs native symbols for that process.
     #[must_use]
     pub fn native<S>(mut self, mut factory: impl FnMut(crate::Pid) -> S + 'static) -> Self
     where
         S: NativeSymbolizer + 'static,
     {
         self.native_factory = Some(Box::new(move |process_id| {
-            erase_native_symbolizer(factory(process_id))
+            Ok(erase_native_symbolizer(factory(process_id)))
+        }));
+        self
+    }
+
+    /// Use a caller-supplied native symbolizer factory that may fail.
+    ///
+    /// The factory runs lazily and its first successful result is retained per
+    /// process id. A factory error is returned by that resolve call; a later
+    /// resolve may retry construction.
+    #[must_use]
+    pub fn try_native<S, E>(
+        mut self,
+        mut factory: impl FnMut(crate::Pid) -> Result<S, E> + 'static,
+    ) -> Self
+    where
+        S: NativeSymbolizer + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.native_factory = Some(Box::new(move |process_id| {
+            factory(process_id)
+                .map(|symbolizer| erase_native_symbolizer(symbolizer))
+                .map_err(|error| Box::new(error) as crate::symbols::NativeBackendError)
         }));
         self
     }
@@ -339,14 +459,7 @@ impl SymbolizerBuilder<'static> {
     /// This avoids copying the table when it was assembled by the caller.
     #[must_use]
     pub fn from_modules(modules: Vec<ModuleRecord>) -> Self {
-        Self {
-            input: SymbolizerInput::OwnedModules(modules),
-            perf_map_processes: PerfMapProcesses::All,
-            perf_map_dir: PathBuf::from("/tmp"),
-            native_factory: None,
-            kernel_symbols: KernelSymbolSource::Host,
-            stack_cache: StackCache::Internal,
-        }
+        Self::with_input(SymbolizerInput::OwnedModules(modules))
     }
 }
 
@@ -360,12 +473,19 @@ struct PendingFrame {
     cache_key: (i32, FrameCacheKey),
     frame: FrameRecord,
     resolution: PendingResolution,
+    transient: bool,
+}
+
+#[derive(Default)]
+struct NativeLookupPreparation {
+    request_index: Option<usize>,
+    transient: bool,
 }
 
 enum PendingResolution {
     PerfMap(ResolvedFrame),
     Native {
-        module: Option<(ModuleRecord, u64)>,
+        module: Option<(u32, u64)>,
         request_index: Option<usize>,
     },
 }
@@ -380,7 +500,7 @@ impl<'a> Iterator for ResolvedStack<'a> {
     type Item = &'a ResolvedFrame;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ids.next().and_then(|&id| self.frames.get(id))
+        self.ids.next().map(|&id| &self.frames[id])
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -433,6 +553,9 @@ impl Symbolizer {
             }
         };
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
+        let frame_count = reader.frames().len();
+        symbolizer.frame_cache.reserve(frame_count);
+        symbolizer.resolved_frames.reserve(frame_count);
         Ok(symbolizer)
     }
 
@@ -443,15 +566,7 @@ impl Symbolizer {
         native_factory: Option<NativeSymbolizerFactory>,
         kernel_source: &KernelSymbolSource,
     ) -> crate::Result<Self> {
-        let mut module_index_by_id = FxHashMap::default();
-        for (index, module) in modules.iter().enumerate() {
-            if module_index_by_id.insert(module.id, index).is_some() {
-                return Err(crate::Error::message(
-                    crate::ErrorKind::InvalidInput,
-                    format!("duplicate module id {}", module.id),
-                ));
-            }
-        }
+        let modules = SymbolizerModules::new(modules)?;
         let kernel_symbols = match kernel_source {
             KernelSymbolSource::Host => None,
             KernelSymbolSource::File(path) => Some(kernel::load_kernel_symbols_from_path(path)?),
@@ -460,17 +575,21 @@ impl Symbolizer {
         Ok(Self {
             source_id: None,
             modules,
-            module_index_by_id,
             perf_map_processes,
             perf_map_dir,
             elf_sections: ElfSectionCache::default(),
             native_symbolizers: FxHashMap::default(),
             native_modules: FxHashMap::default(),
+            native_batch_modules: FxHashMap::default(),
+            retryable_native_modules: FxHashSet::default(),
             unsupported_native_modules: FxHashSet::default(),
             native_requests: Vec::new(),
             native_results: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_keys: FxHashSet::default(),
+            transient_frame_keys: Vec::new(),
+            transient_frame_slots: FxHashMap::default(),
+            vacant_frame_slots: Vec::new(),
             perf_map_cache: FxHashMap::default(),
             kernel_symbols,
             spool_frame_contexts: None,
@@ -503,14 +622,15 @@ impl Symbolizer {
     /// [`ErrorKind::NativeSymbolizer`](crate::ErrorKind::NativeSymbolizer).
     pub fn resolve(&mut self, stack: SampleStack<'_>) -> crate::Result<ResolvedStack<'_>> {
         let (key, sample, mut frames) = stack.into_parts();
-        if self
-            .source_id
-            .is_some_and(|source_id| !key.belongs_to(source_id))
-        {
-            return Err(crate::Error::message(
-                crate::ErrorKind::InvalidInput,
-                "sample stack belongs to a different spool source",
-            ));
+        match self.source_id {
+            Some(source_id) if !key.belongs_to(source_id) => {
+                return Err(crate::Error::message(
+                    crate::ErrorKind::InvalidInput,
+                    "sample stack belongs to a different spool source",
+                ));
+            }
+            None => self.source_id = Some(key.source_id()),
+            Some(_) => {}
         }
 
         if self.stack_cache_mode == StackCache::Internal {
@@ -520,17 +640,21 @@ impl Symbolizer {
                     ids: self.resolved_stack_frame_ids[range].iter(),
                 });
             }
-            self.begin_frame_batch();
-            let mut pending = frames.clone();
-            while let Some(frame_ref) = pending.next_with_id() {
-                self.prepare_frame(
-                    sample.process_id.get(),
-                    *frame_ref.frame,
-                    FrameCacheKey::Spool(frame_ref.id),
-                    Some(frame_ref.id),
-                );
-            }
-            self.finish_frame_batch(sample.process_id.get())?;
+        }
+
+        self.begin_frame_batch(frames.len());
+        let mut pending = frames.clone();
+        while let Some(frame_ref) = pending.next_with_id() {
+            self.prepare_frame(
+                sample.process_id.get(),
+                *frame_ref.frame,
+                FrameCacheKey::Spool(frame_ref.id),
+                Some(frame_ref.id),
+            );
+        }
+        self.finish_frame_batch(sample.process_id.get())?;
+
+        if self.stack_cache_mode == StackCache::Internal && self.transient_frame_keys.is_empty() {
             let start = self.resolved_stack_frame_ids.len();
             while let Some(frame_ref) = frames.next_with_id() {
                 let frame_ids = self.cached_frame_ids(
@@ -547,23 +671,13 @@ impl Symbolizer {
             });
         }
 
-        self.begin_frame_batch();
-        let mut pending = frames.clone();
-        while let Some(frame_ref) = pending.next_with_id() {
-            self.prepare_frame(
-                sample.process_id.get(),
-                *frame_ref.frame,
-                FrameCacheKey::Spool(frame_ref.id),
-                Some(frame_ref.id),
-            );
-        }
-        self.finish_frame_batch(sample.process_id.get())?;
         self.resolved_stack_scratch.clear();
         while let Some(frame_ref) = frames.next_with_id() {
             let frame_ids =
                 self.cached_frame_ids(sample.process_id.get(), FrameCacheKey::Spool(frame_ref.id))?;
             self.resolved_stack_scratch.extend(frame_ids);
         }
+        self.clear_transient_frame_cache();
         Ok(ResolvedStack {
             frames: &self.resolved_frames,
             ids: self.resolved_stack_scratch.iter(),
@@ -581,16 +695,24 @@ impl Symbolizer {
         process_id: crate::Pid,
         frames: &[FrameRecord],
     ) -> crate::Result<ResolvedStack<'_>> {
-        self.begin_frame_batch();
+        self.begin_frame_batch(frames.len());
         for frame in frames {
+            if frame.mode == FrameMode::TruncatedStackMarker && !frame.is_truncated_stack_marker() {
+                return Err(crate::Error::message(
+                    crate::ErrorKind::InvalidInput,
+                    "invalid truncated stack marker frame",
+                ));
+            }
             self.prepare_frame(process_id.get(), *frame, FrameCacheKey::Raw(*frame), None);
         }
         self.finish_frame_batch(process_id.get())?;
         self.resolved_stack_scratch.clear();
+        self.resolved_stack_scratch.reserve(frames.len());
         for frame in frames {
             let frame_ids = self.cached_frame_ids(process_id.get(), FrameCacheKey::Raw(*frame))?;
             self.resolved_stack_scratch.extend(frame_ids);
         }
+        self.clear_transient_frame_cache();
         Ok(ResolvedStack {
             frames: &self.resolved_frames,
             ids: self.resolved_stack_scratch.iter(),
@@ -617,10 +739,12 @@ impl Symbolizer {
         if let Some(frame_ids) = self.frame_cache.get(&cache_key) {
             return Ok(frame_ids.clone());
         }
-        self.begin_frame_batch();
+        self.begin_frame_batch(1);
         self.prepare_frame(process_id, *frame, cache_key.1, spool_frame_id);
         self.finish_frame_batch(process_id)?;
-        self.cached_frame_ids(process_id, cache_key.1)
+        let frame_ids = self.cached_frame_ids(process_id, cache_key.1);
+        self.clear_transient_frame_cache();
+        frame_ids
     }
 
     fn cached_frame_ids(
@@ -639,11 +763,26 @@ impl Symbolizer {
         self.resolve_cached_frame_ref(process_id, frame).clone()
     }
 
-    fn begin_frame_batch(&mut self) {
+    fn begin_frame_batch(&mut self, frame_count: usize) {
+        self.clear_frame_batch();
+        self.pending_frames.reserve(frame_count);
+        self.pending_frame_keys.reserve(frame_count);
+    }
+
+    fn clear_frame_batch(&mut self) {
+        self.clear_transient_frame_cache();
         self.pending_frames.clear();
         self.pending_frame_keys.clear();
         self.native_requests.clear();
         self.native_results.clear();
+        self.native_batch_modules.clear();
+        self.retryable_native_modules.clear();
+    }
+
+    fn clear_transient_frame_cache(&mut self) {
+        for key in self.transient_frame_keys.drain(..) {
+            self.frame_cache.remove(&key);
+        }
     }
 
     fn prepare_frame(
@@ -658,20 +797,20 @@ impl Symbolizer {
             return;
         }
 
-        if let Some(module) = frame
-            .module_id
-            .and_then(|module_id| self.module_by_id(module_id))
-            .filter(|module| !perf_map_module_allowed(module))
-        {
-            let module = (module.clone(), frame.file_relative_ip);
-            let request_index = self.prepare_native_lookup(process_id, &module.0, frame.abs_ip);
+        if let Some(module_id) = frame.module_id.filter(|&module_id| {
+            self.module_by_id(module_id)
+                .is_some_and(|module| !perf_map_module_allowed(module))
+        }) {
+            let module = (module_id, frame.file_relative_ip);
+            let native = self.prepare_native_lookup(process_id, module_id, frame.abs_ip);
             self.pending_frames.push(PendingFrame {
                 cache_key,
                 frame,
                 resolution: PendingResolution::Native {
                     module: Some(module),
-                    request_index,
+                    request_index: native.request_index,
                 },
+                transient: native.transient,
             });
             return;
         }
@@ -683,21 +822,23 @@ impl Symbolizer {
                 None
             };
 
-        if let Some(symbol) = perf_map_symbol {
+        if let Some((symbol, perf_map_module)) = perf_map_symbol {
             let blocked_module = self
                 .module_for_frame(process_id, &frame, spool_frame_id)
                 .and_then(|module| {
-                    (!perf_map_module_allowed(module.module)).then(|| module.into_owned())
+                    (!perf_map_module_allowed(module.module))
+                        .then_some((module.module.id, module.file_relative_ip))
                 });
             if let Some(module) = blocked_module {
-                let request_index = self.prepare_native_lookup(process_id, &module.0, frame.abs_ip);
+                let request_index = self.prepare_native_lookup(process_id, module.0, frame.abs_ip);
                 self.pending_frames.push(PendingFrame {
                     cache_key,
                     frame,
                     resolution: PendingResolution::Native {
                         module: Some(module),
-                        request_index,
+                        request_index: request_index.request_index,
                     },
+                    transient: request_index.transient,
                 });
                 return;
             }
@@ -706,56 +847,100 @@ impl Symbolizer {
                 cache_key,
                 frame,
                 resolution: PendingResolution::PerfMap(perf_map_symbol_to_frame(
-                    process_id,
                     frame.abs_ip,
                     symbol,
-                    &self.perf_map_dir,
+                    perf_map_module,
                 )),
+                transient: false,
             });
             return;
         }
-        let module = self.owned_module_for_frame(process_id, &frame, spool_frame_id);
-        let request_index = module
+        let module = self.module_key_for_frame(process_id, &frame, spool_frame_id);
+        let native = module
             .as_ref()
-            .and_then(|(module, _)| self.prepare_native_lookup(process_id, module, frame.abs_ip));
+            .map_or_else(NativeLookupPreparation::default, |(module_id, _)| {
+                self.prepare_native_lookup(process_id, *module_id, frame.abs_ip)
+            });
         self.pending_frames.push(PendingFrame {
             cache_key,
             frame,
             resolution: PendingResolution::Native {
                 module,
-                request_index,
+                request_index: native.request_index,
             },
+            transient: native.transient,
         });
     }
 
     fn prepare_native_lookup(
         &mut self,
         process_id: i32,
-        module: &ModuleRecord,
+        module_id: u32,
         absolute_address: u64,
-    ) -> Option<usize> {
-        if module.is_kernel
-            || module.process_id != process_id
+    ) -> NativeLookupPreparation {
+        let Some((module, metadata)) = self.modules.get_with_metadata(module_id) else {
+            return NativeLookupPreparation::default();
+        };
+        if module.pid().is_none_or(|pid| pid.get() != process_id)
             || self.native_factory.is_none()
             || self.unsupported_native_modules.contains(&module.id)
         {
-            return None;
+            return NativeLookupPreparation::default();
         }
-        if !self.native_modules.contains_key(&module.id) {
-            let Some(LoadedElfMapping {
-                image_base: Some(image_base),
-                ..
-            }) = self.elf_sections.load_mapping(module)
-            else {
-                self.unsupported_native_modules.insert(module.id);
-                return None;
+        if self.retryable_native_modules.contains(&module.id) {
+            return NativeLookupPreparation {
+                transient: true,
+                ..NativeLookupPreparation::default()
             };
-            self.native_modules.insert(
-                module.id,
-                NativeModule::new(
-                    module.path.as_path().to_path_buf(),
+        }
+        let is_python_runtime = metadata.is_python_runtime;
+        if !self.native_batch_modules.contains_key(&module.id) {
+            if module.path.is_empty()
+                || (module.path.is_bracketed_mapping() && !module.path.is_vdso())
+            {
+                self.unsupported_native_modules.insert(module.id);
+                return NativeLookupPreparation::default();
+            }
+            let batch_module = if let Some(template) = self.native_modules.get(&module.id) {
+                let image_file = match self.elf_sections.acquire_file(module) {
+                    Ok(file) => Some(file),
+                    Err(ElfLoadError::Retryable) => {
+                        self.retryable_native_modules.insert(module.id);
+                        None
+                    }
+                    Err(ElfLoadError::Unsupported) => None,
+                };
+                template.with_image_file(image_file)
+            } else {
+                let mapping = match self.elf_sections.load_mapping(module) {
+                    Ok(mapping) => mapping,
+                    Err(ElfLoadError::Retryable) => {
+                        self.retryable_native_modules.insert(module.id);
+                        return NativeLookupPreparation {
+                            transient: true,
+                            ..NativeLookupPreparation::default()
+                        };
+                    }
+                    Err(ElfLoadError::Unsupported) => {
+                        self.unsupported_native_modules.insert(module.id);
+                        return NativeLookupPreparation::default();
+                    }
+                };
+                let Some(image_base) = mapping.image_base else {
+                    self.unsupported_native_modules.insert(module.id);
+                    return NativeLookupPreparation::default();
+                };
+                let image_file = mapping.file;
+                if image_file.is_none() && !module.path.is_vdso() {
+                    return NativeLookupPreparation {
+                        transient: true,
+                        ..NativeLookupPreparation::default()
+                    };
+                }
+                let template = NativeModule::new(
+                    module.path.clone(),
                     image_base,
-                    crate::is_python_runtime_module_path(&module.path),
+                    is_python_runtime,
                     NativeFileIdentity::new(
                         module.device_major,
                         module.device_minor,
@@ -763,15 +948,30 @@ impl Symbolizer {
                         module.inode_generation,
                     ),
                     module.id,
-                ),
-            );
+                    mapping.image_token,
+                );
+                let batch_module = template.with_image_file(image_file);
+                self.native_modules.insert(module.id, template);
+                batch_module
+            };
+            self.native_batch_modules.insert(module.id, batch_module);
         }
-        let pid = crate::Pid::try_from(process_id).ok()?;
-        let native_module = self.native_modules.get(&module.id)?;
-        let image_address = native_module.image_base().svma_for_avma(absolute_address)?;
-        let relative_address = native_module
+        let transient = self.retryable_native_modules.contains(&module.id);
+        let Some(pid) = crate::Pid::new(process_id) else {
+            return NativeLookupPreparation::default();
+        };
+        let Some(native_module) = self.native_batch_modules.get(&module.id) else {
+            return NativeLookupPreparation::default();
+        };
+        let Some(image_address) = native_module.image_base().svma_for_avma(absolute_address) else {
+            return NativeLookupPreparation::default();
+        };
+        let Some(relative_address) = native_module
             .image_base()
-            .relative_address(absolute_address)?;
+            .relative_address(absolute_address)
+        else {
+            return NativeLookupPreparation::default();
+        };
         let request_index = self.native_requests.len();
         self.native_requests.push(NativeLookup {
             process_id: pid,
@@ -780,49 +980,54 @@ impl Symbolizer {
             relative_address,
             image_address,
         });
-        Some(request_index)
+        NativeLookupPreparation {
+            request_index: Some(request_index),
+            transient,
+        }
     }
 
     fn finish_frame_batch(&mut self, process_id: i32) -> crate::Result<()> {
         if !self.native_requests.is_empty() {
+            self.native_results.reserve(self.native_requests.len());
             let process_id = crate::Pid::try_from(process_id)
                 .map_err(|error| crate::Error::new(crate::ErrorKind::InvalidInput, error))?;
-            if self
-                .native_requests
-                .iter()
-                .any(|request| request.process_id() != process_id)
-            {
-                self.begin_frame_batch();
-                return Err(NativeContractError::MixedProcesses.into_public());
-            }
             if !self.native_symbolizers.contains_key(&process_id.get()) {
                 let Some(factory) = self.native_factory.as_mut() else {
-                    self.begin_frame_batch();
+                    self.clear_frame_batch();
                     return Err(NativeContractError::MissingFactory.into_public());
                 };
-                self.native_symbolizers
-                    .insert(process_id.get(), factory(process_id));
+                let backend = match factory(process_id) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        self.clear_frame_batch();
+                        return Err(crate::Error::native(error));
+                    }
+                };
+                self.native_symbolizers.insert(process_id.get(), backend);
             }
             let Some(backend) = self.native_symbolizers.get_mut(&process_id.get()) else {
-                self.begin_frame_batch();
+                self.clear_frame_batch();
                 return Err(NativeContractError::MissingBackend.into_public());
             };
             if let Err(error) = backend.symbolize(&self.native_requests, &mut self.native_results) {
-                self.begin_frame_batch();
+                self.clear_frame_batch();
                 return Err(crate::Error::native(error));
             }
             if self.native_results.len() != self.native_requests.len() {
                 let expected = self.native_requests.len();
                 let actual = self.native_results.len();
-                self.begin_frame_batch();
+                self.clear_frame_batch();
                 return Err(NativeContractError::ResultCount { expected, actual }.into_public());
             }
+            self.native_requests.clear();
+            self.native_batch_modules.clear();
         }
 
         let mut pending_frames = std::mem::take(&mut self.pending_frames);
         let mut native_results = std::mem::take(&mut self.native_results);
         for pending in pending_frames.drain(..) {
-            let start = self.resolved_frames.len();
+            let appended_start = self.resolved_frames.len();
+            let mut retry = false;
             match pending.resolution {
                 PendingResolution::PerfMap(frame) => self.resolved_frames.push(frame),
                 PendingResolution::Native {
@@ -833,27 +1038,55 @@ impl Symbolizer {
                         .and_then(|index| native_results.get_mut(index))
                         .map(std::mem::take)
                         .filter(|symbols| !symbols.is_empty());
+                    retry = pending.transient && symbols.is_none();
                     self.append_native_frames(&pending.frame, module, symbols);
                 }
             }
-            self.frame_cache
-                .insert(pending.cache_key, start..self.resolved_frames.len());
+            let appended_range = appended_start..self.resolved_frames.len();
+            let previous_slot = self.transient_frame_slots.remove(&pending.cache_key);
+            let frame_range = if appended_range.len() == 1 {
+                let reusable_slot = previous_slot.or_else(|| self.vacant_frame_slots.pop());
+                if let Some(slot) = reusable_slot {
+                    if let Some(replacement) = self.resolved_frames.pop() {
+                        self.resolved_frames[slot] = replacement;
+                        slot..slot + 1
+                    } else {
+                        appended_range
+                    }
+                } else {
+                    appended_range
+                }
+            } else {
+                if let Some(slot) = previous_slot {
+                    self.vacant_frame_slots.push(slot);
+                }
+                appended_range
+            };
+            let frame_start = frame_range.start;
+            self.frame_cache.insert(pending.cache_key, frame_range);
+            if retry {
+                self.transient_frame_slots
+                    .insert(pending.cache_key, frame_start);
+                self.transient_frame_keys.push(pending.cache_key);
+            }
         }
         native_results.clear();
         self.native_results = native_results;
         self.pending_frames = pending_frames;
         self.native_requests.clear();
+        self.native_batch_modules.clear();
+        self.retryable_native_modules.clear();
         Ok(())
     }
 
-    fn owned_module_for_frame(
+    fn module_key_for_frame(
         &self,
         process_id: i32,
         frame: &FrameRecord,
         spool_frame_id: Option<u32>,
-    ) -> Option<(ModuleRecord, u64)> {
+    ) -> Option<(u32, u64)> {
         self.module_for_frame(process_id, frame, spool_frame_id)
-            .map(FrameModuleRef::into_owned)
+            .map(|module| (module.module.id, module.file_relative_ip))
     }
 
     fn module_for_frame(
@@ -872,21 +1105,19 @@ impl Symbolizer {
             (Some(contexts), Some(frame_id)) => {
                 let context = contexts.for_frame_id(frame_id)?;
                 spool::module_for_frame_with_context(
-                    &self.modules,
+                    self.modules.records(),
                     contexts,
                     context,
                     process_id,
                     frame,
                 )
             }
-            _ => spool::module_for_frame_unbounded(&self.modules, process_id, frame),
+            _ => spool::module_for_frame_unbounded(self.modules.records(), process_id, frame),
         }
     }
 
     fn module_by_id(&self, module_id: u32) -> Option<&ModuleRecord> {
-        self.module_index_by_id
-            .get(&module_id)
-            .and_then(|&index| self.modules.get(index))
+        self.modules.get(module_id)
     }
 
     #[cfg(test)]
@@ -895,6 +1126,7 @@ impl Symbolizer {
         frame: &FrameRecord,
         module: Option<(ModuleRecord, u64)>,
     ) -> NativeFrame {
+        let module = module.map(|(module, offset)| (module.id, offset));
         let start = self.resolved_frames.len();
         self.append_native_frames(frame, module, None);
         let ResolvedFrame::Native(frame) = self.resolved_frames[start].clone() else {
@@ -906,7 +1138,7 @@ impl Symbolizer {
     fn append_native_frames(
         &mut self,
         frame: &FrameRecord,
-        module: Option<(ModuleRecord, u64)>,
+        module: Option<(u32, u64)>,
         symbols: Option<NativeSymbols>,
     ) {
         if frame.is_truncated_stack_marker() {
@@ -914,8 +1146,12 @@ impl Symbolizer {
                 .push(ResolvedFrame::Native(NativeFrame::truncated_stack_marker()));
             return;
         }
-        let is_kernel_frame =
-            frame.mode == FrameMode::Kernel || module.as_ref().is_some_and(|(m, _)| m.is_kernel);
+        let is_kernel_frame = frame.mode == FrameMode::Kernel
+            || module.as_ref().is_some_and(|(module_id, _)| {
+                self.modules
+                    .get(*module_id)
+                    .is_some_and(ModuleRecord::is_kernel)
+            });
 
         match (is_kernel_frame, module) {
             (false, None) => {
@@ -936,76 +1172,76 @@ impl Symbolizer {
                             SymbolOrigin::KernelSymbols,
                         ),
                         None => (
-                            format!("[kernel]+0x{:x}", frame.abs_ip),
+                            format_hex_suffix("[kernel]", frame.abs_ip),
                             "[kernel]".to_owned(),
                             0,
                             SymbolOrigin::AddressOnly,
                         ),
                     };
-                let symbol = NativeSymbol::new(
-                    symbol_name,
-                    SourceLocation::default(),
-                    module_name,
-                    offset,
-                    false,
-                    false,
-                );
+                let symbol =
+                    NativeSymbol::new(symbol_name, SourceLocation::default(), module_name, offset);
                 self.resolved_frames
                     .push(ResolvedFrame::Native(NativeFrame {
                         pc: frame.abs_ip,
-                        sp: 0,
                         symbol: Some(symbol),
-                        is_python_runtime: false,
                         kind: FrameKind::Kernel,
                         origin,
                         flags: FrameFlags::empty(),
                     }));
             }
-            (false, Some((module, file_relative_ip))) => {
+            (false, Some((module_id, file_relative_ip))) => {
+                let is_python_runtime = frame.mode == FrameMode::User
+                    && self
+                        .modules
+                        .metadata(module_id)
+                        .is_some_and(|metadata| metadata.is_python_runtime);
                 if let Some(symbols) = symbols {
                     self.resolved_frames
-                        .extend(symbols.into_vec().into_iter().map(|symbol| {
-                            let is_python_runtime = symbol.should_ignore;
+                        .extend(symbols.into_symbols().map(|symbol| {
+                            let mut flags = FrameFlags::empty();
+                            flags.set(FrameFlags::PYTHON_RUNTIME, is_python_runtime);
+                            flags.set(FrameFlags::HIDDEN_DEFAULT, symbol.should_ignore());
                             ResolvedFrame::Native(NativeFrame {
                                 pc: frame.abs_ip,
-                                sp: 0,
                                 symbol: Some(symbol),
-                                is_python_runtime,
                                 kind: FrameKind::Native,
                                 origin: SymbolOrigin::Elf,
-                                flags: if is_python_runtime {
-                                    FrameFlags::PYTHON_RUNTIME | FrameFlags::HIDDEN_DEFAULT
-                                } else {
-                                    FrameFlags::empty()
-                                },
+                                flags,
                             })
                         }));
                     return;
                 }
 
-                let is_python_runtime = frame.mode == FrameMode::User
-                    && crate::is_python_runtime_module_path(&module.path);
-                let symbol_name = format!(
-                    "{}+0x{:x}",
-                    module_display_name(&module.path),
-                    file_relative_ip
-                );
+                let Some((module, module_metadata)) = self.modules.get_with_metadata_mut(module_id)
+                else {
+                    self.resolved_frames
+                        .push(ResolvedFrame::Native(NativeFrame::from_address(
+                            frame.abs_ip,
+                        )));
+                    return;
+                };
+                let path = module_metadata
+                    .path
+                    .get_or_insert_with(|| module.path.as_str().into());
+                let symbol_name =
+                    format_hex_suffix(&path[module_metadata.basename_start..], file_relative_ip);
                 // Pseudo-symbol without a function: the name embeds the
                 // file-relative address, so the function offset is 0.
                 let symbol = NativeSymbol::new(
-                    symbol_name.clone(),
+                    symbol_name,
                     SourceLocation::default(),
-                    module.path,
+                    std::rc::Rc::clone(path),
                     0,
-                    crate::symbols::is_eval_frame(&symbol_name),
-                    is_python_runtime,
                 );
+                let symbol = if is_python_runtime {
+                    symbol.hidden_by_default()
+                } else {
+                    symbol
+                };
                 self.resolved_frames
                     .push(ResolvedFrame::Native(NativeFrame {
                         pc: frame.abs_ip,
-                        sp: 0,
                         symbol: Some(symbol),
-                        is_python_runtime,
                         kind: FrameKind::Native,
                         origin: SymbolOrigin::AddressOnly,
                         flags: if is_python_runtime {
@@ -1033,25 +1269,37 @@ impl Symbolizer {
         }
     }
 
-    fn lookup_perf_map_symbol(&mut self, process_id: i32, abs_ip: u64) -> Option<PerfMapSymbol> {
+    fn lookup_perf_map_symbol(
+        &mut self,
+        process_id: i32,
+        abs_ip: u64,
+    ) -> Option<(PerfMapSymbol, std::rc::Rc<str>)> {
         self.perf_map_cache
             .entry(process_id)
             .or_insert_with(|| load_perf_map(&self.perf_map_dir, process_id))
             .as_ref()
-            .and_then(|symbols| find_perf_map_symbol(symbols, abs_ip))
-            .cloned()
+            .and_then(|perf_map| find_perf_map_symbol(perf_map, abs_ip))
+            .map(|(symbol, module)| (symbol.clone(), module.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::rc::Rc;
 
-    use crate::spool::PerfSpoolWriter;
+    use crate::spool::{ModuleOwner, PerfSpoolWriter};
 
     use super::*;
+
+    fn user_owner(pid: i32) -> ModuleOwner {
+        ModuleOwner::Process(crate::Pid::new(pid).unwrap())
+    }
+
+    fn test_process_id(sequence: i32) -> i32 {
+        1_500_000_000 + sequence
+    }
 
     fn temp_perf_map_path(process_id: i32) -> String {
         format!("/tmp/perf-{process_id}.map")
@@ -1078,7 +1326,7 @@ mod tests {
     fn module_with_path(id: u32, process_id: i32, start: u64, path: &str) -> ModuleRecord {
         ModuleRecord {
             id,
-            process_id,
+            owner: user_owner(process_id),
             start,
             end: start + 0x1000,
             file_offset: 0,
@@ -1087,7 +1335,6 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: path.into(),
-            is_kernel: false,
         }
     }
 
@@ -1100,7 +1347,7 @@ mod tests {
             .expect("executable mapping");
         ModuleRecord {
             id,
-            process_id,
+            owner: user_owner(process_id),
             start: region.address.start,
             end: region.address.end,
             file_offset: region.file_offset,
@@ -1109,7 +1356,6 @@ mod tests {
             device_minor: region.device_minor,
             inode_generation: 0,
             path: region.path.into(),
-            is_kernel: false,
         }
     }
 
@@ -1134,6 +1380,60 @@ mod tests {
                     .collect(),
             );
             output.extend(requests.iter().map(|_| NativeSymbols::unresolved()));
+            Ok(())
+        }
+    }
+
+    struct CountingNativeSymbolizer {
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl NativeSymbolizer for CountingNativeSymbolizer {
+        type Error = std::convert::Infallible;
+
+        fn symbolize(
+            &mut self,
+            requests: &[NativeLookup],
+            output: &mut Vec<NativeSymbols>,
+        ) -> Result<(), Self::Error> {
+            self.calls.set(self.calls.get() + 1);
+            output.extend(requests.iter().map(|request| {
+                NativeSymbols::one(NativeSymbol::new(
+                    "resolved-after-retry",
+                    SourceLocation::default(),
+                    request.module().name_rc().clone(),
+                    0,
+                ))
+            }));
+            Ok(())
+        }
+    }
+
+    struct DescriptorRecordingSymbolizer {
+        descriptors: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl NativeSymbolizer for DescriptorRecordingSymbolizer {
+        type Error = std::convert::Infallible;
+
+        fn symbolize(
+            &mut self,
+            requests: &[NativeLookup],
+            output: &mut Vec<NativeSymbols>,
+        ) -> Result<(), Self::Error> {
+            self.descriptors.borrow_mut().extend(
+                requests
+                    .iter()
+                    .map(|request| request.module().image_path().is_some()),
+            );
+            output.extend(requests.iter().map(|request| {
+                NativeSymbols::one(NativeSymbol::new(
+                    "cached-image",
+                    SourceLocation::default(),
+                    request.module().name_rc().clone(),
+                    0,
+                ))
+            }));
             Ok(())
         }
     }
@@ -1193,6 +1493,32 @@ mod tests {
     }
 
     #[test]
+    fn native_factory_error_is_reported_without_panicking() {
+        let pid = crate::Pid::try_from(std::process::id()).expect("current pid");
+        let module = current_executable_module(0, pid.get());
+        let frame = pinned_frame(0, module.start + 8);
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .try_native(
+                |_| -> Result<FailingNativeSymbolizer, SentinelNativeError> {
+                    Err(SentinelNativeError)
+                },
+            )
+            .build()
+            .unwrap();
+
+        let error = match symbolizer.resolve_raw(pid, &[frame]) {
+            Err(error) => error,
+            Ok(_) => panic!("failing factory unexpectedly resolved the frame"),
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::NativeSymbolizer);
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<SentinelNativeError>())
+            .is_some());
+    }
+
+    #[test]
     fn wrong_native_result_count_is_rejected() {
         let pid = crate::Pid::try_from(std::process::id()).expect("current pid");
         let module = current_executable_module(0, pid.get());
@@ -1243,6 +1569,170 @@ mod tests {
 
         assert_eq!(symbolizer.resolve_raw(pid, &frames).unwrap().count(), 2);
         assert_eq!(batches.borrow().len(), 1);
+    }
+
+    #[test]
+    fn transient_module_open_is_retried_without_retaining_image_descriptors() {
+        let temp = crate::test_support::TempDir::new("symbolize-native-retry");
+        let path = temp.path().join("late-image");
+        let pid = crate::Pid::new(2_000_000_000).unwrap();
+        let mut module = current_executable_module(0, pid.get());
+        module.inode = 0;
+        module.device_major = 0;
+        module.device_minor = 0;
+        module.path = path.to_string_lossy().into_owned().into();
+        let frames = [
+            pinned_frame(0, module.start + 8),
+            pinned_frame(0, module.start + 16),
+        ];
+        let calls = Rc::new(Cell::new(0));
+        let backend_calls = Rc::clone(&calls);
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .native(move |_| CountingNativeSymbolizer {
+                calls: Rc::clone(&backend_calls),
+            })
+            .build()
+            .unwrap();
+
+        let first = symbolizer
+            .resolve_raw(pid, &frames)
+            .unwrap()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            first,
+            ResolvedFrame::Native(frame) if frame.origin == SymbolOrigin::AddressOnly
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(symbolizer.native_modules.is_empty());
+        assert!(symbolizer.unsupported_native_modules.is_empty());
+
+        fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let second = symbolizer
+            .resolve_raw(pid, &frames)
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(second.display_name(), "resolved-after-retry");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(symbolizer.resolved_frames.len(), frames.len());
+        assert!(symbolizer.native_batch_modules.is_empty());
+        assert!(symbolizer
+            .native_modules
+            .values()
+            .all(|module| module.image_path().is_none()));
+
+        assert_eq!(symbolizer.resolve_raw(pid, &frames).unwrap().count(), 2);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn permanent_module_open_failure_is_cached_after_one_retry() {
+        let temp = crate::test_support::TempDir::new("symbolize-native-permanent-miss");
+        let path = temp.path().join("missing-image");
+        let pid = crate::Pid::new(2_000_000_000).unwrap();
+        let mut module = current_executable_module(0, pid.get());
+        module.inode = 0;
+        module.device_major = 0;
+        module.device_minor = 0;
+        module.path = path.to_string_lossy().into_owned().into();
+        let module_id = module.id;
+        let frame = pinned_frame(0, module.start + 8);
+        let calls = Rc::new(Cell::new(0));
+        let backend_calls = Rc::clone(&calls);
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .native(move |_| CountingNativeSymbolizer {
+                calls: Rc::clone(&backend_calls),
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+        assert!(!symbolizer.unsupported_native_modules.contains(&module_id));
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+        assert!(symbolizer.unsupported_native_modules.contains(&module_id));
+        let resolved_frame_count = symbolizer.resolved_frames.len();
+
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+        assert_eq!(symbolizer.resolved_frames.len(), resolved_frame_count);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn invalid_elf_failure_is_cached_without_retrying() {
+        let temp = crate::test_support::TempDir::new("symbolize-native-invalid-elf");
+        let path = temp.path().join("invalid-image");
+        fs::write(&path, b"not an elf").unwrap();
+        let pid = crate::Pid::new(2_000_000_000).unwrap();
+        let mut module = current_executable_module(0, pid.get());
+        module.inode = 0;
+        module.device_major = 0;
+        module.device_minor = 0;
+        module.path = path.to_string_lossy().into_owned().into();
+        let module_id = module.id;
+        let frame = pinned_frame(0, module.start + 8);
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .native(|_| EmptyNativeSymbolizer)
+            .build()
+            .unwrap();
+
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+        assert!(symbolizer.unsupported_native_modules.contains(&module_id));
+        let resolved_frame_count = symbolizer.resolved_frames.len();
+
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+        assert_eq!(symbolizer.resolved_frames.len(), resolved_frame_count);
+    }
+
+    #[test]
+    fn cached_native_backend_can_resolve_after_the_image_disappears() {
+        let temp = crate::test_support::TempDir::new("symbolize-native-cached-image");
+        let path = temp.path().join("image");
+        fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let pid = crate::Pid::new(2_000_000_000).unwrap();
+        let mut module = current_executable_module(0, pid.get());
+        module.inode = 0;
+        module.device_major = 0;
+        module.device_minor = 0;
+        module.path = path.to_string_lossy().into_owned().into();
+        let first = pinned_frame(0, module.start + 8);
+        let second = pinned_frame(0, module.start + 16);
+        let descriptors = Rc::new(RefCell::new(Vec::new()));
+        let backend_descriptors = Rc::clone(&descriptors);
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .native(move |_| DescriptorRecordingSymbolizer {
+                descriptors: Rc::clone(&backend_descriptors),
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            symbolizer
+                .resolve_raw(pid, &[first])
+                .unwrap()
+                .next()
+                .unwrap()
+                .display_name(),
+            "cached-image"
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            symbolizer
+                .resolve_raw(pid, &[second])
+                .unwrap()
+                .next()
+                .unwrap()
+                .display_name(),
+            "cached-image"
+        );
+        assert_eq!(&*descriptors.borrow(), &[true, false]);
+
+        assert_eq!(symbolizer.resolve_raw(pid, &[second]).unwrap().count(), 1);
+        assert_eq!(&*descriptors.borrow(), &[true, false]);
     }
 
     #[test]
@@ -1316,7 +1806,7 @@ mod tests {
 
     #[test]
     fn python_perf_map_symbols_win() {
-        let process_id = -(std::process::id() as i32);
+        let process_id = test_process_id(0);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "1000 10 py::work:/tmp/app.py\n").expect("write perf map");
 
@@ -1327,7 +1817,7 @@ mod tests {
         match resolved {
             ResolvedFrame::Python(frame) => {
                 assert_eq!(frame.func_name.as_ref(), "work");
-                assert_eq!(frame.file_name.as_ref(), "/tmp/app.py");
+                assert_eq!(frame.file_name(), "/tmp/app.py");
             }
             ResolvedFrame::Native(_) => panic!("expected Python perf-map frame"),
         }
@@ -1335,7 +1825,7 @@ mod tests {
 
     #[test]
     fn python_perf_map_symbols_respect_declared_ranges() {
-        let process_id = -(std::process::id() as i32) - 9;
+        let process_id = test_process_id(9);
         let path = temp_perf_map_path(process_id);
         fs::write(
             &path,
@@ -1365,7 +1855,7 @@ mod tests {
 
     #[test]
     fn native_perf_map_symbols_win_without_module() {
-        let process_id = -(std::process::id() as i32) - 1;
+        let process_id = test_process_id(1);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "2000 20 jit_func\n").expect("write perf map");
 
@@ -1379,7 +1869,7 @@ mod tests {
                 assert_eq!(frame.origin, SymbolOrigin::PerfMap);
                 assert_eq!(frame.flags, FrameFlags::JIT);
                 let symbol = frame.symbol.expect("perf-map native symbol");
-                assert_eq!(symbol.name.as_ref(), "jit_func");
+                assert_eq!(symbol.name(), "jit_func");
                 assert_eq!(symbol.module.as_ref(), temp_perf_map_path(process_id));
                 assert_eq!(symbol.offset, 8);
             }
@@ -1389,7 +1879,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_can_be_disabled() {
-        let process_id = -(std::process::id() as i32) - 2;
+        let process_id = test_process_id(2);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "2800 20 py::stale:/tmp/stale.py\n").expect("write perf map");
 
@@ -1438,7 +1928,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_do_not_override_non_python_modules() {
-        let process_id = -(std::process::id() as i32) - 4;
+        let process_id = test_process_id(4);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "4000 20 py::fake_after_exec:/tmp/fake.py\n").expect("write perf map");
         let module = module_with_path(0, process_id, 0x4000, "/bin/bash");
@@ -1460,7 +1950,7 @@ mod tests {
                 assert_eq!(frame.origin, SymbolOrigin::AddressOnly);
                 assert!(!frame.flags.contains(FrameFlags::PYTHON_RUNTIME));
                 assert!(!frame.flags.contains(FrameFlags::HIDDEN_DEFAULT));
-                assert!(!frame.is_python_runtime);
+                assert!(!frame.is_python_runtime());
                 assert_ne!(frame.display_name(), "fake_after_exec");
             }
             ResolvedFrame::Python(_) => panic!("non-Python module should block perf-map symbol"),
@@ -1469,7 +1959,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_do_not_override_file_backed_python_modules() {
-        let process_id = -(std::process::id() as i32) - 11;
+        let process_id = test_process_id(11);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "4000 20 py::stale:/tmp/stale.py\n").expect("write perf map");
         let module = module_with_path(0, process_id, 0x4000, "/usr/lib/libpython3.13.so.1.0");
@@ -1485,7 +1975,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_do_not_override_late_resolved_non_python_modules() {
-        let process_id = -(std::process::id() as i32) - 6;
+        let process_id = test_process_id(6);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "5000 20 py::fake_after_exec:/tmp/fake.py\n").expect("write perf map");
         let module = module_with_path(0, process_id, 0x5000, "/bin/bash");
@@ -1499,7 +1989,7 @@ mod tests {
                 assert_eq!(frame.origin, SymbolOrigin::AddressOnly);
                 assert!(!frame.flags.contains(FrameFlags::PYTHON_RUNTIME));
                 assert!(!frame.flags.contains(FrameFlags::HIDDEN_DEFAULT));
-                assert!(!frame.is_python_runtime);
+                assert!(!frame.is_python_runtime());
                 assert_ne!(frame.display_name(), "fake_after_exec");
             }
             ResolvedFrame::Python(_) => {
@@ -1510,7 +2000,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_do_not_override_memfd_mappings_by_default() {
-        let process_id = -(std::process::id() as i32) - 10;
+        let process_id = test_process_id(10);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "5800 20 jit_memfd\n").expect("write perf map");
         let module = module_with_path(0, process_id, 0x5800, "/memfd:jit-code");
@@ -1537,7 +2027,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_can_override_anonymous_python_code_mappings() {
-        let process_id = -(std::process::id() as i32) - 7;
+        let process_id = test_process_id(7);
         let path = temp_perf_map_path(process_id);
         fs::write(
             &path,
@@ -1567,7 +2057,7 @@ mod tests {
 
     #[test]
     fn perf_map_symbols_cover_perf_anonymous_mapping_names() {
-        let process_id = -(std::process::id() as i32) - 12;
+        let process_id = test_process_id(12);
         let path = temp_perf_map_path(process_id);
         let mapping_paths = [
             "[heap]",
@@ -1599,7 +2089,7 @@ mod tests {
 
     #[test]
     fn resolved_frames_are_cached_across_stacks() {
-        let process_id = -(std::process::id() as i32) - 5;
+        let process_id = test_process_id(5);
         let path = temp_perf_map_path(process_id);
         fs::write(&path, "3000 20 jit_func\n").expect("write perf map");
 
@@ -1619,7 +2109,7 @@ mod tests {
 
     #[test]
     fn python_runtime_modules_are_classified_and_hidden_by_default() {
-        let process_id = -(std::process::id() as i32) - 8;
+        let process_id = test_process_id(8);
         let module = module_with_path(0, process_id, 0x8000, "/usr/bin/python3");
         let mut symbolizer = Symbolizer::new(&[module]);
 
@@ -1637,14 +2127,66 @@ mod tests {
             ResolvedFrame::Native(frame) => {
                 assert_eq!(frame.kind, FrameKind::Native);
                 assert_eq!(frame.origin, SymbolOrigin::AddressOnly);
-                assert!(frame.is_python_runtime);
+                assert!(frame.is_python_runtime());
                 assert!(frame.flags.contains(FrameFlags::PYTHON_RUNTIME));
                 assert!(frame.flags.contains(FrameFlags::HIDDEN_DEFAULT));
                 let symbol = frame.symbol.expect("fallback Python runtime symbol");
-                assert!(symbol.should_ignore);
+                assert!(symbol.should_ignore());
             }
             ResolvedFrame::Python(_) => panic!("Python runtime module should stay native"),
         }
+    }
+
+    #[test]
+    fn native_runtime_and_hidden_flags_are_independent() {
+        let process_id = 42;
+        let python = module_with_path(0, process_id, 0x8000, "/usr/bin/python3");
+        let native = module_with_path(1, process_id, 0x9000, "/usr/lib/libworker.so");
+        let mut symbolizer = Symbolizer::new(&[python.clone(), native.clone()]);
+        let visible = NativeSymbol::new("visible", SourceLocation::default(), "python3", 0);
+        let hidden = NativeSymbol::new("hidden", SourceLocation::default(), "libworker.so", 0)
+            .hidden_by_default();
+
+        symbolizer.append_native_frames(
+            &pinned_frame(0, 0x8008),
+            Some((python.id, 8)),
+            Some(NativeSymbols::new(vec![visible])),
+        );
+        symbolizer.append_native_frames(
+            &pinned_frame(1, 0x9008),
+            Some((native.id, 8)),
+            Some(NativeSymbols::new(vec![hidden])),
+        );
+
+        let ResolvedFrame::Native(python_frame) = &symbolizer.resolved_frames[0] else {
+            panic!("expected native Python-runtime frame")
+        };
+        assert!(python_frame.flags.contains(FrameFlags::PYTHON_RUNTIME));
+        assert!(!python_frame.flags.contains(FrameFlags::HIDDEN_DEFAULT));
+        assert!(python_frame.is_python_runtime());
+
+        let ResolvedFrame::Native(hidden_frame) = &symbolizer.resolved_frames[1] else {
+            panic!("expected hidden native frame")
+        };
+        assert!(!hidden_frame.flags.contains(FrameFlags::PYTHON_RUNTIME));
+        assert!(hidden_frame.flags.contains(FrameFlags::HIDDEN_DEFAULT));
+        assert!(!hidden_frame.is_python_runtime());
+    }
+
+    #[test]
+    fn resolve_raw_rejects_malformed_truncated_marker() {
+        let pid = crate::Pid::new(42).unwrap();
+        let mut symbolizer = Symbolizer::new(&[]);
+        let malformed = FrameRecord {
+            abs_ip: 1,
+            ..FrameRecord::truncated_stack_marker()
+        };
+
+        let error = match symbolizer.resolve_raw(pid, &[malformed]) {
+            Ok(_) => panic!("malformed marker was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1663,7 +2205,7 @@ mod tests {
         assert_eq!(resolved.kind, FrameKind::Kernel);
         assert_eq!(resolved.origin, SymbolOrigin::AddressOnly);
         let symbol = resolved.symbol.expect("kernel fallback symbol");
-        assert_eq!(symbol.name.as_ref(), "[kernel]+0xffffffff80001234");
+        assert_eq!(symbol.name(), "[kernel]+0xffffffff80001234");
         assert_eq!(symbol.module.as_ref(), "[kernel]");
         assert_eq!(symbol.offset, 0);
     }
@@ -1686,7 +2228,7 @@ mod tests {
         let resolved = symbolizer.resolve_native_frame(&frame, None);
 
         let symbol = resolved.symbol.expect("resolved kernel symbol");
-        assert_eq!(symbol.name.as_ref(), "vfs_read+0x14");
+        assert_eq!(symbol.name(), "vfs_read+0x14");
         assert_eq!(symbol.module.as_ref(), "[kernel]");
         assert_eq!(symbol.offset, 0x14);
     }
@@ -1801,7 +2343,7 @@ mod tests {
         writer
             .write_module(&ModuleRecord {
                 id: 0,
-                process_id: 7,
+                owner: user_owner(7),
                 start: 0x1000,
                 end: 0x2000,
                 file_offset: 0,
@@ -1810,7 +2352,6 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/future".into(),
-                is_kernel: false,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -1845,6 +2386,27 @@ mod tests {
             .build()
             .unwrap();
         assert_future_module_unresolved(&reader, symbolizer, stack_id);
+    }
+
+    #[test]
+    fn module_builder_binds_to_the_first_spool_source() {
+        let (first_path, _) = write_future_module_spool("source-binding-first");
+        let (second_path, _) = write_future_module_spool("source-binding-second");
+        let first = Snapshot::open(&first_path).unwrap();
+        let second = Snapshot::open(&second_path).unwrap();
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+        let mut symbolizer = SymbolizerBuilder::for_modules(first.modules())
+            .disable_perf_maps()
+            .build()
+            .unwrap();
+
+        assert!(symbolizer.resolve(first.stacks().next().unwrap()).is_ok());
+        let error = match symbolizer.resolve(second.stacks().next().unwrap()) {
+            Ok(_) => panic!("stack from another source was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1931,7 +2493,7 @@ mod tests {
     fn assert_wireguard_kernel_frame(frame: &NativeFrame) {
         let symbol = frame.symbol.as_ref().expect("kernel module symbol");
         assert_eq!(frame.kind, FrameKind::Kernel);
-        assert_eq!(symbol.name.as_ref(), "wg_packet_tx_worker+0x14");
+        assert_eq!(symbol.name(), "wg_packet_tx_worker+0x14");
         assert_eq!(symbol.module.as_ref(), "[wireguard]");
     }
 

@@ -114,7 +114,8 @@ pub(crate) fn try_process_exists(pid: Pid) -> io::Result<bool> {
         let Ok(entry) = entry else {
             continue;
         };
-        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
             continue;
         };
         let Ok(tid) = file_name.parse::<i32>() else {

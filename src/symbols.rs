@@ -4,6 +4,7 @@ use crate::module_base::ModuleImageBase;
 use crate::profile::NativeSymbol;
 #[cfg(feature = "builtin-wholesym")]
 use crate::profile::SourceLocation;
+use crate::spool::ModulePath;
 
 #[cfg(feature = "builtin-wholesym")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
@@ -18,21 +19,33 @@ use wholesym::{
 #[cfg(feature = "builtin-wholesym")]
 use std::cell::RefCell;
 #[cfg(feature = "builtin-wholesym")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Module information for symbolization.
 #[derive(Clone, Debug)]
-pub struct NativeModule(Rc<NativeModuleData>);
+pub struct NativeModule {
+    data: Rc<NativeModuleData>,
+    image: Option<Arc<NativeImage>>,
+}
+
+#[derive(Debug)]
+struct NativeImage {
+    path: PathBuf,
+    _file: Arc<std::fs::File>,
+}
 
 #[derive(Debug)]
 pub(crate) struct NativeModuleData {
-    pub(crate) path: PathBuf,
+    pub(crate) path: ModulePath,
+    pub(crate) name: Rc<str>,
     pub(crate) image_base: ModuleImageBase,
     pub(crate) is_python_runtime: bool,
     pub(crate) file_identity: NativeFileIdentity,
     pub(crate) mapping_id: u32,
+    pub(crate) image_id: NativeImageId,
 }
 
 /// Stable recorded identity for a native image.
@@ -44,21 +57,56 @@ pub struct NativeFileIdentity {
     inode_generation: u64,
 }
 
+/// Opaque identity of the exact validated image used for symbolization.
+///
+/// Values are comparable within one [`crate::Symbolizer`] and let a backend
+/// share parsed image data without using a pathname or mapping address as a
+/// weaker key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NativeImageId(u64);
+
 impl NativeModule {
     pub(crate) fn new(
-        path: PathBuf,
+        path: ModulePath,
         image_base: ModuleImageBase,
         is_python_runtime: bool,
         file_identity: NativeFileIdentity,
         mapping_id: u32,
+        image_token: u64,
     ) -> Self {
-        Self(Rc::new(NativeModuleData {
-            path,
-            image_base,
-            is_python_runtime,
-            file_identity,
-            mapping_id,
-        }))
+        let name = crate::path_name(path.as_path()).into();
+        Self {
+            data: Rc::new(NativeModuleData {
+                path,
+                name,
+                image_base,
+                is_python_runtime,
+                file_identity,
+                mapping_id,
+                image_id: NativeImageId(image_token),
+            }),
+            image: None,
+        }
+    }
+
+    pub(crate) fn with_image_file(&self, image_file: Option<Arc<std::fs::File>>) -> Self {
+        #[cfg(target_os = "linux")]
+        let image = image_file.map(|file| {
+            use std::os::fd::AsRawFd;
+            Arc::new(NativeImage {
+                path: PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                _file: file,
+            })
+        });
+        #[cfg(not(target_os = "linux"))]
+        let image = {
+            let _ = image_file;
+            None
+        };
+        Self {
+            data: Rc::clone(&self.data),
+            image,
+        }
     }
 }
 
@@ -66,29 +114,52 @@ impl NativeModule {
     /// Return the mapped object's recorded path.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.0.path
+        self.data.path.as_path()
+    }
+
+    /// Borrow the shared module display name without copying it.
+    #[must_use]
+    pub fn name_rc(&self) -> &Rc<str> {
+        &self.data.name
+    }
+
+    /// Return a process-local path to the validated mapped image, when the
+    /// image came from a file.
+    ///
+    /// The path remains valid while this module is alive. It can differ from
+    /// [`Self::path`] when the recorded pathname was replaced or came from
+    /// another mount namespace.
+    #[must_use]
+    pub fn image_path(&self) -> Option<&Path> {
+        self.image.as_ref().map(|image| image.path.as_path())
     }
 
     /// Return whether this image is the Python runtime.
     #[must_use]
     pub fn is_python_runtime(&self) -> bool {
-        self.0.is_python_runtime
+        self.data.is_python_runtime
     }
 
     pub(crate) fn image_base(&self) -> ModuleImageBase {
-        self.0.image_base
+        self.data.image_base
     }
 
     /// Return the recorded filesystem identity.
     #[must_use]
     pub fn file_identity(&self) -> NativeFileIdentity {
-        self.0.file_identity
+        self.data.file_identity
     }
 
     /// Return the spool-local mapping generation identifier.
     #[must_use]
     pub fn mapping_id(&self) -> u32 {
-        self.0.mapping_id
+        self.data.mapping_id
+    }
+
+    /// Return the exact image identity selected by StackPulse.
+    #[must_use]
+    pub fn image_id(&self) -> NativeImageId {
+        self.data.image_id
     }
 }
 
@@ -184,41 +255,113 @@ impl NativeLookup {
     pub fn mapping_id(&self) -> u32 {
         self.module.mapping_id()
     }
+
+    /// Return the exact image identity selected by StackPulse.
+    #[must_use]
+    pub fn image_id(&self) -> NativeImageId {
+        self.module.image_id()
+    }
 }
 
 /// Owned inline-expanded symbols for one native lookup.
-#[derive(Clone, Debug, Default)]
-pub struct NativeSymbols(Vec<NativeSymbol>);
+#[derive(Debug, Default)]
+pub struct NativeSymbols(NativeSymbolStorage);
+
+#[derive(Debug, Default)]
+enum NativeSymbolStorage {
+    #[default]
+    Unresolved,
+    One(NativeSymbol),
+    Many(Vec<NativeSymbol>),
+}
 
 impl NativeSymbols {
     /// Construct a resolved result from innermost-first symbols.
     #[must_use]
-    pub fn new(symbols: Vec<NativeSymbol>) -> Self {
-        Self(symbols)
+    pub fn new(mut symbols: Vec<NativeSymbol>) -> Self {
+        set_inline_depths(&mut symbols);
+        match symbols.len() {
+            0 => Self::unresolved(),
+            1 => symbols.pop().map_or_else(Self::unresolved, |symbol| {
+                Self(NativeSymbolStorage::One(symbol))
+            }),
+            _ => Self(NativeSymbolStorage::Many(symbols)),
+        }
+    }
+
+    /// Construct a single-symbol result without allocating a vector.
+    #[must_use]
+    pub fn one(mut symbol: NativeSymbol) -> Self {
+        symbol.set_inline_depth(0);
+        Self(NativeSymbolStorage::One(symbol))
     }
 
     /// Construct an unresolved result without allocation.
     #[must_use]
     pub const fn unresolved() -> Self {
-        Self(Vec::new())
+        Self(NativeSymbolStorage::Unresolved)
     }
 
     /// Borrow the resolved inline chain.
     #[must_use]
     pub fn as_slice(&self) -> &[NativeSymbol] {
-        &self.0
+        match &self.0 {
+            NativeSymbolStorage::Unresolved => &[],
+            NativeSymbolStorage::One(symbol) => std::slice::from_ref(symbol),
+            NativeSymbolStorage::Many(symbols) => symbols,
+        }
     }
 
     /// Return whether no native symbol was found.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        matches!(self.0, NativeSymbolStorage::Unresolved)
     }
 
-    pub(crate) fn into_vec(self) -> Vec<NativeSymbol> {
-        self.0
+    pub(crate) fn into_symbols(self) -> NativeSymbolsIntoIter {
+        match self.0 {
+            NativeSymbolStorage::Unresolved => NativeSymbolsIntoIter::Unresolved,
+            NativeSymbolStorage::One(symbol) => NativeSymbolsIntoIter::One(Some(symbol)),
+            NativeSymbolStorage::Many(symbols) => NativeSymbolsIntoIter::Many(symbols.into_iter()),
+        }
     }
 }
+
+fn set_inline_depths(symbols: &mut [NativeSymbol]) {
+    let count = symbols.len();
+    for (index, symbol) in symbols.iter_mut().enumerate() {
+        symbol.set_inline_depth(count - index - 1);
+    }
+}
+
+pub(crate) enum NativeSymbolsIntoIter {
+    Unresolved,
+    One(Option<NativeSymbol>),
+    Many(std::vec::IntoIter<NativeSymbol>),
+}
+
+impl Iterator for NativeSymbolsIntoIter {
+    type Item = NativeSymbol;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Unresolved => None,
+            Self::One(symbol) => symbol.take(),
+            Self::Many(symbols) => symbols.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = match self {
+            Self::Unresolved => 0,
+            Self::One(symbol) => usize::from(symbol.is_some()),
+            Self::Many(symbols) => symbols.len(),
+        };
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for NativeSymbolsIntoIter {}
 
 /// Plug-in interface for batched native symbolization.
 pub trait NativeSymbolizer {
@@ -270,6 +413,7 @@ impl NativeSymbolizer for SymbolizerWrapper {
         requests: &[NativeLookup],
         output: &mut Vec<NativeSymbols>,
     ) -> Result<(), Self::Error> {
+        self.preload_symbol_maps(requests);
         output.reserve(requests.len());
         output.extend(
             requests
@@ -285,29 +429,42 @@ struct SharedSymbolizerWrapper(Rc<RefCell<Option<SymbolizerWrapper>>>);
 
 #[cfg(feature = "builtin-wholesym")]
 impl NativeSymbolizer for SharedSymbolizerWrapper {
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
 
     fn symbolize(
         &mut self,
         requests: &[NativeLookup],
         output: &mut Vec<NativeSymbols>,
     ) -> Result<(), Self::Error> {
-        self.0
-            .borrow_mut()
-            .get_or_insert_with(SymbolizerWrapper::new)
+        let mut shared = self.0.borrow_mut();
+        let Some(symbolizer) = shared.as_mut() else {
+            return Err(std::io::Error::other(
+                "shared native symbolizer was not initialized",
+            ));
+        };
+        symbolizer
             .symbolize(requests, output)
+            .map_err(|error| match error {})
     }
 }
 
+pub(crate) type NativeBackendError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type NativeSymbolizerFactory =
-    Box<dyn FnMut(crate::Pid) -> Box<dyn ErasedNativeSymbolizer>>;
+    Box<dyn FnMut(crate::Pid) -> Result<Box<dyn ErasedNativeSymbolizer>, NativeBackendError>>;
 
 /// Factory for StackPulse's bundled Wholesym backend.
 #[cfg(feature = "builtin-wholesym")]
 #[must_use]
 pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
     let shared = Rc::new(RefCell::new(None));
-    Box::new(move |_pid| erase_native_symbolizer(SharedSymbolizerWrapper(Rc::clone(&shared))))
+    Box::new(move |_pid| {
+        if shared.borrow().is_none() {
+            *shared.borrow_mut() = Some(SymbolizerWrapper::try_new()?);
+        }
+        Ok(erase_native_symbolizer(SharedSymbolizerWrapper(Rc::clone(
+            &shared,
+        ))))
+    })
 }
 
 /// Symbols that indicate the Python eval loop.
@@ -502,43 +659,19 @@ struct SymbolizerWrapper {
     /// Local debug directories for `.build-id` lookup (Linux only).
     local_debug_dirs: Box<[PathBuf]>,
 
-    /// Cached redirect mappings keyed by module path (Linux only).
-    /// Maps module path -> (standard_debug_path, actual_debug_path).
-    redirect_cache: HashMap<PathBuf, (PathBuf, PathBuf)>,
+    /// Cached debug-file redirects keyed by validated image identity.
+    redirect_cache: HashMap<NativeImageId, Option<(PathBuf, PathBuf)>>,
 
     /// Shared symbol manager used for symbolization.
     symbol_manager: SymbolManager,
 
-    /// Loaded wholesym maps keyed by recorded file identity. A mapping-local
-    /// key is used when the spool has no stable filesystem identity.
-    symbol_maps: HashMap<NativeImageKey, Option<WholeSymbolMap>>,
+    /// Loaded wholesym maps keyed by StackPulse's validated image identity.
+    symbol_maps: HashMap<NativeImageId, Option<WholeSymbolMap>>,
 
     /// Tokio runtime for wholesym async APIs. Wrapped so Drop can hand it to
     /// `shutdown_background`, which is safe even inside another tokio runtime
     /// (a plain runtime drop there panics mid-unwind and aborts the process).
     runtime: std::mem::ManuallyDrop<TokioRuntime>,
-}
-
-#[cfg(feature = "builtin-wholesym")]
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum NativeImageKey {
-    File(NativeFileIdentity),
-    Mapping { path: PathBuf, id: u32 },
-}
-
-#[cfg(feature = "builtin-wholesym")]
-impl NativeImageKey {
-    fn for_lookup(lookup: &NativeLookup) -> Self {
-        let identity = lookup.file_identity();
-        if identity.inode() != 0 || identity.device_major() != 0 || identity.device_minor() != 0 {
-            Self::File(identity)
-        } else {
-            Self::Mapping {
-                path: lookup.module().path().to_path_buf(),
-                id: lookup.mapping_id(),
-            }
-        }
-    }
 }
 
 #[cfg(feature = "builtin-wholesym")]
@@ -572,36 +705,20 @@ where
     )
 }
 
-/// Extract a short module name from a path (file name, or full path as fallback).
-#[cfg(feature = "builtin-wholesym")]
-fn module_name_rc(path: &Path) -> Rc<str> {
-    crate::path_to_name(path).into()
-}
-
 #[cfg(feature = "builtin-wholesym")]
 fn build_native_symbol(
-    name: String,
+    name: impl Into<Rc<str>>,
     source: SourceLocation,
     module: &Rc<str>,
     offset: u64,
     is_python_runtime: bool,
 ) -> NativeSymbol {
-    let name_str: Rc<str> = name.into();
-    NativeSymbol {
-        is_eval_frame: is_eval_frame(&name_str),
-        name: name_str,
-        source,
-        module: Rc::clone(module),
-        offset,
-        inline_depth: 0,
-        should_ignore: is_python_runtime,
+    let symbol = NativeSymbol::new(name, source, Rc::clone(module), offset);
+    if is_python_runtime {
+        symbol.hidden_by_default()
+    } else {
+        symbol
     }
-}
-
-#[cfg(feature = "builtin-wholesym")]
-#[inline]
-fn inline_depth_for_frame(frame_count: usize, index: usize) -> u16 {
-    u16::try_from(frame_count.saturating_sub(index + 1)).unwrap_or(u16::MAX)
 }
 
 #[cfg(feature = "builtin-wholesym")]
@@ -611,21 +728,8 @@ fn build_native_symbols_from_wholesym_parts(
     module: &Rc<str>,
     function_offset: u64,
     is_python_runtime: bool,
-) -> Vec<NativeSymbol> {
-    let fallback_name = symbol_name;
-    let fallback_symbol = move |source: SourceLocation| {
-        build_native_symbol(
-            fallback_name.clone(),
-            source,
-            module,
-            function_offset,
-            is_python_runtime,
-        )
-    };
-
-    let frame_capacity = frames.as_ref().map_or(1, |frames| frames.len().max(1));
-    let mut symbols = Vec::with_capacity(frame_capacity);
-    let mut push_frame_symbol = |frame: wholesym::FrameDebugInfo, inline_depth| {
+) -> NativeSymbols {
+    let frame_parts = |frame: wholesym::FrameDebugInfo| {
         let file = frame
             .file_path
             .map(|path| Rc::<str>::from(path.display_path()));
@@ -636,61 +740,92 @@ fn build_native_symbols_from_wholesym_parts(
             function_start_line: None,
             function_start_column: None,
         };
-        let symbol = match frame.function {
-            Some(function) => {
-                build_native_symbol(function, source, module, function_offset, is_python_runtime)
-            }
-            None => fallback_symbol(source),
-        };
-        let mut symbol = symbol;
-        symbol.inline_depth = inline_depth;
-        symbols.push(symbol);
+        (frame.function, source)
     };
 
-    if let Some(frames) = frames {
-        let frame_count = frames.len();
-        for (index, frame) in frames.into_iter().enumerate() {
-            let inline_depth = inline_depth_for_frame(frame_count, index);
-            push_frame_symbol(frame, inline_depth);
+    match frames {
+        None => NativeSymbols::one(build_native_symbol(
+            symbol_name,
+            SourceLocation::default(),
+            module,
+            function_offset,
+            is_python_runtime,
+        )),
+        Some(mut frames) if frames.len() == 1 => {
+            let Some(frame) = frames.pop() else {
+                return NativeSymbols::one(build_native_symbol(
+                    symbol_name,
+                    SourceLocation::default(),
+                    module,
+                    function_offset,
+                    is_python_runtime,
+                ));
+            };
+            let (function, source) = frame_parts(frame);
+            NativeSymbols::one(build_native_symbol(
+                function.unwrap_or(symbol_name),
+                source,
+                module,
+                function_offset,
+                is_python_runtime,
+            ))
+        }
+        Some(frames) if frames.is_empty() => NativeSymbols::one(build_native_symbol(
+            symbol_name,
+            SourceLocation::default(),
+            module,
+            function_offset,
+            is_python_runtime,
+        )),
+        Some(frames) => {
+            let fallback_name = frames
+                .iter()
+                .any(|frame| frame.function.is_none())
+                .then(|| Rc::<str>::from(symbol_name));
+            let symbols = frames
+                .into_iter()
+                .map(|frame| {
+                    let (function, source) = frame_parts(frame);
+                    let name = match function {
+                        Some(function) => Rc::<str>::from(function),
+                        None => fallback_name.as_ref().map_or_else(Rc::default, Rc::clone),
+                    };
+                    build_native_symbol(name, source, module, function_offset, is_python_runtime)
+                })
+                .collect();
+            NativeSymbols::new(symbols)
         }
     }
-
-    if symbols.is_empty() {
-        symbols.push(fallback_symbol(SourceLocation::default()));
-    }
-    symbols
 }
 
 #[cfg(feature = "builtin-wholesym")]
 impl SymbolizerWrapper {
     /// Create a symbolizer with the configured debug-file search paths.
-    #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "the infallible NativeSymbolizer factory cannot report Tokio runtime construction failure"
-    )]
-    fn new() -> Self {
+    fn try_new() -> std::io::Result<Self> {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for Linux symbolization");
+            .build()?;
         let local_debug_dirs = parse_debug_dirs();
         let symbol_manager =
             SymbolManager::with_config(build_symbol_manager_config(&local_debug_dirs, &[]));
         let local_debug_dirs = local_debug_dirs.into_boxed_slice();
 
-        Self {
+        Ok(Self {
             local_debug_dirs,
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
             runtime: std::mem::ManuallyDrop::new(runtime),
-        }
+        })
     }
 
-    fn rebuild_symbol_manager(&mut self) {
-        let all_redirects: Vec<(PathBuf, PathBuf)> =
-            self.redirect_cache.values().cloned().collect();
+    fn rebuild_symbol_manager(&mut self, binary_redirects: &[(PathBuf, PathBuf)]) {
+        let mut all_redirects: Vec<(PathBuf, PathBuf)> = self
+            .redirect_cache
+            .values()
+            .filter_map(|redirect| redirect.clone())
+            .collect();
+        all_redirects.extend_from_slice(binary_redirects);
         self.symbol_manager = SymbolManager::with_config(build_symbol_manager_config(
             &self.local_debug_dirs,
             &all_redirects,
@@ -699,31 +834,25 @@ impl SymbolizerWrapper {
 
     fn symbolize_lookup(&mut self, lookup: &NativeLookup) -> NativeSymbols {
         let module = lookup.module();
-        let module_rc = module_name_rc(module.path());
-        let image = NativeImageKey::for_lookup(lookup);
-        let symbols = self
-            .symbolize_with_wholesym(
-                image,
-                module.path(),
-                LookupAddress::Svma(lookup.image_address()),
-                lookup.relative_address(),
-                &module_rc,
-                module.is_python_runtime(),
-            )
-            .unwrap_or_default();
-        NativeSymbols::new(symbols)
+        let image = lookup.image_id();
+        self.symbolize_with_wholesym(
+            image,
+            LookupAddress::Svma(lookup.image_address()),
+            lookup.relative_address(),
+            module.name_rc(),
+            module.is_python_runtime(),
+        )
+        .unwrap_or_default()
     }
 
     fn symbolize_with_wholesym(
         &mut self,
-        image: NativeImageKey,
-        path: &Path,
+        image: NativeImageId,
         lookup_address: LookupAddress,
         module_offset: u64,
         module_rc: &Rc<str>,
         is_python_runtime: bool,
-    ) -> Option<Vec<NativeSymbol>> {
-        self.ensure_symbol_map_loaded(image.clone(), path);
+    ) -> Option<NativeSymbols> {
         let symbol_map = self.symbol_maps.get(&image).and_then(|map| map.as_ref())?;
         let addr_info = symbol_map.lookup_sync(lookup_address)?;
         let frames = match addr_info.frames {
@@ -745,50 +874,108 @@ impl SymbolizerWrapper {
         ))
     }
 
-    fn ensure_symbol_map_loaded(&mut self, image: NativeImageKey, path: &Path) {
-        if !self.symbol_maps.contains_key(&image) {
-            self.prefetch_linux_debug_redirects([path]);
+    /// Load new images through their recorded paths while redirecting each
+    /// binary read to StackPulse's validated descriptor. Images with the same
+    /// recorded path are loaded in separate rounds because a redirect source
+    /// can name only one exact file at a time.
+    fn preload_symbol_maps(&mut self, requests: &[NativeLookup]) {
+        let mut queued_images = HashSet::new();
+        let mut pending: Vec<&NativeLookup> = requests
+            .iter()
+            .filter(|request| {
+                !self.symbol_maps.contains_key(&request.image_id())
+                    && queued_images.insert(request.image_id())
+            })
+            .collect();
 
-            let disambiguator = None;
-            let loaded = block_on_runtime(
-                &self.runtime,
-                self.symbol_manager
-                    .load_symbol_map_for_binary_at_path(path, disambiguator),
-            );
-            if let Err(err) = &loaded {
-                tracing::debug!(
-                    name: "wholesym load failed",
-                    module = %path.display(),
-                    error = %err,
-                    "wholesym failed to load symbols for module"
-                );
+        while !pending.is_empty() {
+            let mut logical_paths = HashSet::new();
+            let mut binary_redirects = Vec::new();
+            let mut round = Vec::new();
+            let mut deferred = Vec::new();
+
+            for request in pending.drain(..) {
+                let image = request.image_id();
+                let module = request.module();
+                let Some(image_path) = module.image_path() else {
+                    self.symbol_maps.insert(image, None);
+                    continue;
+                };
+                if !logical_paths.insert(module.path()) {
+                    deferred.push(request);
+                    continue;
+                }
+                self.redirect_cache.entry(image).or_insert_with(|| {
+                    discover_linux_debug_file_redirect(
+                        &self.runtime,
+                        image_path,
+                        &self.local_debug_dirs,
+                    )
+                });
+                binary_redirects.push((module.path().to_path_buf(), image_path.to_path_buf()));
+                round.push(request);
             }
-            self.symbol_maps.insert(image, loaded.ok());
+
+            self.rebuild_symbol_manager(&binary_redirects);
+            for request in round {
+                let image = request.image_id();
+                let module = request.module();
+                let path = module.path();
+                let loaded = self.load_symbol_map(path, module.image_path().unwrap_or(path));
+                if let Err(err) = &loaded {
+                    tracing::debug!(
+                        name: "wholesym load failed",
+                        module = %path.display(),
+                        error = %err,
+                        "wholesym failed to load symbols for module"
+                    );
+                }
+                self.symbol_maps.insert(image, loaded.ok());
+            }
+            pending = deferred;
         }
     }
 
-    /// Discover and cache debug-file redirects for `paths` (skipping ones
-    /// already cached); rebuild the `SymbolManager` once if anything new.
-    fn prefetch_linux_debug_redirects<P>(&mut self, paths: impl IntoIterator<Item = P>)
-    where
-        P: AsRef<Path>,
-    {
-        let mut discovered = false;
-        for path in paths {
-            let path = path.as_ref();
-            if self.redirect_cache.contains_key(path) {
-                continue;
-            }
-            if let Some(redirect) =
-                discover_linux_debug_file_redirect(&self.runtime, path, &self.local_debug_dirs)
-            {
-                self.redirect_cache.insert(path.to_path_buf(), redirect);
-                discovered = true;
-            }
+    fn load_symbol_map(
+        &mut self,
+        logical_path: &Path,
+        image_path: &Path,
+    ) -> Result<WholeSymbolMap, wholesym::Error> {
+        let mut library_info = block_on_runtime(
+            &self.runtime,
+            SymbolManager::library_info_for_binary_at_path(image_path, None),
+        )?;
+        let Some(logical_path) = logical_path.to_str() else {
+            return block_on_runtime(
+                &self.runtime,
+                self.symbol_manager
+                    .load_symbol_map_for_binary_at_path(image_path, None),
+            );
+        };
+        let logical_name = Path::new(logical_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        library_info.path = Some(logical_path.to_owned());
+        library_info.debug_path = Some(logical_path.to_owned());
+        if let Some(logical_name) = logical_name {
+            library_info.name = Some(logical_name.clone());
+            library_info.debug_name = Some(logical_name);
         }
-        if discovered {
-            self.rebuild_symbol_manager();
-        }
+        let (Some(debug_name), Some(debug_id)) =
+            (library_info.debug_name.clone(), library_info.debug_id)
+        else {
+            return block_on_runtime(
+                &self.runtime,
+                self.symbol_manager
+                    .load_symbol_map_for_binary_at_path(image_path, None),
+            );
+        };
+        self.symbol_manager.add_known_library(library_info);
+        block_on_runtime(
+            &self.runtime,
+            self.symbol_manager.load_symbol_map(&debug_name, debug_id),
+        )
     }
 }
 
@@ -825,40 +1012,120 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_depth_for_innermost_first_frames() {
-        assert_eq!(inline_depth_for_frame(3, 0), 2);
-        assert_eq!(inline_depth_for_frame(3, 1), 1);
-        assert_eq!(inline_depth_for_frame(3, 2), 0);
+    fn build_id_path_uses_the_standard_debug_layout() {
+        assert_eq!(
+            standard_build_id_debug_path("00db9c4d7f584f8f622578265ba9abd86723710f"),
+            Some(PathBuf::from(
+                "/usr/lib/debug/.build-id/00/db9c4d7f584f8f622578265ba9abd86723710f.debug"
+            ))
+        );
+        assert_eq!(standard_build_id_debug_path("00"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validated_fd_loading_preserves_the_logical_debuglink_directory() {
+        use object::{Object, ObjectSymbol};
+        use std::process::Command;
+
+        if Command::new("cc").arg("--version").output().is_err()
+            || Command::new("objcopy").arg("--version").output().is_err()
+        {
+            return;
+        }
+
+        let temp = crate::test_support::TempDir::new("symbols-debuglink");
+        let source = temp.path().join("fixture.c");
+        let binary = temp.path().join("libfixture.so");
+        let debug = temp.path().join("libfixture.so.debug");
+        std::fs::write(
+            &source,
+            b"__attribute__((noinline,visibility(\"default\")))\nint stackpulse_debuglink_target(int value) { return value + 1; }\n",
+        )
+        .unwrap();
+        assert!(Command::new("cc")
+            .args(["-shared", "-fPIC", "-g", "-O0"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("objcopy")
+            .arg("--only-keep-debug")
+            .arg(&binary)
+            .arg(&debug)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("objcopy")
+            .arg("--strip-debug")
+            .arg("--add-gnu-debuglink=libfixture.so.debug")
+            .arg("libfixture.so")
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let bytes = std::fs::read(&binary).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let address = object
+            .dynamic_symbols()
+            .find(|symbol| symbol.name() == Ok("stackpulse_debuglink_target"))
+            .map(|symbol| symbol.address())
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&binary).unwrap());
+        let module = NativeModule::new(
+            binary.to_string_lossy().into_owned().into(),
+            ModuleImageBase::new(0, 0),
+            false,
+            NativeFileIdentity::new(0, 0, 0, 0),
+            0,
+            0,
+        )
+        .with_image_file(Some(file));
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        std::fs::rename(&replacement, &binary).unwrap();
+        let request = NativeLookup {
+            process_id: crate::Pid::try_from(std::process::id()).unwrap(),
+            module,
+            absolute_address: address,
+            relative_address: address,
+            image_address: address,
+        };
+        let mut symbolizer = SymbolizerWrapper::try_new().unwrap();
+        let mut output = Vec::new();
+
+        symbolizer.symbolize(&[request], &mut output).unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert!(
+            output[0]
+                .as_slice()
+                .iter()
+                .any(|symbol| symbol.source.file.is_some() && symbol.source.line.is_some()),
+            "resolved symbols: {:?}",
+            output[0]
+        );
     }
 
     #[test]
-    fn test_build_id_path_construction() {
-        let build_id: Vec<u8> = vec![
-            0x00, 0xdb, 0x9c, 0x4d, 0x7f, 0x58, 0x4f, 0x8f, 0x62, 0x25, 0x78, 0x26, 0x5b, 0xa9,
-            0xab, 0xd8, 0x67, 0x23, 0x71, 0x0f,
-        ];
+    fn native_symbols_assign_innermost_first_inline_depths() {
+        let symbol = |name| NativeSymbol::new(name, SourceLocation::default(), "module", 0);
+        let symbols = NativeSymbols::new(vec![symbol("inner"), symbol("middle"), symbol("outer")]);
 
-        let hex_id: String = build_id.iter().fold(String::new(), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        });
-        assert_eq!(hex_id, "00db9c4d7f584f8f622578265ba9abd86723710f");
-
-        let (dir_part, file_part) = (&hex_id[..2], &hex_id[2..]);
-        assert_eq!(dir_part, "00");
-        assert_eq!(file_part, "db9c4d7f584f8f622578265ba9abd86723710f");
-
-        let base_dir = PathBuf::from("/usr/lib/debug");
-        let path = base_dir
-            .join(".build-id")
-            .join(dir_part)
-            .join(format!("{file_part}.debug"));
         assert_eq!(
-            path,
-            PathBuf::from(
-                "/usr/lib/debug/.build-id/00/db9c4d7f584f8f622578265ba9abd86723710f.debug"
-            )
+            symbols
+                .as_slice()
+                .iter()
+                .map(NativeSymbol::inline_depth)
+                .collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
+        assert_eq!(
+            NativeSymbols::one(symbol("only")).as_slice()[0].inline_depth(),
+            0
         );
     }
 

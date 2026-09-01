@@ -631,7 +631,7 @@ fn resolve_test_frame(frame: &ResolvedFrame) -> ResolvedTestFrame {
             kind: FrameKind::Python,
             origin: SymbolOrigin::PerfMap,
             module: None,
-            file: Some(frame.file_name.to_string()),
+            file: Some(frame.file_name().to_string()),
         },
         ResolvedFrame::Native(frame) => ResolvedTestFrame {
             name: frame.display_name(),

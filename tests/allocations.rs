@@ -1,6 +1,6 @@
 use stackpulse::bench_support::{write_spool_samples_to_path, BenchSpoolSample};
 use stackpulse::spool::{FrameMode, FrameRecord};
-use stackpulse::symbolize::KernelSymbolSource;
+use stackpulse::symbolize::{KernelSymbolSource, StackCache};
 use stackpulse::Snapshot;
 
 #[test]
@@ -19,19 +19,22 @@ fn cached_stack_resolution_allocates_nothing() {
 
     let reader = Snapshot::open(&path).unwrap();
     let stack = reader.stacks().next().unwrap();
-    let mut symbolizer = reader
-        .symbolizer()
-        .disable_perf_maps()
-        .kernel_symbols(KernelSymbolSource::Disabled)
-        .build()
-        .unwrap();
-    assert_eq!(symbolizer.resolve(stack.clone()).unwrap().count(), 2);
+    for cache in [StackCache::Internal, StackCache::External] {
+        let mut symbolizer = reader
+            .symbolizer()
+            .disable_perf_maps()
+            .kernel_symbols(KernelSymbolSource::Disabled)
+            .stack_cache(cache)
+            .build()
+            .unwrap();
+        assert_eq!(symbolizer.resolve(stack.clone()).unwrap().count(), 2);
 
-    let allocations = allocation_counter::measure(|| {
-        assert_eq!(symbolizer.resolve(stack).unwrap().count(), 2);
-    });
-    assert_eq!(allocations.count_total, 0);
-    assert_eq!(allocations.count_current, 0);
+        let allocations = allocation_counter::measure(|| {
+            assert_eq!(symbolizer.resolve(stack.clone()).unwrap().count(), 2);
+        });
+        assert_eq!(allocations.count_total, 0, "{cache:?}");
+        assert_eq!(allocations.count_current, 0, "{cache:?}");
+    }
 
     std::fs::remove_file(path).unwrap();
 }

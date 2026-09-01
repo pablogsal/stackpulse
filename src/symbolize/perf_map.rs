@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
+use std::rc::Rc;
 
 use rustc_hash::FxHashSet;
 
@@ -25,7 +26,18 @@ pub(super) enum PerfMapProcesses {
 pub(super) struct PerfMapSymbol {
     start: u64,
     end: u64,
-    name: String,
+    payload: PerfMapPayload,
+}
+
+#[derive(Clone)]
+enum PerfMapPayload {
+    Native(Rc<str>),
+    Python { function: Rc<str>, file: Rc<str> },
+}
+
+pub(super) struct PerfMap {
+    symbols: Vec<PerfMapSymbol>,
+    module: Rc<str>,
 }
 
 pub(super) fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
@@ -33,41 +45,41 @@ pub(super) fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
 }
 
 pub(super) fn find_perf_map_symbol(
-    symbols: &[PerfMapSymbol],
+    perf_map: &PerfMap,
     address: u64,
-) -> Option<&PerfMapSymbol> {
-    symbols[..symbols.partition_point(|symbol| symbol.start <= address)]
+) -> Option<(&PerfMapSymbol, &Rc<str>)> {
+    let symbol = perf_map.symbols[..perf_map
+        .symbols
+        .partition_point(|symbol| symbol.start <= address)]
         .iter()
-        .rfind(|symbol| address < symbol.end)
+        .rfind(|symbol| address < symbol.end)?;
+    Some((symbol, &perf_map.module))
 }
 
 pub(super) fn perf_map_symbol_to_frame(
-    process_id: i32,
     abs_ip: u64,
     symbol: PerfMapSymbol,
-    perf_map_dir: &Path,
+    module: Rc<str>,
 ) -> ResolvedFrame {
-    if let Some((func, file)) = parse_python_perf_map_symbol(&symbol.name) {
-        return ResolvedFrame::Python(
-            PythonFrame::new(file, LocationInfo::default(), func, None, false)
-                .with_flags(FrameFlags::JIT),
-        );
-    }
+    let PerfMapSymbol { start, payload, .. } = symbol;
+    let name = match payload {
+        PerfMapPayload::Python { function, file } => {
+            return ResolvedFrame::Python(
+                PythonFrame::new(file, LocationInfo::default(), function, None, false)
+                    .with_flags(FrameFlags::JIT),
+            );
+        }
+        PerfMapPayload::Native(name) => name,
+    };
     let native_symbol = NativeSymbol::new(
-        symbol.name,
+        name,
         SourceLocation::default(),
-        perf_map_dir
-            .join(format!("perf-{process_id}.map"))
-            .to_string_lossy(),
-        abs_ip.saturating_sub(symbol.start),
-        false,
-        false,
+        module,
+        abs_ip.saturating_sub(start),
     );
     ResolvedFrame::Native(NativeFrame {
         pc: abs_ip,
-        sp: 0,
         symbol: Some(native_symbol),
-        is_python_runtime: false,
         kind: FrameKind::Native,
         origin: SymbolOrigin::PerfMap,
         flags: FrameFlags::JIT,
@@ -118,19 +130,13 @@ fn is_perf_map_mapping(path: &str) -> bool {
         || path.starts_with("/SYSV")
 }
 
-pub(super) fn module_display_name(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-}
-
-pub(super) fn load_perf_map(directory: &Path, process_id: i32) -> Option<Vec<PerfMapSymbol>> {
+pub(super) fn load_perf_map(directory: &Path, process_id: i32) -> Option<PerfMap> {
     const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
+    let path = directory.join(format!("perf-{process_id}.map"));
     let mut file = File::options()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(directory.join(format!("perf-{process_id}.map")))
+        .open(&path)
         .ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.len() > MAX_PERF_MAP_SIZE {
@@ -146,7 +152,10 @@ pub(super) fn load_perf_map(directory: &Path, process_id: i32) -> Option<Vec<Per
     }
     let mut symbols: Vec<PerfMapSymbol> = text.lines().filter_map(parse_perf_map_line).collect();
     symbols.sort_by_key(|symbol| symbol.start);
-    Some(symbols)
+    Some(PerfMap {
+        symbols,
+        module: path.to_string_lossy().as_ref().into(),
+    })
 }
 
 fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
@@ -161,10 +170,17 @@ fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
         return None;
     }
     let end = start.checked_add(len)?;
+    let payload = parse_python_perf_map_symbol(name).map_or_else(
+        || PerfMapPayload::Native(name.into()),
+        |(function, file)| PerfMapPayload::Python {
+            function: function.into(),
+            file: file.into(),
+        },
+    );
     Some(PerfMapSymbol {
         start,
         end,
-        name: name.to_owned(),
+        payload,
     })
 }
 
@@ -194,8 +210,11 @@ mod tests {
             ("1000 10\t\tcontrolled name", "\tcontrolled name"),
         ] {
             let symbol = parse_perf_map_line(line).expect("valid perf-map entry");
+            let PerfMapPayload::Native(name) = symbol.payload else {
+                panic!("expected native perf-map symbol")
+            };
             assert_eq!(
-                (symbol.start, symbol.end, symbol.name.as_str()),
+                (symbol.start, symbol.end, name.as_ref()),
                 (0x1000, 0x1010, expected_name)
             );
         }

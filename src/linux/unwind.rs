@@ -41,7 +41,7 @@ impl ProcessUnwinder {
         }
         for activation in &update.active {
             let module = &activation.module;
-            if module.is_kernel {
+            if module.is_kernel() {
                 continue;
             }
             if !update.mapping_changed
@@ -51,7 +51,7 @@ impl ProcessUnwinder {
                 continue;
             }
             let start = module.start;
-            let Some(loaded) = self.elf_sections.load_mapping(module) else {
+            let Ok(loaded) = self.elf_sections.load_mapping(module) else {
                 continue;
             };
             if let Some(module) = module_to_framehop(module, &loaded) {
@@ -159,7 +159,7 @@ fn module_to_framehop(
     };
 
     Some(framehop::Module::new(
-        crate::path_to_name(module.path.as_path()),
+        crate::path_name(module.path.as_path()).to_owned(),
         module.start..module.end,
         image_base.avma,
         explicit_info,

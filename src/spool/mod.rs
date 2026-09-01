@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+pub(crate) use model::ModuleOwner;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
@@ -107,7 +108,8 @@ impl<W: Write> PerfSpoolWriter<W> {
     pub(crate) fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
         self.writer.write_all(&[REC_MODULE])?;
         self.writer.write_varint(module.id as u64)?;
-        self.writer.write_varint(module.process_id as i64)?;
+        self.writer
+            .write_varint(i64::from(module.wire_process_id()))?;
         self.writer.write_varint(module.start)?;
         self.writer.write_varint(module.end)?;
         self.writer.write_varint(module.file_offset)?;
@@ -115,7 +117,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(u64::from(module.device_major))?;
         self.writer.write_varint(u64::from(module.device_minor))?;
         self.writer.write_varint(module.inode_generation)?;
-        self.writer.write_all(&[u8::from(module.is_kernel)])?;
+        self.writer.write_all(&[u8::from(module.is_kernel())])?;
         write_bytes(&mut self.writer, module.path.as_bytes())?;
         self.unpinned_frame_cache.clear();
         Ok(())
@@ -383,13 +385,6 @@ pub struct FrameModuleRef<'a> {
     pub file_relative_ip: u64,
 }
 
-impl<'a> FrameModuleRef<'a> {
-    #[must_use]
-    pub(crate) fn into_owned(self) -> (ModuleRecord, u64) {
-        (self.module.clone(), self.file_relative_ip)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrameLookupContext {
     frame_index: usize,
@@ -475,6 +470,10 @@ impl StackKey {
 
     pub(crate) fn belongs_to(self, source_id: u64) -> bool {
         self.source_id == source_id
+    }
+
+    pub(crate) fn source_id(self) -> u64 {
+        self.source_id
     }
 }
 
@@ -735,10 +734,6 @@ impl Snapshot {
     }
     /// Open and read a spool file.
     ///
-    /// The reader borrows path strings from a memory map of the file. The file
-    /// must not be truncated or mutated while the reader, its symbolizer, or
-    /// any cloned [`ModulePath`] from it remains alive.
-    ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::CorruptSpool`](crate::ErrorKind::CorruptSpool) for
@@ -877,8 +872,7 @@ impl Replay {
     /// memory. If that index reaches its limit, iteration scans validated
     /// records instead. Sample metadata is validated during open and decoded
     /// again during iteration. The file must not be truncated or mutated while
-    /// the reader, its symbolizer, or any cloned [`ModulePath`] from it remains
-    /// alive.
+    /// the replay reader remains alive.
     ///
     /// # Errors
     ///
@@ -1111,7 +1105,7 @@ fn open_spool_with_range_limit(
                     let process_id = read_process_id(&mut reader)?;
                     let deactivated_at = frames.len();
                     for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at) {
-                        if module.process_id == process_id && !module.is_kernel {
+                        if module.pid().is_some_and(|pid| pid.get() == process_id) {
                             deactivated.get_or_insert(deactivated_at);
                         }
                     }
@@ -1365,18 +1359,18 @@ fn read_module_mmap(
     };
     let mut flag = [0_u8; 1];
     reader.read_exact_spool(&mut flag)?;
+    let owner = ModuleOwner::from_wire(process_id, flag[0] != 0)?;
     let len = usize::try_from(reader.read_varint::<u64>()?)
         .map_err(|_| invalid_data("module path length too large"))?;
     let range = reader.read_bytes_range(len)?;
     let path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
     Ok(ModuleRecord {
         id,
-        process_id,
+        owner,
         start,
         end,
         file_offset,
         path,
-        is_kernel: flag[0] != 0,
         inode,
         device_major,
         device_minor,
@@ -1392,7 +1386,7 @@ fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeR
     Ok(PythonRuntimeRecord {
         timestamp_ns,
         process_id: crate::Pid::try_from(process_id)
-            .map_err(|error| invalid_data(error.to_string()))?,
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         is_python_runtime: flag[0] != 0,
     })
 }
@@ -1471,8 +1465,8 @@ pub(crate) fn module_for_frame_with_context<'a>(
 
 fn module_owns_frame(module: &ModuleRecord, process_id: i32, frame: &FrameRecord) -> bool {
     let owned_by = match frame.mode {
-        FrameMode::Kernel => module.is_kernel,
-        FrameMode::User => !module.is_kernel && module.process_id == process_id,
+        FrameMode::Kernel => module.is_kernel(),
+        FrameMode::User => module.pid().is_some_and(|pid| pid.get() == process_id),
         FrameMode::TruncatedStackMarker => false,
     };
     owned_by && module.start <= frame.abs_ip && frame.abs_ip < module.end
@@ -1607,7 +1601,7 @@ fn read_frame(
             module_id: Some(module_ref.id),
             file_relative_ip: encoded_ip,
             abs_ip,
-            mode: frame_mode(module.is_kernel),
+            mode: frame_mode(module.is_kernel()),
         })
     } else {
         Ok(FrameRecord {
@@ -1655,9 +1649,9 @@ fn read_thread(reader: &mut impl SpoolRead, expected_id: usize) -> io::Result<Th
     let thread_id = reader.read_varint::<u64>()?;
     Ok(ThreadRecord {
         process_id: crate::Pid::try_from(process_id)
-            .map_err(|error| invalid_data(error.to_string()))?,
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         thread_id: crate::Tid::try_from(thread_id)
-            .map_err(|error| invalid_data(error.to_string()))?,
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     })
 }
 
@@ -1704,6 +1698,10 @@ fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn module_owner(process_id: i32, is_kernel: bool) -> ModuleOwner {
+        ModuleOwner::from_wire(process_id, is_kernel).unwrap()
+    }
+
     fn writer() -> PerfSpoolWriter<Vec<u8>> {
         PerfSpoolWriter {
             writer: Vec::new(),
@@ -1728,7 +1726,7 @@ mod tests {
     fn module(process_id: i32, start: u64, end: u64, path: &str, is_kernel: bool) -> ModuleRecord {
         ModuleRecord {
             id: 0,
-            process_id,
+            owner: module_owner(process_id, is_kernel),
             start,
             end,
             file_offset: 0,
@@ -1737,7 +1735,6 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: path.into(),
-            is_kernel,
         }
     }
 
@@ -2033,7 +2030,7 @@ mod tests {
         writer
             .write_module(&ModuleRecord {
                 id: 0,
-                process_id: 7,
+                owner: module_owner(7, false),
                 start: 0x1000,
                 end: 0x2000,
                 file_offset: 0x100,
@@ -2042,13 +2039,12 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/first".into(),
-                is_kernel: false,
             })
             .unwrap();
         writer
             .write_module(&ModuleRecord {
                 id: 1,
-                process_id: 7,
+                owner: module_owner(7, false),
                 start: 0x3000,
                 end: 0x4000,
                 file_offset: 0x200,
@@ -2057,13 +2053,12 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/second".into(),
-                is_kernel: false,
             })
             .unwrap();
         writer
             .write_module(&ModuleRecord {
                 id: 2,
-                process_id: -1,
+                owner: ModuleOwner::Kernel,
                 start: 0xffff_ffff_8100_0000,
                 end: 0xffff_ffff_8101_0000,
                 file_offset: 0,
@@ -2072,7 +2067,6 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "[kernel]".into(),
-                is_kernel: true,
             })
             .unwrap();
         let stack_id = writer
@@ -2158,7 +2152,7 @@ mod tests {
         writer
             .write_module(&ModuleRecord {
                 id: 0,
-                process_id: 7,
+                owner: module_owner(7, false),
                 start: 0x1000,
                 end: 0x2000,
                 file_offset: 0,
@@ -2167,7 +2161,6 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/future".into(),
-                is_kernel: false,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -2363,7 +2356,7 @@ mod tests {
         writer
             .write_module(&ModuleRecord {
                 id: 7,
-                process_id: 7,
+                owner: module_owner(7, false),
                 start: 0x1000,
                 end: 0x2000,
                 file_offset: 0,
@@ -2372,7 +2365,6 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/bad".into(),
-                is_kernel: false,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -2396,7 +2388,7 @@ mod tests {
             &mut bytes.as_slice(),
             &[ModuleRecord {
                 id: 0,
-                process_id: 7,
+                owner: module_owner(7, false),
                 start: 0x1000,
                 end: 0x2000,
                 file_offset: 0x100,
@@ -2405,7 +2397,6 @@ mod tests {
                 device_minor: 0,
                 inode_generation: 0,
                 path: "/module".into(),
-                is_kernel: false,
             }],
             0,
         )
@@ -2523,6 +2514,22 @@ mod tests {
             "reader accepted an out-of-range module process id",
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reader_rejects_non_positive_user_module_process_ids() {
+        for process_id in [0, -1] {
+            let error = ModuleOwner::from_wire(process_id, false).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                format!("invalid process id {process_id}")
+            );
+        }
+        assert_eq!(
+            ModuleOwner::from_wire(-1, true).unwrap(),
+            ModuleOwner::Kernel
+        );
     }
 
     #[test]

@@ -96,15 +96,14 @@ pub mod record {
 
 /// Display-friendly basename for a module path.
 ///
-/// Returns the final path component as a `String`, falling back to the full
+/// Returns the final path component, falling back to the full
 /// path when it has no basename and to `"<unknown>"` when the path is not
 /// valid UTF-8. Used for grouping and labeling frames by their owning module.
 #[must_use]
-pub(crate) fn path_to_name(path: &std::path::Path) -> String {
+pub(crate) fn path_name(path: &std::path::Path) -> &str {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| path.to_str().unwrap_or("<unknown>"))
-        .to_owned()
 }
 
 /// Heuristic check for whether a module *basename* belongs to a Python runtime.

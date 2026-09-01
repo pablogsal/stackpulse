@@ -75,53 +75,25 @@ impl Error {
     /// Return sampling-limit details when this is a frequency-limit error.
     #[must_use]
     pub fn frequency_limit(&self) -> Option<&crate::record::PerfFrequencyLimit> {
-        let mut source: &(dyn std::error::Error + 'static) = self.source.as_ref();
-        loop {
-            if let Some(limit) = source.downcast_ref::<crate::record::PerfFrequencyLimit>() {
-                return Some(limit);
-            }
-            if let Some(limit) = source
-                .downcast_ref::<io::Error>()
-                .and_then(io::Error::get_ref)
-                .and_then(|source| source.downcast_ref::<crate::record::PerfFrequencyLimit>())
-            {
-                return Some(limit);
-            }
-            source = source.source()?;
-        }
+        find_in_chain(self.source.as_ref())
     }
 
     /// Return the underlying OS error code when this error came from I/O.
     #[must_use]
     pub fn raw_os_error(&self) -> Option<i32> {
-        let mut source: &(dyn std::error::Error + 'static) = self.source.as_ref();
-        loop {
-            if let Some(code) = source
-                .downcast_ref::<io::Error>()
-                .and_then(io::Error::raw_os_error)
-            {
-                return Some(code);
-            }
-            source = source.source()?;
-        }
+        find_raw_os_error(self.source.as_ref())
     }
 
     /// Borrow the underlying I/O error, when present.
     #[must_use]
     pub fn io_error(&self) -> Option<&io::Error> {
-        let mut source: &(dyn std::error::Error + 'static) = self.source.as_ref();
-        loop {
-            if let Some(error) = source.downcast_ref::<io::Error>() {
-                return Some(error);
-            }
-            source = source.source()?;
-        }
+        find_in_chain(self.source.as_ref())
     }
 }
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        let kind = if error_chain_contains::<crate::record::PerfFrequencyLimit>(&error) {
+        let kind = if find_in_chain::<crate::record::PerfFrequencyLimit>(&error).is_some() {
             ErrorKind::FrequencyLimit
         } else {
             match error.kind() {
@@ -135,25 +107,37 @@ impl From<io::Error> for Error {
     }
 }
 
-fn error_chain_contains<T>(error: &(dyn std::error::Error + 'static)) -> bool
+fn find_in_chain<'a, T>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a T>
 where
     T: std::error::Error + 'static,
 {
-    let mut source = Some(error);
-    while let Some(error) = source {
-        if error.is::<T>() {
-            return true;
+    loop {
+        if let Some(error) = error.downcast_ref::<T>() {
+            return Some(error);
         }
-        if error
-            .downcast_ref::<io::Error>()
-            .and_then(io::Error::get_ref)
-            .is_some_and(|source| source.is::<T>())
-        {
-            return true;
-        }
-        source = error.source();
+        error = next_error(error)?;
     }
-    false
+}
+
+fn find_raw_os_error(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    loop {
+        if let Some(io_error) = error.downcast_ref::<io::Error>() {
+            if let Some(code) = io_error.raw_os_error() {
+                return Some(code);
+            }
+        }
+        error = next_error(error)?;
+    }
+}
+
+fn next_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    error
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::get_ref)
+        .map(|source| source as &(dyn std::error::Error + 'static))
+        .or_else(|| error.source())
 }
 
 impl From<Error> for io::Error {

@@ -193,14 +193,14 @@ fn raw_frame_score<'a>(frames: impl IntoIterator<Item = &'a FrameRecord>) -> usi
 fn resolved_frame_score(frame: &ResolvedFrame) -> usize {
     match frame {
         ResolvedFrame::Python(frame) => frame
-            .file_name
+            .file_name()
             .len()
             .wrapping_add(frame.func_name.len())
             .wrapping_add(frame.location.lineno as usize),
         ResolvedFrame::Native(frame) => {
             let symbol_score = frame.symbol.as_ref().map_or(0, |symbol| {
                 symbol
-                    .name
+                    .name()
                     .len()
                     .wrapping_add(symbol.module.len())
                     .wrapping_add(symbol.offset as usize)

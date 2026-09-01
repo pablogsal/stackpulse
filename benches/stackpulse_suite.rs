@@ -15,21 +15,9 @@ use stackpulse::profile::{
 };
 use stackpulse::record::{SampleErrorKind, SampleErrorStats};
 use stackpulse::spool::{FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord};
-use stackpulse::symbolize::ModuleImageBase;
 use stackpulse::{Snapshot, Symbolizer, SymbolizerBuilder};
 
 const FIXTURE_VERSION: u32 = 10;
-
-fn path_to_name(path: &Path) -> &str {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .or_else(|| path.to_str())
-        .unwrap_or("<unknown>")
-}
-
-fn basename_start(path: &str) -> usize {
-    path.rfind('/').map_or(0, |index| index + 1)
-}
 
 const OPEN_BATCH: u64 = 8;
 const BORROWED_ITERATE_BATCH: u64 = 64;
@@ -406,7 +394,8 @@ fn bench_symbolization(c: &mut Criterion) {
             .map(|spec| {
                 let reader =
                     Snapshot::open(ensure_spool_fixture(spec)).expect("open synthetic spool");
-                let mut symbolizer = SymbolizerBuilder::for_modules(reader.modules())
+                let mut symbolizer = reader
+                    .symbolizer()
                     .disable_perf_maps()
                     .build()
                     .expect("build symbolizer");
@@ -544,18 +533,21 @@ fn bench_helpers(c: &mut Criterion) {
                     checksum = checksum.wrapping_add(usize::from(is_python_module(name)));
                 }
                 for path in &paths {
-                    checksum = checksum.wrapping_add(path_to_name(path).len());
+                    checksum = checksum.wrapping_add(bench_support::path_name(path).len());
                 }
                 for input in basename_inputs {
-                    checksum = checksum.wrapping_add(basename_start(input));
+                    checksum = checksum.wrapping_add(bench_support::basename_start(input));
                 }
                 for frame in &frames {
                     checksum = checksum.wrapping_add(frame.display_name().len());
                 }
-                for (base, avma) in &bases {
+                for &(base_avma, base_svma, avma) in &bases {
+                    let (relative, svma) =
+                        bench_support::translate_module_address(base_avma, base_svma, avma)
+                            .expect("valid AVMA");
                     checksum = checksum
-                        .wrapping_add(base.relative_address(*avma).expect("valid AVMA") as usize)
-                        .wrapping_add(base.svma_for_avma(*avma).expect("valid AVMA") as usize);
+                        .wrapping_add(relative as usize)
+                        .wrapping_add(svma as usize);
                 }
             }
             black_box(checksum)
@@ -855,14 +847,14 @@ fn raw_frame_score(frame: &FrameRecord) -> usize {
 fn resolved_frame_score(frame: &ResolvedFrame) -> usize {
     match frame {
         ResolvedFrame::Python(frame) => frame
-            .file_name
+            .file_name()
             .len()
             .wrapping_add(frame.func_name.len())
             .wrapping_add(frame.location.lineno as usize),
         ResolvedFrame::Native(frame) => {
             let symbol_score = frame.symbol.as_ref().map_or(0usize, |symbol| {
                 symbol
-                    .name
+                    .name()
                     .len()
                     .wrapping_add(symbol.module.len())
                     .wrapping_add(symbol.offset as usize)
@@ -898,12 +890,12 @@ fn resolved_frame_matrix() -> Vec<ResolvedFrame> {
     ]
 }
 
-fn module_image_base_inputs() -> Vec<(ModuleImageBase, u64)> {
+fn module_image_base_inputs() -> Vec<(u64, u64, u64)> {
     (0..128)
         .map(|index| {
             let avma = 0x7fff_0000_0000 + index * 0x20_000;
             let svma = 0x1000 + index * 0x10;
-            (ModuleImageBase::new(avma, svma), avma + 0x1234)
+            (avma, svma, avma + 0x1234)
         })
         .collect()
 }

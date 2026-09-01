@@ -418,13 +418,13 @@ fn intern_label_for_frame(
             let Some(symbol) = frame.symbol.as_ref() else {
                 return profile.intern_string(UNKNOWN_NATIVE_LABEL);
             };
-            let name = symbol.name.as_ref();
+            let name = symbol.name();
             let module = symbol.module_basename();
             if is_addressish_symbol_name(name, module) {
                 Cow::Owned(format!("[unknown native frame in {module}]"))
             } else if frame.kind == FrameKind::Kernel && module != "[kernel]" {
                 let key = KernelModuleLabelKey {
-                    name: Rc::clone(&symbol.name),
+                    name: Rc::clone(symbol.name_rc()),
                     module: Rc::clone(&symbol.module),
                 };
                 return match kernel_module_labels.entry(key) {
@@ -448,17 +448,17 @@ fn label_for_frame(frame: &GeckoFrame) -> Cow<'_, str> {
     match frame {
         GeckoFrame::TruncatedStack => Cow::Borrowed(TRUNCATED_STACK_LABEL),
         GeckoFrame::Resolved(ResolvedFrame::Python(frame)) => {
-            if frame.file_name.is_empty() {
+            if frame.file_name().is_empty() {
                 Cow::Borrowed(frame.func_name.as_ref())
             } else {
-                Cow::Owned(format!("{}:{}", frame.func_name, frame.file_name))
+                Cow::Owned(format!("{}:{}", frame.func_name, frame.file_name()))
             }
         }
         GeckoFrame::Resolved(ResolvedFrame::Native(frame)) => {
             let Some(symbol) = frame.symbol.as_ref() else {
                 return Cow::Borrowed(UNKNOWN_NATIVE_LABEL);
             };
-            let name = symbol.name.as_ref();
+            let name = symbol.name();
             let module = symbol.module_basename();
             if is_addressish_symbol_name(name, module) {
                 return Cow::Owned(format!("[unknown native frame in {module}]"));

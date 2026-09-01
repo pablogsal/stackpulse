@@ -11,31 +11,13 @@ pub(crate) const VDSO_PATH: &str = "[vdso]";
 
 /// File path or display name for a recorded module.
 #[derive(Clone)]
-pub struct ModulePath(ModulePathStorage);
-
-#[derive(Clone)]
-enum ModulePathStorage {
-    Owned(Arc<str>),
-    Mmap {
-        mmap: Arc<Mmap>,
-        range: Range<usize>,
-    },
-}
+pub struct ModulePath(Arc<str>);
 
 impl ModulePath {
-    /// Borrow the path as a `&str`. Free for owned paths; cheap for paths
-    /// served directly out of the memory-mapped spool.
+    /// Borrow the path as a `&str`.
     #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "mmap-backed paths are UTF-8 validated before ModulePath construction"
-    )]
     pub fn as_str(&self) -> &str {
-        match &self.0 {
-            ModulePathStorage::Owned(path) => path,
-            ModulePathStorage::Mmap { mmap, range } => std::str::from_utf8(&mmap[range.clone()])
-                .expect("mmap-backed module path was validated while reading the spool"),
-        }
+        &self.0
     }
 
     /// Borrow the underlying UTF-8 bytes.
@@ -65,9 +47,12 @@ impl ModulePath {
     }
 
     pub(super) fn from_mmap(mmap: Arc<Mmap>, range: Range<usize>) -> io::Result<Self> {
-        std::str::from_utf8(&mmap[range.clone()])
-            .map_err(|err| super::invalid_data(err.to_string()))?;
-        Ok(Self(ModulePathStorage::Mmap { mmap, range }))
+        let bytes = mmap
+            .get(range)
+            .ok_or_else(|| super::invalid_data("module path range is outside the spool"))?;
+        let path =
+            std::str::from_utf8(bytes).map_err(|err| super::invalid_data(err.to_string()))?;
+        Ok(Self(Arc::from(path)))
     }
 }
 
@@ -105,13 +90,13 @@ impl std::borrow::Borrow<str> for ModulePath {
 
 impl From<String> for ModulePath {
     fn from(path: String) -> Self {
-        Self(ModulePathStorage::Owned(Arc::from(path.into_boxed_str())))
+        Self(Arc::from(path.into_boxed_str()))
     }
 }
 
 impl From<&str> for ModulePath {
     fn from(path: &str) -> Self {
-        Self(ModulePathStorage::Owned(Arc::from(path)))
+        Self(Arc::from(path))
     }
 }
 
@@ -153,8 +138,8 @@ impl Hash for ModulePath {
 pub struct ModuleRecord {
     /// Stable module id within the spool.
     pub(crate) id: u32,
-    /// Process that owned this code area, or a kernel marker for kernel code.
-    pub(crate) process_id: i32,
+    /// Process that owned this code area, or the kernel.
+    pub(crate) owner: ModuleOwner,
     /// Start address in memory.
     pub(crate) start: u64,
     /// End address in memory.
@@ -171,8 +156,42 @@ pub struct ModuleRecord {
     pub(crate) inode_generation: u64,
     /// File path or display name.
     pub(crate) path: ModulePath,
-    /// Whether this record is kernel code.
-    pub(crate) is_kernel: bool,
+}
+
+/// Validated owner of an executable mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ModuleOwner {
+    Process(Pid),
+    Kernel,
+}
+
+impl ModuleOwner {
+    pub(super) fn from_wire(process_id: i32, is_kernel: bool) -> io::Result<Self> {
+        if is_kernel {
+            return Ok(Self::Kernel);
+        }
+        Pid::try_from(process_id)
+            .map(Self::Process)
+            .map_err(|error| super::invalid_data(error.to_string()))
+    }
+
+    pub(crate) const fn pid(self) -> Option<Pid> {
+        match self {
+            Self::Process(pid) => Some(pid),
+            Self::Kernel => None,
+        }
+    }
+
+    pub(crate) const fn wire_process_id(self) -> i32 {
+        match self {
+            Self::Process(pid) => pid.get(),
+            Self::Kernel => -1,
+        }
+    }
+
+    pub(crate) const fn is_kernel(self) -> bool {
+        matches!(self, Self::Kernel)
+    }
 }
 
 impl ModuleRecord {
@@ -184,12 +203,8 @@ impl ModuleRecord {
 
     /// Return the process that owns this mapping, or `None` for kernel code.
     #[must_use]
-    pub fn pid(&self) -> Option<Pid> {
-        if self.is_kernel {
-            None
-        } else {
-            Pid::new(self.process_id)
-        }
+    pub const fn pid(&self) -> Option<Pid> {
+        self.owner.pid()
     }
 
     /// Return the mapped absolute address range.
@@ -237,7 +252,16 @@ impl ModuleRecord {
     /// Return whether this mapping contains kernel code.
     #[must_use]
     pub const fn is_kernel(&self) -> bool {
-        self.is_kernel
+        self.owner.is_kernel()
+    }
+
+    pub(crate) const fn wire_process_id(&self) -> i32 {
+        self.owner.wire_process_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pid(&mut self, pid: Pid) {
+        self.owner = ModuleOwner::Process(pid);
     }
 
     /// Construct a user-space mapping with unknown file identity.
@@ -260,7 +284,7 @@ impl ModuleRecord {
         }
         Ok(Self {
             id,
-            process_id: process_id.get(),
+            owner: ModuleOwner::Process(process_id),
             start: addresses.start,
             end: addresses.end,
             file_offset,
@@ -269,7 +293,6 @@ impl ModuleRecord {
             device_minor: 0,
             inode_generation: 0,
             path: path.into(),
-            is_kernel: false,
         })
     }
 
@@ -307,7 +330,7 @@ impl ModuleRecord {
         }
         Ok(Self {
             id,
-            process_id: -1,
+            owner: ModuleOwner::Kernel,
             start: addresses.start,
             end: addresses.end,
             file_offset: 0,
@@ -316,7 +339,6 @@ impl ModuleRecord {
             device_minor: 0,
             inode_generation: 0,
             path: path.into(),
-            is_kernel: true,
         })
     }
 }
@@ -407,7 +429,7 @@ mod tests {
     use crate::test_support::mmap_from_bytes;
 
     #[test]
-    fn mmap_module_path_validates_utf8_and_borrows_range() {
+    fn mmap_module_path_validates_utf8_and_range() {
         let mmap = mmap_from_bytes(b"prefix:/lib/libc.so\xff[vdso]");
 
         let path = ModulePath::from_mmap(mmap.clone(), 7..19).expect("valid path");
@@ -418,6 +440,7 @@ mod tests {
         assert_eq!(path, ModulePath::from("/lib/libc.so"));
         assert!(!path.is_bracketed_mapping());
         assert!(vdso.is_bracketed_mapping());
-        assert!(ModulePath::from_mmap(mmap, 19..20).is_err());
+        assert!(ModulePath::from_mmap(mmap.clone(), 19..20).is_err());
+        assert!(ModulePath::from_mmap(mmap, 100..101).is_err());
     }
 }

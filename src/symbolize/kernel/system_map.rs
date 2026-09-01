@@ -287,7 +287,7 @@ pub(super) fn kernel_rebase_anchors(modules: &[ModuleRecord]) -> Arc<[u64]> {
 }
 
 fn kernel_text_module(module: &ModuleRecord) -> bool {
-    if !module.is_kernel {
+    if !module.is_kernel() {
         return false;
     }
     let path = module.path.as_str();
@@ -331,7 +331,7 @@ mod tests {
                            ffffffff81000200 T entry_SYSCALL_64_after_hwframe\n";
         let module = ModuleRecord {
             id: 0,
-            process_id: -1,
+            owner: crate::spool::ModuleOwner::Kernel,
             start: 0xffff_ffff_8c80_0000,
             end: 0xffff_ffff_8d00_0000,
             file_offset: 0,
@@ -340,7 +340,6 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: "[kernel.kallsyms]_text".into(),
-            is_kernel: true,
         };
 
         let anchors = kernel_rebase_anchors(&[module]);

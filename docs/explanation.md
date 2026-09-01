@@ -189,13 +189,14 @@ Native frames inside the Python runtime get `FrameFlags::PYTHON_RUNTIME` and
 `FrameFlags::HIDDEN_DEFAULT` when the symbolizer can identify them. UIs can
 hide interpreter machinery by default while still letting users dig in.
 
-Native symbolization is delegated to a `NativeSymbolizer` implementor, one
-per non-overlapping module group. The default is the bundled `wholesym`
+Native symbolization is delegated to a `NativeSymbolizer` created per process.
+The default is the bundled `wholesym`
 backend, configured from `STACKPULSE_DEBUG_DIRS`, `DEBUGINFOD_URLS`, and
 related environment variables. Applications with their own debuginfod,
 debug-directory, or source-info setup can replace that backend through
-`SymbolizerBuilder::native`; `Symbolizer` still handles kernel and perf-map
-resolution. Each `NativeLookup` contains the module selected by StackPulse and
+`SymbolizerBuilder::native`; fallible setup can use
+`SymbolizerBuilder::try_native`. `Symbolizer` still handles kernel and perf-map
+resolution. Each `NativeLookup` contains the exact image selected by StackPulse and
 the absolute, relative, and image addresses needed by a backend. Requests are
 batched per process.
 

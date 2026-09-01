@@ -6,7 +6,7 @@ use std::io;
 use perf_event_open::sample::record::mmap::{Info as MmapInfo, Mmap};
 use perf_event_open::sample::record::Priv;
 
-use crate::spool::{ModuleRecord, ModuleTable, PerfSpoolWriter};
+use crate::spool::{ModuleOwner, ModuleRecord, ModuleTable, PerfSpoolWriter};
 
 use super::{c_string_to_string, i32_from_u32, is_kernel_mode, ProcessTable};
 
@@ -25,9 +25,9 @@ pub(super) fn record_module<W: std::io::Write>(
     }
     for activation in &update.active {
         let module = &activation.module;
-        if !module.is_kernel {
+        if let Some(pid) = module.pid() {
             processes
-                .state_mut(module.process_id)
+                .state_mut(pid.get())
                 .unwinder
                 .get_or_insert_default()
                 .apply_module_update(&update);
@@ -61,18 +61,25 @@ fn record_mmap_event<W: std::io::Write>(
     if !is_kernel && !event.is_executable {
         return Ok(());
     }
+    let owner = if is_kernel {
+        ModuleOwner::Kernel
+    } else {
+        let Some(pid) = crate::Pid::new(event.pid) else {
+            return Ok(());
+        };
+        ModuleOwner::Process(pid)
+    };
     record_module(
         modules,
         processes,
         writer,
         ModuleRecord {
             id: 0,
-            process_id: event.pid,
+            owner,
             start: event.address,
             end: event.address.saturating_add(event.length),
             file_offset: event.page_offset,
             path: c_string_to_string(event.path).into(),
-            is_kernel,
             inode: event.inode,
             device_major: event.device_major,
             device_minor: event.device_minor,
@@ -137,11 +144,15 @@ pub(super) fn register_existing_maps<W: std::io::Write>(
     processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<bool> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    let maps = read_existing_maps(pid)?;
     register_existing_maps_snapshot(pid, &maps, modules, processes, writer)
 }
 
-fn register_existing_maps_snapshot<W: std::io::Write>(
+pub(super) fn read_existing_maps(pid: u32) -> io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/maps"))
+}
+
+pub(super) fn register_existing_maps_snapshot<W: std::io::Write>(
     pid: u32,
     maps: &str,
     modules: &mut ModuleTable,
@@ -160,20 +171,22 @@ pub(super) fn executable_modules_from_maps(
     pid: u32,
     maps: &str,
 ) -> impl Iterator<Item = ModuleRecord> + '_ {
+    let owner = crate::Pid::try_from(pid).ok().map(ModuleOwner::Process);
     crate::proc_maps::parse_iter(maps)
         .filter(|region| region.is_executable && !region.path.is_empty())
-        .map(move |region| ModuleRecord {
-            id: 0,
-            process_id: pid as i32,
-            start: region.address.start,
-            end: region.address.end,
-            file_offset: region.file_offset,
-            path: region.path.into(),
-            is_kernel: false,
-            inode: region.inode,
-            device_major: region.device_major,
-            device_minor: region.device_minor,
-            inode_generation: 0,
+        .filter_map(move |region| {
+            Some(ModuleRecord {
+                id: 0,
+                owner: owner?,
+                start: region.address.start,
+                end: region.address.end,
+                file_offset: region.file_offset,
+                path: region.path.into(),
+                inode: region.inode,
+                device_major: region.device_major,
+                device_minor: region.device_minor,
+                inode_generation: 0,
+            })
         })
 }
 

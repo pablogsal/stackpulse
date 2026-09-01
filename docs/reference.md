@@ -161,7 +161,7 @@ Use [`Snapshot`](crate::Snapshot) when sample random access is required.
 | `address_range()` | Runtime address range. |
 | `file_offset()` | File offset matching the mapping start. |
 | `inode()` and device accessors | Recorded file identity, when known. |
-| `path()` | Path or display name as [`ModulePath`](crate::spool::ModulePath). Spool-read paths can borrow from the mmap-backed profile. |
+| `path()` | Owned, shared path or display name as [`ModulePath`](crate::spool::ModulePath). |
 | `is_kernel()` | Whether this mapping is a kernel range. |
 
 ### [`FrameRecord`](crate::spool::FrameRecord)
@@ -208,6 +208,7 @@ Resolves raw frames into displayable frames. Reuse one symbolizer per profile.
 | `perf_maps_for(pids)` | Allow perf maps only for the listed PIDs. |
 | `perf_map_dir(path)` | Read preserved `perf-<pid>.map` files from `path` instead of `/tmp`. |
 | `native(factory)` | Replace the bundled native symbolizer with a [`NativeSymbolizer`](crate::symbolize::NativeSymbolizer). |
+| `try_native(factory)` | Replace it with a lazily constructed backend whose factory may fail. |
 | `kernel_symbols(source)` | Use host symbols, a preserved `kallsyms` file, or no kernel symbols. |
 | `stack_cache(mode)` | Choose whether StackPulse or the caller caches resolved stacks. |
 | `build()` | Validate the configuration and construct the symbolizer. |
@@ -247,7 +248,7 @@ address-only frames that need hexadecimal formatting.
 
 | Field / method | Meaning |
 | --- | --- |
-| `file_name` | Python source filename. |
+| `file_name()` | Python source filename. |
 | `location` | Line + column when available. |
 | `func_name` | Python function name. |
 | `opcode` | Optional opcode. |
@@ -261,16 +262,15 @@ address-only frames that need hexadecimal formatting.
 | Field | Meaning |
 | --- | --- |
 | `pc` | Program counter. |
-| `sp` | Stack pointer when available (currently `0` from the public symbolizer). |
 | `symbol` | `Option<NativeSymbol>`. `None` means address-only. |
-| `is_python_runtime` | Belongs to Python runtime machinery. |
+| `is_python_runtime()` | Whether the owning module is Python runtime machinery. |
 | `kind` | [`FrameKind::Native`](crate::profile::FrameKind::Native), `Kernel`, or `Unknown`. |
 | `origin` | [`SymbolOrigin`](crate::profile::SymbolOrigin). Where the name came from. |
 | `flags` | [`FrameFlags`](crate::profile::FrameFlags) for UI policy. |
 
 `NativeSymbol` carries the symbol name, optional source file / line, module
 name, basename access, function-relative offset, and Python-runtime helpers
-like `is_eval_frame` and `should_ignore`.
+like `is_eval_frame()` and `should_ignore()`.
 
 ### Kinds, origins, and flags
 
@@ -368,7 +368,6 @@ be cloned or reset.
 | [`MAX_SAMPLE_USER_STACK`](crate::record::MAX_SAMPLE_USER_STACK) | Maximum user stack bytes perf will accept. |
 | [`max_sample_rate`](crate::record::max_sample_rate) | Reads `/proc/sys/kernel/perf_event_max_sample_rate`, `None` if unavailable. |
 | [`is_python_runtime_basename`](crate::profile::is_python_runtime_basename) | Report whether a basename looks like a Python executable or `libpython`. |
-| [`ModuleImageBase`](crate::symbolize::ModuleImageBase) | Translates runtime AVMA addresses to static VMAs. |
 | [`PerfFrequencyLimit`](crate::record::PerfFrequencyLimit) | Error payload when requested frequency exceeds the kernel cap. |
 
 ## Spool format invariants

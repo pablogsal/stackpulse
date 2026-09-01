@@ -5,7 +5,7 @@ use super::{
     finish_prepared_event, perf_event, prepare_event, record_module, ConvertRegs,
     ConvertRegsNative, EventContext, PreparedEvent, ProcessTable, RecordingSummary,
 };
-use crate::spool::{ModuleRecord, ModuleTable, PerfSpoolWriter};
+use crate::spool::{ModuleOwner, ModuleRecord, ModuleTable, PerfSpoolWriter};
 
 const LIVE_BENCH_PROCESS_ID: u32 = 42_000;
 const LIVE_BENCH_USER_BASE: u64 = 0x7000_0000_0000;
@@ -143,10 +143,13 @@ pub(crate) fn bench_replay_live_perf_ring_records(
 }
 
 fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
+    let Ok(process) = crate::Pid::try_from(LIVE_BENCH_PROCESS_ID) else {
+        return Vec::new();
+    };
     vec![
         ModuleRecord {
             id: 0,
-            process_id: LIVE_BENCH_PROCESS_ID as i32,
+            owner: ModuleOwner::Process(process),
             start: LIVE_BENCH_USER_BASE,
             end: LIVE_BENCH_USER_BASE + 0x0008_0000,
             file_offset: 0,
@@ -155,11 +158,10 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_minor: 0,
             inode_generation: 0,
             path: "/opt/stackpulse/live-bench/libworkload.so".into(),
-            is_kernel: false,
         },
         ModuleRecord {
             id: 0,
-            process_id: LIVE_BENCH_PROCESS_ID as i32,
+            owner: ModuleOwner::Process(process),
             start: LIVE_BENCH_USER_BASE + 0x0010_0000,
             end: LIVE_BENCH_USER_BASE + 0x0018_0000,
             file_offset: 0,
@@ -168,11 +170,10 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_minor: 0,
             inode_generation: 0,
             path: "/opt/stackpulse/live-bench/python3.12".into(),
-            is_kernel: false,
         },
         ModuleRecord {
             id: 0,
-            process_id: -1,
+            owner: ModuleOwner::Kernel,
             start: LIVE_BENCH_KERNEL_BASE,
             end: LIVE_BENCH_KERNEL_BASE + 0x0010_0000,
             file_offset: 0,
@@ -181,7 +182,6 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_minor: 0,
             inode_generation: 0,
             path: "[kernel.kallsyms]".into(),
-            is_kernel: true,
         },
     ]
 }

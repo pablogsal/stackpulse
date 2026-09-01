@@ -2,11 +2,13 @@ use std::io::{self, Write};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{next_spool_id, FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfSpoolWriter};
+use super::{
+    next_spool_id, FrameMode, FrameRecord, ModuleOwner, ModulePath, ModuleRecord, PerfSpoolWriter,
+};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ModuleIdentity {
-    process_id: i32,
+    owner: ModuleOwner,
     start: u64,
     end: u64,
     file_offset: u64,
@@ -15,13 +17,12 @@ struct ModuleIdentity {
     device_minor: u32,
     inode_generation: u64,
     path: ModulePath,
-    is_kernel: bool,
 }
 
 impl From<&ModuleRecord> for ModuleIdentity {
     fn from(module: &ModuleRecord) -> Self {
         Self {
-            process_id: module.process_id,
+            owner: module.owner,
             start: module.start,
             end: module.end,
             file_offset: module.file_offset,
@@ -30,7 +31,6 @@ impl From<&ModuleRecord> for ModuleIdentity {
             device_minor: module.device_minor,
             inode_generation: module.inode_generation,
             path: module.path.clone(),
-            is_kernel: module.is_kernel,
         }
     }
 }
@@ -79,7 +79,7 @@ impl ModuleTable {
             .slots
             .iter()
             .filter(|slot| {
-                slot.active && !slot.module.is_kernel && slot.module.process_id == process_id
+                slot.active && slot.module.pid().is_some_and(|pid| pid.get() == process_id)
             })
             .count();
         let matched: FxHashSet<_> = snapshot
@@ -115,14 +115,13 @@ impl ModuleTable {
         // A mapping is a generation. MAP_FIXED can replace only part of an
         // existing VMA, so retire every overlap and preserve its unaffected
         // fragments before activating the replacement.
-        if !module.is_kernel {
+        if let Some(module_pid) = module.pid() {
             let overlapping: Vec<_> = self
                 .slots
                 .iter()
                 .filter(|slot| {
                     slot.active
-                        && !slot.module.is_kernel
-                        && slot.module.process_id == module.process_id
+                        && slot.module.pid() == Some(module_pid)
                         && module_ranges_overlap(&slot.module, &module)
                 })
                 .map(|slot| (slot.module.id, slot.module.clone()))
@@ -208,7 +207,7 @@ impl ModuleTable {
     ) -> io::Result<()> {
         let mut changed = false;
         for slot in &mut self.slots {
-            if slot.module.process_id == process_id && !slot.module.is_kernel && slot.active {
+            if slot.active && slot.module.pid().is_some_and(|pid| pid.get() == process_id) {
                 changed = true;
                 slot.active = false;
                 self.active_by_key
@@ -228,18 +227,24 @@ impl ModuleTable {
         child_process_id: i32,
         writer: &mut PerfSpoolWriter<W>,
     ) -> io::Result<Vec<ModuleUpdate>> {
+        let child_pid = crate::Pid::try_from(child_process_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let inherited: Vec<_> = self
             .slots
             .iter()
             .filter(|slot| {
-                slot.active && slot.module.process_id == parent_process_id && !slot.module.is_kernel
+                slot.active
+                    && slot
+                        .module
+                        .pid()
+                        .is_some_and(|pid| pid.get() == parent_process_id)
             })
             .map(|slot| {
                 (
                     slot.module.id,
                     ModuleRecord {
                         id: 0,
-                        process_id: child_process_id,
+                        owner: ModuleOwner::Process(child_pid),
                         ..slot.module.clone()
                     },
                 )
@@ -303,7 +308,7 @@ fn module_ranges_overlap(left: &ModuleRecord, right: &ModuleRecord) -> bool {
 }
 
 fn same_mapping_except_inode_generation(left: &ModuleRecord, right: &ModuleRecord) -> bool {
-    left.process_id == right.process_id
+    left.owner == right.owner
         && left.start == right.start
         && left.end == right.end
         && left.file_offset == right.file_offset
@@ -311,7 +316,6 @@ fn same_mapping_except_inode_generation(left: &ModuleRecord, right: &ModuleRecor
         && left.device_major == right.device_major
         && left.device_minor == right.device_minor
         && left.path == right.path
-        && left.is_kernel == right.is_kernel
 }
 
 fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
@@ -351,14 +355,11 @@ impl ModuleIndex {
                 end: module.end,
                 id: module.id,
             };
-            if module.is_kernel {
-                index.kernel.push(entry);
-            } else {
-                index
-                    .by_process
-                    .entry(module.process_id)
-                    .or_default()
-                    .push(entry);
+            match module.owner {
+                ModuleOwner::Kernel => index.kernel.push(entry),
+                ModuleOwner::Process(pid) => {
+                    index.by_process.entry(pid.get()).or_default().push(entry);
+                }
             }
         }
         index.kernel.finish();

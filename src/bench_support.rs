@@ -2,10 +2,35 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::linux;
+#[cfg(test)]
+use crate::spool::ModuleOwner;
 use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, PythonRuntimeRecord};
 
 #[doc(hidden)]
 pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
+
+#[doc(hidden)]
+pub fn path_name(path: &Path) -> &str {
+    crate::path_name(path)
+}
+
+#[doc(hidden)]
+pub fn basename_start(path: &str) -> usize {
+    crate::profile::basename_start(path)
+}
+
+#[doc(hidden)]
+pub fn translate_module_address(
+    base_avma: u64,
+    base_svma: u64,
+    address: u64,
+) -> Option<(u64, u64)> {
+    let base = crate::module_base::ModuleImageBase::new(base_avma, base_svma);
+    Some((
+        base.relative_address(address)?,
+        base.svma_for_avma(address)?,
+    ))
+}
 
 const FIXTURE_START_TIMESTAMP_US: u64 = 1_700_000_000_000_000;
 const FIXTURE_SAMPLE_INTERVAL_US: u64 = 1_000;
@@ -198,7 +223,7 @@ mod tests {
         let path = temp.path().join("samples.spool");
         let module = ModuleRecord {
             id: 0,
-            process_id: 42,
+            owner: ModuleOwner::Process(crate::Pid::new(42).unwrap()),
             start: 0x1000,
             end: 0x2000,
             file_offset: 0x100,
@@ -207,7 +232,6 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: "/tmp/libstackpulse.so".into(),
-            is_kernel: false,
         };
         let runtime = PythonRuntimeRecord {
             timestamp_ns: 1_700_000_000_000_001,

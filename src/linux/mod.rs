@@ -41,16 +41,16 @@ use perf_event_open::sample::record::sample::{CallChain, Sample};
 use perf_event_open::sample::record::{Priv, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-#[cfg(test)]
-use crate::spool::ModuleRecord;
 use crate::spool::{FrameMode, FrameRecord, ModuleTable, PerfSpoolWriter};
+#[cfg(test)]
+use crate::spool::{ModuleOwner, ModuleRecord};
 use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
 #[cfg(any(test, feature = "bench-support"))]
 use module_tracking::record_module;
 use module_tracking::{
-    executable_modules_from_maps, mmap_is_executable, record_mmap, register_existing_maps,
-    register_existing_modules,
+    executable_modules_from_maps, mmap_is_executable, read_existing_maps, record_mmap,
+    register_existing_maps, register_existing_maps_snapshot, register_existing_modules,
 };
 use perf_event::{
     CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource,
@@ -1032,8 +1032,23 @@ impl<W: std::io::Write> Recorder<W> {
             self.processes.track_or_refresh(pid_i32);
             self.processes.capture_available_generation(pid_i32);
             let python_perf_support = process_has_python_perf_support(pid, &mut self.processes);
-            match register_existing_maps(
+            let maps = match read_existing_maps(pid) {
+                Ok(maps) => maps,
+                Err(err) if process_gone_error(&err) => {
+                    return match self.rollback_open_process(pid, opened) {
+                        Ok(()) => Ok(AttachOutcome::Exited),
+                        Err(cleanup_error) => {
+                            Err(crate::error::with_cleanup_error(err, cleanup_error).into())
+                        }
+                    };
+                }
+                Err(err) => {
+                    return Err(self.rollback_open_process_error(pid, opened, err).into());
+                }
+            };
+            match register_existing_maps_snapshot(
                 pid,
+                &maps,
                 &mut self.modules,
                 &mut self.processes,
                 &mut self.writer,
@@ -1045,12 +1060,12 @@ impl<W: std::io::Write> Recorder<W> {
                         0,
                         pid_i32,
                     ) {
-                        return Err(self.rollback_open_process(pid, opened, err).into());
+                        return Err(self.rollback_open_process_error(pid, opened, err).into());
                     }
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    return Err(self.rollback_open_process(pid, opened, err).into());
+                    return Err(self.rollback_open_process_error(pid, opened, err).into());
                 }
             }
         }
@@ -1059,7 +1074,7 @@ impl<W: std::io::Write> Recorder<W> {
             AttachMode::Running | AttachMode::StopWhileAttaching
         ) {
             if let Err(err) = self.perf.enable() {
-                return Err(self.rollback_open_process(pid, opened, err).into());
+                return Err(self.rollback_open_process_error(pid, opened, err).into());
             }
         }
         self.summary.kernel_enabled &= self.perf.kernel_enabled();
@@ -1171,21 +1186,32 @@ impl<W: std::io::Write> Recorder<W> {
         &mut self,
         pid: u32,
         opened: perf_group::OpenTransaction,
-        original_error: io::Error,
-    ) -> io::Error {
-        let mut error = self.perf.resume_error_or(original_error);
+    ) -> io::Result<()> {
+        let resume_result = self.perf.resume_stopped_processes();
         self.perf.rollback_open(opened);
-        if let Some(pid) = i32_from_u32(pid) {
-            if let Err(cleanup_error) = cleanup_process(
+        let cleanup_result = if let Some(pid) = i32_from_u32(pid) {
+            cleanup_process(
                 pid,
                 &mut self.modules,
                 &mut self.processes,
                 &mut self.writer,
-            ) {
-                error = crate::error::with_cleanup_error(error, cleanup_error);
-            }
+            )
+        } else {
+            Ok(())
+        };
+        crate::error::and_cleanup(resume_result, cleanup_result)
+    }
+
+    fn rollback_open_process_error(
+        &mut self,
+        pid: u32,
+        opened: perf_group::OpenTransaction,
+        original_error: io::Error,
+    ) -> io::Error {
+        match self.rollback_open_process(pid, opened) {
+            Ok(()) => original_error,
+            Err(cleanup_error) => crate::error::with_cleanup_error(original_error, cleanup_error),
         }
-        error
     }
 }
 
@@ -1445,10 +1471,6 @@ fn reconcile_process_image<W: std::io::Write>(
             }
             Ok(true)
         }
-        Err(err) if process_gone_error(&err) => {
-            processes.forget_generation(pid_i32);
-            Ok(false)
-        }
         Err(err) => Err(err),
     }
 }
@@ -1465,12 +1487,16 @@ fn register_recovered_descendant<W: std::io::Write>(
         return Ok(None);
     };
     let python_perf_support = process_has_python_perf_support(child_pid, processes);
-    match register_existing_maps(child_pid, modules, processes, writer) {
+    let maps = match read_existing_maps(child_pid) {
+        Ok(maps) => maps,
+        Err(err) if process_gone_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    match register_existing_maps_snapshot(child_pid, &maps, modules, processes, writer) {
         Ok(true) if python_perf_support => {
             mark_python_runtime_process(processes, writer, timestamp_ns, child)?;
         }
         Ok(_) => {}
-        Err(err) if process_gone_error(&err) => return Ok(None),
         Err(err) => return Err(err),
     }
 
@@ -1892,7 +1918,12 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     {
         return Ok(());
     }
-    match register_existing_maps(pid, ctx.modules, ctx.processes, ctx.writer) {
+    let maps = match read_existing_maps(pid) {
+        Ok(maps) => maps,
+        Err(err) if process_gone_error(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    match register_existing_maps_snapshot(pid, &maps, ctx.modules, ctx.processes, ctx.writer) {
         Ok(true) if process_has_python_perf_support(pid, ctx.processes) => {
             mark_python_runtime_process(
                 ctx.processes,
@@ -1902,7 +1933,6 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
             )
         }
         Ok(_) => Ok(()),
-        Err(err) if process_gone_error(&err) => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -2139,6 +2169,9 @@ fn c_string_to_string(data: &std::ffi::CString) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::test_support::{SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
@@ -2258,7 +2291,7 @@ mod tests {
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut module = test_module(0x1000, 0x2000);
-        module.process_id = pid_i32;
+        module.set_pid(crate::Pid::new(pid_i32).unwrap());
         modules.intern_module(module, &mut writer).unwrap();
 
         {
@@ -2367,7 +2400,7 @@ mod tests {
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut module = test_module(0x1000, 0x2000);
-        module.process_id = pid;
+        module.set_pid(crate::Pid::new(pid).unwrap());
         modules.intern_module(module, &mut writer).unwrap();
 
         let mut ctx = EventContext {
@@ -2483,7 +2516,7 @@ mod tests {
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut module = test_module(0x1000, 0x2000);
-        module.process_id = pid;
+        module.set_pid(crate::Pid::new(pid).unwrap());
         let module_id = modules.intern_module(module, &mut writer).unwrap();
 
         let mut ctx = EventContext {
@@ -2537,7 +2570,7 @@ mod tests {
         let mut stack_scratch = Vec::new();
         let mut lifecycle_actions = Vec::new();
         let mut module = test_module(0x1000, 0x2000);
-        module.process_id = parent_pid;
+        module.set_pid(crate::Pid::new(parent_pid).unwrap());
         modules.intern_module(module, &mut writer).unwrap();
 
         let mut ctx = EventContext {
@@ -2654,6 +2687,75 @@ mod tests {
         assert!(ctx.modules.covers_user_pc(pid, pc));
     }
 
+    struct SwitchWriter {
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl io::Write for SwitchWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail.get() {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "synthetic missing spool sink",
+                ))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn map_refresh_does_not_mistake_writer_not_found_for_process_exit() {
+        let pid_u32 = std::process::id();
+        let pid = i32::try_from(pid_u32).unwrap();
+        let pc = map_refresh_does_not_mistake_writer_not_found_for_process_exit as *const () as u64;
+        let fail = Rc::new(Cell::new(false));
+        let mut writer = PerfSpoolWriter::from_writer(
+            SwitchWriter {
+                fail: Rc::clone(&fail),
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        fail.set(true);
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut summary = RecordingSummary::default();
+        let mut stack_scratch = Vec::new();
+        let mut lifecycle_actions = Vec::new();
+        let mut ctx = EventContext {
+            modules: &mut modules,
+            processes: &mut processes,
+            writer: &mut writer,
+            summary: &mut summary,
+            stack_scratch: &mut stack_scratch,
+            lifecycle_actions: &mut lifecycle_actions,
+            inherit_child_processes: false,
+        };
+        let sample = PreparedSample {
+            meta: PreparedSampleMeta {
+                timestamp_ns: 0,
+                pid,
+                tid: u64::from(pid_u32),
+            },
+            privilege: Priv::User,
+            code_addr: Some(pc),
+            user_regs: None,
+            user_stack: None,
+            callchain_stack: Vec::new(),
+        };
+
+        let error = refresh_maps_for_uncovered_user_pc(&mut ctx, &sample).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "synthetic missing spool sink");
+    }
+
     #[test]
     fn hypervisor_sample_ip_does_not_refresh_user_maps() {
         let pid_u32 = std::process::id();
@@ -2705,7 +2807,7 @@ mod tests {
     fn test_module(start: u64, end: u64) -> ModuleRecord {
         ModuleRecord {
             id: 0,
-            process_id: 7,
+            owner: ModuleOwner::Process(crate::Pid::new(7).unwrap()),
             start,
             end,
             file_offset: 0,
@@ -2714,7 +2816,6 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: "/tmp/libtest.so".into(),
-            is_kernel: false,
         }
     }
 
