@@ -11,48 +11,87 @@ pub mod children;
 /// Recording and integration guide.
 pub mod docs;
 mod elf;
-mod error;
+/// Typed errors returned by recording, spool, and symbolization workflows.
+pub mod error;
+/// Validated Linux process and thread identifiers.
+pub mod identity;
 mod linux;
 mod module_base;
 mod native_module;
 mod proc_maps;
-/// Resolved frames and symbol metadata returned by [`PerfSymbolizer`].
+/// Resolved frames and symbol metadata returned by [`Symbolizer`].
 pub mod profile;
-mod spool;
+/// Spool readers and raw recorded profile types.
+pub mod spool;
 /// Process liveness checks, exit watching, and signal helpers.
 pub mod state;
 mod stats;
-mod symbolize;
+pub mod symbolize;
 mod symbols;
 #[cfg(test)]
 mod test_support;
 
-pub use linux::perf_event::PerfFrequencyLimit;
-pub use linux::perf_event::MAX_SAMPLE_USER_STACK;
-pub use linux::{process, AttachMode, PerfRecorder, PerfRecorderOptions, PerfSummary};
-pub use module_base::ModuleImageBase;
-pub use profile::{
-    FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
-    SourceLocation, SymbolOrigin,
-};
-pub use spool::{
-    FrameContext, FrameMode, FrameModuleRef, FrameRecord, ModulePath, ModuleRecord,
-    PerfSpoolReader, PerfSpoolReplayReader, PythonRuntimeRecord, ReplaySampleStack, SampleRecord,
-    SampleStack, SampleStacks, StackFrameContexts, StackFrameRefs,
-};
-pub use stats::{ErrorStatsFormatter, SampleErrorKind, SampleErrorStats};
-pub use symbolize::{PerfSymbolizer, PerfSymbolizerBuilder};
-pub use symbols::{NativeSymbolizer, SymModule, SymbolsRc};
+pub use error::{Error, ErrorKind, Result};
+pub use identity::{Pid, Tid};
+pub use linux::{process, AttachMode, Recorder, RecorderOptions, RecordingSummary, SampleRate};
+pub use spool::{Replay, Snapshot};
+pub use symbolize::{StackCache, Symbolizer, SymbolizerBuilder};
 
-/// Read the kernel's current maximum perf sample rate, in samples per second.
-///
-/// Reads `/proc/sys/kernel/perf_event_max_sample_rate`, the kernel ceiling
-/// the recorder must stay under (otherwise it returns [`PerfFrequencyLimit`]).
-/// Returns `None` if the file cannot be read or parsed (older kernels,
-/// restricted procfs, sandboxed mounts).
-pub fn max_sample_rate() -> Option<u64> {
-    let data = std::fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate").ok()?;
-    data.trim().parse().ok()
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send::<Recorder>();
+    assert_send_sync::<Replay>();
+    assert_send_sync::<Snapshot>();
+    assert_send_sync::<process::RunningProcess>();
+    assert_send_sync::<process::SuspendedLaunchedProcess>();
+};
+
+/// Perf recording types and statistics.
+pub mod record {
+    use std::io;
+
+    pub use crate::linux::perf_event::{PerfFrequencyLimit, MAX_SAMPLE_USER_STACK};
+    pub use crate::linux::{
+        AttachMode, AttachOutcome, PollSummary, Recorder, RecorderOptions, RecordingSummary,
+        RefreshOutcome, SampleRate,
+    };
+    pub use crate::stats::{SampleErrorKind, SampleErrorStats};
+
+    /// Read the kernel's current maximum perf sample rate.
+    #[must_use]
+    pub fn max_sample_rate() -> Option<u64> {
+        read_max_sample_rate().ok()
+    }
+
+    pub(crate) fn read_max_sample_rate() -> io::Result<u64> {
+        const PATH: &str = "/proc/sys/kernel/perf_event_max_sample_rate";
+        let data = std::fs::read_to_string(PATH).map_err(|source| {
+            let kind = source.kind();
+            io::Error::new(kind, MaxSampleRateError::Read { source })
+        })?;
+        data.trim().parse().map_err(|source| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                MaxSampleRateError::Parse { source },
+            )
+        })
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum MaxSampleRateError {
+        #[error("failed to read /proc/sys/kernel/perf_event_max_sample_rate: {source}")]
+        Read {
+            #[source]
+            source: io::Error,
+        },
+        #[error("/proc/sys/kernel/perf_event_max_sample_rate is not an integer: {source}")]
+        Parse {
+            #[source]
+            source: std::num::ParseIntError,
+        },
+    }
 }
 
 /// Display-friendly basename for a module path.
@@ -61,7 +100,7 @@ pub fn max_sample_rate() -> Option<u64> {
 /// path when it has no basename and to `"<unknown>"` when the path is not
 /// valid UTF-8. Used for grouping and labeling frames by their owning module.
 #[must_use]
-pub fn path_to_name(path: &std::path::Path) -> String {
+pub(crate) fn path_to_name(path: &std::path::Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| path.to_str().unwrap_or("<unknown>"))
@@ -76,7 +115,7 @@ pub fn path_to_name(path: &std::path::Path) -> String {
 /// suffixes after the extension). Returns `false` for extension modules and
 /// other libraries that happen to start with `python`.
 #[must_use]
-pub fn is_python_module(name: &str) -> bool {
+pub(crate) fn is_python_module(name: &str) -> bool {
     is_python_executable_name(name) || lib_name_matches_libpython(name)
 }
 

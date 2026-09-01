@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -12,7 +11,9 @@ use libc::execvp;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, pipe2, read, write, ForkResult, Pid};
+use nix::unistd::{fork, pipe2, read, write, ForkResult, Pid as NixPid};
+
+use crate::Pid;
 
 unsafe extern "C" {
     static mut environ: *mut *mut c_char;
@@ -20,11 +21,14 @@ unsafe extern "C" {
 
 /// Forks a child that blocks before `execve` so the parent can capture its PID
 /// and initialize profiling first.
+#[derive(Debug)]
 pub struct SuspendedLaunchedProcess {
-    pid: Pid,
+    pid: NixPid,
+    public_pid: Pid,
     pipes: Option<SuspendPipes>,
 }
 
+#[derive(Debug)]
 struct SuspendPipes {
     resume_tx: OwnedFd,
     exec_error_rx: OwnedFd,
@@ -60,8 +64,14 @@ impl SuspendedLaunchedProcess {
             }
             ForkResult::Parent { child } => {
                 drop((resume_rp, execerr_sp));
+                let Some(public_pid) = Pid::new(child.as_raw()) else {
+                    drop((resume_sp, execerr_rp));
+                    reap(child);
+                    return Err(io::Error::other("fork returned a non-positive child pid"));
+                };
                 Ok(Self {
                     pid: child,
+                    public_pid,
                     pipes: Some(SuspendPipes {
                         resume_tx: resume_sp,
                         exec_error_rx: execerr_rp,
@@ -72,8 +82,8 @@ impl SuspendedLaunchedProcess {
     }
 
     /// Return the child process id.
-    pub fn pid(&self) -> u32 {
-        self.pid.as_raw() as u32
+    pub fn pid(&self) -> Pid {
+        self.public_pid
     }
 
     const EXECERR_MSG_FOOTER: [u8; 4] = *b"NOEX";
@@ -132,7 +142,7 @@ impl SuspendedLaunchedProcess {
         }
 
         Ok(RunningProcess {
-            state: Cell::new(ChildState::Running(self.pid)),
+            state: ChildState::Running(self.pid),
         })
     }
 
@@ -179,7 +189,7 @@ impl SuspendedLaunchedProcess {
     }
 }
 
-fn waitpid_retry(pid: Pid, flags: Option<WaitPidFlag>) -> nix::Result<WaitStatus> {
+fn waitpid_retry(pid: NixPid, flags: Option<WaitPidFlag>) -> nix::Result<WaitStatus> {
     loop {
         match waitpid(pid, flags) {
             Err(Errno::EINTR) => {}
@@ -188,7 +198,7 @@ fn waitpid_retry(pid: Pid, flags: Option<WaitPidFlag>) -> nix::Result<WaitStatus
     }
 }
 
-fn reap(pid: Pid) {
+fn reap(pid: NixPid) {
     let _ = waitpid_retry(pid, None);
 }
 
@@ -229,20 +239,28 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 /// A launched process that is now running.
 #[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
-    state: Cell<ChildState>,
+    state: ChildState,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ChildState {
-    Running(Pid),
+    Running(NixPid),
     Exited(ExitStatus),
     Waited,
 }
 
+impl std::fmt::Debug for RunningProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningProcess")
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
-    pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
-        let pid = match self.state.get() {
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let pid = match self.state {
             ChildState::Running(pid) => pid,
             ChildState::Exited(status) => return Ok(Some(status)),
             ChildState::Waited => return Ok(None),
@@ -251,7 +269,7 @@ impl RunningProcess {
             Ok(WaitStatus::StillAlive) => Ok(None),
             Ok(status) => {
                 let status = process_exit_status(status)?;
-                self.state.set(ChildState::Exited(status));
+                self.state = ChildState::Exited(status);
                 Ok(Some(status))
             }
             Err(err) => Err(err.into()),
@@ -259,8 +277,8 @@ impl RunningProcess {
     }
 
     /// Wait until the process exits.
-    pub fn wait(self) -> io::Result<ExitStatus> {
-        match self.state.replace(ChildState::Waited) {
+    pub fn wait(mut self) -> io::Result<ExitStatus> {
+        match std::mem::replace(&mut self.state, ChildState::Waited) {
             ChildState::Running(pid) => process_exit_status(waitpid_retry(pid, None)?),
             ChildState::Exited(status) => Ok(status),
             ChildState::Waited => Err(io::Error::other("process was already waited")),
@@ -270,7 +288,7 @@ impl RunningProcess {
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
-        if let ChildState::Running(pid) = self.state.get() {
+        if let ChildState::Running(pid) = self.state {
             let _ = waitpid_retry(pid, Some(WaitPidFlag::WNOHANG));
         }
     }
@@ -340,7 +358,7 @@ mod tests {
         let launched =
             SuspendedLaunchedProcess::launch_in_suspended_state(OsStr::new("unused"), &[], &[])
                 .expect("launch suspended child");
-        let pid = Pid::from_raw(launched.pid() as i32);
+        let pid = NixPid::from_raw(launched.pid().get());
 
         drop(launched);
 
@@ -358,7 +376,7 @@ mod tests {
             &[],
         )
         .expect("launch suspended child");
-        let pid = Pid::from_raw(launched.pid() as i32);
+        let pid = NixPid::from_raw(launched.pid().get());
 
         let result = launched.unsuspend_and_run();
         assert!(result.is_err());
@@ -423,8 +441,8 @@ mod tests {
 
     #[test]
     fn running_process_reports_none_after_it_has_been_waited() {
-        let process = RunningProcess {
-            state: Cell::new(ChildState::Waited),
+        let mut process = RunningProcess {
+            state: ChildState::Waited,
         };
 
         assert!(process.try_wait().expect("try wait without pid").is_none());
@@ -436,7 +454,7 @@ mod tests {
 
     #[test]
     fn exit_status_preserves_signal_and_core_dump() {
-        let pid = Pid::from_raw(42);
+        let pid = NixPid::from_raw(42);
         let status = process_exit_status(WaitStatus::Signaled(pid, Signal::SIGTERM, true))
             .expect("convert wait status");
 
@@ -456,12 +474,12 @@ mod tests {
 
     #[test]
     fn try_wait_reports_missing_child() {
-        let process = RunningProcess {
-            state: Cell::new(ChildState::Running(Pid::from_raw(i32::MAX))),
+        let mut process = RunningProcess {
+            state: ChildState::Running(NixPid::from_raw(i32::MAX)),
         };
 
         let error = process.try_wait().expect_err("missing child should fail");
-        process.state.set(ChildState::Waited);
+        process.state = ChildState::Waited;
 
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
@@ -473,7 +491,7 @@ mod tests {
         let launched =
             SuspendedLaunchedProcess::launch_in_suspended_state(command.as_os_str(), &args, &[])
                 .expect("launch suspended child");
-        let running = launched.unsuspend_and_run().expect("resume child");
+        let mut running = launched.unsuspend_and_run().expect("resume child");
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
@@ -490,7 +508,7 @@ mod tests {
                 return;
             }
             if Instant::now() >= deadline {
-                if let ChildState::Running(pid) = running.state.get() {
+                if let ChildState::Running(pid) = running.state {
                     unsafe {
                         libc::kill(pid.as_raw(), libc::SIGKILL);
                     }

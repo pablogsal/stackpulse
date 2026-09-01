@@ -9,7 +9,7 @@ use perf_event_open_sys::bindings::{
 #[cfg(target_arch = "x86_64")]
 use perf_event_open_sys::bindings::{PERF_REG_X86_BP, PERF_REG_X86_IP, PERF_REG_X86_SP};
 
-pub trait ConvertRegs {
+pub(super) trait ConvertRegs {
     type UnwindRegs;
     /// `(pc, sp, regs)` if every unwind register is present; `None` otherwise.
     fn convert_regs(regs: &[u64]) -> Option<(u64, u64, Self::UnwindRegs)>;
@@ -26,7 +26,7 @@ fn reg_value(regs: &[u64], regs_mask: u64, register: u32) -> Option<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub struct ConvertRegsX86_64;
+pub(super) struct ConvertRegsX86_64;
 #[cfg(target_arch = "x86_64")]
 impl ConvertRegs for ConvertRegsX86_64 {
     type UnwindRegs = UnwindRegsX86_64;
@@ -45,7 +45,7 @@ impl ConvertRegs for ConvertRegsX86_64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub struct ConvertRegsAarch64;
+pub(super) struct ConvertRegsAarch64;
 #[cfg(target_arch = "aarch64")]
 impl ConvertRegs for ConvertRegsAarch64 {
     type UnwindRegs = UnwindRegsAarch64;

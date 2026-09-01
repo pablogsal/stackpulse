@@ -34,7 +34,7 @@ impl<K: Ord, V> PartialOrd for EventHeapItem<K, V> {
 /// timestamp), `V` the consumed event. Events are held until every group has
 /// completed another read and their key is covered by the previous round's
 /// high watermark.
-pub struct EventSorter<G: Ord, K: Ord, V> {
+pub(super) struct EventSorter<G: Ord, K: Ord, V> {
     heap: BinaryHeap<EventHeapItem<K, V>>,
     current_group: Option<G>,
     next_sequence: u64,
@@ -44,7 +44,7 @@ pub struct EventSorter<G: Ord, K: Ord, V> {
 }
 
 impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         EventSorter {
             heap: BinaryHeap::new(),
             current_group: None,
@@ -57,12 +57,12 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
 
     /// True if events remain buffered. `pop` can return `None` while more
     /// events are still held back waiting for later rounds.
-    pub fn has_more(&self) -> bool {
+    pub(super) fn has_more(&self) -> bool {
         !self.heap.is_empty()
     }
 
     /// Start a new round after the largest-identifier group has been read.
-    pub fn advance_round(&mut self) {
+    pub(super) fn advance_round(&mut self) {
         self.flush_through = self.next_flush.take();
         self.next_flush.clone_from(&self.max_key);
         self.current_group = None;
@@ -70,7 +70,7 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
 
     /// Begin a new group within the current round. Panics if `group` is not
     /// monotonically increasing.
-    pub fn begin_group(&mut self, group: G) {
+    pub(super) fn begin_group(&mut self, group: G) {
         assert!(
             Some(&group) >= self.current_group.as_ref(),
             "Group keys must be monotonically increasing"
@@ -79,7 +79,7 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
     }
 
     /// Try to consume an event.
-    pub fn pop(&mut self) -> Option<V> {
+    pub(super) fn pop(&mut self) -> Option<V> {
         if self.current_group.is_some() {
             return None;
         }
@@ -95,11 +95,11 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
     }
 
     /// Unconditionally pop the next event, ignoring round constraints.
-    pub fn force_pop(&mut self) -> Option<V> {
+    pub(super) fn force_pop(&mut self) -> Option<V> {
         self.heap.pop().map(|x| x.value)
     }
 
-    pub fn push_current_group(&mut self, key: K, value: V) {
+    pub(super) fn push_current_group(&mut self, key: K, value: V) {
         assert!(
             self.current_group.is_some(),
             "begin_group must be called before insertion"

@@ -122,7 +122,7 @@ impl ThreadPerfEvents {
     }
 }
 
-pub struct PerfGroup {
+pub(super) struct PerfGroup {
     members: BTreeMap<RawFd, Member>,
     outputs: BTreeMap<RawFd, OutputMember>,
     cpu_outputs: BTreeMap<u32, RawFd>,
@@ -184,16 +184,20 @@ fn get_threads(pid: u32) -> io::Result<Vec<u32>> {
 }
 
 /// How recording should attach to a process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttachMode {
+    /// Attach to a running process without stopping it.
+    Running,
     /// Attach before a not-yet-executed child is allowed to run.
-    AttachWithEnableOnExec,
+    /// Counters remain disabled until the target calls `execve`.
+    OnExec,
     /// Briefly stop an already-running process, attach, then resume it.
-    StopAttachEnableResume,
+    StopWhileAttaching,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PerfGroupOptions {
+pub(super) struct PerfGroupOptions {
     pub frequency: u32,
     pub stack_size: u32,
     pub event_source: EventSource,
@@ -203,7 +207,7 @@ pub struct PerfGroupOptions {
 }
 
 impl PerfGroup {
-    pub fn new(options: PerfGroupOptions) -> io::Result<Self> {
+    pub(super) fn new(options: PerfGroupOptions) -> io::Result<Self> {
         Ok(PerfGroup {
             members: Default::default(),
             outputs: Default::default(),
@@ -225,13 +229,17 @@ impl PerfGroup {
         })
     }
 
-    pub fn open(pid: u32, attach_mode: AttachMode, options: PerfGroupOptions) -> io::Result<Self> {
+    pub(super) fn open(
+        pid: u32,
+        attach_mode: AttachMode,
+        options: PerfGroupOptions,
+    ) -> io::Result<Self> {
         let mut group = PerfGroup::new(options)?;
         let _ = group.open_process(pid, attach_mode)?;
         Ok(group)
     }
 
-    pub fn open_process(
+    pub(super) fn open_process(
         &mut self,
         pid: u32,
         attach_mode: AttachMode,
@@ -246,8 +254,14 @@ impl PerfGroup {
         frequency_mode: FrequencyMode,
     ) -> io::Result<OpenTransaction> {
         validate_target_pid(pid)?;
+        if attach_mode == AttachMode::StopWhileAttaching && pid == std::process::id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot stop the recording process while attaching to itself",
+            ));
+        }
         let frequency = frequency_for_mode(self.frequency, frequency_mode);
-        let (stopped_process, threads) = if attach_mode == AttachMode::StopAttachEnableResume {
+        let (stopped_process, threads) = if attach_mode == AttachMode::StopWhileAttaching {
             let (stopped, threads) = StoppedProcess::new(pid)?;
             (Some(stopped), threads)
         } else {
@@ -316,17 +330,17 @@ impl PerfGroup {
             }
             Err(err) => {
                 if let Some(mut stopped_process) = stopped_process {
-                    stopped_process.resume()?;
+                    return Err(stopped_process.resume_error_or(err));
                 }
                 Err(err)
             }
         }
     }
 
-    pub fn refresh_threads(&mut self, pid: u32) -> io::Result<()> {
+    pub(super) fn refresh_threads(&mut self, pid: u32) -> io::Result<bool> {
         let mut threads = match get_threads(pid) {
             Ok(threads) => threads,
-            Err(err) if process_gone_error(&err) => return Ok(()),
+            Err(err) if process_gone_error(&err) => return Ok(false),
             Err(err) => return Err(err),
         };
         threads.sort_unstable();
@@ -356,7 +370,7 @@ impl PerfGroup {
                 self.tracked_threads
                     .insert(tid, ThreadTrack::new(pid, true));
             }
-            return Ok(());
+            return Ok(true);
         }
         let cpu_ids = online_cpu_ids()?;
         let cpu_count = cpu_ids.len();
@@ -373,7 +387,7 @@ impl PerfGroup {
                     owner_pid: pid,
                 },
                 &cpu_ids,
-                AttachMode::StopAttachEnableResume,
+                AttachMode::StopWhileAttaching,
                 frequency,
                 &mut pending,
             )? {
@@ -384,10 +398,10 @@ impl PerfGroup {
         }
         self.enable_and_register_pending(pending)?;
         self.tracked_threads.extend(tracked_threads);
-        Ok(())
+        Ok(true)
     }
 
-    pub fn open_forked_threads(&mut self, thread_forks: &[ThreadFork]) -> io::Result<()> {
+    pub(super) fn open_forked_threads(&mut self, thread_forks: &[ThreadFork]) -> io::Result<()> {
         if thread_forks.is_empty() {
             return Ok(());
         }
@@ -424,7 +438,7 @@ impl PerfGroup {
             if let Some(thread_perfs) = self.try_open_thread_perfs(
                 TaskTarget { tid, owner_pid },
                 &cpu_ids,
-                AttachMode::StopAttachEnableResume,
+                AttachMode::StopWhileAttaching,
                 frequency,
                 &mut pending,
             )? {
@@ -439,7 +453,10 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn open_forked_processes(&mut self, process_forks: &[ProcessFork]) -> io::Result<()> {
+    pub(super) fn open_forked_processes(
+        &mut self,
+        process_forks: &[ProcessFork],
+    ) -> io::Result<()> {
         if !self.inherit_child_processes {
             return Ok(());
         }
@@ -461,7 +478,7 @@ impl PerfGroup {
             }
             match self.open_process_with_frequency_mode(
                 pid,
-                AttachMode::StopAttachEnableResume,
+                AttachMode::StopWhileAttaching,
                 FrequencyMode::ClampToKernelMax,
             ) {
                 Ok(opened) => {
@@ -480,7 +497,7 @@ impl PerfGroup {
 
     /// Repair process bookkeeping after LOST when only the owning parent
     /// process (not the exact forking TID) can be recovered from /proc.
-    pub fn recover_forked_processes(
+    pub(super) fn recover_forked_processes(
         &mut self,
         process_forks: &[RecoveredProcessFork],
     ) -> io::Result<()> {
@@ -503,7 +520,7 @@ impl PerfGroup {
         self.open_forked_processes(&need_explicit_open)
     }
 
-    pub fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
+    pub(super) fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
         self.remove_members(|member| {
             member.perf.target() == tid && !member.perf.inherit().is_enabled()
         })?;
@@ -511,7 +528,7 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn remove_process(&mut self, pid: u32) -> io::Result<()> {
+    pub(super) fn remove_process(&mut self, pid: u32) -> io::Result<()> {
         self.remove_members(|member| {
             member.owner_pid == pid && member.perf.inherit() != TaskInheritance::Children
         })?;
@@ -759,7 +776,7 @@ impl PerfGroup {
             reg_mask: self.regs_mask,
             event_source: self.event_source,
             inherit,
-            enable_on_exec: attach_mode == AttachMode::AttachWithEnableOnExec,
+            enable_on_exec: attach_mode == AttachMode::OnExec,
             include_kernel: self.include_kernel && !pending.kernel_excluded,
             sample_callchain: true,
             exclude_user_callchain: true,
@@ -814,15 +831,15 @@ impl PerfGroup {
         }
     }
 
-    pub fn has_pending_events(&self) -> bool {
+    pub(super) fn has_pending_events(&self) -> bool {
         self.saw_readable
     }
 
-    pub fn kernel_enabled(&self) -> bool {
+    pub(super) fn kernel_enabled(&self) -> bool {
         self.include_kernel
     }
 
-    pub fn enable(&mut self) -> io::Result<()> {
+    pub(super) fn enable(&mut self) -> io::Result<()> {
         let enable_result = (|| {
             for member in self.outputs.values() {
                 member.ring.enable()?;
@@ -833,10 +850,10 @@ impl PerfGroup {
             Ok(())
         })();
         let resume_result = self.resume_stopped_processes();
-        resume_result.and(enable_result)
+        crate::error::and_cleanup(enable_result, resume_result)
     }
 
-    pub fn resume_stopped_processes(&mut self) -> io::Result<()> {
+    pub(super) fn resume_stopped_processes(&mut self) -> io::Result<()> {
         let mut first_error = None;
         for mut process in std::mem::take(&mut self.stopped_processes) {
             if let Err(err) = process.resume() {
@@ -847,12 +864,13 @@ impl PerfGroup {
     }
 
     pub(super) fn resume_error_or(&mut self, original_error: io::Error) -> io::Error {
-        self.resume_stopped_processes()
-            .err()
-            .unwrap_or(original_error)
+        match self.resume_stopped_processes() {
+            Ok(()) => original_error,
+            Err(cleanup_error) => crate::error::with_cleanup_error(original_error, cleanup_error),
+        }
     }
 
-    pub fn disable(&mut self) -> io::Result<()> {
+    pub(super) fn disable(&mut self) -> io::Result<()> {
         let mut first_error = None;
         for member in self.outputs.values() {
             if let Err(err) = member.ring.disable() {
@@ -867,7 +885,7 @@ impl PerfGroup {
         first_error.map_or(Ok(()), Err)
     }
 
-    pub fn take_lost_records(&mut self) -> io::Result<u64> {
+    pub(super) fn take_lost_records(&mut self) -> io::Result<u64> {
         let mut total = self.retired_lost_records;
         for output in self.outputs.values() {
             total = checked_loss_sum(total, output.ring.lost_records()?)?;
@@ -887,16 +905,13 @@ impl PerfGroup {
         Ok(delta)
     }
 
-    pub fn wait(&mut self) -> io::Result<()> {
+    pub(super) fn wait(&mut self, timeout: Duration) -> io::Result<()> {
         if self.saw_readable {
             return Ok(());
         }
         self.ensure_poll_anchors()?;
         // EINTR is normal (signals: e.g. parent's Ctrl-C handler).
-        if let Err(err) = self
-            .poll
-            .poll(&mut self.poll_events, Some(Duration::from_millis(100)))
-        {
+        if let Err(err) = self.poll.poll(&mut self.poll_events, Some(timeout)) {
             return if err.kind() == io::ErrorKind::Interrupted {
                 Ok(())
             } else {
@@ -919,7 +934,7 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) {
+    pub(super) fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) {
         self.saw_readable = false;
         // Drain every ring buffer on every pass. Poll readiness is only a wakeup
         // hint; using it as a filter can let older mmap/fork records sit behind
@@ -940,7 +955,7 @@ impl PerfGroup {
         consumer.drain_ready_events();
     }
 
-    pub fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) {
+    pub(super) fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) {
         self.consume_events(consumer);
         consumer.flush_ready_events();
     }
@@ -962,7 +977,7 @@ fn checked_loss_sum(total: u64, lost: u64) -> io::Result<u64> {
 }
 
 fn frequency_for_mode(frequency: u32, mode: FrequencyMode) -> u64 {
-    frequency_for_kernel_max(frequency, mode, crate::max_sample_rate())
+    frequency_for_kernel_max(frequency, mode, crate::record::max_sample_rate())
 }
 
 fn frequency_for_kernel_max(frequency: u32, mode: FrequencyMode, max_rate: Option<u64>) -> u64 {
@@ -1033,7 +1048,7 @@ mod tests {
         .expect("create perf group");
 
         let err = group
-            .open_process(pid, AttachMode::AttachWithEnableOnExec)
+            .open_process(pid, AttachMode::OnExec)
             .expect_err("invalid stack size should fail before opening perf events");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1043,7 +1058,7 @@ mod tests {
 
     #[test]
     fn open_rejects_invalid_pid_before_tracking_process() {
-        let err = match PerfGroup::open(0, AttachMode::AttachWithEnableOnExec, TEST_OPTIONS) {
+        let err = match PerfGroup::open(0, AttachMode::OnExec, TEST_OPTIONS) {
             Ok(_) => panic!("pid 0 should be rejected"),
             Err(err) => err,
         };
@@ -1382,7 +1397,7 @@ mod tests {
                     owner_pid,
                 },
                 cpu,
-                AttachMode::AttachWithEnableOnExec,
+                AttachMode::OnExec,
                 inherit,
                 1,
                 &mut pending,
@@ -1401,12 +1416,11 @@ mod tests {
     #[test]
     fn rollback_removes_exact_open_transaction() {
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
-        let opened =
-            match group.open_process(std::process::id(), AttachMode::AttachWithEnableOnExec) {
-                Ok(opened) => opened,
-                Err(err) if perf_open_can_be_skipped(&err) => return,
-                Err(err) => panic!("open process: {err}"),
-            };
+        let opened = match group.open_process(std::process::id(), AttachMode::OnExec) {
+            Ok(opened) => opened,
+            Err(err) if perf_open_can_be_skipped(&err) => return,
+            Err(err) => panic!("open process: {err}"),
+        };
         assert!(!group.outputs.is_empty());
 
         group.rollback_open(opened);

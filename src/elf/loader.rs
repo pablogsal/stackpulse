@@ -212,8 +212,12 @@ fn find_section_data_with_object(
     file: &object::File<'_>,
     storage: &ElfFileData,
 ) -> Option<(u64, ElfSectionData)> {
+    const MAX_DECOMPRESSED_SECTION_SIZE: u64 = 512 * 1024 * 1024;
     let section = file.section_by_name(name)?;
     let file_range = section.compressed_file_range().ok()?;
+    if file_range.uncompressed_size > MAX_DECOMPRESSED_SECTION_SIZE {
+        return None;
+    }
     let data = match file_range.format {
         CompressionFormat::None => {
             let range = checked_usize_range(file_range.offset, file_range.uncompressed_size)?;

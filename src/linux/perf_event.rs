@@ -20,7 +20,7 @@ use perf_event_open_sys::bindings as sys;
 
 /// Hard kernel cap on the user-stack snapshot size, in bytes, that
 /// `perf_event_open` will copy per sample. Acts as a ceiling for
-/// `PerfRecorderOptions::stack_size`; anything larger is rejected.
+/// `RecorderOptions::stack_size`; anything larger is rejected.
 pub const MAX_SAMPLE_USER_STACK: u32 = 65_528;
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -32,8 +32,11 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 ///
 /// Wraps the rate the caller asked for and the cap currently in effect, so
 /// they can adjust the recorder's `frequency` option and retry, or read the
-/// cap up front via [`crate::max_sample_rate`].
-#[derive(Debug)]
+/// cap up front via [`crate::record::max_sample_rate`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, thiserror::Error)]
+#[error(
+    "frequency {requested_frequency} exceeds /proc/sys/kernel/perf_event_max_sample_rate {max_frequency}"
+)]
 pub struct PerfFrequencyLimit {
     /// Frequency the caller asked for, in Hz.
     pub requested_frequency: u64,
@@ -41,20 +44,8 @@ pub struct PerfFrequencyLimit {
     pub max_frequency: u64,
 }
 
-impl fmt::Display for PerfFrequencyLimit {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            fmt,
-            "frequency {} exceeds /proc/sys/kernel/perf_event_max_sample_rate {}",
-            self.requested_frequency, self.max_frequency
-        )
-    }
-}
-
-impl std::error::Error for PerfFrequencyLimit {}
-
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
-pub enum EventSource {
+pub(super) enum EventSource {
     HwCpuCycles,
     #[default]
     SwCpuClock,
@@ -62,7 +53,7 @@ pub enum EventSource {
 
 /// `include_kernel = false` is the safe default; everything else zero-defaults.
 #[derive(Clone, Debug, Default)]
-pub struct PerfOptions {
+pub(super) struct PerfOptions {
     pub pid: u32,
     pub cpu: u32,
     pub frequency: u64,
@@ -78,7 +69,7 @@ pub struct PerfOptions {
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum TaskInheritance {
+pub(super) enum TaskInheritance {
     #[default]
     None,
     Threads,
@@ -88,7 +79,7 @@ pub enum TaskInheritance {
 impl TaskInheritance {
     #[inline]
     #[must_use]
-    pub(crate) fn is_enabled(self) -> bool {
+    pub(super) fn is_enabled(self) -> bool {
         self != Self::None
     }
 }
@@ -100,7 +91,7 @@ struct OpenedCounter {
 }
 
 impl PerfOptions {
-    pub fn open(mut self) -> io::Result<Perf> {
+    pub(super) fn open(mut self) -> io::Result<Perf> {
         self.align_stack_size()?;
         let OpenedCounter {
             counter,
@@ -117,7 +108,7 @@ impl PerfOptions {
         ))
     }
 
-    pub fn open_ring(mut self) -> io::Result<OutputRing> {
+    pub(super) fn open_ring(mut self) -> io::Result<OutputRing> {
         self.align_stack_size()?;
         let OpenedCounter {
             counter,
@@ -172,7 +163,7 @@ impl PerfOptions {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if let Some(max_rate) = crate::max_sample_rate().filter(|&r| self.frequency > r) {
+        if let Some(max_rate) = crate::record::max_sample_rate().filter(|&r| self.frequency > r) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 PerfFrequencyLimit {
@@ -257,47 +248,47 @@ impl PerfOptions {
     }
 }
 
-pub struct OutputRing {
+pub(super) struct OutputRing {
     perf: Perf,
     sampler: Sampler,
 }
 
 impl OutputRing {
-    pub fn enable(&self) -> io::Result<()> {
+    pub(super) fn enable(&self) -> io::Result<()> {
         self.perf.enable()
     }
 
-    pub fn disable(&self) -> io::Result<()> {
+    pub(super) fn disable(&self) -> io::Result<()> {
         self.perf.disable()
     }
 
     #[inline]
-    pub fn fd(&self) -> RawFd {
+    pub(super) fn fd(&self) -> RawFd {
         self.perf.fd()
     }
 
     #[inline]
-    pub fn cpu(&self) -> u32 {
+    pub(super) fn cpu(&self) -> u32 {
         self.perf.cpu
     }
 
     #[inline]
-    pub fn inherit(&self) -> TaskInheritance {
+    pub(super) fn inherit(&self) -> TaskInheritance {
         self.perf.inherit()
     }
 
     #[inline]
-    pub fn includes_kernel(&self) -> bool {
+    pub(super) fn includes_kernel(&self) -> bool {
         self.perf.includes_kernel()
     }
 
-    pub fn event_drain(&self) -> EventDrain<'_> {
+    pub(super) fn event_drain(&self) -> EventDrain<'_> {
         EventDrain {
             iter: self.sampler.iter().into_cow(),
         }
     }
 
-    pub fn lost_records(&self) -> io::Result<u64> {
+    pub(super) fn lost_records(&self) -> io::Result<u64> {
         self.perf.lost_records()
     }
 }
@@ -429,7 +420,7 @@ fn ring_buffer_page_exp_for_page_size(stack_size: u32, page_size: u64) -> io::Re
     Ok(page_exp as u8)
 }
 
-pub struct Perf {
+pub(super) struct Perf {
     counter: Counter,
     target: u32,
     cpu: u32,
@@ -454,35 +445,35 @@ impl Perf {
         }
     }
 
-    pub fn enable(&self) -> io::Result<()> {
+    pub(super) fn enable(&self) -> io::Result<()> {
         self.counter.enable()
     }
 
-    pub fn disable(&self) -> io::Result<()> {
+    pub(super) fn disable(&self) -> io::Result<()> {
         self.counter.disable()
     }
 
     #[inline]
-    pub fn fd(&self) -> RawFd {
+    pub(super) fn fd(&self) -> RawFd {
         self.counter.file().as_raw_fd()
     }
 
     #[inline]
-    pub fn target(&self) -> u32 {
+    pub(super) fn target(&self) -> u32 {
         self.target
     }
 
     #[inline]
-    pub fn inherit(&self) -> TaskInheritance {
+    pub(super) fn inherit(&self) -> TaskInheritance {
         self.inherit
     }
 
     #[inline]
-    pub fn includes_kernel(&self) -> bool {
+    pub(super) fn includes_kernel(&self) -> bool {
         self.include_kernel
     }
 
-    pub fn set_output(&self, output: &OutputRing) -> io::Result<()> {
+    pub(super) fn set_output(&self, output: &OutputRing) -> io::Result<()> {
         if self.cpu != output.cpu() {
             return Err(invalid_input("incompatible perf output ring"));
         }
@@ -494,7 +485,7 @@ impl Perf {
         Ok(())
     }
 
-    pub fn lost_records(&self) -> io::Result<u64> {
+    pub(super) fn lost_records(&self) -> io::Result<u64> {
         self.counter.stat()?.lost_records.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -504,24 +495,24 @@ impl Perf {
     }
 }
 
-pub struct EventDrain<'a> {
+pub(super) struct EventDrain<'a> {
     iter: CowIter<'a>,
 }
 
 impl EventDrain<'_> {
-    pub fn next_event<R>(&mut self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> Option<R> {
+    pub(super) fn next_event<R>(&mut self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> Option<R> {
         self.iter
             .next(|record, parser| OwnedEventRecord::new(record, parser).with_event_ref(cb))
     }
 }
 
-pub struct EventRef<'a> {
+pub(super) struct EventRef<'a> {
     privilege: Priv,
     record: EventRecord<'a>,
     timestamp: Option<u64>,
 }
 
-pub enum EventRecord<'a> {
+pub(super) enum EventRecord<'a> {
     Sample(SampleRecordRef<'a>),
     Owned(Record),
 }
@@ -570,7 +561,7 @@ impl<'a> OwnedEventRecord<'a> {
         }
     }
 
-    pub fn with_event_ref<R>(self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> R {
+    pub(super) fn with_event_ref<R>(self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> R {
         match self {
             Self::Sample { record, parser } => {
                 let result = dispatch_event_bytes(record.as_bytes(), &parser, cb);
@@ -591,7 +582,7 @@ impl<'a> OwnedEventRecord<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct SampleRecordRef<'a> {
+pub(super) struct SampleRecordRef<'a> {
     pub task: Option<TaskRef>,
     pub time: Option<u64>,
     pub code_addr: Option<(u64, bool)>,
@@ -601,35 +592,35 @@ pub struct SampleRecordRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct TaskRef {
+pub(super) struct TaskRef {
     pub pid: u32,
     pub tid: u32,
 }
 
 #[derive(Clone, Copy)]
-pub struct CallChainRef<'a> {
+pub(super) struct CallChainRef<'a> {
     addresses: &'a [u64],
 }
 
 impl<'a> CallChainRef<'a> {
-    pub fn iter(&self) -> CallChainIter<'a> {
+    pub(super) fn iter(&self) -> CallChainIter<'a> {
         CallChainIter {
             addresses: self.addresses,
             cursor: 0,
         }
     }
 
-    pub fn raw_address_count(&self) -> usize {
+    pub(super) fn raw_address_count(&self) -> usize {
         self.addresses.len()
     }
 }
 
-pub struct CallChainIter<'a> {
+pub(super) struct CallChainIter<'a> {
     addresses: &'a [u64],
     cursor: usize,
 }
 
-pub enum CallChainEntry<'a> {
+pub(super) enum CallChainEntry<'a> {
     User(&'a [u64]),
     Kernel(&'a [u64]),
     Hv(&'a [u64]),
@@ -685,11 +676,11 @@ impl<'a> EventRef<'a> {
         }
     }
 
-    pub fn timestamp(&self) -> Option<u64> {
+    pub(super) fn timestamp(&self) -> Option<u64> {
         self.timestamp
     }
 
-    pub fn into_parts(self) -> (Priv, EventRecord<'a>) {
+    pub(super) fn into_parts(self) -> (Priv, EventRecord<'a>) {
         (self.privilege, self.record)
     }
 }
@@ -981,7 +972,7 @@ fn is_callchain_marker(address: u64) -> bool {
 }
 
 #[cfg(any(test, feature = "bench-support"))]
-pub(crate) struct BenchSampleBatch {
+pub(super) struct BenchSampleBatch {
     parser: perf_event_open::sample::record::UnsafeParser,
     records: Vec<AlignedPerfRecord>,
     event_bytes: usize,
@@ -989,7 +980,7 @@ pub(crate) struct BenchSampleBatch {
 }
 
 #[cfg(any(test, feature = "bench-support"))]
-pub(crate) struct BenchSampleBatchSpec {
+pub(super) struct BenchSampleBatchSpec {
     pub samples: usize,
     pub user_frames: usize,
     pub kernel_frames: usize,
@@ -1003,7 +994,7 @@ pub(crate) struct BenchSampleBatchSpec {
 
 #[cfg(any(test, feature = "bench-support"))]
 impl BenchSampleBatch {
-    pub(crate) fn new(spec: BenchSampleBatchSpec) -> Self {
+    pub(super) fn new(spec: BenchSampleBatchSpec) -> Self {
         let parser = perf_event_open::sample::record::UnsafeParser {
             sample_id_all: false,
             sample_type: sample_type_bits(true, true, true),
@@ -1029,30 +1020,30 @@ impl BenchSampleBatch {
         }
     }
 
-    pub(crate) fn records(&self) -> &[AlignedPerfRecord] {
+    pub(super) fn records(&self) -> &[AlignedPerfRecord] {
         &self.records
     }
 
-    pub(crate) fn event_bytes(&self) -> usize {
+    pub(super) fn event_bytes(&self) -> usize {
         self.event_bytes
     }
 
-    pub(crate) fn sample_count(&self) -> usize {
+    pub(super) fn sample_count(&self) -> usize {
         self.records.len()
     }
 
-    pub(crate) fn frame_count(&self) -> usize {
+    pub(super) fn frame_count(&self) -> usize {
         self.records.len() * self.frames_per_sample
     }
 
-    pub(crate) fn parse<'a>(
+    pub(super) fn parse<'a>(
         &self,
         record: &'a AlignedPerfRecord,
     ) -> Option<(Priv, SampleRecordRef<'a>)> {
         parse_sample_record(record.as_bytes(), &self.parser)
     }
 
-    pub(crate) fn dispatch_event<R>(
+    pub(super) fn dispatch_event<R>(
         &self,
         record: &AlignedPerfRecord,
         cb: &mut impl FnMut(EventRef<'_>) -> R,
@@ -1066,7 +1057,7 @@ impl BenchSampleBatch {
     clippy::expect_used,
     reason = "the benchmark parses records generated by this module"
 )]
-pub(crate) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) -> usize {
+pub(super) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) -> usize {
     let mut checksum = 0usize;
     for _ in 0..rounds {
         for record in batch.records() {
@@ -1122,7 +1113,7 @@ enum AlignedPerfRecordStorage {
     Words(Vec<u64>),
 }
 
-pub(crate) struct AlignedPerfRecord {
+pub(super) struct AlignedPerfRecord {
     storage: AlignedPerfRecordStorage,
     len: usize,
 }
@@ -1152,7 +1143,7 @@ impl AlignedPerfRecord {
         }
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub(super) fn as_bytes(&self) -> &[u8] {
         match &self.storage {
             #[cfg(any(test, feature = "bench-support"))]
             AlignedPerfRecordStorage::Bytes(bytes) => bytes,

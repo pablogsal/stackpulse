@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::Pid;
+
 /// Return every descendant of `root` currently visible in `/proc`, excluding
 /// `root` itself.
 ///
@@ -8,16 +10,25 @@ use std::path::Path;
 /// may be silently skipped. Prefers `/proc/<pid>/task/<tid>/children`
 /// (cheap, one read per thread) and falls back to walking every `/proc/<pid>/stat`
 /// when the kernel does not expose the `children` files.
-pub fn discover_all_descendants(root: i32) -> Vec<i32> {
-    discover_descendant_edges(root)
+#[must_use]
+pub fn discover_all_descendants(root: Pid) -> Vec<Pid> {
+    discover_descendant_edges_raw(root.get())
         .into_iter()
-        .map(|(child, _)| child)
+        .filter_map(|(child, _)| Pid::new(child))
         .collect()
 }
 
 /// Return visible descendants together with each child's immediate parent.
 /// Parent edges precede any edges discovered below that child.
-pub fn discover_descendant_edges(root: i32) -> Vec<(i32, i32)> {
+#[must_use]
+pub fn discover_descendant_edges(root: Pid) -> Vec<(Pid, Pid)> {
+    discover_descendant_edges_raw(root.get())
+        .into_iter()
+        .filter_map(|(child, parent)| Some((Pid::new(child)?, Pid::new(parent)?)))
+        .collect()
+}
+
+pub(crate) fn discover_descendant_edges_raw(root: i32) -> Vec<(i32, i32)> {
     descendant_edges_via_proc_children(root).unwrap_or_else(|| descendant_edges_via_stat(root))
 }
 
@@ -192,9 +203,9 @@ mod tests {
         }
         let child = SleepChild::spawn();
 
-        let descendants = discover_all_descendants(root);
+        let descendants = discover_all_descendants(Pid::new(root).expect("positive process id"));
 
-        assert!(descendants.contains(&child.pid_i32()));
-        assert!(!descendants.contains(&root));
+        assert!(descendants.contains(&Pid::new(child.pid_i32()).expect("positive child pid")));
+        assert!(!descendants.contains(&Pid::new(root).expect("positive process id")));
     }
 }

@@ -143,8 +143,11 @@ impl StoppedProcess {
         }
     }
 
-    fn resume_error_or(&mut self, original_error: io::Error) -> io::Error {
-        self.resume().err().unwrap_or(original_error)
+    pub(super) fn resume_error_or(&mut self, original_error: io::Error) -> io::Error {
+        match self.resume() {
+            Ok(()) => original_error,
+            Err(cleanup_error) => crate::error::with_cleanup_error(original_error, cleanup_error),
+        }
     }
 }
 

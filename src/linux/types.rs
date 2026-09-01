@@ -1,7 +1,7 @@
 use perf_event_open::sample::record::Priv;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StackMode {
+pub(super) enum StackMode {
     User,
     Kernel,
 }
@@ -16,7 +16,7 @@ impl From<Priv> for StackMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StackFrame {
+pub(super) enum StackFrame {
     InstructionPointer(u64, StackMode),
     ReturnAddress(u64, StackMode),
     TruncatedStackMarker,

@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+use crate::Pid;
+
 /// Result of polling a [`ProcessExitWatcher`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessExitState {
@@ -18,18 +20,21 @@ pub enum ProcessExitState {
 /// Holds an open `pidfd` for a target PID so the recorder can cheaply check
 /// whether the target is gone without racing against PID reuse. Cheaper and
 /// race-free compared to repeatedly stat-ing `/proc/<pid>`.
+#[derive(Debug)]
 pub struct ProcessExitWatcher {
     pidfd: OwnedFd,
     exited: bool,
 }
 
 impl ProcessExitWatcher {
-    /// Open a pidfd for `pid`. Fails if `pid` is non-positive or if
-    /// `pidfd_open` is unavailable or denied (e.g. older kernels, sandbox).
-    pub fn try_new(pid: i32) -> io::Result<Self> {
-        validate_signal_pid(pid)?;
-        // SAFETY: pid was validated above and pidfd_open takes no pointer arguments.
-        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid, 0) };
+    /// Open a pidfd for `pid`.
+    ///
+    /// This fails when `pidfd_open` is unavailable or denied, for example on
+    /// an older kernel or inside a restrictive sandbox.
+    pub fn try_new(pid: Pid) -> io::Result<Self> {
+        // SAFETY: a validated Pid identifies one process and pidfd_open takes
+        // no pointer arguments.
+        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid.get(), 0) };
         if raw_fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -69,16 +74,10 @@ impl ProcessExitWatcher {
     }
 }
 
-/// Try to build a [`ProcessExitWatcher`], returning `None` on any failure.
-/// Convenience wrapper for callers that fall back to `/proc` polling when
-/// `pidfd_open` is unavailable.
-pub fn try_new_exit_watcher(pid: i32) -> Option<ProcessExitWatcher> {
-    ProcessExitWatcher::try_new(pid).ok()
-}
-
 /// Combined liveness check: prefers the pidfd watcher (race-free) and falls
 /// back to [`process_exists`] when no watcher is available or the poll errors.
-pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: i32) -> bool {
+#[must_use]
+pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: Pid) -> bool {
     if let Some(active) = watcher.as_mut() {
         match active.poll() {
             Ok(ProcessExitState::Exited) => return false,
@@ -95,10 +94,19 @@ pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: i32) -> b
 /// at least one non-leader thread is still alive (the leader can have exited
 /// while siblings remain). `false` on `ENOENT`/`ESRCH`. Subject to PID reuse;
 /// prefer a [`ProcessExitWatcher`] when you have a long-lived target.
-pub fn process_exists(pid: i32) -> bool {
+#[must_use]
+pub fn process_exists(pid: Pid) -> bool {
+    try_process_exists(pid).unwrap_or(true)
+}
+
+pub(crate) fn try_process_exists(pid: Pid) -> io::Result<bool> {
+    let pid = pid.get();
     let mut tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
         Ok(tasks) => tasks,
-        Err(err) => return !matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)),
+        Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Ok(false)
+        }
+        Err(err) => return Err(err),
     };
 
     let mut saw_leader = false;
@@ -113,43 +121,32 @@ pub fn process_exists(pid: i32) -> bool {
             continue;
         };
         if tid != pid {
-            return true;
+            return Ok(true);
         }
         saw_leader = true;
     }
-    saw_leader
+    Ok(saw_leader)
 }
 
 /// Send `SIGINT` to `pid` (graceful interrupt). Fails with the underlying
 /// `kill(2)` error, typically `EPERM` or `ESRCH`.
-pub fn interrupt_process(pid: i32) -> io::Result<()> {
+pub fn interrupt_process(pid: Pid) -> io::Result<()> {
     send_signal(pid, libc::SIGINT)
 }
 
 /// Send `SIGKILL` to `pid` (uncatchable termination).
-pub fn kill_process(pid: i32) -> io::Result<()> {
+pub fn kill_process(pid: Pid) -> io::Result<()> {
     send_signal(pid, libc::SIGKILL)
 }
 
-fn send_signal(pid: i32, signal: libc::c_int) -> io::Result<()> {
-    validate_signal_pid(pid)?;
-    // SAFETY: kill takes scalar arguments and pid was validated above.
-    let rc = unsafe { libc::kill(pid, signal) };
+fn send_signal(pid: Pid, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: kill takes scalar arguments and a validated Pid cannot invoke
+    // process-group or broadcast semantics.
+    let rc = unsafe { libc::kill(pid.get(), signal) };
     if rc == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    }
-}
-
-fn validate_signal_pid(pid: i32) -> io::Result<()> {
-    if pid > 0 {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("pid must identify a single process: {pid}"),
-        ))
     }
 }
 
@@ -160,45 +157,31 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
 
-    #[test]
-    fn invalid_pids_are_rejected_for_watchers_and_signals() {
-        let err = match ProcessExitWatcher::try_new(0) {
-            Ok(_) => panic!("pid 0 should be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(try_new_exit_watcher(0).is_none());
-        assert!(ProcessExitWatcher::try_new(i32::MAX).is_err());
-        assert_eq!(
-            interrupt_process(0).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            kill_process(-1).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert!(kill_process(i32::MAX).is_err());
+    fn pid(raw: i32) -> Pid {
+        Pid::new(raw).expect("positive test pid")
     }
 
     #[test]
     fn process_exists_reports_current_and_missing_processes() {
-        assert!(process_exists(std::process::id() as i32));
-        assert!(!process_exists(i32::MAX));
+        assert!(process_exists(pid(std::process::id() as i32)));
+        assert!(!process_exists(pid(i32::MAX)));
     }
 
     #[test]
     fn process_is_alive_uses_proc_fallback_without_watcher() {
         let mut watcher = None;
 
-        assert!(process_is_alive(&mut watcher, std::process::id() as i32));
-        assert!(!process_is_alive(&mut watcher, i32::MAX));
+        assert!(process_is_alive(
+            &mut watcher,
+            pid(std::process::id() as i32)
+        ));
+        assert!(!process_is_alive(&mut watcher, pid(i32::MAX)));
     }
 
     #[test]
     fn process_is_alive_uses_pidfd_watcher_when_available() {
-        let pid = std::process::id() as i32;
-        let Some(watcher) = try_new_exit_watcher(pid) else {
+        let pid = pid(std::process::id() as i32);
+        let Ok(watcher) = ProcessExitWatcher::try_new(pid) else {
             return;
         };
         let mut watcher = Some(watcher);
@@ -210,7 +193,7 @@ mod tests {
     #[test]
     fn pidfd_watcher_observes_child_exit_when_available() {
         let mut child = SleepChild::spawn();
-        let pid = child.pid_i32();
+        let pid = pid(child.pid_i32());
         let Ok(mut watcher) = ProcessExitWatcher::try_new(pid) else {
             return;
         };
@@ -241,7 +224,7 @@ mod tests {
     fn interrupt_process_sends_sigint() {
         let mut child = SleepChild::spawn();
 
-        interrupt_process(child.pid_i32()).expect("interrupt child");
+        interrupt_process(pid(child.pid_i32())).expect("interrupt child");
         let status = child
             .wait_timeout(Duration::from_secs(2))
             .expect("wait child")
@@ -254,7 +237,7 @@ mod tests {
     fn kill_process_sends_sigkill() {
         let mut child = SleepChild::spawn();
 
-        kill_process(child.pid_i32()).expect("kill child");
+        kill_process(pid(child.pid_i32())).expect("kill child");
         let status = child
             .wait_timeout(Duration::from_secs(2))
             .expect("wait child")

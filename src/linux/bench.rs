@@ -3,7 +3,7 @@ use std::io;
 use super::sorter::EventSorter;
 use super::{
     finish_prepared_event, perf_event, prepare_event, record_module, ConvertRegs,
-    ConvertRegsNative, EventContext, PerfSummary, PreparedEvent, ProcessTable,
+    ConvertRegsNative, EventContext, PreparedEvent, ProcessTable, RecordingSummary,
 };
 use crate::spool::{ModuleRecord, ModuleTable, PerfSpoolWriter};
 
@@ -73,7 +73,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
             record_module(&mut modules, &mut processes, &mut writer, module.clone())?;
         }
 
-        let mut summary = PerfSummary::default();
+        let mut summary = RecordingSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
         let mut lifecycle_actions = Vec::new();
         let mut sorter = EventSorter::<usize, u64, PreparedEvent>::new();

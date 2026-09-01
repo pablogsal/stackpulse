@@ -16,7 +16,7 @@ pub(crate) use types::{ElfSectionData, ElfSectionInfo};
 
 use std::sync::OnceLock;
 
-use crate::ModuleImageBase;
+use crate::module_base::ModuleImageBase;
 
 /// A PT_LOAD segment from an ELF binary.
 #[derive(Debug, Clone, PartialEq, Eq)]

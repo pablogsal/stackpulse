@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Region<'a> {
+pub(crate) struct Region<'a> {
     pub address: Range<u64>,
     pub is_executable: bool,
     pub file_offset: u64,
@@ -14,15 +14,15 @@ pub struct Region<'a> {
 }
 
 #[cfg(test)]
-pub fn parse(maps: &str) -> Vec<Region<'_>> {
+fn parse(maps: &str) -> Vec<Region<'_>> {
     parse_iter(maps).collect()
 }
 
-pub fn parse_iter(maps: &str) -> impl Iterator<Item = Region<'_>> + '_ {
+pub(crate) fn parse_iter(maps: &str) -> impl Iterator<Item = Region<'_>> + '_ {
     maps.lines().filter_map(parse_line)
 }
 
-pub fn parse_line(line: &str) -> Option<Region<'_>> {
+fn parse_line(line: &str) -> Option<Region<'_>> {
     let mut rest = line.trim_start();
     if rest.is_empty() {
         return None;
