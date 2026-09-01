@@ -33,7 +33,7 @@ workspace = true
 bitflags = "2.4"
 framehop = { version = "0.16.0", default-features = false, features = ["std"] }
 gimli = { version = "0.33", default-features = false, features = ["read"] }
-goblin = "0.9"
+goblin = "0.10"
 integer-encoding = { version = "4.1.0", default-features = false }
 libc = "0.2"
 memchr = "2.7"
