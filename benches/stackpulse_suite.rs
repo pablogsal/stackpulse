@@ -353,7 +353,7 @@ fn bench_live_perf_events(c: &mut Criterion) {
     recorder.throughput(Throughput::Elements(
         fixture.sample_count() * LIVE_RECORD_BATCH,
     ));
-    recorder.bench_function("mock_ring_records_to_spool", |b| {
+    recorder.bench_function("zero_copy_ring_records_to_spool", |b| {
         b.iter(|| {
             black_box(
                 bench_support::replay_live_perf_ring_records_to_spool(
