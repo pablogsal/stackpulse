@@ -128,6 +128,7 @@ mod tests {
     use super::*;
     use crate::test_support::{SleepChild, TempDir};
     use std::fs;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_parent_pid_from_stat_handles_command_names_with_parens() {
@@ -202,10 +203,21 @@ mod tests {
             return;
         }
         let child = SleepChild::spawn();
+        let child_pid = Pid::new(child.pid_i32()).expect("positive child pid");
+        let root_pid = Pid::new(root).expect("positive process id");
+        let deadline = Instant::now() + Duration::from_secs(1);
 
-        let descendants = discover_all_descendants(Pid::new(root).expect("positive process id"));
-
-        assert!(descendants.contains(&Pid::new(child.pid_i32()).expect("positive child pid")));
-        assert!(!descendants.contains(&Pid::new(root).expect("positive process id")));
+        loop {
+            let descendants = discover_all_descendants(root_pid);
+            if descendants.contains(&child_pid) {
+                assert!(!descendants.contains(&root_pid));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live child {child_pid} did not appear below {root_pid} in /proc"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
