@@ -16,7 +16,6 @@ pub(super) struct ProcessUnwinder {
     pub(super) unwinder: NativeUnwinder,
     pub(super) cache: NativeCache,
     refreshed_uncovered_pages: FxHashSet<u64>,
-    elf_sections: ElfSectionCache,
 }
 
 impl ProcessUnwinder {
@@ -26,17 +25,20 @@ impl ProcessUnwinder {
             unwinder: self.unwinder.clone(),
             cache: NativeCache::default(),
             refreshed_uncovered_pages: FxHashSet::default(),
-            elf_sections: self.elf_sections.clone(),
         }
     }
 
-    pub(super) fn apply_module_update(&mut self, update: &ModuleUpdate) {
+    pub(super) fn apply_module_update(
+        &mut self,
+        update: &ModuleUpdate,
+        elf_sections: &mut ElfSectionCache,
+    ) {
         for module in &update.retired {
             self.unwinder.remove_module(module.start);
         }
         for activation in &update.active {
             if let Some(source_id) = activation.source_module_id {
-                self.elf_sections.reuse(source_id, activation.module.id);
+                elf_sections.reuse(source_id, activation.module.id);
             }
         }
         for activation in &update.active {
@@ -46,31 +48,51 @@ impl ProcessUnwinder {
             }
             if !update.mapping_changed
                 && activation.source_module_id.is_none()
-                && self.elf_sections.contains(module.id)
+                && elf_sections.contains(module.id)
             {
                 continue;
             }
-            let start = module.start;
-            let Ok(loaded) = self.elf_sections.load_mapping(module) else {
-                continue;
-            };
-            if let Some(module) = module_to_framehop(module, &loaded) {
-                self.unwinder.remove_module(start);
-                self.unwinder.add_module(module);
-            }
+            self.load_and_install_module(module, elf_sections);
         }
         for module in &update.retired {
-            self.elf_sections.remove(module.id);
-        }
-        for source_id in update
-            .active
-            .iter()
-            .filter_map(|activation| activation.source_module_id)
-        {
-            self.elf_sections.remove(source_id);
+            elf_sections.remove(module.id);
         }
         if update.mapping_changed {
             self.refreshed_uncovered_pages.clear();
+        }
+    }
+
+    pub(super) fn reuse_inherited_modules(
+        &mut self,
+        update: &ModuleUpdate,
+        elf_sections: &mut ElfSectionCache,
+    ) {
+        debug_assert!(update.retired.is_empty());
+        for activation in &update.active {
+            if let Some(source_id) = activation.source_module_id {
+                if elf_sections.reuse(source_id, activation.module.id) {
+                    continue;
+                }
+                let module = &activation.module;
+                if module.is_kernel() {
+                    continue;
+                }
+                self.load_and_install_module(module, elf_sections);
+            }
+        }
+    }
+
+    fn load_and_install_module(
+        &mut self,
+        module: &ModuleRecord,
+        elf_sections: &mut ElfSectionCache,
+    ) {
+        let Ok(loaded) = elf_sections.load_mapping(module) else {
+            return;
+        };
+        if let Some(framehop_module) = module_to_framehop(module, &loaded) {
+            self.unwinder.remove_module(module.start);
+            self.unwinder.add_module(framehop_module);
         }
     }
 
@@ -172,6 +194,95 @@ mod tests {
 
     use super::*;
     use crate::elf::fake_hard_case_section_info;
+    use crate::spool::{ModuleActivation, ModuleOwner};
+
+    #[test]
+    fn fork_reuse_keeps_parent_entry_without_reloading_inherited_module() {
+        let pid = crate::Pid::try_from(std::process::id()).unwrap();
+        let parent = ModuleRecord {
+            id: 1,
+            owner: ModuleOwner::Process(pid),
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        };
+        let mut child = parent.clone();
+        child.id = 2;
+        let mut elf_sections = ElfSectionCache::default();
+        let parent_update = ModuleUpdate {
+            active: vec![ModuleActivation {
+                module: parent.clone(),
+                source_module_id: None,
+            }],
+            mapping_changed: true,
+            ..ModuleUpdate::default()
+        };
+        let mut parent_unwinder = ProcessUnwinder::default();
+        parent_unwinder.apply_module_update(&parent_update, &mut elf_sections);
+        assert_eq!(elf_sections.file_parse_count(), 1);
+        let mut child_unwinder = parent_unwinder.inherit_for_fork();
+        let update = ModuleUpdate {
+            active: vec![ModuleActivation {
+                module: child,
+                source_module_id: Some(parent.id),
+            }],
+            mapping_changed: true,
+            ..ModuleUpdate::default()
+        };
+
+        child_unwinder.reuse_inherited_modules(&update, &mut elf_sections);
+
+        assert_eq!(elf_sections.file_parse_count(), 1);
+        assert!(elf_sections.contains(parent.id));
+        assert!(elf_sections.contains(2));
+        assert_eq!(child_unwinder.unwinder.max_known_code_address(), 0x2000);
+    }
+
+    #[test]
+    fn fork_reuse_retries_missing_parent_entry_under_child_id() {
+        let child = ModuleRecord {
+            id: 2,
+            owner: ModuleOwner::Process(crate::Pid::try_from(std::process::id()).unwrap()),
+            start: 0x3000,
+            end: 0x4000,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: std::fs::canonicalize("/bin/true")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        };
+        let update = ModuleUpdate {
+            active: vec![ModuleActivation {
+                module: child,
+                source_module_id: Some(1),
+            }],
+            mapping_changed: true,
+            ..ModuleUpdate::default()
+        };
+        let mut elf_sections = ElfSectionCache::default();
+        let mut child_unwinder = ProcessUnwinder::default();
+
+        child_unwinder.reuse_inherited_modules(&update, &mut elf_sections);
+
+        assert_eq!(elf_sections.file_parse_count(), 1);
+        assert!(!elf_sections.contains(1));
+        assert!(elf_sections.contains(2));
+        assert_eq!(child_unwinder.unwinder.max_known_code_address(), 0x4000);
+    }
 
     #[test]
     fn only_indexed_eh_frame_headers_are_forwarded() {

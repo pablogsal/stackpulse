@@ -16,6 +16,8 @@ pub enum ErrorKind {
     InvalidInput,
     /// The operation was denied by the operating system.
     Permission,
+    /// The target process exited before the operation completed.
+    TargetGone,
     /// The requested sampling rate exceeds the kernel limit.
     FrequencyLimit,
     /// The spool is malformed.
@@ -57,6 +59,18 @@ impl Error {
         }
     }
 
+    /// Classify an I/O failure from an operation whose subject is a process.
+    ///
+    /// This is intentionally contextual. A generic filesystem `ENOENT` is an
+    /// I/O error, while `ENOENT` or `ESRCH` from `/proc/<pid>`, `pidfd_open`,
+    /// `kill`, or perf attachment means that the target disappeared.
+    pub(crate) fn target(source: io::Error) -> Self {
+        if is_target_gone_io(&source) {
+            return Self::new(ErrorKind::TargetGone, source);
+        }
+        Self::from(source)
+    }
+
     pub(crate) fn spool(source: io::Error) -> Self {
         match source.kind() {
             io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
@@ -91,6 +105,11 @@ impl Error {
     }
 }
 
+pub(crate) fn is_target_gone_io(source: &io::Error) -> bool {
+    source.kind() == io::ErrorKind::NotFound
+        || matches!(find_raw_os_error(source), Some(libc::ENOENT | libc::ESRCH))
+}
+
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         let kind = if find_in_chain::<crate::record::PerfFrequencyLimit>(&error).is_some() {
@@ -104,6 +123,18 @@ impl From<io::Error> for Error {
             }
         };
         Self::new(kind, error)
+    }
+}
+
+impl From<crate::identity::InvalidPid> for Error {
+    fn from(error: crate::identity::InvalidPid) -> Self {
+        Self::new(ErrorKind::InvalidInput, error)
+    }
+}
+
+impl From<crate::identity::InvalidTid> for Error {
+    fn from(error: crate::identity::InvalidTid) -> Self {
+        Self::new(ErrorKind::InvalidInput, error)
     }
 }
 
@@ -145,6 +176,7 @@ impl From<Error> for io::Error {
         let kind = match error.kind {
             ErrorKind::FrequencyLimit | ErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
             ErrorKind::Permission => io::ErrorKind::PermissionDenied,
+            ErrorKind::TargetGone => io::ErrorKind::NotFound,
             ErrorKind::CorruptSpool | ErrorKind::NativeSymbolizer => io::ErrorKind::InvalidData,
             ErrorKind::Unsupported => io::ErrorKind::Unsupported,
             ErrorKind::Io => error
@@ -236,6 +268,40 @@ mod tests {
         assert_eq!(generic.kind(), ErrorKind::Io);
         assert_eq!(spool.kind(), ErrorKind::CorruptSpool);
         assert_eq!(spool.to_string(), "failed to read spool: bad record tag");
+
+        let gone = Error::target(io::Error::from_raw_os_error(libc::ESRCH));
+        assert_eq!(gone.kind(), ErrorKind::TargetGone);
+        assert_eq!(gone.raw_os_error(), Some(libc::ESRCH));
+
+        let changed_identity = Error::target(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target process identity changed",
+        ));
+        assert_eq!(changed_identity.kind(), ErrorKind::TargetGone);
+
+        let nested_gone = Error::target(with_cleanup_error(
+            io::Error::from_raw_os_error(libc::ESRCH),
+            io::Error::from_raw_os_error(libc::EPERM),
+        ));
+        assert_eq!(nested_gone.kind(), ErrorKind::TargetGone);
+        assert_eq!(nested_gone.raw_os_error(), Some(libc::ESRCH));
+
+        let missing_file = Error::from(io::Error::from_raw_os_error(libc::ENOENT));
+        assert_eq!(missing_file.kind(), ErrorKind::Io);
+        assert_eq!(missing_file.raw_os_error(), Some(libc::ENOENT));
+
+        fn accepts_typed_ids() -> Result<()> {
+            let _ = crate::Pid::try_from(0_i32)?;
+            Ok(())
+        }
+        assert_eq!(
+            accepts_typed_ids().unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            Error::from(crate::Tid::try_from(0_i32).unwrap_err()).kind(),
+            ErrorKind::InvalidInput
+        );
     }
 
     #[test]

@@ -56,10 +56,39 @@ pub(crate) fn bench_parse_live_perf_samples(
     perf_event::bench_parse_sample_records(&fixture.samples, rounds)
 }
 
+pub(crate) fn bench_perf_ring_record_lifecycle(
+    fixture: &LivePerfSampleBenchFixture,
+    ring_count: usize,
+    rounds: u64,
+) -> io::Result<usize> {
+    let (batches, mut rings) = build_mock_rings(&fixture.samples, ring_count)?;
+
+    let mut checksum = 0usize;
+    let mut consumed = 0usize;
+    for round in 0..rounds {
+        for (ring, bytes) in rings.iter_mut().zip(&batches) {
+            if round != 0 {
+                super::ring_buffer::mock_publish(ring, bytes);
+            }
+            let head = ring.snapshot_head();
+            while let Some(record) = ring.next_record_to(head)? {
+                consumed += 1;
+                checksum = checksum
+                    .wrapping_add(record.as_bytes().len())
+                    .wrapping_add(usize::from(record.as_bytes()[0]));
+            }
+        }
+    }
+    std::hint::black_box(checksum);
+    Ok(consumed)
+}
+
 pub(crate) fn bench_replay_live_perf_ring_records(
     fixture: &LivePerfSampleBenchFixture,
     rounds: u64,
 ) -> io::Result<usize> {
+    let (batches, mut rings) = build_mock_rings(&fixture.samples, LIVE_BENCH_RING_COUNT)?;
+
     let mut checksum = 0usize;
     for round in 0..rounds {
         let mut writer = PerfSpoolWriter::from_writer(
@@ -75,6 +104,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
 
         let mut summary = RecordingSummary::default();
         let mut stack_scratch = Vec::with_capacity(128);
+        let mut callchain_scratch = Vec::with_capacity(32);
         let mut lifecycle_actions = Vec::new();
         let mut sorter = EventSorter::<usize, u64, PreparedEvent>::new();
         let mut result: io::Result<()> = Ok(());
@@ -85,26 +115,24 @@ pub(crate) fn bench_replay_live_perf_ring_records(
                 writer: &mut writer,
                 summary: &mut summary,
                 stack_scratch: &mut stack_scratch,
+                callchain_scratch: &mut callchain_scratch,
                 lifecycle_actions: &mut lifecycle_actions,
                 inherit_child_processes: false,
             };
-            for ring in 0..LIVE_BENCH_RING_COUNT {
-                sorter.begin_group(ring);
-                for record in fixture
-                    .samples
-                    .records()
-                    .iter()
-                    .skip(ring)
-                    .step_by(LIVE_BENCH_RING_COUNT)
-                {
-                    if result.is_err() {
+            for (ring_index, (ring, bytes)) in rings.iter_mut().zip(&batches).enumerate() {
+                if round != 0 {
+                    super::ring_buffer::mock_publish(ring, bytes);
+                }
+                sorter.begin_group(ring_index);
+                let mut drain = fixture.samples.event_drain(ring);
+                while result.is_ok() {
+                    let next = drain.next_event(&mut |event| {
+                        let timestamp = event.timestamp().unwrap_or(0);
+                        (timestamp, prepare_event(event, ctx.summary))
+                    })?;
+                    let Some((timestamp, prepared)) = next else {
                         break;
-                    }
-                    let (timestamp, prepared) =
-                        fixture.samples.dispatch_event(record, &mut |event| {
-                            let timestamp = event.timestamp().unwrap_or(0);
-                            (timestamp, prepare_event(event, ctx.summary))
-                        });
+                    };
                     if let Some(prepared) = prepared {
                         sorter.push_current_group(timestamp, prepared);
                     }
@@ -115,6 +143,7 @@ pub(crate) fn bench_replay_live_perf_ring_records(
                     }
                 }
             }
+            sorter.visit_values_mut(PreparedEvent::detach_ring_storage);
             sorter.advance_round();
             while let Some(prepared) = sorter.force_pop() {
                 if result.is_ok() {
@@ -140,6 +169,27 @@ pub(crate) fn bench_replay_live_perf_ring_records(
             .wrapping_add(lifecycle_actions.len());
     }
     Ok(checksum)
+}
+
+fn build_mock_rings(
+    samples: &perf_event::BenchSampleBatch,
+    ring_count: usize,
+) -> io::Result<(Vec<Vec<u8>>, Vec<super::ring_buffer::RingBuffer>)> {
+    if !(1..=samples.sample_count()).contains(&ring_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ring_count must be between one and the fixture sample count",
+        ));
+    }
+    let mut batches = vec![Vec::new(); ring_count];
+    for (index, record) in samples.records().iter().enumerate() {
+        batches[index % ring_count].extend_from_slice(record.as_bytes());
+    }
+    let rings = batches
+        .iter()
+        .map(|bytes| super::ring_buffer::mock_wrapped_ring(bytes))
+        .collect();
+    Ok((batches, rings))
 }
 
 fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {

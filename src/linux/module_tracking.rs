@@ -26,11 +26,7 @@ pub(super) fn record_module<W: std::io::Write>(
     for activation in &update.active {
         let module = &activation.module;
         if let Some(pid) = module.pid() {
-            processes
-                .state_mut(pid.get())
-                .unwinder
-                .get_or_insert_default()
-                .apply_module_update(&update);
+            processes.apply_module_update(pid.get(), &update);
             break;
         }
     }
@@ -136,16 +132,6 @@ pub(super) fn mmap_is_executable(mmap: &Mmap) -> bool {
         Some(ext) => ext.prot & PROT_EXEC != 0,
         None => mmap.executable,
     }
-}
-
-pub(super) fn register_existing_maps<W: std::io::Write>(
-    pid: u32,
-    modules: &mut ModuleTable,
-    processes: &mut ProcessTable,
-    writer: &mut PerfSpoolWriter<W>,
-) -> io::Result<bool> {
-    let maps = read_existing_maps(pid)?;
-    register_existing_maps_snapshot(pid, &maps, modules, processes, writer)
 }
 
 pub(super) fn read_existing_maps(pid: u32) -> io::Result<String> {

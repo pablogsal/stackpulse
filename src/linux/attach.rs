@@ -110,7 +110,7 @@ impl StoppedProcess {
                     self.resume_on_drop = false;
                     return Ok(());
                 }
-                Err(err) if super::process_gone_error(&err) => {
+                Err(err) if crate::error::is_target_gone_io(&err) => {
                     self.resume_on_drop = false;
                     return Ok(());
                 }
@@ -130,7 +130,7 @@ impl StoppedProcess {
                     return Ok(());
                 }
                 Ok(_) => {}
-                Err(err) if super::process_gone_error(&err) => return Ok(()),
+                Err(err) if crate::error::is_target_gone_io(&err) => return Ok(()),
                 Err(err) => return Err(err),
             }
             if Instant::now() >= deadline {
@@ -191,7 +191,7 @@ fn process_snapshot_with(
     for entry in fs::read_dir(format!("/proc/{pid}/task"))? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(err) if super::process_gone_error(&err) => continue,
+            Err(err) if crate::error::is_target_gone_io(&err) => continue,
             Err(err) => return Err(err),
         };
         let Some(tid) = entry.file_name().to_str().and_then(|tid| tid.parse().ok()) else {
@@ -202,7 +202,7 @@ fn process_snapshot_with(
                 tids.push(tid);
                 all_stopped &= matches!(stat.state, 'T' | 't');
             }
-            Err(err) if super::process_gone_error(&err) => {}
+            Err(err) if crate::error::is_target_gone_io(&err) => {}
             Err(err) => return Err(err),
         }
     }

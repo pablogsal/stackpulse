@@ -603,6 +603,8 @@ fn finish_recording(
         recorder.poll(Duration::from_millis(100))?;
     }
     let summary = recorder.finish()?;
+    assert!(summary.minimum_ring_buffer_bytes > 0);
+    assert!(summary.maximum_ring_buffer_bytes >= summary.minimum_ring_buffer_bytes);
     let reader = Snapshot::open(profile_path.as_ref())?;
     let stacks = resolve_stacks(&reader)?;
     Ok(CapturedProfile {

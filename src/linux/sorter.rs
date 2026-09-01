@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-struct EventHeapItem<K: Ord, V> {
+struct EventHeapItem<G, K: Ord, V> {
+    group: G,
+    round: usize,
     key: K,
     sequence: u64,
     value: V,
@@ -9,13 +11,13 @@ struct EventHeapItem<K: Ord, V> {
 
 // Invert ordering to make `BinaryHeap` a min-heap, preserving insertion order
 // for records with identical timestamps.
-impl<K: Ord, V> PartialEq for EventHeapItem<K, V> {
+impl<G, K: Ord, V> PartialEq for EventHeapItem<G, K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key && self.sequence == other.sequence
     }
 }
-impl<K: Ord, V> Eq for EventHeapItem<K, V> {}
-impl<K: Ord, V> Ord for EventHeapItem<K, V> {
+impl<G, K: Ord, V> Eq for EventHeapItem<G, K, V> {}
+impl<G, K: Ord, V> Ord for EventHeapItem<G, K, V> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
@@ -23,7 +25,7 @@ impl<K: Ord, V> Ord for EventHeapItem<K, V> {
             .reverse()
     }
 }
-impl<K: Ord, V> PartialOrd for EventHeapItem<K, V> {
+impl<G, K: Ord, V> PartialOrd for EventHeapItem<G, K, V> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -32,26 +34,23 @@ impl<K: Ord, V> PartialOrd for EventHeapItem<K, V> {
 /// Incremental round-robin sorter merging events from multiple ring buffers.
 /// `G` is the ring-buffer identifier, `K` the sort key (typically a
 /// timestamp), `V` the consumed event. Events are held until every group has
-/// completed another read and their key is covered by the previous round's
-/// high watermark.
-pub(super) struct EventSorter<G: Ord, K: Ord, V> {
-    heap: BinaryHeap<EventHeapItem<K, V>>,
+/// completed a later read. This is the same release rule used by Samply: an
+/// event from one ring stays queued until every other ring has been read after
+/// it, including the earlier-numbered rings in the next round.
+pub(super) struct EventSorter<G: Clone + Ord, K: Ord, V> {
+    heap: BinaryHeap<EventHeapItem<G, K, V>>,
     current_group: Option<G>,
+    round: usize,
     next_sequence: u64,
-    max_key: Option<K>,
-    next_flush: Option<K>,
-    flush_through: Option<K>,
 }
 
-impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
+impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
     pub(super) fn new() -> Self {
         EventSorter {
             heap: BinaryHeap::new(),
             current_group: None,
+            round: 0,
             next_sequence: 0,
-            max_key: None,
-            next_flush: None,
-            flush_through: None,
         }
     }
 
@@ -61,10 +60,23 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
         !self.heap.is_empty()
     }
 
-    /// Start a new round after the largest-identifier group has been read.
+    /// Complete a round after the largest-identifier group has been read.
+    #[expect(
+        clippy::expect_used,
+        reason = "completing usize::MAX ring-drain rounds is unreachable"
+    )]
     pub(super) fn advance_round(&mut self) {
-        self.flush_through = self.next_flush.take();
-        self.next_flush.clone_from(&self.max_key);
+        self.round = self.round.checked_add(1).expect("sorter round exhausted");
+        self.current_group = None;
+    }
+
+    /// Restart an incomplete read round without releasing its queued events.
+    ///
+    /// A ring decode error can stop a round before every group was visited.
+    /// Keeping the round number prevents those partial results from becoming
+    /// eligible, while clearing the group lets the next attempt start again at
+    /// the lowest identifier.
+    pub(super) fn abort_round(&mut self) {
         self.current_group = None;
     }
 
@@ -80,14 +92,9 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
 
     /// Try to consume an event.
     pub(super) fn pop(&mut self) -> Option<V> {
-        if self.current_group.is_some() {
-            return None;
-        }
         let event = self.heap.peek()?;
-        if self
-            .flush_through
-            .as_ref()
-            .is_none_or(|key| &event.key > key)
+        if (event.round.saturating_add(1), Some(&event.group))
+            > (self.round, self.current_group.as_ref())
         {
             return None;
         }
@@ -99,16 +106,26 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
         self.heap.pop().map(|x| x.value)
     }
 
+    pub(super) fn visit_values_mut(&mut self, mut visitor: impl FnMut(&mut V)) {
+        let mut items = std::mem::take(&mut self.heap).into_vec();
+        for item in &mut items {
+            visitor(&mut item.value);
+        }
+        self.heap = BinaryHeap::from(items);
+    }
+
     pub(super) fn push_current_group(&mut self, key: K, value: V) {
         assert!(
             self.current_group.is_some(),
             "begin_group must be called before insertion"
         );
-        if self.max_key.as_ref().is_none_or(|max| &key > max) {
-            self.max_key = Some(key.clone());
-        }
+        let Some(group) = self.current_group.clone() else {
+            return;
+        };
         let sequence = take_sequence(&mut self.next_sequence);
         self.heap.push(EventHeapItem {
+            group,
+            round: self.round,
             key,
             sequence,
             value,
@@ -116,7 +133,8 @@ impl<G: Ord, K: Clone + Ord, V> EventSorter<G, K, V> {
     }
 }
 
-impl<G: Ord, K: Clone + Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
+#[cfg(test)]
+impl<G: Clone + Ord, K: Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (key, value) in iter {
             self.push_current_group(key, value);
@@ -151,8 +169,7 @@ mod tests {
             (10_u64, "exit"),
         ]);
         sorter.advance_round();
-        assert_eq!(sorter.pop(), None);
-        sorter.advance_round();
+        sorter.begin_group(1);
 
         let mut out = Vec::new();
         while let Some(event) = sorter.pop() {
@@ -174,8 +191,9 @@ mod tests {
 
         sorter.advance_round();
 
+        sorter.begin_group(1);
         assert_eq!(sorter.pop(), None);
-        sorter.advance_round();
+        sorter.begin_group(2);
 
         assert_eq!(sorter.pop(), Some("group 2"));
         assert_eq!(sorter.pop(), Some("group 1"));
@@ -210,9 +228,6 @@ mod tests {
 
         sorter.begin_group(2);
 
-        assert_eq!(sorter.pop(), None);
-        sorter.advance_round();
-
         assert_eq!(sorter.pop(), Some("old group 2"));
         assert_eq!(sorter.pop(), Some("old group 1"));
     }
@@ -236,6 +251,7 @@ mod tests {
         assert_eq!(sorter.pop(), None);
 
         sorter.advance_round();
+        sorter.begin_group(10);
 
         assert_eq!(sorter.pop(), Some("fd10 mmap"));
         assert_eq!(sorter.pop(), Some("fd20 sample"));
@@ -253,9 +269,9 @@ mod tests {
         assert!(sorter.has_more());
 
         sorter.advance_round();
-
+        sorter.begin_group(3);
         assert_eq!(sorter.pop(), None);
-        sorter.advance_round();
+        sorter.begin_group(7);
 
         let mut out = Vec::new();
         while let Some(event) = sorter.pop() {
@@ -276,17 +292,32 @@ mod tests {
         sorter.begin_group(1);
         sorter.extend([(30_u64, "new")]);
 
-        assert_eq!(sorter.pop(), None);
+        assert_eq!(sorter.pop(), Some("old"));
         assert!(sorter.has_more());
 
         sorter.advance_round();
-
-        assert_eq!(sorter.pop(), Some("old"));
-        assert_eq!(sorter.pop(), None);
-
-        sorter.advance_round();
+        sorter.begin_group(1);
 
         assert_eq!(sorter.pop(), Some("new"));
         assert_eq!(sorter.pop(), None);
+    }
+
+    #[test]
+    fn aborted_round_restarts_without_releasing_partial_results() {
+        let mut sorter = EventSorter::new();
+        sorter.begin_group(10);
+        sorter.extend([(10_u64, "partial")]);
+        sorter.begin_group(20);
+        sorter.abort_round();
+
+        sorter.begin_group(10);
+        assert_eq!(sorter.pop(), None);
+        sorter.begin_group(20);
+        assert_eq!(sorter.pop(), None);
+        sorter.advance_round();
+        assert_eq!(sorter.pop(), None);
+
+        sorter.begin_group(10);
+        assert_eq!(sorter.pop(), Some("partial"));
     }
 }

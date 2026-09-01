@@ -17,6 +17,9 @@ pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
     ThreadRecord,
 };
+pub(crate) use modules::ClonedProcessModules;
+#[cfg(test)]
+pub(crate) use modules::ModuleActivation;
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
 
@@ -2193,7 +2196,9 @@ mod tests {
         table
             .intern_module(module(7, 0x1000, 0x2000, "/old", false), &mut writer)
             .unwrap();
-        table.deactivate_process_modules(7, &mut writer).unwrap();
+        table
+            .deactivate_process_modules(7, &mut writer, |_| {})
+            .unwrap();
         let stack_id = writer
             .write_sample_frames(1_000, 7, 11, [frame(0x1500)])
             .unwrap()
@@ -2336,7 +2341,9 @@ mod tests {
         let kernel = table
             .intern_module(module(7, 0x8000, 0x9000, "[kernel]", true), &mut spool)
             .unwrap();
-        table.deactivate_process_modules(7, &mut spool).unwrap();
+        table
+            .deactivate_process_modules(7, &mut spool, |_| {})
+            .unwrap();
 
         let reinterned = table
             .intern_module(module(7, 0x1000, 0x2000, "/m", false), &mut spool)
@@ -2347,6 +2354,28 @@ mod tests {
             .intern_module(module(7, 0x8000, 0x9000, "[kernel]", true), &mut spool)
             .unwrap();
         assert_eq!(kernel, kernel_again);
+    }
+
+    #[test]
+    fn module_table_drops_historical_module_payloads() {
+        let mut table = ModuleTable::default();
+        let mut spool = writer();
+
+        for generation in 0..10_000_u64 {
+            let path = format!("/generation/{generation:05}/a-long-module-name.so");
+            table
+                .intern_module(module(7, 0x1000, 0x2000, &path, false), &mut spool)
+                .unwrap();
+            table
+                .deactivate_process_modules(7, &mut spool, |_| {})
+                .unwrap();
+        }
+
+        assert_eq!(table.active_module_count(), 0);
+        let id = table
+            .intern_module(module(7, 0x1000, 0x2000, "/latest", false), &mut spool)
+            .unwrap();
+        assert_eq!(id, 10_000);
     }
 
     #[test]
@@ -2910,6 +2939,22 @@ mod tests {
         assert_ne!(right.module_id, Some(replacement));
         assert_eq!(left.file_relative_ip, 0x8800);
         assert_eq!(right.file_relative_ip, 0xa800);
+
+        table
+            .deactivate_process_modules(7, &mut writer, |_| {})
+            .unwrap();
+        assert_eq!(
+            table.resolve_frame(7, 0x1800, FrameMode::User).module_id,
+            None
+        );
+        assert_eq!(
+            table.resolve_frame(7, 0x2800, FrameMode::User).module_id,
+            None
+        );
+        assert_eq!(
+            table.resolve_frame(7, 0x3800, FrameMode::User).module_id,
+            None
+        );
     }
 
     #[test]
@@ -2973,7 +3018,9 @@ mod tests {
             .intern_module(module(7, 0x0800, 0x4000, "/second", false), &mut writer)
             .unwrap();
 
-        table.deactivate_process_modules(7, &mut writer).unwrap();
+        table
+            .deactivate_process_modules(7, &mut writer, |_| {})
+            .unwrap();
         table
             .intern_module(module(7, 0x1000, 0x3000, "/first", false), &mut writer)
             .unwrap();

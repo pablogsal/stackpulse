@@ -1,26 +1,32 @@
 use std::fmt;
 use std::io;
-use std::mem::{align_of, size_of};
+use std::mem::{size_of, size_of_val};
+use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
 use std::slice;
+use std::sync::Arc;
 
 use perf_event_open::config::{
     CallChain, Clock, Cpu, Inherit, OnExecve, Opts, Proc, RecordIdFormat, RegsMask, SampleOn, Size,
-    UseBuildId,
+    UseBuildId, WakeUpOn,
 };
 use perf_event_open::count::Counter;
 use perf_event_open::event::hw::Hardware;
 use perf_event_open::event::sw::Software;
 use perf_event_open::event::Event as PerfOpenEvent;
-use perf_event_open::sample::iter::CowIter;
-use perf_event_open::sample::rb::CowChunk;
-use perf_event_open::sample::record::{Parser, Priv, Record, RecordId, UnsafeParser};
-use perf_event_open::sample::Sampler;
+use perf_event_open::sample::record::{Priv, Record, RecordId, UnsafeParser};
 use perf_event_open_sys::bindings as sys;
 
-/// Hard kernel cap on the user-stack snapshot size, in bytes, that
-/// `perf_event_open` will copy per sample. Acts as a ceiling for
-/// `RecorderOptions::stack_size`; anything larger is rejected.
+use super::aligned_bytes::{is_u64_aligned, AlignedBytes};
+use super::ring_buffer::{RingBuffer, RingRecord};
+#[cfg(test)]
+use super::DEFAULT_RING_BUFFER_STACKS;
+use super::{invalid_data, normalized_ring_stacks};
+
+/// Maximum accepted `sample_stack_user` request, in bytes. The kernel may
+/// return fewer bytes so the complete perf record still fits its size field.
+/// Acts as a ceiling for `RecorderOptions::stack_size`; larger values are
+/// rejected.
 pub const MAX_SAMPLE_USER_STACK: u32 = 65_528;
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -52,12 +58,14 @@ pub(super) enum EventSource {
 }
 
 /// `include_kernel = false` is the safe default; everything else zero-defaults.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct PerfOptions {
     pub pid: u32,
     pub cpu: u32,
     pub frequency: u64,
     pub stack_size: u32,
+    pub ring_stacks: u32,
+    pub maximum_ring_bytes: u64,
     pub reg_mask: u64,
     pub event_source: EventSource,
     pub inherit: TaskInheritance,
@@ -66,6 +74,27 @@ pub(super) struct PerfOptions {
     pub sample_callchain: bool,
     pub exclude_user_callchain: bool,
     pub exclude_kernel_callchain: bool,
+}
+
+impl Default for PerfOptions {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            cpu: 0,
+            frequency: 0,
+            stack_size: 0,
+            ring_stacks: 0,
+            maximum_ring_bytes: MAX_RING_BUFFER_BYTES,
+            reg_mask: 0,
+            event_source: EventSource::default(),
+            inherit: TaskInheritance::default(),
+            enable_on_exec: false,
+            include_kernel: false,
+            sample_callchain: false,
+            exclude_user_callchain: false,
+            exclude_kernel_callchain: false,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -90,7 +119,65 @@ struct OpenedCounter {
     include_kernel: bool,
 }
 
+struct PerfRecordLayout {
+    callchain: bool,
+    user_regs_mask: u64,
+    user_stack_size: u32,
+}
+
+impl PerfRecordLayout {
+    fn apply(self, opts: &mut Opts, exclude_user_callchain: bool, exclude_kernel_callchain: bool) {
+        opts.sample_format.code_addr = true;
+        if self.callchain {
+            opts.sample_format.call_chain = Some(CallChain {
+                exclude_user: exclude_user_callchain,
+                exclude_kernel: exclude_kernel_callchain,
+                defer_user: false,
+                // Zero lets the kernel honor its current perf_event_max_stack
+                // setting instead of rejecting hosts configured below ours.
+                max_stack_frames: 0,
+            });
+        }
+        if self.user_regs_mask != 0 {
+            opts.sample_format.user_regs = Some(RegsMask(self.user_regs_mask));
+        }
+        if self.user_stack_size != 0 {
+            opts.sample_format.user_stack = Some(Size(self.user_stack_size));
+        }
+        opts.stat_format.lost_records = true;
+    }
+
+    fn parser(self) -> UnsafeParser {
+        UnsafeParser {
+            sample_id_all: true,
+            sample_type: sample_type_bits(
+                self.callchain,
+                self.user_regs_mask != 0,
+                self.user_stack_size != 0,
+            ),
+            read_format: u64::from(sys::PERF_FORMAT_LOST),
+            user_regs: self.user_regs_mask.count_ones() as usize,
+            intr_regs: 0,
+            branch_sample_type: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RingPlan {
+    requested_exp: u8,
+    fallback_exp: u8,
+}
+
 impl PerfOptions {
+    fn record_layout(&self) -> PerfRecordLayout {
+        PerfRecordLayout {
+            callchain: self.sample_callchain,
+            user_regs_mask: self.reg_mask,
+            user_stack_size: self.stack_size,
+        }
+    }
+
     pub(super) fn open(mut self) -> io::Result<Perf> {
         self.align_stack_size()?;
         let OpenedCounter {
@@ -110,15 +197,24 @@ impl PerfOptions {
 
     pub(super) fn open_ring(mut self) -> io::Result<OutputRing> {
         self.align_stack_size()?;
+        let plan = self.ring_plan()?;
+        let parser = Arc::new(self.record_parser());
+        self.validate()?;
+        let (opened, ring) = open_ring_with_fallback(
+            plan.requested_exp,
+            plan.fallback_exp,
+            |page_exp| self.open_counter_with_page_exp(page_exp),
+            |opened, page_exp| RingBuffer::new(opened.counter.file(), page_exp),
+        )?;
         let OpenedCounter {
             counter,
             inherit,
             include_kernel,
-        } = self.open_counter()?;
-        let sampler = counter.sampler(ring_buffer_page_exp(self.stack_size)?)?;
+        } = opened;
         Ok(OutputRing {
             perf: Perf::new(counter, self.pid, self.cpu, inherit, include_kernel),
-            sampler,
+            ring,
+            parser,
         })
     }
 
@@ -139,7 +235,12 @@ impl PerfOptions {
 
     fn open_counter(&self) -> io::Result<OpenedCounter> {
         self.validate()?;
-        let opts = self.perf_open_opts();
+        let plan = self.ring_plan()?;
+        self.open_counter_with_page_exp(plan.requested_exp)
+    }
+
+    fn open_counter_with_page_exp(&self, page_exp: u8) -> io::Result<OpenedCounter> {
+        let opts = self.perf_open_opts(ring_wakeup_bytes(page_exp)?);
         match self.open_counter_once(&opts) {
             Ok((counter, include_kernel)) => Ok(OpenedCounter {
                 counter,
@@ -172,7 +273,7 @@ impl PerfOptions {
                 },
             ));
         }
-        ring_buffer_page_exp(self.stack_size).map(drop)
+        Ok(())
     }
 
     fn open_counter_once(&self, opts: &Opts) -> io::Result<(Counter, bool)> {
@@ -201,7 +302,23 @@ impl PerfOptions {
         }
     }
 
-    fn perf_open_opts(&self) -> Opts {
+    fn ring_plan(&self) -> io::Result<RingPlan> {
+        let requested_exp = ring_buffer_page_exp(self.stack_size, self.ring_stacks)?;
+        let budget_exp = ring_buffer_budget_page_exp(self.maximum_ring_bytes)?;
+        let minimum_exp = ring_buffer_page_exp(self.stack_size, 1)?;
+        if budget_exp < minimum_exp {
+            return Err(invalid_input(
+                "aggregate perf ring budget cannot fit one complete sample per CPU",
+            ));
+        }
+        let requested_exp = requested_exp.min(budget_exp);
+        Ok(RingPlan {
+            requested_exp,
+            fallback_exp: minimum_exp,
+        })
+    }
+
+    fn perf_open_opts(&self, wakeup_bytes: u32) -> Opts {
         let mut opts = Opts {
             exclude: perf_event_open::config::Priv {
                 kernel: !self.include_kernel,
@@ -224,33 +341,28 @@ impl PerfOptions {
             timer: Some(Clock::Monotonic),
             ..Opts::default()
         };
-        opts.sample_format.code_addr = true;
-        if self.sample_callchain {
-            opts.sample_format.call_chain = Some(CallChain {
-                exclude_user: self.exclude_user_callchain,
-                exclude_kernel: self.exclude_kernel_callchain,
-                defer_user: false,
-                max_stack_frames: 0,
-            });
-        }
-        if self.reg_mask != 0 {
-            opts.sample_format.user_regs = Some(RegsMask(self.reg_mask));
-        }
-        if self.stack_size != 0 {
-            opts.sample_format.user_stack = Some(Size(self.stack_size));
-        }
+        opts.wake_up.on = WakeUpOn::Bytes(wakeup_bytes);
+        self.record_layout().apply(
+            &mut opts,
+            self.exclude_user_callchain,
+            self.exclude_kernel_callchain,
+        );
         opts.extra_record.mmap.code = true;
         opts.extra_record.mmap.ext = Some(UseBuildId(false));
         opts.extra_record.comm = true;
         opts.extra_record.task = true;
-        opts.stat_format.lost_records = true;
         opts
+    }
+
+    fn record_parser(&self) -> UnsafeParser {
+        self.record_layout().parser()
     }
 }
 
 pub(super) struct OutputRing {
     perf: Perf,
-    sampler: Sampler,
+    ring: RingBuffer,
+    parser: Arc<UnsafeParser>,
 }
 
 impl OutputRing {
@@ -272,6 +384,10 @@ impl OutputRing {
         self.perf.cpu
     }
 
+    pub(super) fn capacity_bytes(&self) -> u64 {
+        self.ring.capacity_bytes() as u64
+    }
+
     #[inline]
     pub(super) fn inherit(&self) -> TaskInheritance {
         self.perf.inherit()
@@ -282,9 +398,12 @@ impl OutputRing {
         self.perf.includes_kernel()
     }
 
-    pub(super) fn event_drain(&self) -> EventDrain<'_> {
+    pub(super) fn event_drain(&mut self) -> EventDrain<'_> {
+        let end = self.ring.snapshot_head();
         EventDrain {
-            iter: self.sampler.iter().into_cow(),
+            ring: &mut self.ring,
+            parser: &self.parser,
+            end,
         }
     }
 
@@ -293,7 +412,6 @@ impl OutputRing {
     }
 }
 
-#[cfg(any(test, feature = "bench-support"))]
 fn sample_type_bits(
     include_callchain: bool,
     include_user_regs: bool,
@@ -394,30 +512,83 @@ fn with_guest_exclusion_fallback<T>(
     }
 }
 
-fn ring_buffer_page_exp(stack_size: u32) -> io::Result<u8> {
-    ring_buffer_page_exp_for_page_size(stack_size, crate::elf::system_page_size())
+const RING_WAKEUP_FRACTION: u64 = 8;
+const MAX_RING_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PERF_RECORD_BYTES: u64 = u16::MAX as u64;
+
+fn ring_buffer_page_exp(stack_size: u32, ring_stacks: u32) -> io::Result<u8> {
+    ring_buffer_page_exp_for_page_size(stack_size, ring_stacks, crate::elf::system_page_size())
 }
 
-fn ring_buffer_page_exp_for_page_size(stack_size: u32, page_size: u64) -> io::Result<u8> {
-    const STACK_COUNT_PER_BUFFER: u32 = 32;
+fn ring_buffer_page_exp_for_page_size(
+    stack_size: u32,
+    ring_stacks: u32,
+    page_size: u64,
+) -> io::Result<u8> {
     if page_size == 0 {
         return Err(invalid_input("system page size cannot be zero"));
     }
+    // Size each requested slot from the configured stack snapshot while
+    // keeping enough total capacity for any perf_event_header::size value.
     let required_space = u64::from(stack_size)
         .max(page_size)
-        .checked_mul(u64::from(STACK_COUNT_PER_BUFFER))
-        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
+        .checked_mul(u64::from(normalized_ring_stacks(ring_stacks)))
+        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?
+        .max(MAX_PERF_RECORD_BYTES);
     let pages = required_space
         .div_ceil(page_size)
         .checked_next_power_of_two()
         .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
-    let page_exp = pages.trailing_zeros();
-    if page_exp >= 26 {
+    let ring_bytes = page_size
+        .checked_mul(pages)
+        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
+    if ring_bytes > MAX_RING_BUFFER_BYTES {
         return Err(invalid_input(format!(
-            "stack_size {stack_size} too large for the ring buffer"
+            "requested perf ring buffer exceeds {MAX_RING_BUFFER_BYTES} bytes per CPU"
         )));
     }
-    Ok(page_exp as u8)
+    Ok(pages.trailing_zeros() as u8)
+}
+
+fn ring_wakeup_bytes(page_exp: u8) -> io::Result<u32> {
+    let capacity = crate::elf::system_page_size()
+        .checked_shl(u32::from(page_exp))
+        .ok_or_else(|| invalid_input("perf ring buffer size overflow"))?;
+    u32::try_from((capacity / RING_WAKEUP_FRACTION).max(1))
+        .map_err(|_| invalid_input("perf ring wakeup watermark exceeds u32"))
+}
+
+fn ring_buffer_budget_page_exp(maximum_bytes: u64) -> io::Result<u8> {
+    let page_size = crate::elf::system_page_size();
+    let pages = maximum_bytes / page_size;
+    if pages == 0 {
+        return Err(invalid_input(
+            "perf ring buffer budget is smaller than one page",
+        ));
+    }
+    Ok((u64::BITS - 1 - pages.leading_zeros()) as u8)
+}
+
+fn open_ring_with_fallback<C, R>(
+    requested_exp: u8,
+    fallback_exp: u8,
+    mut open_counter: impl FnMut(u8) -> io::Result<C>,
+    mut open_ring: impl FnMut(&C, u8) -> io::Result<R>,
+) -> io::Result<(C, R)> {
+    let mut page_exp = requested_exp;
+    loop {
+        let counter = open_counter(page_exp)?;
+        match open_ring(&counter, page_exp) {
+            Err(error)
+                if page_exp > fallback_exp
+                    && matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOMEM)) =>
+            {
+                page_exp -= 1;
+            }
+            Ok(ring) => return Ok((counter, ring)),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(super) struct Perf {
@@ -496,89 +667,184 @@ impl Perf {
 }
 
 pub(super) struct EventDrain<'a> {
-    iter: CowIter<'a>,
+    ring: &'a mut RingBuffer,
+    parser: &'a Arc<UnsafeParser>,
+    end: u64,
 }
 
 impl EventDrain<'_> {
-    pub(super) fn next_event<R>(&mut self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> Option<R> {
-        self.iter
-            .next(|record, parser| OwnedEventRecord::new(record, parser).with_event_ref(cb))
-    }
-}
-
-pub(super) struct EventRef<'a> {
-    privilege: Priv,
-    record: EventRecord<'a>,
-    timestamp: Option<u64>,
-}
-
-pub(super) enum EventRecord<'a> {
-    Sample(SampleRecordRef<'a>),
-    Owned(Record),
-}
-
-enum OwnedEventRecord<'a> {
-    Sample {
-        record: CowChunk<'a>,
-        parser: UnsafeParser,
-    },
-    Parsed {
-        privilege: Priv,
-        record: Record,
-        time: Option<u64>,
-    },
-}
-
-impl<'a> OwnedEventRecord<'a> {
-    #[expect(
-        clippy::expect_used,
-        reason = "CowIter only yields complete perf records; unaligned records are copied before parsing"
-    )]
-    fn new(record: CowChunk<'a>, parser: &Parser) -> Self {
+    pub(super) fn next_event<R>(
+        &mut self,
+        cb: &mut impl FnMut(EventRef) -> R,
+    ) -> io::Result<Option<R>> {
+        let Some(record) = self.ring.next_record_to(self.end)? else {
+            return Ok(None);
+        };
         let bytes = record.as_bytes();
         if PerfRecordHeader::from_bytes(bytes)
             .is_some_and(|header| header.is_sample() && header.matches_len(bytes))
             && is_u64_aligned(bytes)
         {
-            return Self::Sample {
-                record,
-                parser: parser.as_unsafe().clone(),
+            let (privilege, metadata, layout) = {
+                let (privilege, sample) = parse_sample_record(bytes, self.parser)
+                    .ok_or_else(|| invalid_data("perf sample payload does not match its format"))?;
+                (
+                    privilege,
+                    SampleMetadata {
+                        task: sample.task,
+                        time: sample.time,
+                        code_addr: sample.code_addr,
+                    },
+                    SampleRecordLayout::from_sample(bytes, sample).ok_or_else(|| {
+                        invalid_data("perf sample slices fall outside their record")
+                    })?,
+                )
             };
+            return Ok(Some(cb(EventRef {
+                privilege,
+                timestamp: metadata.time,
+                record: EventRecord::RingSample {
+                    sample: RingSample {
+                        storage: RingSampleStorage::Ring(record),
+                        layout,
+                    },
+                    metadata,
+                },
+            })));
         }
 
-        let (privilege, parsed_record) = if is_u64_aligned(bytes) {
-            parser.parse(record)
-        } else {
-            let parsed = parse_event_record_bytes(bytes, parser.as_unsafe())
-                .expect("aligned perf record bytes should parse");
-            drop(record);
-            parsed
-        };
-        Self::Parsed {
+        let (privilege, parsed_record) = parse_event_record_bytes(bytes, self.parser)
+            .ok_or_else(|| invalid_data("perf record payload does not match its format"))?;
+        drop(record);
+        let timestamp = record_timestamp(&parsed_record);
+        Ok(Some(cb(EventRef {
             privilege,
-            time: record_timestamp(&parsed_record),
-            record: parsed_record,
+            record: EventRecord::Owned(parsed_record),
+            timestamp,
+        })))
+    }
+}
+
+pub(super) struct EventRef {
+    privilege: Priv,
+    record: EventRecord,
+    timestamp: Option<u64>,
+}
+
+pub(super) enum EventRecord {
+    RingSample {
+        sample: RingSample,
+        metadata: SampleMetadata,
+    },
+    Owned(Record),
+}
+
+pub(super) struct RingSample {
+    storage: RingSampleStorage,
+    layout: SampleRecordLayout,
+}
+
+struct SampleRecordLayout {
+    user_regs: Option<Range<usize>>,
+    user_stack: Option<Range<usize>>,
+    call_chain: Option<Range<usize>>,
+}
+
+impl SampleRecordLayout {
+    fn from_sample(bytes: &[u8], sample: SampleRecordRef<'_>) -> Option<Self> {
+        Some(Self {
+            user_regs: match sample.user_regs {
+                Some(slice) => Some(slice_byte_range(bytes, slice)?),
+                None => None,
+            },
+            user_stack: match sample.user_stack {
+                Some(slice) => Some(slice_byte_range(bytes, slice)?),
+                None => None,
+            },
+            call_chain: match sample.call_chain {
+                Some(chain) => Some(slice_byte_range(bytes, chain.addresses)?),
+                None => None,
+            },
+        })
+    }
+
+    fn sample<'a>(&self, bytes: &'a [u8]) -> Option<RingSampleRef<'a>> {
+        Some(RingSampleRef {
+            user_regs: match &self.user_regs {
+                Some(range) => Some(u64_slice(bytes.get(range.clone())?)?),
+                None => None,
+            },
+            user_stack: match &self.user_stack {
+                Some(range) => Some(bytes.get(range.clone())?),
+                None => None,
+            },
+            call_chain: match &self.call_chain {
+                Some(range) => Some(CallChainRef {
+                    addresses: u64_slice(bytes.get(range.clone())?)?,
+                }),
+                None => None,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SampleMetadata {
+    pub(super) task: Option<TaskRef>,
+    pub(super) time: Option<u64>,
+    pub(super) code_addr: Option<(u64, bool)>,
+}
+
+enum RingSampleStorage {
+    Ring(RingRecord),
+    Detached(AlignedBytes),
+}
+
+impl RingSample {
+    fn bytes(&self) -> &[u8] {
+        match &self.storage {
+            RingSampleStorage::Ring(record) => record.as_bytes(),
+            RingSampleStorage::Detached(record) => record.as_bytes(),
         }
     }
 
-    pub(super) fn with_event_ref<R>(self, cb: &mut impl FnMut(EventRef<'_>) -> R) -> R {
-        match self {
-            Self::Sample { record, parser } => {
-                let result = dispatch_event_bytes(record.as_bytes(), &parser, cb);
-                drop(record);
-                result
-            }
-            Self::Parsed {
-                privilege,
-                record,
-                time,
-            } => cb(EventRef {
-                privilege,
-                timestamp: time,
-                record: EventRecord::Owned(record),
-            }),
-        }
+    pub(super) fn with_sample<R>(
+        &self,
+        callback: impl FnOnce(RingSampleRef<'_>) -> R,
+    ) -> Option<R> {
+        self.layout.sample(self.bytes()).map(callback)
     }
+
+    pub(super) fn detach(&mut self) {
+        let RingSampleStorage::Ring(record) = &mut self.storage else {
+            return;
+        };
+        let detached = record.detach_bytes();
+        self.storage = RingSampleStorage::Detached(detached);
+    }
+}
+
+pub(super) struct RingSampleRef<'a> {
+    pub(super) user_regs: Option<&'a [u64]>,
+    pub(super) user_stack: Option<&'a [u8]>,
+    pub(super) call_chain: Option<CallChainRef<'a>>,
+}
+
+fn slice_byte_range<T>(bytes: &[u8], slice: &[T]) -> Option<Range<usize>> {
+    let start = (slice.as_ptr() as usize).checked_sub(bytes.as_ptr() as usize)?;
+    let end = start.checked_add(size_of_val(slice))?;
+    bytes.get(start..end)?;
+    Some(start..end)
+}
+
+fn u64_slice(bytes: &[u8]) -> Option<&[u64]> {
+    if !is_u64_aligned(bytes) || !bytes.len().is_multiple_of(size_of::<u64>()) {
+        return None;
+    }
+    // SAFETY: the alignment and exact u64-multiple byte length were checked.
+    Some(unsafe {
+        slice::from_raw_parts(bytes.as_ptr().cast::<u64>(), bytes.len() / size_of::<u64>())
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -657,7 +923,7 @@ impl<'a> Iterator for CallChainIter<'a> {
     }
 }
 
-impl fmt::Debug for EventRef<'_> {
+impl fmt::Debug for EventRef {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("EventRef")
             .field("privilege", &self.privilege)
@@ -666,21 +932,12 @@ impl fmt::Debug for EventRef<'_> {
     }
 }
 
-impl<'a> EventRef<'a> {
-    fn new(privilege: Priv, record: Record) -> Self {
-        let timestamp = record_timestamp(&record);
-        Self {
-            privilege,
-            record: EventRecord::Owned(record),
-            timestamp,
-        }
-    }
-
+impl EventRef {
     pub(super) fn timestamp(&self) -> Option<u64> {
         self.timestamp
     }
 
-    pub(super) fn into_parts(self) -> (Priv, EventRecord<'a>) {
+    pub(super) fn into_parts(self) -> (Priv, EventRecord) {
         (self.privilege, self.record)
     }
 }
@@ -738,33 +995,13 @@ impl PerfRecordHeader {
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "callers pass complete perf records from CowIter or validated synthetic fixtures"
-)]
-fn dispatch_event_bytes<R>(
-    bytes: &[u8],
-    parser: &UnsafeParser,
-    cb: &mut impl FnMut(EventRef<'_>) -> R,
-) -> R {
-    if let Some((privilege, sample)) = parse_sample_record(bytes, parser) {
-        return cb(EventRef {
-            privilege,
-            timestamp: sample.time,
-            record: EventRecord::Sample(sample),
-        });
-    }
-
-    let (privilege, record) =
-        parse_aligned_event_record(bytes, parser).expect("perf record bytes should parse");
-    cb(EventRef::new(privilege, record))
-}
-
 fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
     if !is_u64_aligned(bytes) || !PerfRecordHeader::from_bytes(bytes)?.matches_len(bytes) {
         return None;
     }
-    // SAFETY: alignment and the complete record length were checked above.
+    // SAFETY: the bytes are aligned, contain a complete record, and come from
+    // the same perf layout as this parser. Output rings and synthetic fixtures
+    // construct their parser and bytes from one `PerfRecordLayout`.
     let (privilege, record, _) = unsafe { parser.parse(bytes) };
     Some((privilege, record))
 }
@@ -773,7 +1010,7 @@ fn parse_event_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv
     if is_u64_aligned(bytes) {
         return parse_aligned_event_record(bytes, parser);
     }
-    let aligned = AlignedPerfRecord::from_unaligned_bytes(bytes);
+    let aligned = AlignedBytes::from_unaligned_bytes(bytes);
     parse_aligned_event_record(aligned.as_bytes(), parser)
 }
 
@@ -801,7 +1038,6 @@ fn parse_sample_record<'a>(
     };
 
     parse_common_sample_fields(sample_type, misc, &mut cursor, &mut sample)?;
-    skip_sample_fields(sample_type, &mut cursor)?;
     parse_stack_sample_fields(sample_type, parser, &mut cursor, &mut sample)?;
     if !cursor.is_finished() {
         return None;
@@ -816,20 +1052,17 @@ fn read_sample_header(cursor: &mut ByteCursor<'_>) -> Option<PerfRecordHeader> {
 }
 
 fn sample_type_supported(sample_type: u64) -> bool {
+    const REQUIRED_SAMPLE_TYPE: u64 =
+        sys::PERF_SAMPLE_IP as u64 | sys::PERF_SAMPLE_TID as u64 | sys::PERF_SAMPLE_TIME as u64;
     const SUPPORTED_SAMPLE_TYPE: u64 = sys::PERF_SAMPLE_IP as u64
         | sys::PERF_SAMPLE_TID as u64
         | sys::PERF_SAMPLE_TIME as u64
-        | sys::PERF_SAMPLE_ADDR as u64
-        | sys::PERF_SAMPLE_ID as u64
-        | sys::PERF_SAMPLE_STREAM_ID as u64
-        | sys::PERF_SAMPLE_CPU as u64
-        | sys::PERF_SAMPLE_PERIOD as u64
         | sys::PERF_SAMPLE_CALLCHAIN as u64
-        | sys::PERF_SAMPLE_RAW as u64
         | sys::PERF_SAMPLE_REGS_USER as u64
         | sys::PERF_SAMPLE_STACK_USER as u64;
 
-    sample_type & !SUPPORTED_SAMPLE_TYPE == 0
+    sample_type & REQUIRED_SAMPLE_TYPE == REQUIRED_SAMPLE_TYPE
+        && sample_type & !SUPPORTED_SAMPLE_TYPE == 0
 }
 
 fn parse_common_sample_fields<'a>(
@@ -856,28 +1089,6 @@ fn parse_common_sample_fields<'a>(
     Some(())
 }
 
-fn skip_sample_fields(sample_type: u64, cursor: &mut ByteCursor<'_>) -> Option<()> {
-    if has_sample(sample_type, sys::PERF_SAMPLE_ADDR) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_ID) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_STREAM_ID) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_CPU) {
-        cursor.skip(size_of::<u32>() * 2)?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_PERIOD) {
-        cursor.skip(size_of::<u64>())?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_READ) {
-        return None;
-    }
-    Some(())
-}
-
 fn parse_stack_sample_fields<'a>(
     sample_type: u64,
     parser: &perf_event_open::sample::record::UnsafeParser,
@@ -889,14 +1100,6 @@ fn parse_stack_sample_fields<'a>(
         sample.call_chain = Some(CallChainRef {
             addresses: cursor.read_u64_slice(len)?,
         });
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_RAW) {
-        let len = cursor.read_u32()? as usize;
-        cursor.skip(len)?;
-        cursor.align_to_u64()?;
-    }
-    if has_sample(sample_type, sys::PERF_SAMPLE_BRANCH_STACK) {
-        return None;
     }
     parse_user_regs_sample(sample_type, parser, cursor, sample)?;
     parse_user_stack_sample(sample_type, cursor, sample)
@@ -963,18 +1166,14 @@ fn priv_from_misc(misc: u16) -> Priv {
     }
 }
 
-fn is_u64_aligned(bytes: &[u8]) -> bool {
-    (bytes.as_ptr() as usize).is_multiple_of(align_of::<u64>())
-}
-
 fn is_callchain_marker(address: u64) -> bool {
     address.wrapping_add(4095) < 4095
 }
 
 #[cfg(any(test, feature = "bench-support"))]
 pub(super) struct BenchSampleBatch {
-    parser: perf_event_open::sample::record::UnsafeParser,
-    records: Vec<AlignedPerfRecord>,
+    parser: Arc<perf_event_open::sample::record::UnsafeParser>,
+    records: Vec<AlignedBytes>,
     event_bytes: usize,
     frames_per_sample: usize,
 }
@@ -995,14 +1194,14 @@ pub(super) struct BenchSampleBatchSpec {
 #[cfg(any(test, feature = "bench-support"))]
 impl BenchSampleBatch {
     pub(super) fn new(spec: BenchSampleBatchSpec) -> Self {
-        let parser = perf_event_open::sample::record::UnsafeParser {
+        let parser = Arc::new(perf_event_open::sample::record::UnsafeParser {
             sample_id_all: false,
             sample_type: sample_type_bits(true, true, true),
             read_format: 0,
             user_regs: spec.user_regs,
             intr_regs: 0,
             branch_sample_type: 0,
-        };
+        });
 
         let mut records = Vec::with_capacity(spec.samples);
         let mut event_bytes = 0;
@@ -1020,7 +1219,7 @@ impl BenchSampleBatch {
         }
     }
 
-    pub(super) fn records(&self) -> &[AlignedPerfRecord] {
+    pub(super) fn records(&self) -> &[AlignedBytes] {
         &self.records
     }
 
@@ -1038,17 +1237,17 @@ impl BenchSampleBatch {
 
     pub(super) fn parse<'a>(
         &self,
-        record: &'a AlignedPerfRecord,
+        record: &'a AlignedBytes,
     ) -> Option<(Priv, SampleRecordRef<'a>)> {
         parse_sample_record(record.as_bytes(), &self.parser)
     }
 
-    pub(super) fn dispatch_event<R>(
-        &self,
-        record: &AlignedPerfRecord,
-        cb: &mut impl FnMut(EventRef<'_>) -> R,
-    ) -> R {
-        dispatch_event_bytes(record.as_bytes(), &self.parser, cb)
+    pub(super) fn event_drain<'a>(&'a self, ring: &'a mut RingBuffer) -> EventDrain<'a> {
+        EventDrain {
+            end: ring.snapshot_head(),
+            ring,
+            parser: &self.parser,
+        }
     }
 }
 
@@ -1107,72 +1306,8 @@ pub(super) fn bench_parse_sample_records(batch: &BenchSampleBatch, rounds: u64) 
     checksum
 }
 
-enum AlignedPerfRecordStorage {
-    #[cfg(any(test, feature = "bench-support"))]
-    Bytes(Vec<u8>),
-    Words(Vec<u64>),
-}
-
-pub(super) struct AlignedPerfRecord {
-    storage: AlignedPerfRecordStorage,
-    len: usize,
-}
-
-impl AlignedPerfRecord {
-    #[cfg(any(test, feature = "bench-support"))]
-    fn from_vec(bytes: Vec<u8>) -> Self {
-        if is_u64_aligned(&bytes) {
-            return Self {
-                len: bytes.len(),
-                storage: AlignedPerfRecordStorage::Bytes(bytes),
-            };
-        }
-        Self::from_unaligned_bytes(&bytes)
-    }
-
-    fn from_unaligned_bytes(bytes: &[u8]) -> Self {
-        let mut words = vec![0_u64; bytes.len().div_ceil(size_of::<u64>())];
-        // SAFETY: the byte slice spans exactly the initialized Vec<u64>
-        // allocation and does not outlive it.
-        let aligned_bytes =
-            unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8) };
-        aligned_bytes[..bytes.len()].copy_from_slice(bytes);
-        Self {
-            len: bytes.len(),
-            storage: AlignedPerfRecordStorage::Words(words),
-        }
-    }
-
-    pub(super) fn as_bytes(&self) -> &[u8] {
-        match &self.storage {
-            #[cfg(any(test, feature = "bench-support"))]
-            AlignedPerfRecordStorage::Bytes(bytes) => bytes,
-            // SAFETY: self.len never exceeds the backing Vec<u64> byte length.
-            AlignedPerfRecordStorage::Words(words) => unsafe {
-                slice::from_raw_parts(words.as_ptr().cast::<u8>(), self.len)
-            },
-        }
-    }
-
-    #[cfg(test)]
-    fn as_mut_bytes(&mut self) -> &mut [u8] {
-        match &mut self.storage {
-            #[cfg(any(test, feature = "bench-support"))]
-            AlignedPerfRecordStorage::Bytes(bytes) => bytes,
-            AlignedPerfRecordStorage::Words(words) => unsafe {
-                slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8)
-            },
-        }
-    }
-
-    #[cfg(any(test, feature = "bench-support"))]
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
 #[cfg(any(test, feature = "bench-support"))]
-fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> AlignedPerfRecord {
+fn build_bench_sample_record(spec: &BenchSampleBatchSpec, sample_idx: usize) -> AlignedBytes {
     build_bench_sample_record_with_abi(spec, sample_idx, sys::PERF_SAMPLE_REGS_ABI_64)
 }
 
@@ -1185,7 +1320,7 @@ fn build_bench_sample_record_with_abi(
     spec: &BenchSampleBatchSpec,
     sample_idx: usize,
     user_regs_abi: u32,
-) -> AlignedPerfRecord {
+) -> AlignedBytes {
     let mut bytes = Vec::with_capacity(
         64 + (spec.user_frames + spec.kernel_frames) * size_of::<u64>()
             + spec.user_regs * size_of::<u64>()
@@ -1241,18 +1376,20 @@ fn build_bench_sample_record_with_abi(
     }
 
     push_u64(&mut bytes, spec.user_stack_bytes as u64);
-    let stack_start = bytes.len();
-    bytes.resize(stack_start + spec.user_stack_bytes, 0);
-    for (offset, byte) in bytes[stack_start..].iter_mut().enumerate() {
-        *byte = sample_idx.wrapping_add(offset) as u8;
+    if spec.user_stack_bytes != 0 {
+        let stack_start = bytes.len();
+        bytes.resize(stack_start + spec.user_stack_bytes, 0);
+        for (offset, byte) in bytes[stack_start..].iter_mut().enumerate() {
+            *byte = sample_idx.wrapping_add(offset) as u8;
+        }
+        push_u64(&mut bytes, spec.user_stack_bytes as u64);
     }
-    push_u64(&mut bytes, spec.user_stack_bytes as u64);
 
     let padded_len = bytes.len().next_multiple_of(size_of::<u64>());
     bytes.resize(padded_len, 0);
     let size = u16::try_from(bytes.len()).expect("synthetic perf sample fits in u16");
     bytes[6..8].copy_from_slice(&size.to_ne_bytes());
-    AlignedPerfRecord::from_vec(bytes)
+    AlignedBytes::from_vec(bytes)
 }
 
 #[cfg(any(test, feature = "bench-support"))]
@@ -1333,19 +1470,6 @@ impl<'a> ByteCursor<'a> {
         Some(bytes)
     }
 
-    fn skip(&mut self, len: usize) -> Option<()> {
-        self.read_bytes(len).map(drop)
-    }
-
-    fn align_to_u64(&mut self) -> Option<()> {
-        let aligned = self.offset.checked_add(align_of::<u64>() - 1)? & !(align_of::<u64>() - 1);
-        if aligned > self.bytes.len() {
-            return None;
-        }
-        self.offset = aligned;
-        Some(())
-    }
-
     fn read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
         self.read_bytes(N)?.try_into().ok()
     }
@@ -1353,6 +1477,7 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SampleCallChain;
     use super::*;
 
     fn stack_sample_spec(user_stack_bytes: usize) -> BenchSampleBatchSpec {
@@ -1380,35 +1505,250 @@ mod tests {
         }
     }
 
-    fn set_dynamic_stack_size(record: &mut AlignedPerfRecord, dyn_len: u64) {
+    fn set_dynamic_stack_size(record: &mut AlignedBytes, dyn_len: u64) {
         let len = record.len();
         let bytes = record.as_mut_bytes();
         bytes[len - size_of::<u64>()..len].copy_from_slice(&dyn_len.to_ne_bytes());
     }
 
     #[test]
-    fn ring_buffer_exp_keeps_space_for_queued_stack_samples() {
-        assert_eq!(ring_buffer_page_exp(0).expect("page exp"), 5);
+    fn detached_ring_sample_releases_tail_and_remains_parseable() {
+        let spec = stack_sample_spec(64);
+        let parser = Arc::new(stack_sample_parser(spec.user_regs));
+        let bytes = build_bench_sample_record(&spec, 3);
+        let mut ring = super::super::ring_buffer::mock_ring(0, bytes.as_bytes());
+        let (mut sample, time) = {
+            let end = ring.snapshot_head();
+            let mut drain = EventDrain {
+                ring: &mut ring,
+                parser: &parser,
+                end,
+            };
+            drain
+                .next_event(&mut |event| match event.record {
+                    EventRecord::RingSample { sample, metadata } => (sample, metadata.time),
+                    _ => panic!("expected ring-backed sample"),
+                })
+                .expect("read ring sample")
+                .expect("ring sample")
+        };
+
+        assert_eq!(super::super::ring_buffer::test_tail(&ring), 0);
+        sample.detach();
+        assert_eq!(
+            super::super::ring_buffer::test_tail(&ring),
+            bytes.len() as u64
+        );
+        let stack_len = sample
+            .with_sample(|sample| sample.user_stack.map_or(0, <[u8]>::len))
+            .expect("detached sample parses");
+        assert_eq!(time, Some(1_700_000_000_000_000 + 3_000));
+        assert_eq!(stack_len, 64);
     }
 
     #[test]
-    fn ring_buffer_exp_uses_the_runtime_page_size() {
+    fn ring_buffer_exp_uses_stack_size_and_record_count() {
         assert_eq!(
-            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 4_096).expect("4K page exp"),
+            ring_buffer_page_exp_for_page_size(32 * 1024, 32, 4_096).unwrap(),
+            8
+        );
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(32 * 1024, 0, 4_096).unwrap(),
+            8
+        );
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(64 * 1024, 32, 4_096).unwrap(),
             9
         );
         assert_eq!(
-            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 16_384)
-                .expect("16K page exp"),
-            7
-        );
-        assert_eq!(
-            ring_buffer_page_exp_for_page_size(MAX_SAMPLE_USER_STACK, 65_536)
-                .expect("64K page exp"),
+            ring_buffer_page_exp_for_page_size(16 * 1024, 8, 4_096).unwrap(),
             5
         );
-        assert!(ring_buffer_page_exp_for_page_size(0, 0).is_err());
-        assert!(ring_buffer_page_exp_for_page_size(0, u64::MAX).is_err());
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(48 * 1024, 3, 4_096).unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn ring_buffer_exp_preserves_record_minimum_and_runtime_page_size() {
+        assert_eq!(ring_buffer_page_exp_for_page_size(0, 1, 4_096).unwrap(), 4);
+        assert_eq!(ring_buffer_page_exp_for_page_size(0, 1, 16_384).unwrap(), 2);
+        assert_eq!(ring_buffer_page_exp_for_page_size(0, 1, 65_536).unwrap(), 0);
+        assert!(ring_buffer_page_exp_for_page_size(0, 1, 0).is_err());
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(64 * 1024, 256, 4_096).expect("256 stacks"),
+            12
+        );
+        assert_eq!(
+            ring_buffer_page_exp_for_page_size(64 * 1024, 4_096, 4_096).expect("256 MiB ring"),
+            16
+        );
+        assert!(ring_buffer_page_exp_for_page_size(64 * 1024, 4_097, 4_096).is_err());
+        assert!(ring_buffer_page_exp_for_page_size(0, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn aggregate_ring_budget_rounds_down_to_complete_pages() {
+        let page_size = crate::elf::system_page_size();
+
+        assert_eq!(ring_buffer_budget_page_exp(page_size * 3).unwrap(), 1);
+        assert_eq!(ring_buffer_budget_page_exp(page_size * 8).unwrap(), 3);
+        assert!(ring_buffer_budget_page_exp(page_size - 1).is_err());
+    }
+
+    #[test]
+    fn ring_plan_clamps_watermark_to_the_smallest_effective_capacity() {
+        let page_size = crate::elf::system_page_size();
+        let minimum_exp = ring_buffer_page_exp(32 * 1024, 1).unwrap();
+        let budget = page_size << minimum_exp;
+        let options = PerfOptions {
+            stack_size: 32 * 1024,
+            ring_stacks: DEFAULT_RING_BUFFER_STACKS,
+            maximum_ring_bytes: budget,
+            sample_callchain: true,
+            ..PerfOptions::default()
+        };
+
+        let plan = options.ring_plan().unwrap();
+        let wakeup_bytes = ring_wakeup_bytes(plan.requested_exp).unwrap();
+
+        assert_eq!(plan.requested_exp, minimum_exp);
+        assert_eq!(plan.fallback_exp, minimum_exp);
+        assert!(u64::from(wakeup_bytes) <= budget / RING_WAKEUP_FRACTION);
+        let WakeUpOn::Bytes(watermark) = options.perf_open_opts(wakeup_bytes).wake_up.on else {
+            panic!("expected byte watermark");
+        };
+        assert_eq!(watermark, wakeup_bytes);
+    }
+
+    #[test]
+    fn aggregate_budget_clamps_requested_ring_but_preserves_fallback_range() {
+        let page_size = crate::elf::system_page_size();
+        let options = PerfOptions {
+            stack_size: 64 * 1024,
+            ring_stacks: DEFAULT_RING_BUFFER_STACKS,
+            maximum_ring_bytes: 1024 * 1024,
+            ..PerfOptions::default()
+        };
+
+        let plan = options.ring_plan().unwrap();
+
+        assert_eq!(page_size << plan.requested_exp, 1024 * 1024);
+        assert!(page_size << plan.fallback_exp >= MAX_PERF_RECORD_BYTES);
+        assert!(plan.fallback_exp <= plan.requested_exp);
+        assert_eq!(
+            u64::from(ring_wakeup_bytes(plan.requested_exp).unwrap()),
+            (page_size << plan.requested_exp) / RING_WAKEUP_FRACTION
+        );
+    }
+
+    #[test]
+    fn ring_plan_rejects_a_budget_smaller_than_one_record() {
+        let options = PerfOptions {
+            stack_size: 32 * 1024,
+            maximum_ring_bytes: crate::elf::system_page_size(),
+            sample_callchain: true,
+            ..PerfOptions::default()
+        };
+
+        assert_eq!(
+            options.ring_plan().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn ring_mmap_fallback_steps_through_every_smaller_mapping() {
+        let mut attempts = Vec::new();
+        let (counter, ring) = open_ring_with_fallback(8, 5, Ok, |_, exp| {
+            attempts.push(exp);
+            if exp == 5 {
+                Ok(exp)
+            } else if exp % 2 == 0 {
+                Err(io::Error::from_raw_os_error(libc::ENOMEM))
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+        })
+        .unwrap();
+        assert_eq!((counter, ring, attempts), (5, 5, vec![8, 7, 6, 5]));
+    }
+
+    #[test]
+    fn ring_mmap_fallback_stops_on_non_resource_errors() {
+        let mut attempts = Vec::new();
+        let error = open_ring_with_fallback(8, 5, Ok, |_, exp| {
+            attempts.push(exp);
+            Err::<u8, _>(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(attempts, vec![8]);
+    }
+
+    #[test]
+    fn ring_mmap_fallback_returns_resource_error_at_minimum() {
+        let mut attempts = Vec::new();
+        let error = open_ring_with_fallback(6, 4, Ok, |_, exp| {
+            attempts.push(exp);
+            Err::<u8, _>(io::Error::from_raw_os_error(libc::ENOMEM))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOMEM));
+        assert_eq!(attempts, vec![6, 5, 4]);
+    }
+
+    #[test]
+    fn ring_mmap_fallback_does_not_retry_counter_open_errors() {
+        let mut attempts = Vec::new();
+        let error = open_ring_with_fallback(
+            8,
+            5,
+            |exp| {
+                attempts.push(exp);
+                Err::<u8, _>(io::Error::from_raw_os_error(libc::EPERM))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(attempts, vec![8]);
+    }
+
+    #[test]
+    fn ring_fallback_attempts_use_matching_wakeup_watermarks() {
+        let options = PerfOptions {
+            stack_size: 32 * 1024,
+            ring_stacks: DEFAULT_RING_BUFFER_STACKS,
+            ..PerfOptions::default()
+        };
+        let plan = options.ring_plan().unwrap();
+        let mut attempts = Vec::new();
+        let (_, selected) = open_ring_with_fallback(
+            plan.requested_exp,
+            plan.fallback_exp,
+            |exp| {
+                attempts.push((exp, ring_wakeup_bytes(exp)?));
+                Ok(exp)
+            },
+            |_, exp| {
+                if exp == plan.fallback_exp {
+                    Ok(exp)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(selected, plan.fallback_exp);
+        for (exp, watermark) in attempts {
+            let capacity = crate::elf::system_page_size() << exp;
+            assert_eq!(u64::from(watermark), capacity / RING_WAKEUP_FRACTION);
+        }
     }
 
     #[test]
@@ -1522,10 +1862,50 @@ mod tests {
 
     #[test]
     fn perf_options_request_executable_mmaps_and_lost_counters() {
-        let opts = PerfOptions::default().perf_open_opts();
+        let options = PerfOptions::default();
+        let plan = options.ring_plan().unwrap();
+        let opts = options.perf_open_opts(ring_wakeup_bytes(plan.requested_exp).unwrap());
         assert!(opts.extra_record.mmap.code);
         assert!(!opts.extra_record.mmap.data);
         assert!(opts.stat_format.lost_records);
+    }
+
+    #[test]
+    fn configured_record_layout_matches_the_unsafe_parser() {
+        for (callchain, reg_mask, stack_size) in [
+            (false, 0, 0),
+            (true, 0, 0),
+            (false, 0b10101, 8),
+            (true, u64::MAX, MAX_SAMPLE_USER_STACK),
+        ] {
+            let options = PerfOptions {
+                sample_callchain: callchain,
+                reg_mask,
+                stack_size,
+                ..PerfOptions::default()
+            };
+            let plan = options.ring_plan().unwrap();
+            let opts = options.perf_open_opts(ring_wakeup_bytes(plan.requested_exp).unwrap());
+            let parser = options.record_parser();
+            assert_eq!(
+                parser.sample_type,
+                sample_type_bits(
+                    opts.sample_format.call_chain.is_some(),
+                    opts.sample_format.user_regs.is_some(),
+                    opts.sample_format.user_stack.is_some(),
+                )
+            );
+            assert_eq!(parser.user_regs, reg_mask.count_ones() as usize);
+            assert_eq!(
+                parser.read_format & u64::from(sys::PERF_FORMAT_LOST),
+                u64::from(sys::PERF_FORMAT_LOST)
+            );
+            assert!(parser.sample_id_all);
+            assert!(opts.stat_format.lost_records);
+            if let Some(callchain) = &opts.sample_format.call_chain {
+                assert_eq!(callchain.max_stack_frames, 0);
+            }
+        }
     }
 
     #[test]
@@ -1539,7 +1919,12 @@ mod tests {
 
         assert_eq!(options.stack_size, 12_352);
         assert_eq!(
-            options.perf_open_opts().sample_format.user_stack,
+            options
+                .perf_open_opts(
+                    ring_wakeup_bytes(options.ring_plan().unwrap().requested_exp).unwrap()
+                )
+                .sample_format
+                .user_stack,
             Some(Size(12_352))
         );
     }
@@ -1647,24 +2032,15 @@ mod tests {
     }
 
     #[test]
-    fn bench_batch_dispatches_sample_event() {
+    fn bench_batch_parses_sample_event() {
         let spec = stack_sample_spec(16);
         let batch = BenchSampleBatch::new(spec);
 
-        let mut timestamp = None;
-        let mut task = None;
-        batch.dispatch_event(&batch.records()[0], &mut |event| {
-            timestamp = event.timestamp();
-            let (privilege, record) = event.into_parts();
-            let EventRecord::Sample(sample) = record else {
-                panic!("expected sample record");
-            };
-            assert!(matches!(privilege, Priv::User));
-            task = sample.task;
-        });
+        let (privilege, sample) = batch.parse(&batch.records()[0]).expect("sample record");
+        assert!(matches!(privilege, Priv::User));
 
-        assert_eq!(timestamp, Some(1_700_000_000_000_000));
-        let task = task.expect("sample task");
+        assert_eq!(sample.time, Some(1_700_000_000_000_000));
+        let task = sample.task.expect("sample task");
         assert_eq!(task.pid, 1234);
         assert_eq!(task.tid, 1234);
     }
@@ -1704,5 +2080,115 @@ mod tests {
         set_dynamic_stack_size(&mut record, 17);
 
         assert!(parse_sample_record(record.as_bytes(), &parser).is_none());
+    }
+
+    #[test]
+    fn borrowed_sample_parser_matches_the_dependency_parser() {
+        for (stack_bytes, dynamic_stack_bytes, user_frames) in [
+            (0, 0, 0),
+            (8, 0, 1),
+            (8, 8, 4),
+            (64, 7, 0),
+            (512, 511, 8),
+            (4096, 4096, 16),
+        ] {
+            let mut spec = stack_sample_spec(stack_bytes);
+            spec.user_frames = user_frames;
+            let parser = stack_sample_parser(spec.user_regs);
+            let mut record = build_bench_sample_record(&spec, 3);
+            if stack_bytes != 0 {
+                set_dynamic_stack_size(&mut record, dynamic_stack_bytes);
+            }
+
+            let (borrowed_privilege, borrowed) =
+                parse_sample_record(record.as_bytes(), &parser).expect("borrowed sample");
+            let (owned_privilege, owned) =
+                parse_aligned_event_record(record.as_bytes(), &parser).expect("owned sample");
+            let Record::Sample(owned) = owned else {
+                panic!("dependency parser did not return a sample");
+            };
+
+            assert_eq!(borrowed_privilege, owned_privilege);
+            assert_eq!(borrowed.time, owned.record_id.time);
+            assert_eq!(
+                borrowed.task.map(|task| (task.pid, task.tid)),
+                owned.record_id.task.map(|task| (task.pid, task.tid))
+            );
+            assert_eq!(borrowed.code_addr, owned.code_addr);
+            assert_eq!(
+                borrowed.user_regs,
+                owned
+                    .user_regs
+                    .as_ref()
+                    .map(|(registers, _)| registers.as_slice())
+            );
+            assert_eq!(borrowed.user_stack, owned.user_stack.as_deref());
+            assert_eq!(
+                borrowed
+                    .call_chain
+                    .map_or(SampleCallChain::None, SampleCallChain::Borrowed)
+                    .to_stack_frames(),
+                owned
+                    .call_chain
+                    .as_deref()
+                    .map_or(SampleCallChain::None, SampleCallChain::Owned)
+                    .to_stack_frames()
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_sample_parser_handles_mutated_records_without_panicking() {
+        let spec = stack_sample_spec(4096);
+        let parser = stack_sample_parser(spec.user_regs);
+        let original = build_bench_sample_record(&spec, 7);
+
+        for index in 0..original.len() {
+            let mut mutated = AlignedBytes::from_unaligned_bytes(original.as_bytes());
+            mutated.as_mut_bytes()[index] ^= 0xff;
+            let _ = parse_sample_record(mutated.as_bytes(), &parser);
+        }
+    }
+
+    #[test]
+    fn borrowed_parser_matches_dependency_across_generated_layouts() {
+        let mut seed = 0xbb67_ae85_84ca_a73b_u64;
+        for sample_index in 0..256 {
+            seed = seed
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            let stack_bytes = (((seed as usize) % 512) + 1) * 8;
+            let dynamic_stack_bytes = ((seed >> 16) as usize) % (stack_bytes + 1);
+            let mut spec = stack_sample_spec(stack_bytes);
+            spec.user_frames = ((seed >> 32) as usize) % 33;
+            spec.kernel_frames = ((seed >> 40) as usize) % 17;
+            let parser = stack_sample_parser(spec.user_regs);
+            let mut record = build_bench_sample_record(&spec, sample_index);
+            set_dynamic_stack_size(&mut record, dynamic_stack_bytes as u64);
+
+            let (_, borrowed) =
+                parse_sample_record(record.as_bytes(), &parser).expect("borrowed sample");
+            let (_, owned) =
+                parse_aligned_event_record(record.as_bytes(), &parser).expect("owned sample");
+            let Record::Sample(owned) = owned else {
+                panic!("dependency parser did not return a sample");
+            };
+            assert_eq!(
+                borrowed.user_regs,
+                owned.user_regs.as_ref().map(|r| r.0.as_slice())
+            );
+            assert_eq!(borrowed.user_stack, owned.user_stack.as_deref());
+            assert_eq!(
+                borrowed
+                    .call_chain
+                    .map_or(SampleCallChain::None, SampleCallChain::Borrowed)
+                    .to_stack_frames(),
+                owned
+                    .call_chain
+                    .as_deref()
+                    .map_or(SampleCallChain::None, SampleCallChain::Owned)
+                    .to_stack_frames()
+            );
+        }
     }
 }

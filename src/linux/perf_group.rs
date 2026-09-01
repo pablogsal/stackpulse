@@ -9,9 +9,11 @@ use mio::{Events, Interest, Poll, Token};
 use rustc_hash::FxHashMap;
 
 use super::attach::StoppedProcess;
+use super::checked_loss_sum;
 use super::cpu::online_cpu_ids;
 use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
-use super::process_gone_error;
+
+const MAX_TOTAL_RING_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Reject pids that would not name a single real process once cast to the
 /// signed `pid_t` that `kill` takes: `0` targets the caller's own process
@@ -37,6 +39,13 @@ struct Member {
 struct TaskTarget {
     tid: u32,
     owner_pid: u32,
+}
+
+struct OpenSettings {
+    attach_mode: AttachMode,
+    inherit: TaskInheritance,
+    frequency: u64,
+    maximum_ring_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -70,12 +79,28 @@ struct PendingEvents {
     perfs: Vec<Member>,
     outputs: Vec<OutputRing>,
     cpu_outputs: BTreeMap<u32, RawFd>,
+    allocated_ring_bytes: u64,
     kernel_excluded: bool,
 }
 
-struct OpenedEvent {
-    member: Option<Member>,
-    inherit: TaskInheritance,
+enum OpenedEvent {
+    Member {
+        member: Member,
+        inherit: TaskInheritance,
+    },
+    Output {
+        inherit: TaskInheritance,
+        capacity_bytes: u64,
+    },
+}
+
+impl OpenedEvent {
+    fn allocated_capacity_bytes(&self) -> u64 {
+        match self {
+            Self::Member { .. } => 0,
+            Self::Output { capacity_bytes, .. } => *capacity_bytes,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -115,9 +140,14 @@ impl ThreadPerfEvents {
     }
 
     fn push(&mut self, opened: OpenedEvent) {
-        self.inherits |= opened.inherit.is_enabled();
-        if let Some(member) = opened.member {
-            self.events.push(member);
+        match opened {
+            OpenedEvent::Member { member, inherit } => {
+                self.inherits |= inherit.is_enabled();
+                self.events.push(member);
+            }
+            OpenedEvent::Output { inherit, .. } => {
+                self.inherits |= inherit.is_enabled();
+            }
         }
     }
 }
@@ -133,6 +163,7 @@ pub(super) struct PerfGroup {
     poll_events: Events,
     frequency: u32,
     stack_size: u32,
+    ring_stacks: u32,
     regs_mask: u64,
     event_source: EventSource,
     include_kernel: bool,
@@ -154,13 +185,19 @@ pub(crate) trait EventConsumer {
 
     fn begin_group(&mut self, fd: RawFd);
 
-    fn prepare_event(&mut self, event_ref: EventRef<'_>) -> Self::Prepared;
+    fn prepare_event(&mut self, event_ref: EventRef) -> Self::Prepared;
 
     fn queue_event(&mut self, timestamp: u64, prepared: Self::Prepared);
 
     fn drain_ready_events(&mut self);
 
     fn advance_round(&mut self);
+
+    fn abort_round(&mut self);
+
+    fn has_queued_events(&self) -> bool;
+
+    fn detach_queued_events(&mut self);
 
     fn flush_ready_events(&mut self);
 }
@@ -188,6 +225,11 @@ fn get_threads(pid: u32) -> io::Result<Vec<u32>> {
 #[non_exhaustive]
 pub enum AttachMode {
     /// Attach to a running process without stopping it.
+    ///
+    /// Mappings can change while StackPulse opens counters and reads
+    /// `/proc/<pid>/maps`, so the initial module snapshot can race with mmap,
+    /// munmap, and exec activity. Use [`Self::StopWhileAttaching`] when the
+    /// initial mapping boundary must be coherent.
     Running,
     /// Attach before a not-yet-executed child is allowed to run.
     /// Counters remain disabled until the target calls `execve`.
@@ -200,6 +242,7 @@ pub enum AttachMode {
 pub(super) struct PerfGroupOptions {
     pub frequency: u32,
     pub stack_size: u32,
+    pub ring_stacks: u32,
     pub event_source: EventSource,
     pub regs_mask: u64,
     pub include_kernel: bool,
@@ -207,6 +250,17 @@ pub(super) struct PerfGroupOptions {
 }
 
 impl PerfGroup {
+    fn pending_events(&self) -> PendingEvents {
+        PendingEvents {
+            allocated_ring_bytes: self
+                .outputs
+                .values()
+                .map(|output| output.ring.capacity_bytes())
+                .fold(0_u64, u64::saturating_add),
+            ..PendingEvents::default()
+        }
+    }
+
     pub(super) fn new(options: PerfGroupOptions) -> io::Result<Self> {
         Ok(PerfGroup {
             members: Default::default(),
@@ -218,6 +272,7 @@ impl PerfGroup {
             poll_events: Events::with_capacity(16),
             frequency: options.frequency,
             stack_size: options.stack_size,
+            ring_stacks: options.ring_stacks,
             event_source: options.event_source,
             regs_mask: options.regs_mask,
             include_kernel: options.include_kernel,
@@ -272,7 +327,7 @@ impl PerfGroup {
             let cpu_count = cpu_ids.len();
             // Match perf's mmap topology: the first sampling counter on each CPU
             // owns the ring and every other same-CPU counter redirects into it.
-            let mut pending = PendingEvents::default();
+            let mut pending = self.pending_events();
             pending
                 .perfs
                 .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
@@ -340,7 +395,7 @@ impl PerfGroup {
     pub(super) fn refresh_threads(&mut self, pid: u32) -> io::Result<bool> {
         let mut threads = match get_threads(pid) {
             Ok(threads) => threads,
-            Err(err) if process_gone_error(&err) => return Ok(false),
+            Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
             Err(err) => return Err(err),
         };
         threads.sort_unstable();
@@ -361,6 +416,9 @@ impl PerfGroup {
             .into_iter()
             .filter(|tid| !self.tracked_threads.contains_key(tid))
             .collect();
+        if new_threads.is_empty() {
+            return Ok(true);
+        }
         let process_inherits = self
             .tracked_threads
             .values()
@@ -375,7 +433,7 @@ impl PerfGroup {
         let cpu_ids = online_cpu_ids()?;
         let cpu_count = cpu_ids.len();
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
-        let mut pending = PendingEvents::default();
+        let mut pending = self.pending_events();
         pending
             .perfs
             .reserve(cpu_count.saturating_mul(new_threads.len()));
@@ -409,7 +467,7 @@ impl PerfGroup {
         let cpu_ids = online_cpu_ids()?;
         let cpu_count = cpu_ids.len();
         let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
-        let mut pending = PendingEvents::default();
+        let mut pending = self.pending_events();
         pending
             .perfs
             .reserve(cpu_count.saturating_mul(thread_forks.len()));
@@ -487,7 +545,7 @@ impl PerfGroup {
                         return Err(err);
                     }
                 }
-                Err(err) if process_gone_error(&err) => {}
+                Err(err) if crate::error::is_target_gone_io(&err) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -565,16 +623,26 @@ impl PerfGroup {
         pending: &mut PendingEvents,
     ) -> io::Result<ThreadPerfEvents> {
         let mut perf_events = ThreadPerfEvents::with_capacity(cpu_ids.len());
+        let per_cpu_budget =
+            MAX_TOTAL_RING_BUFFER_BYTES / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
         for &cpu in cpu_ids {
-            let perf = self.open_perf(
+            let remaining =
+                MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
+            let opened = self.open_perf(
                 target,
                 cpu,
-                attach_mode,
-                self.task_inheritance(),
-                frequency,
+                OpenSettings {
+                    attach_mode,
+                    inherit: self.task_inheritance(),
+                    frequency,
+                    maximum_ring_bytes: per_cpu_budget.min(remaining),
+                },
                 pending,
             )?;
-            perf_events.push(perf);
+            pending.allocated_ring_bytes = pending
+                .allocated_ring_bytes
+                .saturating_add(opened.allocated_capacity_bytes());
+            perf_events.push(opened);
         }
         Ok(perf_events)
     }
@@ -763,16 +831,38 @@ impl PerfGroup {
         &self,
         target: TaskTarget,
         cpu: u32,
-        attach_mode: AttachMode,
-        inherit: TaskInheritance,
-        frequency: u64,
+        settings: OpenSettings,
         pending: &mut PendingEvents,
     ) -> io::Result<OpenedEvent> {
+        let OpenSettings {
+            attach_mode,
+            inherit,
+            frequency,
+            maximum_ring_bytes,
+        } = settings;
+        let output_fd = self
+            .cpu_outputs
+            .get(&cpu)
+            .copied()
+            .or_else(|| pending.cpu_outputs.get(&cpu).copied());
+        let existing_output = output_fd
+            .map(|fd| {
+                self.outputs
+                    .get(&fd)
+                    .map(|member| &member.ring)
+                    .or_else(|| pending.outputs.iter().find(|output| output.fd() == fd))
+                    .ok_or_else(|| io::Error::other("missing perf output ring"))
+                    .map(|output| (fd, output))
+            })
+            .transpose()?;
         let options = PerfOptions {
             pid: target.tid,
             cpu,
             frequency,
             stack_size: self.stack_size,
+            ring_stacks: self.ring_stacks,
+            maximum_ring_bytes: existing_output
+                .map_or(maximum_ring_bytes, |(_, output)| output.capacity_bytes()),
             reg_mask: self.regs_mask,
             event_source: self.event_source,
             inherit,
@@ -782,30 +872,19 @@ impl PerfGroup {
             exclude_user_callchain: true,
             exclude_kernel_callchain: !self.include_kernel || pending.kernel_excluded,
         };
-        if let Some(fd) = self
-            .cpu_outputs
-            .get(&cpu)
-            .copied()
-            .or_else(|| pending.cpu_outputs.get(&cpu).copied())
-        {
-            let perf = options.clone().open()?;
+        if let Some((fd, output)) = existing_output {
+            let perf = options.open()?;
             if !perf.includes_kernel() {
                 pending.kernel_excluded = true;
             }
-            let output = self
-                .outputs
-                .get(&fd)
-                .map(|member| &member.ring)
-                .or_else(|| pending.outputs.iter().find(|output| output.fd() == fd))
-                .ok_or_else(|| io::Error::other("missing perf output ring"))?;
             perf.set_output(output)?;
-            Ok(OpenedEvent {
+            Ok(OpenedEvent::Member {
                 inherit: perf.inherit(),
-                member: Some(Member {
+                member: Member {
                     perf,
                     output_fd: fd,
                     owner_pid: target.owner_pid,
-                }),
+                },
             })
         } else {
             let output = options.open_ring()?;
@@ -814,11 +893,12 @@ impl PerfGroup {
             }
             let fd = output.fd();
             let inherit = output.inherit();
+            let capacity_bytes = output.capacity_bytes();
             pending.cpu_outputs.insert(cpu, fd);
             pending.outputs.push(output);
-            Ok(OpenedEvent {
-                member: None,
+            Ok(OpenedEvent::Output {
                 inherit,
+                capacity_bytes,
             })
         }
     }
@@ -837,6 +917,19 @@ impl PerfGroup {
 
     pub(super) fn kernel_enabled(&self) -> bool {
         self.include_kernel
+    }
+
+    pub(super) fn ring_capacity_bytes_range(&self) -> Option<(u64, u64)> {
+        let mut capacities = self
+            .outputs
+            .values()
+            .map(|output| output.ring.capacity_bytes());
+        let first = capacities.next()?;
+        Some(
+            capacities.fold((first, first), |(minimum, maximum), capacity| {
+                (minimum.min(capacity), maximum.max(capacity))
+            }),
+        )
     }
 
     pub(super) fn enable(&mut self) -> io::Result<()> {
@@ -934,30 +1027,42 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub(super) fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) {
+    pub(super) fn consume_events<C: EventConsumer>(&mut self, consumer: &mut C) -> io::Result<()> {
         self.saw_readable = false;
         // Drain every ring buffer on every pass. Poll readiness is only a wakeup
         // hint; using it as a filter can let older mmap/fork records sit behind
         // newer samples from another fd, which breaks timestamp-ordered unwinding.
-        for (&fd, member) in &mut self.outputs {
-            consumer.begin_group(fd);
-            let mut drain = member.ring.event_drain();
-            while let Some((timestamp, prepared)) = drain.next_event(&mut |event_ref| {
-                let timestamp = event_ref.timestamp().unwrap_or(0);
-                let prepared = consumer.prepare_event(event_ref);
-                (timestamp, prepared)
-            }) {
-                consumer.queue_event(timestamp, prepared);
-            }
-            consumer.drain_ready_events();
+        // A real second read round is required when events remain queued. An
+        // empty synthetic round could release a newer event from a later ring
+        // before an older event published into an earlier ring after that
+        // ring's first snapshot. Two rounds still bound work under continuous
+        // production; anything held after them is detached for the next call.
+        drain_event_round(
+            self.outputs
+                .iter_mut()
+                .map(|(&fd, member)| (fd, &mut member.ring)),
+            consumer,
+            drain_output_ring,
+        )?;
+        if consumer.has_queued_events() {
+            drain_event_round(
+                self.outputs
+                    .iter_mut()
+                    .map(|(&fd, member)| (fd, &mut member.ring)),
+                consumer,
+                drain_output_ring,
+            )?;
         }
-        consumer.advance_round();
-        consumer.drain_ready_events();
+        if consumer.has_queued_events() {
+            consumer.detach_queued_events();
+        }
+        Ok(())
     }
 
-    pub(super) fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) {
-        self.consume_events(consumer);
+    pub(super) fn flush_events<C: EventConsumer>(&mut self, consumer: &mut C) -> io::Result<()> {
+        self.consume_events(consumer)?;
         consumer.flush_ready_events();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -970,10 +1075,39 @@ impl PerfGroup {
     }
 }
 
-fn checked_loss_sum(total: u64, lost: u64) -> io::Result<u64> {
-    total
-        .checked_add(lost)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "perf lost-record overflow"))
+fn drain_event_round<C, R>(
+    rings: impl IntoIterator<Item = (RawFd, R)>,
+    consumer: &mut C,
+    mut drain_ring: impl FnMut(R, &mut C) -> io::Result<()>,
+) -> io::Result<()>
+where
+    C: EventConsumer,
+{
+    for (fd, ring) in rings {
+        consumer.begin_group(fd);
+        consumer.drain_ready_events();
+        if let Err(err) = drain_ring(ring, consumer) {
+            consumer.detach_queued_events();
+            consumer.abort_round();
+            return Err(err);
+        }
+        consumer.drain_ready_events();
+    }
+    consumer.advance_round();
+    consumer.drain_ready_events();
+    Ok(())
+}
+
+fn drain_output_ring<C: EventConsumer>(ring: &mut OutputRing, consumer: &mut C) -> io::Result<()> {
+    let mut drain = ring.event_drain();
+    while let Some((timestamp, prepared)) = drain.next_event(&mut |event_ref| {
+        let timestamp = event_ref.timestamp().unwrap_or(0);
+        let prepared = consumer.prepare_event(event_ref);
+        (timestamp, prepared)
+    })? {
+        consumer.queue_event(timestamp, prepared);
+    }
+    Ok(())
 }
 
 fn frequency_for_mode(frequency: u32, mode: FrequencyMode) -> u64 {
@@ -999,6 +1133,7 @@ mod tests {
     const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
         frequency: 1,
         stack_size: 0,
+        ring_stacks: 0,
         event_source: EventSource::SwCpuClock,
         regs_mask: 0,
         include_kernel: false,
@@ -1016,7 +1151,7 @@ mod tests {
             self.calls.push("begin_group");
         }
 
-        fn prepare_event(&mut self, _event_ref: EventRef<'_>) -> Self::Prepared {
+        fn prepare_event(&mut self, _event_ref: EventRef) -> Self::Prepared {
             unreachable!("empty group has no events")
         }
 
@@ -1032,9 +1167,185 @@ mod tests {
             self.calls.push("advance_round");
         }
 
+        fn abort_round(&mut self) {
+            self.calls.push("abort_round");
+        }
+
+        fn has_queued_events(&self) -> bool {
+            false
+        }
+
+        fn detach_queued_events(&mut self) {}
+
         fn flush_ready_events(&mut self) {
             self.calls.push("flush_ready_events");
         }
+    }
+
+    #[derive(Default)]
+    struct NeverEmptyConsumer {
+        rounds: usize,
+        detaches: usize,
+    }
+
+    impl EventConsumer for NeverEmptyConsumer {
+        type Prepared = ();
+
+        fn begin_group(&mut self, _fd: RawFd) {}
+        fn prepare_event(&mut self, _event_ref: EventRef) -> Self::Prepared {}
+        fn queue_event(&mut self, _timestamp: u64, _prepared: Self::Prepared) {}
+        fn drain_ready_events(&mut self) {}
+        fn advance_round(&mut self) {
+            self.rounds += 1;
+        }
+        fn abort_round(&mut self) {}
+        fn has_queued_events(&self) -> bool {
+            true
+        }
+        fn detach_queued_events(&mut self) {
+            self.detaches += 1;
+        }
+        fn flush_ready_events(&mut self) {}
+    }
+
+    struct OrderingConsumer {
+        sorter: super::super::sorter::EventSorter<RawFd, u64, &'static str>,
+        output: Vec<&'static str>,
+    }
+
+    impl OrderingConsumer {
+        fn new() -> Self {
+            Self {
+                sorter: super::super::sorter::EventSorter::new(),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl EventConsumer for OrderingConsumer {
+        type Prepared = &'static str;
+
+        fn begin_group(&mut self, fd: RawFd) {
+            self.sorter.begin_group(fd);
+        }
+
+        fn prepare_event(&mut self, _event_ref: EventRef) -> Self::Prepared {
+            unreachable!("the ordering regression supplies prepared events")
+        }
+
+        fn queue_event(&mut self, timestamp: u64, prepared: Self::Prepared) {
+            self.sorter.push_current_group(timestamp, prepared);
+        }
+
+        fn drain_ready_events(&mut self) {
+            while let Some(event) = self.sorter.pop() {
+                self.output.push(event);
+            }
+        }
+
+        fn advance_round(&mut self) {
+            self.sorter.advance_round();
+        }
+
+        fn abort_round(&mut self) {
+            self.sorter.abort_round();
+        }
+
+        fn has_queued_events(&self) -> bool {
+            self.sorter.has_more()
+        }
+
+        fn detach_queued_events(&mut self) {}
+
+        fn flush_ready_events(&mut self) {
+            while let Some(event) = self.sorter.force_pop() {
+                self.output.push(event);
+            }
+        }
+    }
+
+    #[test]
+    fn second_ring_snapshot_preserves_inter_round_lifecycle_order() {
+        fn queue_events(
+            events: &[(u64, &'static str)],
+            consumer: &mut OrderingConsumer,
+        ) -> io::Result<()> {
+            for &(timestamp, event) in events {
+                consumer.queue_event(timestamp, event);
+            }
+            Ok(())
+        }
+
+        let empty: &[(u64, &'static str)] = &[];
+        let newer_sample = &[(20, "newer sample")][..];
+        let older_fork = &[(10, "older fork")][..];
+        let mut consumer = OrderingConsumer::new();
+
+        // Ring 10 is snapshotted empty. The older fork is published into it
+        // before ring 20's first snapshot observes the newer sample.
+        drain_event_round(
+            [(10, empty), (20, newer_sample)],
+            &mut consumer,
+            queue_events,
+        )
+        .unwrap();
+        assert!(consumer.output.is_empty());
+
+        // The bounded second round must really snapshot ring 10. A synthetic
+        // empty round would release the newer sample here.
+        drain_event_round([(10, older_fork), (20, empty)], &mut consumer, queue_events).unwrap();
+        assert!(consumer.output.is_empty());
+
+        // The next consume call can now release both records in timestamp and
+        // lifecycle order.
+        drain_event_round([(10, empty), (20, empty)], &mut consumer, queue_events).unwrap();
+        assert_eq!(consumer.output, ["older fork", "newer sample"]);
+    }
+
+    #[test]
+    fn saturated_sorter_work_is_bounded_to_two_rounds() {
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
+        let mut consumer = NeverEmptyConsumer::default();
+
+        group
+            .consume_events(&mut consumer)
+            .expect("bounded drain succeeds");
+
+        assert_eq!(consumer.rounds, 2);
+        assert_eq!(consumer.detaches, 1);
+    }
+
+    #[test]
+    fn failed_ring_read_aborts_partial_round_before_retry() {
+        fn queue_or_fail(
+            events: &[(u64, &'static str)],
+            consumer: &mut OrderingConsumer,
+        ) -> io::Result<()> {
+            if events.first().is_some_and(|event| event.1 == "malformed") {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed"));
+            }
+            for &(timestamp, event) in events {
+                consumer.queue_event(timestamp, event);
+            }
+            Ok(())
+        }
+
+        let mut consumer = OrderingConsumer::new();
+        let error = drain_event_round(
+            [(10, &[(10, "partial")][..]), (20, &[(0, "malformed")][..])],
+            &mut consumer,
+            queue_or_fail,
+        )
+        .expect_err("second ring fails");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(consumer.output.is_empty());
+
+        drain_event_round([(10, &[][..]), (20, &[][..])], &mut consumer, queue_or_fail)
+            .expect("retry can begin at the lowest fd");
+        assert!(consumer.output.is_empty());
+        drain_event_round([(10, &[][..]), (20, &[][..])], &mut consumer, queue_or_fail)
+            .expect("later round releases partial result");
+        assert_eq!(consumer.output, ["partial"]);
     }
 
     #[test]
@@ -1239,7 +1550,7 @@ mod tests {
             group.resume_error_or(original).raw_os_error(),
             Some(libc::ENOSPC)
         );
-        group.flush_events(&mut consumer);
+        group.flush_events(&mut consumer).unwrap();
 
         assert_eq!(
             consumer.calls,
@@ -1389,7 +1700,7 @@ mod tests {
         count: usize,
         inherit: TaskInheritance,
     ) -> Option<PendingEvents> {
-        let mut pending = PendingEvents::default();
+        let mut pending = group.pending_events();
         for _ in 0..count {
             let opened = match group.open_perf(
                 TaskTarget {
@@ -1397,16 +1708,19 @@ mod tests {
                     owner_pid,
                 },
                 cpu,
-                AttachMode::OnExec,
-                inherit,
-                1,
+                OpenSettings {
+                    attach_mode: AttachMode::OnExec,
+                    inherit,
+                    frequency: 1,
+                    maximum_ring_bytes: MAX_TOTAL_RING_BUFFER_BYTES,
+                },
                 &mut pending,
             ) {
                 Ok(opened) => opened,
                 Err(err) if perf_open_can_be_skipped(&err) => return None,
                 Err(err) => panic!("open redirected perf event: {err}"),
             };
-            if let Some(member) = opened.member {
+            if let OpenedEvent::Member { member, .. } = opened {
                 pending.perfs.push(member);
             }
         }

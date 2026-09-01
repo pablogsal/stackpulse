@@ -25,6 +25,7 @@ const EXPANDED_ITERATE_BATCH: u64 = 16;
 const METADATA_BATCH: u64 = 4096;
 const WRITE_BATCH: u64 = 4;
 const LIVE_PARSE_BATCH: u64 = 64;
+const LIVE_RING_BATCH: u64 = 16;
 const LIVE_RECORD_BATCH: u64 = 4;
 const SPOOL_SYMBOLIZE_BATCH: u64 = 8;
 const ADDRESS_CACHE_BATCH: u64 = 512;
@@ -322,6 +323,31 @@ fn bench_live_perf_events(c: &mut Criterion) {
     });
     perf_event.finish();
 
+    let mut ring_lifecycle = c.benchmark_group("stackpulse_self/ring_lifecycle");
+    ring_lifecycle.sampling_mode(SamplingMode::Flat);
+    ring_lifecycle.throughput(Throughput::Elements(
+        fixture.sample_count() * LIVE_RING_BATCH,
+    ));
+    for ring_count in [1, 4, 64] {
+        ring_lifecycle.bench_with_input(
+            BenchmarkId::new("construct_publish_consume_drop", ring_count),
+            &ring_count,
+            |b, &ring_count| {
+                b.iter(|| {
+                    black_box(
+                        bench_support::consume_perf_ring_records(
+                            black_box(&fixture),
+                            ring_count,
+                            LIVE_RING_BATCH,
+                        )
+                        .expect("consume synthetic records through perf mmap ring"),
+                    )
+                });
+            },
+        );
+    }
+    ring_lifecycle.finish();
+
     let mut recorder = c.benchmark_group("stackpulse_self/ring_replay");
     recorder.sampling_mode(SamplingMode::Flat);
     recorder.throughput(Throughput::Elements(
@@ -617,12 +643,12 @@ fn write_synthetic_spool(path: &Path, spec: ScenarioSpec) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let case = materialize_spool_case(spec);
-    bench_support::write_spool_samples_to_path(
+    Ok(bench_support::write_spool_samples_to_path(
         path,
         &case.modules,
         &case.python_runtime_records,
         &case.samples,
-    )
+    )?)
 }
 
 struct SpoolBenchCase {
