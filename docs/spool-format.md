@@ -7,24 +7,19 @@ complete prefix that precedes it. A finished file can be read fully in memory
 through `Snapshot` or replayed sequentially with bounded memory through
 `Replay`.
 
-## Compatibility
-
-`Snapshot` and `Replay` read every released SPULSE
-version. StackPulse 0.8 writes SPULSE3 and continues to read SPULSE1 and
-SPULSE2. When existing records cannot express new data, a future writer adds
-a new magic version; the meaning of an existing record never changes in
-place.
+## Recovery
 
 A reader accepts a file that ends partway through its final record. It retains
 the complete prefix and reports recovery through
-`Snapshot::recovered_from_truncated_tail`. Corruption within the
-complete prefix remains an error.
+`Snapshot::recovered_from_truncated_tail` or
+`Replay::recovered_from_truncated_tail`. Corruption within the complete prefix
+remains an error.
 
 ## Stream header
 
 Every file begins with:
 
-1. An eight-byte magic value: `SPULSE1\0`, `SPULSE2\0`, or `SPULSE3\0`.
+1. The eight-byte magic value `SPULSE3\0`.
 2. The profile start timestamp in microseconds, encoded as an unsigned varint.
 3. The requested sample interval in microseconds, encoded as an unsigned
    varint.
@@ -51,13 +46,6 @@ Definitions are ordered and ids are dense. A record may only refer to an id
 defined earlier in the stream. Readers reject forward references, duplicate
 definition ids, overflowing address arithmetic, and references outside a
 module's mapped span.
-
-## Version differences
-
-SPULSE1 contains the core module, frame, stack, thread, sample, and runtime
-records. SPULSE2 adds mapping-generation-aware module deactivation. SPULSE3
-extends module identity with device major, device minor, and inode generation,
-which prevents stale symbol reuse across remapped files.
 
 ## Frame encoding
 

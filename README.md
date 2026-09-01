@@ -20,7 +20,7 @@ newer.
 
 ```toml
 [dependencies]
-stackpulse = "0.8"
+stackpulse = "0.9"
 ```
 
 ## Record a profile
@@ -80,7 +80,7 @@ locally with `make doc`.
 | Native symbols | Bundled `wholesym` backend or a caller-supplied symbolizer |
 | Dynamic runtimes | Python perf maps and Python runtime frames |
 | Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
-| Profile files | Writes SPULSE3; reads SPULSE1, SPULSE2, and SPULSE3 |
+| Profile files | Reads and writes SPULSE3 |
 | Rust version | 1.88 or newer |
 
 ## Development

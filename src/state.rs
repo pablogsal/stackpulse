@@ -28,8 +28,8 @@ pub struct ProcessExitWatcher {
 impl ProcessExitWatcher {
     /// Open a pidfd for `pid`.
     ///
-    /// This fails when `pidfd_open` is unavailable or denied, for example on
-    /// an older kernel or inside a restrictive sandbox.
+    /// This fails when `pidfd_open` is denied, for example inside a
+    /// restrictive sandbox.
     ///
     /// # Errors
     ///

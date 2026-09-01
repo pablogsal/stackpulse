@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `Snapshot` and `Replay` now accept only the current SPULSE3 format.
+- CI no longer checks public API compatibility against the previous crates.io release.
+
 ## 0.9.0 - 2026-09-01
 
 ### Changed

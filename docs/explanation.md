@@ -260,7 +260,7 @@ gates:
 - ownership of the target process;
 - `/proc/sys/kernel/perf_event_paranoid`;
 - `/proc/sys/kernel/perf_event_max_sample_rate`;
-- capabilities such as `CAP_PERFMON` (or full admin on older kernels);
+- capabilities such as `CAP_PERFMON` or `CAP_SYS_ADMIN`;
 - `/proc/<pid>` visibility inside containers and PID namespaces;
 - read access to `/proc/kallsyms` for kernel symbol names.
 

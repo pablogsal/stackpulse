@@ -23,10 +23,7 @@ pub(crate) use modules::ModuleActivation;
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
 
-const MAGIC_V1: &[u8; 8] = b"SPULSE1\0";
-const MAGIC_V2: &[u8; 8] = b"SPULSE2\0";
-const MAGIC_V3: &[u8; 8] = b"SPULSE3\0";
-pub(crate) const CURRENT_MAGIC: &[u8; 8] = MAGIC_V3;
+pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -572,7 +569,6 @@ struct ReplayScanStart {
 
 #[derive(Clone, Copy)]
 struct ReplayRecordState {
-    spool_version: u8,
     module_count: usize,
     frame_count: usize,
     stack_count: usize,
@@ -1034,7 +1030,7 @@ fn open_spool_with_range_limit(
     // range. The public reader contract requires the spool to remain unchanged.
     let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
-    let spool_version = reader.check_magic()?;
+    reader.check_magic()?;
     let start_timestamp_us = reader.read_varint::<u64>()?;
     let sample_interval_us = reader.read_varint::<u64>()?;
     let (
@@ -1074,7 +1070,7 @@ fn open_spool_with_range_limit(
         let parsed = (|| -> io::Result<()> {
             match tag {
                 REC_MODULE => {
-                    modules.push(read_module_mmap(&mut reader, modules.len(), spool_version)?);
+                    modules.push(read_module_mmap(&mut reader, modules.len())?);
                     module_deactivated_at.push(None);
                 }
                 REC_FRAME => {
@@ -1114,11 +1110,6 @@ fn open_spool_with_range_limit(
                     }
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
-                    if spool_version < 2 {
-                        return Err(invalid_data(
-                            "targeted module deactivation requires spool version 2",
-                        ));
-                    }
                     let module_id =
                         read_index_within(&mut reader, modules.len(), "module deactivation")?;
                     module_deactivated_at[module_id].get_or_insert(frames.len());
@@ -1145,7 +1136,6 @@ fn open_spool_with_range_limit(
                     scan_start = Some(ReplayScanStart {
                         position: record_start,
                         state: ReplayRecordState {
-                            spool_version,
                             module_count: modules.len(),
                             frame_count: frames.len(),
                             stack_count: stack_nodes.len(),
@@ -1198,14 +1188,13 @@ impl MmapSpoolCursor {
         Self { mmap, position }
     }
 
-    fn check_magic(&mut self) -> io::Result<u8> {
+    fn check_magic(&mut self) -> io::Result<()> {
         let mut magic = [0_u8; 8];
         self.read_exact_spool(&mut magic)?;
-        match &magic {
-            magic if magic == MAGIC_V1 => Ok(1),
-            magic if magic == MAGIC_V2 => Ok(2),
-            magic if magic == CURRENT_MAGIC => Ok(3),
-            _ => Err(invalid_data("invalid stackpulse spool magic")),
+        if magic == *CURRENT_MAGIC {
+            Ok(())
+        } else {
+            Err(invalid_data("invalid stackpulse spool magic"))
         }
     }
 
@@ -1296,7 +1285,7 @@ fn consume_validated_record(
 ) -> io::Result<()> {
     match tag {
         REC_MODULE => {
-            read_module_mmap(reader, state.module_count, state.spool_version)?;
+            read_module_mmap(reader, state.module_count)?;
             state.module_count += 1;
         }
         REC_FRAME => {
@@ -1337,11 +1326,7 @@ fn consume_validated_record(
     Ok(())
 }
 
-fn read_module_mmap(
-    reader: &mut MmapSpoolCursor,
-    expected_id: usize,
-    spool_version: u8,
-) -> io::Result<ModuleRecord> {
+fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Result<ModuleRecord> {
     check_id(reader, expected_id, "module")?;
     let id = u32::try_from(expected_id).map_err(|_| invalid_data("module id too large"))?;
     let process_id = read_process_id(reader)?;
@@ -1349,17 +1334,11 @@ fn read_module_mmap(
     let end = reader.read_varint::<u64>()?;
     let file_offset = reader.read_varint::<u64>()?;
     let inode = reader.read_varint::<u64>()?;
-    let (device_major, device_minor, inode_generation) = if spool_version >= 3 {
-        (
-            u32::try_from(reader.read_varint::<u64>()?)
-                .map_err(|_| invalid_data("module device major too large"))?,
-            u32::try_from(reader.read_varint::<u64>()?)
-                .map_err(|_| invalid_data("module device minor too large"))?,
-            reader.read_varint::<u64>()?,
-        )
-    } else {
-        (0, 0, 0)
-    };
+    let device_major = u32::try_from(reader.read_varint::<u64>()?)
+        .map_err(|_| invalid_data("module device major too large"))?;
+    let device_minor = u32::try_from(reader.read_varint::<u64>()?)
+        .map_err(|_| invalid_data("module device minor too large"))?;
+    let inode_generation = reader.read_varint::<u64>()?;
     let mut flag = [0_u8; 1];
     reader.read_exact_spool(&mut flag)?;
     let owner = ModuleOwner::from_wire(process_id, flag[0] != 0)?;
@@ -2538,7 +2517,7 @@ mod tests {
         let mut reader = MmapSpoolCursor::new(mmap);
 
         assert_invalid_data_contains(
-            read_module_mmap(&mut reader, 0, 3),
+            read_module_mmap(&mut reader, 0),
             "process id",
             "reader accepted an out-of-range module process id",
         );
@@ -2751,106 +2730,17 @@ mod tests {
     }
 
     #[test]
-    fn spool_v2_defaults_extended_module_identity() {
-        let path = temp_spool_path("module-identity-v2");
-        let mut bytes = MAGIC_V2.to_vec();
-        bytes.write_varint(0_u64).unwrap();
-        bytes.write_varint(0_u64).unwrap();
-        bytes.push(REC_MODULE);
-        bytes.write_varint(0_u64).unwrap();
-        bytes.write_varint(7_i64).unwrap();
-        bytes.write_varint(0x1000_u64).unwrap();
-        bytes.write_varint(0x2000_u64).unwrap();
-        bytes.write_varint(0_u64).unwrap();
-        bytes.write_varint(99_u64).unwrap();
-        bytes.push(0);
-        write_bytes(&mut bytes, b"/module").unwrap();
-        std::fs::write(&path, bytes).unwrap();
+    fn readers_reject_legacy_spool_versions() {
+        for (label, magic) in [("v1", b"SPULSE1\0"), ("v2", b"SPULSE2\0")] {
+            let path = temp_spool_path(&format!("legacy-{label}"));
+            std::fs::write(&path, magic).unwrap();
 
-        let reader = Snapshot::open(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-        assert_eq!(reader.modules()[0].inode, 99);
-        assert_eq!(reader.modules()[0].device_major, 0);
-        assert_eq!(reader.modules()[0].device_minor, 0);
-        assert_eq!(reader.modules()[0].inode_generation, 0);
-    }
-
-    #[test]
-    fn replay_reader_decodes_samples_from_older_spool_versions() {
-        for (label, magic) in [("v1", MAGIC_V1), ("v2", MAGIC_V2)] {
-            let path = temp_spool_path(&format!("replay-{label}"));
-            let mut bytes = magic.to_vec();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(10_u64).unwrap();
-            bytes.push(REC_MODULE);
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(7_i64).unwrap();
-            bytes.write_varint(0x1000_u64).unwrap();
-            bytes.write_varint(0x2000_u64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(99_u64).unwrap();
-            bytes.push(0);
-            write_bytes(&mut bytes, b"/module").unwrap();
-            bytes.push(REC_FRAME);
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(0x10_u64).unwrap();
-            bytes.push(REC_STACK);
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(u64::from(NONE_U32)).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.push(REC_THREAD);
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(7_i64).unwrap();
-            bytes.write_varint(11_u64).unwrap();
-            bytes.push(REC_SAMPLE);
-            bytes.write_varint(1_000_i64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.push(REC_MODULE);
-            bytes.write_varint(1_u64).unwrap();
-            bytes.write_varint(7_i64).unwrap();
-            bytes.write_varint(0x3000_u64).unwrap();
-            bytes.write_varint(0x4000_u64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(100_u64).unwrap();
-            bytes.push(0);
-            write_bytes(&mut bytes, b"/second").unwrap();
-            bytes.push(REC_FRAME);
-            bytes.write_varint(1_u64).unwrap();
-            bytes.write_varint(2_u64).unwrap();
-            bytes.write_varint(0x10_u64).unwrap();
-            bytes.push(REC_STACK);
-            bytes.write_varint(1_u64).unwrap();
-            bytes.write_varint(u64::from(NONE_U32)).unwrap();
-            bytes.write_varint(1_u64).unwrap();
-            bytes.push(REC_SAMPLE);
-            bytes.write_varint(1_000_i64).unwrap();
-            bytes.write_varint(0_u64).unwrap();
-            bytes.write_varint(1_u64).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-
-            let reader = Replay::open(&path).unwrap();
-            let scanned = Replay::from_opened(
-                open_spool_with_range_limit(&path, SampleStorage::Replay, 0).unwrap(),
-            );
+            let snapshot = Snapshot::open(&path).expect_err("legacy snapshot must be rejected");
+            let replay = Replay::open(&path).expect_err("legacy replay must be rejected");
             let _ = std::fs::remove_file(path);
-            let expected = vec![
-                SampleRecord {
-                    timestamp_ns: 1_000,
-                    process_id: crate::Pid::try_from(7).unwrap(),
-                    thread_id: crate::Tid::try_from(11).unwrap(),
-                    stack_id: 0,
-                },
-                SampleRecord {
-                    timestamp_ns: 2_000,
-                    process_id: crate::Pid::try_from(7).unwrap(),
-                    thread_id: crate::Tid::try_from(11).unwrap(),
-                    stack_id: 1,
-                },
-            ];
-            assert_eq!(reader.samples().collect::<Vec<_>>(), expected);
-            assert_eq!(scanned.samples().collect::<Vec<_>>(), expected);
+
+            assert_eq!(snapshot.kind(), crate::ErrorKind::CorruptSpool);
+            assert_eq!(replay.kind(), crate::ErrorKind::CorruptSpool);
         }
     }
 
