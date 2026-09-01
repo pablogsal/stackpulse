@@ -2,6 +2,12 @@ use std::rc::Rc;
 
 use bitflags::bitflags;
 
+/// Return whether a basename names a Python executable or runtime library.
+#[must_use]
+pub fn is_python_runtime_basename(name: &str) -> bool {
+    crate::is_python_module(name)
+}
+
 /// High-level frame category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -55,7 +61,7 @@ bitflags! {
 ///
 /// A value of `-1` for any field means "unknown"; this matches the CPython
 /// convention for missing position attributes on code objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocationInfo {
     /// 1-based starting line number (`-1` if unknown).
     pub lineno: i32,
@@ -85,7 +91,7 @@ impl Default for LocationInfo {
 /// any inlined source-position info CPython provides. `Rc<str>` is used for
 /// the file and function strings so identical entries from repeated samples
 /// share one allocation across a profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PythonFrame {
     /// Source file as recorded by CPython. May be absolute, relative, or a
     /// pseudo-path such as `<frozen importlib._bootstrap>`.
@@ -99,9 +105,11 @@ pub struct PythonFrame {
     /// Whether this frame is the entry point of a Python call (top of an
     /// eval-loop activation, not an inlined or continuation frame).
     pub is_entry: bool,
+    /// Classification flags for this frame.
+    pub flags: FrameFlags,
     /// Byte offset into [`Self::file_name`] where the basename begins;
     /// use [`Self::basename`] to read it.
-    pub basename_start: usize,
+    basename_start: usize,
 }
 
 impl PythonFrame {
@@ -121,8 +129,16 @@ impl PythonFrame {
             func_name: func_name.into(),
             opcode,
             is_entry,
+            flags: FrameFlags::empty(),
             basename_start,
         }
+    }
+
+    /// Set classification flags for this frame.
+    #[must_use]
+    pub fn with_flags(mut self, flags: FrameFlags) -> Self {
+        self.flags = flags;
+        self
     }
 
     /// Final path component of [`Self::file_name`] (filename only).
@@ -138,7 +154,7 @@ impl PythonFrame {
 /// All fields are `Option` because DWARF, debuginfod, and address-only
 /// fallbacks each provide different subsets. Callers should treat any missing
 /// field as "unknown" rather than "zero".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SourceLocation {
     /// Source file path (absolute or compiler-relative).
     pub file: Option<Rc<str>>,
@@ -157,7 +173,7 @@ pub struct SourceLocation {
 /// One [`NativeFrame`] may resolve to multiple `NativeSymbol`s when inline
 /// frames are expanded; the innermost callee is listed first and
 /// [`Self::inline_depth`] grows outward.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NativeSymbol {
     /// Demangled symbol name (function/method).
     pub name: Rc<str>,
@@ -218,7 +234,7 @@ impl NativeSymbol {
 ///
 /// Carries the raw program counter and stack pointer from the sample plus
 /// whatever symbol metadata was recovered (or `None` when address-only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NativeFrame {
     /// Absolute program counter sampled from the target.
     pub pc: u64,
@@ -227,7 +243,7 @@ pub struct NativeFrame {
     /// Resolved symbol, if symbolization succeeded.
     pub symbol: Option<NativeSymbol>,
     /// Whether the owning module is the Python runtime
-    /// (see [`is_python_module`](crate::is_python_module)).
+    /// (see [`is_python_runtime_basename`]).
     pub is_python_runtime: bool,
     /// High-level category: native, kernel, or unknown.
     pub kind: FrameKind,
@@ -255,7 +271,7 @@ impl NativeFrame {
     }
 
     /// Sentinel resolved frame for a truncated-stack marker (see
-    /// [`crate::FrameRecord::truncated_stack_marker`]): the unwinder ran out
+    /// [`crate::spool::FrameRecord::truncated_stack_marker`]): the unwinder ran out
     /// of captured stack bytes before reaching the root. Distinguishable from
     /// a failed resolve via [`FrameFlags::TRUNCATED_STACK`].
     #[must_use]
@@ -278,18 +294,24 @@ impl NativeFrame {
         }
     }
 
-    /// Display name for the frame: the resolved symbol name, or the
-    /// hex-formatted `pc` (`<0xCAFEBABE>`) when no symbol was recovered.
+    /// Borrow the resolved symbol name without allocating.
     #[must_use]
-    pub fn func_name(&self) -> String {
-        self.symbol
-            .as_ref()
-            .map_or_else(|| format!("<0x{:x}>", self.pc), |s| s.name.to_string())
+    pub fn name(&self) -> Option<&str> {
+        self.symbol.as_ref().map(|symbol| symbol.name.as_ref())
+    }
+
+    /// Allocate a display name, formatting unresolved addresses when needed.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.symbol.as_ref().map_or_else(
+            || format!("<0x{:x}>", self.pc),
+            |symbol| symbol.name.to_string(),
+        )
     }
 }
 
 /// A resolved frame from a profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResolvedFrame {
     /// Python frame.
     Python(PythonFrame),
@@ -298,13 +320,21 @@ pub enum ResolvedFrame {
 }
 
 impl ResolvedFrame {
-    /// Display name across both variants: Python function name or the
-    /// native frame's [`NativeFrame::func_name`].
+    /// Borrow the resolved name without allocating.
     #[must_use]
-    pub fn func_name(&self) -> String {
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Python(frame) => Some(&frame.func_name),
+            Self::Native(frame) => frame.name(),
+        }
+    }
+
+    /// Allocate a display name, formatting unresolved addresses when needed.
+    #[must_use]
+    pub fn display_name(&self) -> String {
         match self {
             Self::Python(frame) => frame.func_name.to_string(),
-            Self::Native(frame) => frame.func_name(),
+            Self::Native(frame) => frame.display_name(),
         }
     }
 }
@@ -316,7 +346,7 @@ impl ResolvedFrame {
 /// multi-byte sequence.
 #[inline]
 #[must_use]
-pub fn basename_start(path: &str) -> usize {
+pub(crate) fn basename_start(path: &str) -> usize {
     memchr::memrchr(b'/', path.as_bytes()).map_or(0, |i| i + 1)
 }
 

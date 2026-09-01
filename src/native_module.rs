@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -8,17 +9,26 @@ use crate::elf::{
     load_elf_sections_from_bytes, load_elf_sections_from_file, resolve_mapping_image_base,
     ElfSectionInfo,
 };
-use crate::ModuleImageBase;
+use crate::module_base::ModuleImageBase;
 use rustc_hash::FxHashMap;
 
 use crate::spool::{ModuleRecord, VDSO_PATH};
 
 #[derive(Clone, Default)]
 pub(crate) struct ElfSectionCache {
-    // Module ids are unique within a spool. Keying by id avoids reusing ELF
-    // data across processes or mapping generations that happen to report the
-    // same pathname and inode number in different mount namespaces.
     by_module: FxHashMap<u32, Arc<ElfSectionInfo>>,
+    by_image: FxHashMap<ElfImageIdentity, Arc<ElfSectionInfo>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ElfImageIdentity {
+    device: u64,
+    inode: u64,
+    inode_generation: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    mount_namespace: Option<u64>,
 }
 
 pub(crate) struct LoadedElfMapping {
@@ -43,7 +53,21 @@ impl ElfSectionCache {
                     load_elf_sections_from_bytes(bytes, module.path.as_path()).ok()?
                 } else {
                     let file = open_module_file(module)?;
-                    load_elf_sections_from_file(&file, module.path.as_path()).ok()?
+                    let identity = elf_image_identity(module, &file)?;
+                    if let Some(sections) = self.by_image.get(&identity).cloned() {
+                        let sections = Arc::clone(entry.insert(sections));
+                        return Some(LoadedElfMapping {
+                            image_base: resolve_image_base(module, &sections),
+                            sections,
+                        });
+                    }
+                    let sections =
+                        Arc::new(load_elf_sections_from_file(&file, module.path.as_path()).ok()?);
+                    self.by_image.insert(identity, Arc::clone(&sections));
+                    return Some(LoadedElfMapping {
+                        image_base: resolve_image_base(module, &sections),
+                        sections: Arc::clone(entry.insert(sections)),
+                    });
                 });
                 Arc::clone(entry.insert(section_info))
             }
@@ -73,6 +97,23 @@ impl ElfSectionCache {
     fn len(&self) -> usize {
         self.by_module.len()
     }
+}
+
+fn elf_image_identity(module: &ModuleRecord, file: &File) -> Option<ElfImageIdentity> {
+    let metadata = file.metadata().ok()?;
+    let mount_namespace = std::fs::metadata(format!("/proc/{}/ns/mnt", module.process_id))
+        .or_else(|_| std::fs::metadata("/proc/self/ns/mnt"))
+        .ok()
+        .map(|metadata| metadata.ino());
+    Some(ElfImageIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        inode_generation: module.inode_generation,
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        mount_namespace,
+    })
 }
 
 fn local_vdso_bytes() -> Option<Arc<[u8]>> {
@@ -122,12 +163,24 @@ fn open_module_file_with_mapping_path(
     // win over a textual pathname that may now refer to a replacement file or
     // resolve in a different mount namespace. The pathname remains a useful
     // fallback after the process exits and map_files disappears.
-    validated_module_file(map_file, module)
-        .or_else(|| validated_module_file(module.path.as_path(), module))
+    validated_module_file(map_file, module, true)
+        .or_else(|| validated_module_file(module.path.as_path(), module, false))
 }
 
-fn validated_module_file(path: &std::path::Path, module: &ModuleRecord) -> Option<File> {
-    let file = File::open(path).ok()?;
+fn validated_module_file(
+    path: &std::path::Path,
+    module: &ModuleRecord,
+    allow_symlink: bool,
+) -> Option<File> {
+    let mut flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
+    if !allow_symlink {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = File::options()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -158,6 +211,10 @@ fn resolve_image_base(
 mod tests {
     use super::*;
     use crate::elf::LoadSegment;
+    use crate::test_support::TempDir;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn image_base_is_not_guessed_when_mapping_cannot_be_correlated() {
@@ -260,6 +317,34 @@ mod tests {
         assert!(module_path_matches_inode(&module));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hostile_fifo_and_symlink_module_paths_are_rejected() {
+        let temp = TempDir::new("native-module-hostile-paths");
+        let fifo = temp.path().join("module.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("module-link");
+        std::fs::write(&target, b"not an elf").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let module = |path: &std::path::Path| ModuleRecord {
+            id: 1,
+            process_id: 42,
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: path.to_string_lossy().into_owned().into(),
+            is_kernel: false,
+        };
+
+        assert!(validated_module_file(&fifo, &module(&fifo), false).is_none());
+        assert!(validated_module_file(&link, &module(&link), false).is_none());
     }
 
     #[test]

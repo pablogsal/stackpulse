@@ -5,7 +5,7 @@
 /// `avma` is the runtime address that corresponds to the object's `svma`.
 /// Every mapping of the same loaded image shares this pair when correlation
 /// against the object file succeeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleImageBase {
     /// Process-absolute virtual memory address (AVMA) where the image's
     /// base SVMA is mapped.

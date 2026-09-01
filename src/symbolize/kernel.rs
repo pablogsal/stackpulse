@@ -4,7 +4,7 @@
 //! user-space frames, there is no per-process ELF mapping we can hand to the
 //! native symbolizer, and many machines hide `/proc/kallsyms` addresses behind
 //! `kptr_restrict` or `perf_event_paranoid`. This module keeps the shared table,
-//! sparse lookup cache, and resolver facade used by `PerfSymbolizer`. For
+//! sparse lookup cache, and resolver facade used by `Symbolizer`. For
 //! spool-backed sparse symbolization, it asks `kallsyms` for live symbols, then
 //! falls back to `system_map` when kallsyms is unavailable or zeroed; the shared
 //! full-table path uses live kallsyms only.
@@ -16,7 +16,9 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
@@ -48,6 +50,46 @@ pub(super) struct ResolvedKernelSymbol {
 pub(super) enum KernelSymbolTable {
     Full(Arc<[KernelSymbol]>),
     Sparse(Arc<[(u64, KernelSymbol)]>),
+}
+
+impl KernelSymbolTable {
+    pub(super) fn empty() -> Self {
+        Self::Sparse(Arc::from([]))
+    }
+}
+
+const MAX_KERNEL_SYMBOL_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
+pub(super) fn load_kernel_symbols_from_path(path: &Path) -> io::Result<KernelSymbolTable> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kernel symbol source is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_KERNEL_SYMBOL_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel symbol source exceeds 64 MiB",
+        ));
+    }
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_KERNEL_SYMBOL_FILE_SIZE + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_KERNEL_SYMBOL_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel symbol source exceeds 64 MiB",
+        ));
+    }
+    Ok(KernelSymbolTable::Full(Arc::from(
+        kallsyms::parse_kernel_symbols(&data).into_boxed_slice(),
+    )))
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]

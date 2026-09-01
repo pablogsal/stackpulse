@@ -1,6 +1,8 @@
 //! Linux perf-map parsing and frame conversion.
 
-use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 
 use rustc_hash::FxHashSet;
@@ -16,7 +18,7 @@ pub(super) enum PerfMapProcesses {
     /// Allow perf-map lookup for every process.
     All,
     /// Allow perf-map lookup only for the listed process ids.
-    Pids(FxHashSet<i32>),
+    Pids(FxHashSet<crate::Pid>),
 }
 
 #[derive(Clone)]
@@ -43,20 +45,20 @@ pub(super) fn perf_map_symbol_to_frame(
     process_id: i32,
     abs_ip: u64,
     symbol: PerfMapSymbol,
+    perf_map_dir: &Path,
 ) -> ResolvedFrame {
     if let Some((func, file)) = parse_python_perf_map_symbol(&symbol.name) {
-        return ResolvedFrame::Python(PythonFrame::new(
-            file,
-            LocationInfo::default(),
-            func,
-            None,
-            false,
-        ));
+        return ResolvedFrame::Python(
+            PythonFrame::new(file, LocationInfo::default(), func, None, false)
+                .with_flags(FrameFlags::JIT),
+        );
     }
     let native_symbol = NativeSymbol::new(
         symbol.name,
         SourceLocation::default(),
-        format!("/tmp/perf-{process_id}.map"),
+        perf_map_dir
+            .join(format!("perf-{process_id}.map"))
+            .to_string_lossy(),
         abs_ip.saturating_sub(symbol.start),
         false,
         false,
@@ -123,12 +125,26 @@ pub(super) fn module_display_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-pub(super) fn load_perf_map(process_id: i32) -> Option<Vec<PerfMapSymbol>> {
-    let mut symbols: Vec<PerfMapSymbol> = fs::read_to_string(format!("/tmp/perf-{process_id}.map"))
-        .ok()?
-        .lines()
-        .filter_map(parse_perf_map_line)
-        .collect();
+pub(super) fn load_perf_map(directory: &Path, process_id: i32) -> Option<Vec<PerfMapSymbol>> {
+    const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
+    let mut file = File::options()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(directory.join(format!("perf-{process_id}.map")))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.len() > MAX_PERF_MAP_SIZE {
+        return None;
+    }
+    let mut text = String::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.by_ref()
+        .take(MAX_PERF_MAP_SIZE + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_PERF_MAP_SIZE {
+        return None;
+    }
+    let mut symbols: Vec<PerfMapSymbol> = text.lines().filter_map(parse_perf_map_line).collect();
     symbols.sort_by_key(|symbol| symbol.start);
     Some(symbols)
 }

@@ -1,8 +1,9 @@
 //! Native address-to-symbol resolution.
 
+use crate::module_base::ModuleImageBase;
+use crate::profile::NativeSymbol;
 #[cfg(feature = "builtin-wholesym")]
-use crate::SourceLocation;
-use crate::{ModuleImageBase, NativeSymbol};
+use crate::profile::SourceLocation;
 
 #[cfg(feature = "builtin-wholesym")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
@@ -15,176 +16,298 @@ use wholesym::{
 };
 
 #[cfg(feature = "builtin-wholesym")]
-use std::collections::HashMap;
-use std::ops::Range;
-#[cfg(all(unix, feature = "builtin-wholesym"))]
-use std::os::unix::fs::MetadataExt;
+use std::cell::RefCell;
 #[cfg(feature = "builtin-wholesym")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Module information for symbolization.
-///
-/// Each `SymModule` describes one memory mapping with its `avma_range` and
-/// optional image base. The backend derives its address from that image base:
-/// `SVMA` on Linux or `Relative` on macOS. Mappings without an image base are
-/// skipped.
-#[derive(Clone)]
-#[non_exhaustive]
-pub struct SymModule {
-    /// On-disk path of the mapped object file (ELF on Linux, Mach-O on macOS).
-    pub path: PathBuf,
-    /// Absolute virtual memory address range this mapping occupies in the
-    /// target process. Both endpoints are process-absolute, not file offsets.
-    pub avma_range: Range<u64>,
-    /// Image-base anchor used to translate sampled instruction pointers into
-    /// the address form expected by the symbol backend. `None` means the
-    /// image base could not be resolved and the mapping must be skipped.
-    pub image_base: Option<ModuleImageBase>,
-    /// Whether this mapping has executable permissions.
-    /// Non-executable mappings (data sections) should not be symbolized.
-    pub is_executable: bool,
-    /// Whether this module is the Python runtime binary/shared library.
-    pub is_python_runtime: bool,
+#[derive(Clone, Debug)]
+pub struct NativeModule(Rc<NativeModuleData>);
+
+#[derive(Debug)]
+pub(crate) struct NativeModuleData {
+    pub(crate) path: PathBuf,
+    pub(crate) image_base: ModuleImageBase,
+    pub(crate) is_python_runtime: bool,
+    pub(crate) file_identity: NativeFileIdentity,
+    pub(crate) mapping_id: u32,
 }
 
-#[cfg(feature = "builtin-wholesym")]
-type SymModuleLayoutKey = (Range<u64>, Option<ModuleImageBase>, bool, bool);
-
-#[cfg(feature = "builtin-wholesym")]
-fn sym_module_layout_key(module: &SymModule) -> SymModuleLayoutKey {
-    (
-        module.avma_range.clone(),
-        module.image_base,
-        module.is_executable,
-        module.is_python_runtime,
-    )
+/// Stable recorded identity for a native image.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NativeFileIdentity {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    inode_generation: u64,
 }
 
-#[cfg(feature = "builtin-wholesym")]
-fn sym_module_layouts_by_path(modules: &[SymModule]) -> HashMap<&Path, Vec<SymModuleLayoutKey>> {
-    let mut layouts = HashMap::new();
-    for module in modules {
-        layouts
-            .entry(module.path.as_path())
-            .or_insert_with(Vec::new)
-            .push(sym_module_layout_key(module));
+impl NativeModule {
+    pub(crate) fn new(
+        path: PathBuf,
+        image_base: ModuleImageBase,
+        is_python_runtime: bool,
+        file_identity: NativeFileIdentity,
+        mapping_id: u32,
+    ) -> Self {
+        Self(Rc::new(NativeModuleData {
+            path,
+            image_base,
+            is_python_runtime,
+            file_identity,
+            mapping_id,
+        }))
     }
-    layouts
 }
 
-#[cfg(feature = "builtin-wholesym")]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
-}
-
-#[cfg(all(unix, feature = "builtin-wholesym"))]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(FileIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        size: metadata.size(),
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
-        ctime: metadata.ctime(),
-        ctime_nsec: metadata.ctime_nsec(),
-    })
-}
-
-#[cfg(feature = "builtin-wholesym")]
-fn module_file_identities(modules: &[SymModule]) -> HashMap<PathBuf, Option<FileIdentity>> {
-    let mut identities = HashMap::new();
-    for module in modules {
-        identities
-            .entry(module.path.clone())
-            .or_insert_with(|| file_identity(&module.path));
+impl NativeModule {
+    /// Return the mapped object's recorded path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0.path
     }
-    identities
+
+    /// Return whether this image is the Python runtime.
+    #[must_use]
+    pub fn is_python_runtime(&self) -> bool {
+        self.0.is_python_runtime
+    }
+
+    pub(crate) fn image_base(&self) -> ModuleImageBase {
+        self.0.image_base
+    }
+
+    /// Return the recorded filesystem identity.
+    #[must_use]
+    pub fn file_identity(&self) -> NativeFileIdentity {
+        self.0.file_identity
+    }
+
+    /// Return the spool-local mapping generation identifier.
+    #[must_use]
+    pub fn mapping_id(&self) -> u32 {
+        self.0.mapping_id
+    }
 }
 
-#[cfg(feature = "builtin-wholesym")]
-#[derive(Clone, Copy)]
-struct ModuleAddressIndexEntry {
-    start: u64,
-    end: u64,
-    module_index: usize,
+impl NativeFileIdentity {
+    pub(crate) const fn new(
+        device_major: u32,
+        device_minor: u32,
+        inode: u64,
+        inode_generation: u64,
+    ) -> Self {
+        Self {
+            device_major,
+            device_minor,
+            inode,
+            inode_generation,
+        }
+    }
+
+    /// Return the recorded device major number.
+    #[must_use]
+    pub const fn device_major(self) -> u32 {
+        self.device_major
+    }
+
+    /// Return the recorded device minor number.
+    #[must_use]
+    pub const fn device_minor(self) -> u32 {
+        self.device_minor
+    }
+
+    /// Return the recorded inode.
+    #[must_use]
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    /// Return the recorded inode generation.
+    #[must_use]
+    pub const fn inode_generation(self) -> u64 {
+        self.inode_generation
+    }
 }
 
-#[cfg(feature = "builtin-wholesym")]
-fn build_module_address_index(modules: &[SymModule]) -> Box<[ModuleAddressIndexEntry]> {
-    let mut index: Vec<_> = modules
-        .iter()
-        .enumerate()
-        .map(|(module_index, module)| ModuleAddressIndexEntry {
-            start: module.avma_range.start,
-            end: module.avma_range.end,
-            module_index,
-        })
-        .collect();
-    index.sort_by_key(|entry| entry.start);
-    debug_assert!(
-        index.windows(2).all(|w| w[0].end <= w[1].start),
-        "module_address_index must be non-overlapping for binary search",
-    );
-    index.into_boxed_slice()
+/// One exact native lookup selected by StackPulse.
+#[derive(Clone, Debug)]
+pub struct NativeLookup {
+    pub(crate) process_id: crate::Pid,
+    pub(crate) module: NativeModule,
+    pub(crate) absolute_address: u64,
+    pub(crate) relative_address: u64,
+    pub(crate) image_address: u64,
 }
 
-/// Cached symbols behind `Rc` for inexpensive clones.
-pub type SymbolsRc = Rc<[NativeSymbol]>;
+impl NativeLookup {
+    /// Return the process that owns the mapping.
+    #[must_use]
+    pub fn process_id(&self) -> crate::Pid {
+        self.process_id
+    }
 
-#[cfg(feature = "builtin-wholesym")]
-fn symbols_rc(symbols: Vec<NativeSymbol>) -> SymbolsRc {
-    Rc::from(symbols.into_boxed_slice())
+    /// Return the exact module selected for this address.
+    #[must_use]
+    pub fn module(&self) -> &NativeModule {
+        &self.module
+    }
+
+    /// Return the sampled process-absolute address.
+    #[must_use]
+    pub fn absolute_address(&self) -> u64 {
+        self.absolute_address
+    }
+
+    /// Return the address relative to the image base.
+    #[must_use]
+    pub fn relative_address(&self) -> u64 {
+        self.relative_address
+    }
+
+    /// Return the static virtual address used for debug lookup.
+    #[must_use]
+    pub fn image_address(&self) -> u64 {
+        self.image_address
+    }
+
+    /// Return the image identity selected for this lookup.
+    #[must_use]
+    pub fn file_identity(&self) -> NativeFileIdentity {
+        self.module.file_identity()
+    }
+
+    /// Return the spool-local mapping generation identifier.
+    #[must_use]
+    pub fn mapping_id(&self) -> u32 {
+        self.module.mapping_id()
+    }
 }
 
-/// Plug-in interface for native ELF or Mach-O symbolization.
-///
-/// [`crate::PerfSymbolizer`] handles kernel and perf-map frames itself. It
-/// creates one `NativeSymbolizer` per non-overlapping process module group,
-/// calls `set_modules` when that group changes, and passes each native frame
-/// address to `symbolize_one`. Implementations own their symbol-map caches and
-/// debug-file policy.
+/// Owned inline-expanded symbols for one native lookup.
+#[derive(Clone, Debug, Default)]
+pub struct NativeSymbols(Vec<NativeSymbol>);
+
+impl NativeSymbols {
+    /// Construct a resolved result from innermost-first symbols.
+    #[must_use]
+    pub fn new(symbols: Vec<NativeSymbol>) -> Self {
+        Self(symbols)
+    }
+
+    /// Construct an unresolved result without allocation.
+    #[must_use]
+    pub const fn unresolved() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Borrow the resolved inline chain.
+    #[must_use]
+    pub fn as_slice(&self) -> &[NativeSymbol] {
+        &self.0
+    }
+
+    /// Return whether no native symbol was found.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<NativeSymbol> {
+        self.0
+    }
+}
+
+/// Plug-in interface for batched native symbolization.
 pub trait NativeSymbolizer {
-    /// Replace the module set this symbolizer should resolve against.
-    /// Implementors should invalidate per-module caches for paths no longer
-    /// present and reuse caches for paths that are unchanged.
-    fn set_modules(&mut self, modules: Vec<SymModule>);
+    /// Backend error type.
+    type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Resolve a single absolute instruction pointer to zero or more symbols
-    /// (multiple symbols when inline frames are expanded; innermost first).
-    /// Returns an empty slice when the address is not attributable.
-    fn symbolize_one(&mut self, addr: u64) -> SymbolsRc;
+    /// Resolve every request and append one ordered result per request.
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Self::Error>;
+}
+
+pub(crate) trait ErasedNativeSymbolizer {
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+struct NativeSymbolizerAdapter<S>(S);
+
+impl<S: NativeSymbolizer> ErasedNativeSymbolizer for NativeSymbolizerAdapter<S> {
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0
+            .symbolize(requests, output)
+            .map_err(|error| Box::new(error) as _)
+    }
+}
+
+pub(crate) fn erase_native_symbolizer(
+    symbolizer: impl NativeSymbolizer + 'static,
+) -> Box<dyn ErasedNativeSymbolizer> {
+    Box::new(NativeSymbolizerAdapter(symbolizer))
 }
 
 #[cfg(feature = "builtin-wholesym")]
 impl NativeSymbolizer for SymbolizerWrapper {
-    fn set_modules(&mut self, modules: Vec<SymModule>) {
-        SymbolizerWrapper::set_modules(self, modules);
-    }
+    type Error = std::convert::Infallible;
 
-    fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
-        SymbolizerWrapper::symbolize_one(self, addr)
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Self::Error> {
+        output.reserve(requests.len());
+        output.extend(
+            requests
+                .iter()
+                .map(|request| self.symbolize_lookup(request)),
+        );
+        Ok(())
     }
 }
 
-/// Factory that produces a [`NativeSymbolizer`] for a given process id.
-/// `PerfSymbolizer` calls this once per non-overlapping module group.
-pub(crate) type NativeSymbolizerFactory = Box<dyn FnMut(i32) -> Box<dyn NativeSymbolizer>>;
+#[cfg(feature = "builtin-wholesym")]
+struct SharedSymbolizerWrapper(Rc<RefCell<Option<SymbolizerWrapper>>>);
+
+#[cfg(feature = "builtin-wholesym")]
+impl NativeSymbolizer for SharedSymbolizerWrapper {
+    type Error = std::convert::Infallible;
+
+    fn symbolize(
+        &mut self,
+        requests: &[NativeLookup],
+        output: &mut Vec<NativeSymbols>,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(SymbolizerWrapper::new)
+            .symbolize(requests, output)
+    }
+}
+
+pub(crate) type NativeSymbolizerFactory =
+    Box<dyn FnMut(crate::Pid) -> Box<dyn ErasedNativeSymbolizer>>;
 
 /// Factory for StackPulse's bundled Wholesym backend.
 #[cfg(feature = "builtin-wholesym")]
 #[must_use]
 pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
-    Box::new(|_pid: i32| -> Box<dyn NativeSymbolizer> { Box::new(SymbolizerWrapper::new()) })
+    let shared = Rc::new(RefCell::new(None));
+    Box::new(move |_pid| erase_native_symbolizer(SharedSymbolizerWrapper(Rc::clone(&shared))))
 }
 
 /// Symbols that indicate the Python eval loop.
@@ -200,12 +323,6 @@ pub(crate) fn is_eval_frame(func_name: &str) -> bool {
 }
 
 #[cfg(feature = "builtin-wholesym")]
-fn mark_python_runtime_modules(modules: &mut [SymModule]) {
-    for module in modules {
-        module.is_python_runtime = crate::is_python_runtime_module_path(&module.path);
-    }
-}
-
 /// Standard system debug directory on Linux.
 #[cfg(feature = "builtin-wholesym")]
 const DEFAULT_DEBUG_DIR: &str = "/usr/lib/debug";
@@ -381,23 +498,7 @@ fn linux_build_id_string(info: &wholesym::LibraryInfo) -> Option<String> {
 ///
 /// Note: NOT thread-safe. Each thread needs its own `SymbolizerWrapper` instance.
 #[cfg(feature = "builtin-wholesym")]
-pub struct SymbolizerWrapper {
-    /// Loaded modules for symbolization
-    modules: Vec<SymModule>,
-
-    /// File identities captured when module state was installed.
-    module_file_identities: HashMap<PathBuf, Option<FileIdentity>>,
-
-    /// Sorted by `start`, non-overlapping; see `find_module_index`.
-    module_address_index: Box<[ModuleAddressIndexEntry]>,
-
-    /// Resolved symbols by address. Only attributed addresses are stored;
-    /// every key MUST also appear in `cache_keys_by_path` for its path.
-    cache: HashMap<u64, SymbolsRc>,
-
-    /// Per-path index into `cache` for selective eviction on layout change.
-    cache_keys_by_path: HashMap<PathBuf, Vec<u64>>,
-
+struct SymbolizerWrapper {
     /// Local debug directories for `.build-id` lookup (Linux only).
     local_debug_dirs: Box<[PathBuf]>,
 
@@ -408,13 +509,36 @@ pub struct SymbolizerWrapper {
     /// Shared symbol manager used for symbolization.
     symbol_manager: SymbolManager,
 
-    /// Loaded wholesym maps keyed by module path.
-    symbol_maps: HashMap<PathBuf, Option<WholeSymbolMap>>,
+    /// Loaded wholesym maps keyed by recorded file identity. A mapping-local
+    /// key is used when the spool has no stable filesystem identity.
+    symbol_maps: HashMap<NativeImageKey, Option<WholeSymbolMap>>,
 
     /// Tokio runtime for wholesym async APIs. Wrapped so Drop can hand it to
     /// `shutdown_background`, which is safe even inside another tokio runtime
     /// (a plain runtime drop there panics mid-unwind and aborts the process).
     runtime: std::mem::ManuallyDrop<TokioRuntime>,
+}
+
+#[cfg(feature = "builtin-wholesym")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum NativeImageKey {
+    File(NativeFileIdentity),
+    Mapping { path: PathBuf, id: u32 },
+}
+
+#[cfg(feature = "builtin-wholesym")]
+impl NativeImageKey {
+    fn for_lookup(lookup: &NativeLookup) -> Self {
+        let identity = lookup.file_identity();
+        if identity.inode() != 0 || identity.device_major() != 0 || identity.device_minor() != 0 {
+            Self::File(identity)
+        } else {
+            Self::Mapping {
+                path: lookup.module().path().to_path_buf(),
+                id: lookup.mapping_id(),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "builtin-wholesym")]
@@ -545,7 +669,7 @@ impl SymbolizerWrapper {
         clippy::expect_used,
         reason = "the infallible NativeSymbolizer factory cannot report Tokio runtime construction failure"
     )]
-    pub fn new() -> Self {
+    fn new() -> Self {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
             .build()
@@ -556,140 +680,12 @@ impl SymbolizerWrapper {
         let local_debug_dirs = local_debug_dirs.into_boxed_slice();
 
         Self {
-            modules: Vec::new(),
-            module_file_identities: HashMap::new(),
-            module_address_index: Box::default(),
-            cache: HashMap::new(),
-            cache_keys_by_path: HashMap::new(),
             local_debug_dirs,
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
             runtime: std::mem::ManuallyDrop::new(runtime),
         }
-    }
-
-    fn cache_insert(&mut self, addr: u64, path: &Path, value: SymbolsRc) {
-        self.cache.insert(addr, value);
-        self.cache_keys_by_path
-            .entry(path.to_path_buf())
-            .or_default()
-            .push(addr);
-    }
-
-    fn evict_cache_for_path(&mut self, path: &Path) {
-        if let Some(keys) = self.cache_keys_by_path.remove(path) {
-            for addr in keys {
-                self.cache.remove(&addr);
-            }
-        }
-    }
-
-    /// Drop all per-path state for `path`. On Linux, returns `true` when a
-    /// debug-file redirect was removed (caller must rebuild `SymbolManager`).
-    fn evict_path_state(&mut self, path: &Path) -> bool {
-        self.evict_cache_for_path(path);
-        self.symbol_maps.remove(path);
-        self.redirect_cache.remove(path).is_some()
-    }
-
-    /// Set modules for symbolization.
-    ///
-    /// Diffs old vs new module paths to avoid re-loading symbol maps for
-    /// modules that haven't changed. Only evicts entries for removed modules;
-    /// Linux debug-file redirects are discovered lazily during symbol loading.
-    pub fn set_modules(&mut self, mut modules: Vec<SymModule>) {
-        mark_python_runtime_modules(&mut modules);
-
-        let old_layouts = sym_module_layouts_by_path(&self.modules);
-        let new_layouts = sym_module_layouts_by_path(&modules);
-        let new_file_identities = module_file_identities(&modules);
-        let evicted: Vec<PathBuf> = old_layouts
-            .iter()
-            .filter_map(|(path, old)| match new_layouts.get(*path) {
-                None => Some((*path).to_path_buf()),
-                Some(new) if new != old => Some((*path).to_path_buf()),
-                Some(_) => {
-                    let old_identity = self
-                        .module_file_identities
-                        .get(*path)
-                        .copied()
-                        .unwrap_or(None);
-                    let new_identity = new_file_identities.get(*path).copied().unwrap_or(None);
-                    if old_identity != new_identity {
-                        Some((*path).to_path_buf())
-                    } else {
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        {
-            let mut redirects_evicted = false;
-            for path in &evicted {
-                redirects_evicted |= self.evict_path_state(path);
-            }
-            if redirects_evicted {
-                self.rebuild_symbol_manager();
-            }
-        }
-
-        self.modules = modules;
-        self.module_file_identities = new_file_identities;
-        self.rebuild_module_address_index();
-    }
-
-    #[cfg(test)]
-    pub fn update_modules_for_path(&mut self, path: &Path, mut modules: Box<[SymModule]>) {
-        mark_python_runtime_modules(modules.as_mut());
-
-        let old_identity = self
-            .module_file_identities
-            .get(path)
-            .copied()
-            .unwrap_or(None);
-        let new_identity = file_identity(path);
-        let unchanged = self
-            .modules
-            .iter()
-            .filter(|module| module.path == path)
-            .map(sym_module_layout_key)
-            .eq(modules.iter().map(sym_module_layout_key))
-            && old_identity == new_identity;
-        if unchanged {
-            return;
-        }
-
-        if self.evict_path_state(path) {
-            self.rebuild_symbol_manager();
-        }
-
-        self.modules.retain(|module| module.path != path);
-        self.modules.extend(modules.into_vec());
-        if self.modules.iter().any(|module| module.path == path) {
-            self.module_file_identities
-                .insert(path.to_path_buf(), new_identity);
-        } else {
-            self.module_file_identities.remove(path);
-        }
-        self.rebuild_module_address_index();
-    }
-
-    fn rebuild_module_address_index(&mut self) {
-        self.module_address_index = build_module_address_index(&self.modules);
-    }
-
-    fn find_module_index(&self, addr: u64, executable_only: bool) -> Option<usize> {
-        let idx = self
-            .module_address_index
-            .partition_point(|entry| entry.start <= addr);
-        let entry = self.module_address_index.get(idx.checked_sub(1)?)?;
-        if addr >= entry.end {
-            return None;
-        }
-        let module = &self.modules[entry.module_index];
-        (!executable_only || module.is_executable).then_some(entry.module_index)
     }
 
     fn rebuild_symbol_manager(&mut self) {
@@ -701,57 +697,34 @@ impl SymbolizerWrapper {
         ));
     }
 
-    /// Resolve one instruction address to symbol information.
-    pub fn symbolize_one(&mut self, addr: u64) -> SymbolsRc {
-        if let Some(cached) = self.cache.get(&addr) {
-            return Rc::clone(cached);
-        }
-
-        let empty = symbols_rc(Vec::new());
-        let Some(module_idx) = self.find_module_index(addr, true) else {
-            return empty;
-        };
-        let module = &self.modules[module_idx];
-        let path = module.path.clone();
-        let image_base_opt = module.image_base;
-        let is_python_runtime = module.is_python_runtime;
-        let Some(image_base) = image_base_opt else {
-            return empty;
-        };
-
-        let Some(svma) = image_base.svma_for_avma(addr) else {
-            return empty;
-        };
-        let Some(module_offset) = image_base.relative_address(addr) else {
-            return empty;
-        };
-        let module_rc = module_name_rc(&path);
-
+    fn symbolize_lookup(&mut self, lookup: &NativeLookup) -> NativeSymbols {
+        let module = lookup.module();
+        let module_rc = module_name_rc(module.path());
+        let image = NativeImageKey::for_lookup(lookup);
         let symbols = self
             .symbolize_with_wholesym(
-                &path,
-                LookupAddress::Svma(svma),
-                module_offset,
+                image,
+                module.path(),
+                LookupAddress::Svma(lookup.image_address()),
+                lookup.relative_address(),
                 &module_rc,
-                is_python_runtime,
+                module.is_python_runtime(),
             )
             .unwrap_or_default();
-
-        let symbols_rc = symbols_rc(symbols);
-        self.cache_insert(addr, &path, Rc::clone(&symbols_rc));
-        symbols_rc
+        NativeSymbols::new(symbols)
     }
 
     fn symbolize_with_wholesym(
         &mut self,
+        image: NativeImageKey,
         path: &Path,
         lookup_address: LookupAddress,
         module_offset: u64,
         module_rc: &Rc<str>,
         is_python_runtime: bool,
     ) -> Option<Vec<NativeSymbol>> {
-        self.ensure_symbol_map_loaded(path);
-        let symbol_map = self.symbol_maps.get(path).and_then(|map| map.as_ref())?;
+        self.ensure_symbol_map_loaded(image.clone(), path);
+        let symbol_map = self.symbol_maps.get(&image).and_then(|map| map.as_ref())?;
         let addr_info = symbol_map.lookup_sync(lookup_address)?;
         let frames = match addr_info.frames {
             Some(FramesLookupResult::Available(frames)) => Some(frames),
@@ -772,8 +745,8 @@ impl SymbolizerWrapper {
         ))
     }
 
-    fn ensure_symbol_map_loaded(&mut self, path: &Path) {
-        if !self.symbol_maps.contains_key(path) {
+    fn ensure_symbol_map_loaded(&mut self, image: NativeImageKey, path: &Path) {
+        if !self.symbol_maps.contains_key(&image) {
             self.prefetch_linux_debug_redirects([path]);
 
             let disambiguator = None;
@@ -790,7 +763,7 @@ impl SymbolizerWrapper {
                     "wholesym failed to load symbols for module"
                 );
             }
-            self.symbol_maps.insert(path.to_path_buf(), loaded.ok());
+            self.symbol_maps.insert(image, loaded.ok());
         }
     }
 
@@ -858,16 +831,6 @@ mod tests {
         assert_eq!(inline_depth_for_frame(3, 2), 0);
     }
 
-    fn test_sym_module_with_range(path: &str, avma_range: Range<u64>) -> SymModule {
-        SymModule {
-            path: PathBuf::from(path),
-            avma_range,
-            image_base: Some(ModuleImageBase::new(0, 0)),
-            is_executable: true,
-            is_python_runtime: false,
-        }
-    }
-
     #[test]
     fn test_build_id_path_construction() {
         let build_id: Vec<u8> = vec![
@@ -920,150 +883,6 @@ mod tests {
         assert_eq!(found, Some(debug_file.clone()));
 
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn test_set_modules_evicts_only_changed_paths_from_symbol_cache() {
-        let keep = PathBuf::from("/tmp/libkeep.so");
-        let removed = PathBuf::from("/tmp/libremoved.so");
-        let added = PathBuf::from("/tmp/libadded.so");
-
-        let mut symbolizer = SymbolizerWrapper::new();
-        symbolizer.local_debug_dirs = Box::default();
-        symbolizer.modules = vec![
-            test_sym_module_with_range(keep.to_str().unwrap(), 0x1000..0x2000),
-            test_sym_module_with_range(removed.to_str().unwrap(), 0x3000..0x4000),
-        ];
-        let keep_symbol = symbols_rc(vec![build_native_symbol(
-            "cached".to_string(),
-            SourceLocation::default(),
-            &module_name_rc(&keep),
-            0,
-            false,
-        )]);
-        symbolizer.cache_insert(0x1234, &keep, keep_symbol);
-        symbolizer.cache_insert(0x3456, &removed, symbols_rc(Vec::new()));
-        symbolizer.symbol_maps.insert(keep.clone(), None);
-        symbolizer.symbol_maps.insert(removed.clone(), None);
-        symbolizer.redirect_cache.insert(
-            keep.clone(),
-            (
-                PathBuf::from("/usr/lib/debug/.build-id/aa/keep.debug"),
-                PathBuf::from("/tmp/debug/keep.debug"),
-            ),
-        );
-        symbolizer.redirect_cache.insert(
-            removed.clone(),
-            (
-                PathBuf::from("/usr/lib/debug/.build-id/bb/removed.debug"),
-                PathBuf::from("/tmp/debug/removed.debug"),
-            ),
-        );
-
-        symbolizer.set_modules(vec![
-            test_sym_module_with_range(keep.to_str().unwrap(), 0x1000..0x2000),
-            test_sym_module_with_range(added.to_str().unwrap(), 0x5000..0x6000),
-        ]);
-
-        assert!(symbolizer.cache.contains_key(&0x1234));
-        assert!(!symbolizer.cache.contains_key(&0x3456));
-        assert!(symbolizer.cache_keys_by_path.contains_key(&keep));
-        assert!(!symbolizer.cache_keys_by_path.contains_key(&removed));
-        assert!(symbolizer.symbol_maps.contains_key(&keep));
-        assert!(!symbolizer.symbol_maps.contains_key(&removed));
-        assert!(!symbolizer.symbol_maps.contains_key(&added));
-        assert!(symbolizer.redirect_cache.contains_key(&keep));
-        assert!(!symbolizer.redirect_cache.contains_key(&removed));
-    }
-
-    #[test]
-    fn test_missing_image_base_does_not_poison_symbol_cache() {
-        let path = PathBuf::from("/tmp/libpending.so");
-        let mut symbolizer = SymbolizerWrapper::new();
-        symbolizer.local_debug_dirs = Box::default();
-        symbolizer.set_modules(vec![SymModule {
-            path: path.clone(),
-            avma_range: 0x1000..0x2000,
-            image_base: None,
-            is_executable: true,
-            is_python_runtime: false,
-        }]);
-
-        assert!(symbolizer.symbolize_one(0x1234).is_empty());
-        assert!(!symbolizer.cache.contains_key(&0x1234));
-        assert!(!symbolizer.cache_keys_by_path.contains_key(&path));
-    }
-
-    #[test]
-    fn test_set_modules_evicts_same_path_when_file_identity_changes() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("stackpulse-symbol-cache-{unique}"));
-        let path = root.join("libchanged.so");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&path, b"old").unwrap();
-
-        let mut symbolizer = SymbolizerWrapper::new();
-        symbolizer.local_debug_dirs = Box::default();
-        let module = test_sym_module_with_range(path.to_str().unwrap(), 0x1000..0x2000);
-        symbolizer.set_modules(vec![module.clone()]);
-        symbolizer.cache_insert(0x1234, &path, symbols_rc(Vec::new()));
-        symbolizer.symbol_maps.insert(path.clone(), None);
-
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"new").unwrap();
-
-        symbolizer.set_modules(vec![module]);
-
-        assert!(!symbolizer.cache.contains_key(&0x1234));
-        assert!(!symbolizer.cache_keys_by_path.contains_key(&path));
-        assert!(!symbolizer.symbol_maps.contains_key(&path));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn test_update_modules_for_path_evicts_only_that_path_from_symbol_cache() {
-        let keep = PathBuf::from("/tmp/libkeep.so");
-        let changed = PathBuf::from("/tmp/libchanged.so");
-        let mut symbolizer = SymbolizerWrapper::new();
-        symbolizer.local_debug_dirs = Box::default();
-        symbolizer.set_modules(vec![
-            test_sym_module_with_range(keep.to_str().unwrap(), 0x1000..0x2000),
-            test_sym_module_with_range(changed.to_str().unwrap(), 0x3000..0x4000),
-        ]);
-        symbolizer.cache_insert(0x1234, &keep, symbols_rc(Vec::new()));
-        symbolizer.cache_insert(0x3456, &changed, symbols_rc(Vec::new()));
-        symbolizer.symbol_maps.insert(keep.clone(), None);
-        symbolizer.symbol_maps.insert(changed.clone(), None);
-
-        symbolizer.update_modules_for_path(
-            &changed,
-            vec![test_sym_module_with_range(
-                changed.to_str().unwrap(),
-                0x5000..0x6000,
-            )]
-            .into_boxed_slice(),
-        );
-
-        assert!(symbolizer.cache.contains_key(&0x1234));
-        assert!(!symbolizer.cache.contains_key(&0x3456));
-        assert!(symbolizer.cache_keys_by_path.contains_key(&keep));
-        assert!(!symbolizer.cache_keys_by_path.contains_key(&changed));
-        assert!(symbolizer.symbol_maps.contains_key(&keep));
-        assert!(!symbolizer.symbol_maps.contains_key(&changed));
-        assert_eq!(
-            symbolizer.find_module_index(0x5555, true),
-            Some(
-                symbolizer
-                    .modules
-                    .iter()
-                    .position(|module| module.path == changed)
-                    .unwrap()
-            )
-        );
     }
 
     #[test]
