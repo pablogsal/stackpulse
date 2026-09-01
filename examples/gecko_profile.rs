@@ -20,7 +20,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -31,13 +31,11 @@ use fxprof_processed_profile::{
 };
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
 use stackpulse::process::SuspendedLaunchedProcess;
-use stackpulse::{
-    AttachMode, FrameFlags, FrameKind, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
-    PerfSummary, PerfSymbolizer, ResolvedFrame,
-};
+use stackpulse::profile::{FrameFlags, FrameKind, ResolvedFrame};
+use stackpulse::{AttachMode, Recorder, RecorderOptions, RecordingSummary, Snapshot};
 
 const DEFAULT_OUTPUT: &str = "stackpulse_gecko.json.gz";
-const STACK_SIZE: u32 = stackpulse::MAX_SAMPLE_USER_STACK;
+const STACK_SIZE: u32 = stackpulse::record::MAX_SAMPLE_USER_STACK;
 const TRUNCATED_STACK_LABEL: &str = "[truncated stack]";
 const UNKNOWN_NATIVE_LABEL: &str = "[unknown native frame]";
 
@@ -102,7 +100,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         &[],
     )?;
     let pid = suspended.pid();
-    let pid_i32 = i32::try_from(pid).map_err(|_| invalid_input("child pid does not fit i32"))?;
+    let pid_i32 = pid.get();
     let spool = options.spool.clone().unwrap_or_else(|| {
         env::temp_dir().join(format!(
             "stackpulse-gecko-{}-{pid}.spool",
@@ -111,7 +109,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     });
 
     let (summary, command_status) = record_until_exit(&options, &spool, suspended, started_at_us)?;
-    let reader = PerfSpoolReader::open(&spool)?;
+    let reader = Snapshot::open(&spool)?;
     let profile = build_profile(&reader, &product, pid_i32, started_at, options.frequency)?;
     write_profile(&profile, &options.output)?;
 
@@ -127,7 +125,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         if summary.kernel_enabled { "on" } else { "off" },
         summary.truncated_frame_markers,
     );
-    for (kind, count) in summary.error_stats.iter_nonzero() {
+    for (kind, count) in summary.error_stats.nonzero_counts() {
         eprintln!("  err {:?}: {}", kind, count);
     }
     propagate_wait_status(command_status).map_err(Into::into)
@@ -138,28 +136,23 @@ fn record_until_exit(
     spool: &Path,
     suspended: SuspendedLaunchedProcess,
     started_at_us: u64,
-) -> Result<(PerfSummary, ExitStatus), Box<dyn std::error::Error>> {
+) -> Result<(RecordingSummary, ExitStatus), Box<dyn std::error::Error>> {
     let pid = suspended.pid();
-    let mut recorder = PerfRecorder::attach(
+    let mut recorder = Recorder::attach(
         pid,
         spool,
-        AttachMode::AttachWithEnableOnExec,
-        PerfRecorderOptions {
-            frequency: options.frequency,
-            stack_size: STACK_SIZE,
-            include_kernel: options.include_kernel,
-            inherit_child_processes: true,
-            start_timestamp_us: started_at_us,
-            sample_interval_us: (1_000_000 / u64::from(options.frequency)).max(1),
-        },
+        AttachMode::OnExec,
+        RecorderOptions::new(stackpulse::SampleRate::hz(options.frequency)?)
+            .stack_size(STACK_SIZE)
+            .include_kernel(options.include_kernel)
+            .inherit_children(true)
+            .start_timestamp_us(started_at_us)
+            .sample_interval_us((1_000_000 / u64::from(options.frequency)).max(1)),
     )?;
 
-    let running = suspended.unsuspend_and_run()?;
+    let mut running = suspended.unsuspend_and_run()?;
     let command_status = loop {
-        if !recorder.has_pending_events() {
-            recorder.wait()?;
-        }
-        recorder.consume_available()?;
+        recorder.poll(Duration::from_millis(100))?;
         if let Some(status) = running.try_wait()? {
             break status;
         }
@@ -202,7 +195,7 @@ fn propagate_wait_status(status: ExitStatus) -> io::Result<ExitCode> {
 }
 
 fn build_profile(
-    reader: &PerfSpoolReader,
+    reader: &Snapshot,
     product: &str,
     main_pid: i32,
     started_at: SystemTime,
@@ -226,16 +219,16 @@ fn build_profile(
         0,
     );
 
-    let mut symbolizer = PerfSymbolizer::for_spool(reader);
-    for stack in reader.sample_stacks() {
-        let sample = stack.sample;
+    let mut symbolizer = reader.symbolizer().build()?;
+    for stack in reader.stacks() {
+        let sample = stack.sample();
         let timestamp_ns = sample.timestamp_ns.saturating_sub(first_sample_ns);
         let timestamp = Timestamp::from_nanos_since_reference(timestamp_ns);
         let (thread, cpu_delta) = {
             let thread = state.ensure_thread(
                 &mut profile,
-                sample.process_id,
-                sample.thread_id,
+                sample.process_id.get(),
+                u64::try_from(sample.thread_id.get()).unwrap_or_default(),
                 timestamp_ns,
             );
             let cpu_delta = thread
@@ -248,7 +241,7 @@ fn build_profile(
         };
 
         let mut frames = Vec::new();
-        symbolizer.for_each_sample_stack(stack, |frame| {
+        for frame in symbolizer.resolve(stack)? {
             if matches!(
                 frame,
                 ResolvedFrame::Native(native)
@@ -258,7 +251,7 @@ fn build_profile(
             } else {
                 frames.push(GeckoFrame::Resolved(frame.clone()));
             }
-        });
+        }
         let stack = stack_handle_for_frames(
             &mut profile,
             thread,
@@ -556,7 +549,7 @@ fn parse_u32(value: OsString) -> Result<u32, String> {
 }
 
 fn default_frequency() -> u32 {
-    stackpulse::max_sample_rate()
+    stackpulse::record::max_sample_rate()
         .and_then(|limit| u32::try_from(limit.min(999)).ok())
         .filter(|&limit| limit > 0)
         .unwrap_or(999)
@@ -589,7 +582,7 @@ mod tests {
     use super::*;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::{fork, ForkResult};
-    use stackpulse::{LocationInfo, PythonFrame};
+    use stackpulse::profile::{LocationInfo, PythonFrame};
 
     #[test]
     fn command_exit_code_is_preserved() {

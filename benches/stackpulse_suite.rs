@@ -9,14 +9,27 @@ use criterion::{
 use stackpulse::bench_support::{
     self, BenchSpoolSample, LivePerfSampleFixture, SparseKernelSymbolsFixture, CURRENT_SPOOL_MAGIC,
 };
-use stackpulse::profile::{basename_start, LocationInfo, PythonFrame};
-use stackpulse::{
-    is_python_module, path_to_name, ErrorStatsFormatter, FrameMode, FrameRecord, ModuleImageBase,
-    ModulePath, ModuleRecord, NativeFrame, PerfSpoolReader, PerfSymbolizer, PerfSymbolizerBuilder,
-    PythonRuntimeRecord, ResolvedFrame, SampleErrorKind, SampleErrorStats,
+use stackpulse::profile::{
+    is_python_runtime_basename as is_python_module, LocationInfo, NativeFrame, PythonFrame,
+    ResolvedFrame,
 };
+use stackpulse::record::{SampleErrorKind, SampleErrorStats};
+use stackpulse::spool::{FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord};
+use stackpulse::symbolize::ModuleImageBase;
+use stackpulse::{Snapshot, Symbolizer, SymbolizerBuilder};
 
 const FIXTURE_VERSION: u32 = 10;
+
+fn path_to_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .or_else(|| path.to_str())
+        .unwrap_or("<unknown>")
+}
+
+fn basename_start(path: &str) -> usize {
+    path.rfind('/').map_or(0, |index| index + 1)
+}
 
 const OPEN_BATCH: u64 = 8;
 const BORROWED_ITERATE_BATCH: u64 = 64;
@@ -128,8 +141,7 @@ fn bench_spool_open(c: &mut Criterion) {
             b.iter(|| {
                 let mut checksum = 0usize;
                 for _ in 0..OPEN_BATCH {
-                    let reader =
-                        PerfSpoolReader::open(black_box(&path)).expect("open synthetic spool");
+                    let reader = Snapshot::open(black_box(&path)).expect("open synthetic spool");
                     checksum = checksum
                         .wrapping_add(reader.modules().len())
                         .wrapping_add(reader.samples().len())
@@ -148,7 +160,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
         .map(|spec| {
             (
                 *spec,
-                PerfSpoolReader::open(ensure_spool_fixture(*spec)).expect("open synthetic spool"),
+                Snapshot::open(ensure_spool_fixture(*spec)).expect("open synthetic spool"),
             )
         })
         .collect();
@@ -159,7 +171,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
         .sum::<u64>()
         * BORROWED_ITERATE_BATCH;
 
-    let mut borrowed = c.benchmark_group("stackpulse_cpu/spool/iterate/borrowed_stack_frame_refs");
+    let mut borrowed = c.benchmark_group("stackpulse_cpu/spool/iterate/borrowed_stack_frames");
     borrowed.sampling_mode(SamplingMode::Flat);
     borrowed.throughput(Throughput::Elements(borrowed_frame_count));
     borrowed.bench_function("all_scenarios", |b| {
@@ -168,11 +180,8 @@ fn bench_spool_iteration(c: &mut Criterion) {
             let mut frames = 0usize;
             for _ in 0..BORROWED_ITERATE_BATCH {
                 for (_, reader) in &readers {
-                    for sample in reader.samples() {
-                        for frame in reader
-                            .stack_frame_refs(sample.stack_id)
-                            .expect("borrow synthetic stack")
-                        {
+                    for stack in reader.stacks() {
+                        for frame in stack.frames() {
                             frames += 1;
                             checksum = checksum.wrapping_add(raw_frame_score(frame));
                         }
@@ -185,7 +194,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
     borrowed.finish();
 
     let mut context_group =
-        c.benchmark_group("stackpulse_cpu/spool/iterate/borrowed_stack_frame_contexts");
+        c.benchmark_group("stackpulse_cpu/spool/iterate/borrowed_stack_contexts");
     context_group.sampling_mode(SamplingMode::Flat);
     context_group.throughput(Throughput::Elements(borrowed_frame_count));
     context_group.bench_function("all_scenarios", |b| {
@@ -194,16 +203,13 @@ fn bench_spool_iteration(c: &mut Criterion) {
             let mut frames = 0usize;
             for _ in 0..BORROWED_ITERATE_BATCH {
                 for (_, reader) in &readers {
-                    for sample in reader.samples() {
-                        for context in reader
-                            .stack_frame_contexts(sample.process_id, sample.stack_id)
-                            .expect("borrow synthetic stack contexts")
-                        {
+                    for stack in reader.stacks() {
+                        for context in stack.contexts() {
                             frames += 1;
                             checksum = checksum
                                 .wrapping_add(raw_frame_score(context.frame))
                                 .wrapping_add(context.module.map_or(0, |module| {
-                                    module.module.id as usize ^ module.file_relative_ip as usize
+                                    module.module.id() as usize ^ module.file_relative_ip as usize
                                 }));
                         }
                     }
@@ -228,10 +234,9 @@ fn bench_spool_iteration(c: &mut Criterion) {
                 let mut checksum = 0usize;
                 let mut frames = 0usize;
                 for _ in 0..EXPANDED_ITERATE_BATCH {
-                    for sample in reader.samples() {
-                        reader
-                            .stack_frames(sample.stack_id, &mut expanded)
-                            .expect("expand synthetic stack");
+                    for stack in reader.stacks() {
+                        expanded.clear();
+                        expanded.extend(stack.frames().copied());
                         frames += expanded.len();
                         checksum = checksum.wrapping_add(raw_frames_score(&expanded));
                     }
@@ -258,13 +263,12 @@ fn bench_spool_iteration(c: &mut Criterion) {
                 for (_, reader) in &readers {
                     for sample in reader.samples() {
                         checksum = checksum
-                            .wrapping_add(reader.timestamp_us(sample) as usize)
-                            .wrapping_add(sample.process_id as usize)
-                            .wrapping_add(sample.thread_id as usize)
-                            .wrapping_add(sample.stack_id as usize);
+                            .wrapping_add(reader.timestamp_us(sample).unwrap_or(0) as usize)
+                            .wrapping_add(sample.process_id.get() as usize)
+                            .wrapping_add(sample.thread_id.get() as usize);
                     }
                     for module in reader.modules() {
-                        let path = module.path.as_str();
+                        let path = module.path().as_str();
                         checksum = checksum
                             .wrapping_add(path.len())
                             .wrapping_add(usize::from(is_python_module(basename(path))));
@@ -356,9 +360,10 @@ fn bench_symbolization(c: &mut Criterion) {
     address_group.throughput(Throughput::Elements(total_frames(&address_stacks) as u64));
     address_group.bench_function("unique_stacks", |b| {
         b.iter(|| {
-            let mut symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+            let mut symbolizer = SymbolizerBuilder::for_modules(&[])
                 .disable_perf_maps()
-                .build();
+                .build()
+                .expect("build symbolizer");
             let mut checksum = 0usize;
             for frames in &address_stacks {
                 checksum =
@@ -368,9 +373,10 @@ fn bench_symbolization(c: &mut Criterion) {
         });
     });
 
-    let mut warm_symbolizer = PerfSymbolizerBuilder::for_modules(&[])
+    let mut warm_symbolizer = SymbolizerBuilder::for_modules(&[])
         .disable_perf_maps()
-        .build();
+        .build()
+        .expect("build symbolizer");
     for frames in &address_stacks {
         let _ = score_resolved_frame_slice(&mut warm_symbolizer, 42, frames);
     }
@@ -398,11 +404,12 @@ fn bench_symbolization(c: &mut Criterion) {
         [SPOOL_SCENARIOS[0], SPOOL_SCENARIOS[1], SPOOL_SCENARIOS[3]]
             .into_iter()
             .map(|spec| {
-                let reader = PerfSpoolReader::open(ensure_spool_fixture(spec))
-                    .expect("open synthetic spool");
-                let mut symbolizer = PerfSymbolizerBuilder::for_modules(reader.modules())
+                let reader =
+                    Snapshot::open(ensure_spool_fixture(spec)).expect("open synthetic spool");
+                let mut symbolizer = SymbolizerBuilder::for_modules(reader.modules())
                     .disable_perf_maps()
-                    .build();
+                    .build()
+                    .expect("build symbolizer");
                 let _ = symbolize_reader(&reader, &mut symbolizer);
                 (spec, reader, symbolizer)
             })
@@ -438,7 +445,9 @@ fn bench_symbolization(c: &mut Criterion) {
     ));
     perf_map_group.bench_function("python_perf_map", |b| {
         b.iter(|| {
-            let mut symbolizer = PerfSymbolizer::new(&[]);
+            let mut symbolizer = SymbolizerBuilder::for_modules(&[])
+                .build()
+                .expect("build symbolizer");
             let mut checksum = 0usize;
             for stack_id in 0..PERF_MAP_BATCH {
                 checksum = checksum.wrapping_add(stack_id as usize).wrapping_add(
@@ -460,9 +469,10 @@ fn bench_symbolization(c: &mut Criterion) {
         native_group.throughput(Throughput::Elements(frames.len() as u64));
         native_group.bench_function("cold_current_exe_batch", |b| {
             b.iter(|| {
-                let mut symbolizer = PerfSymbolizerBuilder::for_modules(&modules)
+                let mut symbolizer = SymbolizerBuilder::for_modules(&modules)
                     .disable_perf_maps()
-                    .build();
+                    .build()
+                    .expect("build symbolizer");
                 black_box(score_resolved_frame_slice(
                     &mut symbolizer,
                     std::process::id() as i32,
@@ -537,10 +547,10 @@ fn bench_helpers(c: &mut Criterion) {
                     checksum = checksum.wrapping_add(path_to_name(path).len());
                 }
                 for input in basename_inputs {
-                    checksum = checksum.wrapping_add(basename_start(input) as usize);
+                    checksum = checksum.wrapping_add(basename_start(input));
                 }
                 for frame in &frames {
-                    checksum = checksum.wrapping_add(frame.func_name().len());
+                    checksum = checksum.wrapping_add(frame.display_name().len());
                 }
                 for (base, avma) in &bases {
                     checksum = checksum
@@ -559,8 +569,13 @@ fn bench_helpers(c: &mut Criterion) {
             for _ in 0..ERROR_STATS_BATCH {
                 let stats = dense_error_stats();
                 stats.record(SampleErrorKind::NativeStackRead);
-                let output = ErrorStatsFormatter::new(&stats, 100_000, 97_000).to_string();
-                checksum = checksum.wrapping_add(stats.total() as usize ^ output.len());
+                checksum = checksum.wrapping_add(
+                    stats.total() as usize
+                        ^ stats
+                            .nonzero_counts()
+                            .map(|(_, count)| count as usize)
+                            .sum::<usize>(),
+                );
             }
             black_box(checksum)
         });
@@ -630,14 +645,18 @@ fn materialize_spool_case(spec: ScenarioSpec) -> SpoolBenchCase {
         (0..spec.processes)
             .map(|process| PythonRuntimeRecord {
                 timestamp_ns: 10_000 + process as u64,
-                process_id: process_id(process),
+                process_id: stackpulse::Pid::try_from(process_id(process))
+                    .expect("valid benchmark pid"),
                 is_python_runtime: spec.include_python && process % 2 == 0,
             })
             .collect()
     } else {
         Vec::new()
     };
-    let kernel_module_id = modules.iter().find(|m| m.is_kernel).map(|m| m.id);
+    let kernel_module_id = modules
+        .iter()
+        .find(|module| module.is_kernel())
+        .map(ModuleRecord::id);
     let mut stack = Vec::with_capacity(spec.stack_depth);
     let mut samples = Vec::with_capacity(spec.samples);
     for sample_idx in 0..spec.samples {
@@ -684,37 +703,30 @@ fn synthetic_modules(spec: ScenarioSpec) -> Vec<ModuleRecord> {
         for index in 0..spec.modules_per_process {
             let id = modules.len() as u32;
             let start = process_base + index as u64 * 0x0010_0000;
-            modules.push(ModuleRecord {
-                id,
-                process_id,
-                start,
-                end: start + 0x000c_0000,
-                file_offset: (index as u64 % 4) * 0x1000,
-                inode: 100_000 + id as u64,
-                device_major: 0,
-                device_minor: 0,
-                inode_generation: 0,
-                path: module_path(spec, process, index),
-                is_kernel: false,
-            });
+            modules.push(
+                ModuleRecord::new(
+                    id,
+                    stackpulse::Pid::try_from(process_id).expect("valid benchmark pid"),
+                    start..start + 0x000c_0000,
+                    (index as u64 % 4) * 0x1000,
+                    module_path(spec, process, index),
+                )
+                .expect("valid benchmark module")
+                .file_identity(0, 0, 100_000 + id as u64, 0),
+            );
         }
     }
 
     if spec.include_kernel {
         let id = modules.len() as u32;
-        modules.push(ModuleRecord {
-            id,
-            process_id: -1,
-            start: 0xffff_ffff_8000_0000,
-            end: 0xffff_ffff_9000_0000,
-            file_offset: 0,
-            inode: 0,
-            device_major: 0,
-            device_minor: 0,
-            inode_generation: 0,
-            path: ModulePath::from("[kernel.kallsyms]"),
-            is_kernel: true,
-        });
+        modules.push(
+            ModuleRecord::kernel(
+                id,
+                0xffff_ffff_8000_0000..0xffff_ffff_9000_0000,
+                ModulePath::from("[kernel.kallsyms]"),
+            )
+            .expect("valid benchmark kernel module"),
+        );
     }
 
     modules
@@ -738,15 +750,16 @@ fn frame_in_module(
     depth: usize,
     fallback_mode: FrameMode,
 ) -> FrameRecord {
-    let span = module.end - module.start;
+    let addresses = module.address_range();
+    let span = addresses.end - addresses.start;
     let offset = ((variant as u64 * 131) + (depth as u64 * 67)) % span.saturating_sub(0x100);
-    let file_relative_ip = module.file_offset + offset;
-    let abs_ip = module.start + offset;
+    let file_relative_ip = module.file_offset() + offset;
+    let abs_ip = addresses.start + offset;
     FrameRecord {
-        module_id: Some(module.id),
+        module_id: Some(module.id()),
         file_relative_ip,
         abs_ip,
-        mode: if module.is_kernel {
+        mode: if module.is_kernel() {
             FrameMode::Kernel
         } else {
             fallback_mode
@@ -793,28 +806,37 @@ fn total_frames(stacks: &[Vec<FrameRecord>]) -> usize {
     stacks.iter().map(Vec::len).sum()
 }
 
-fn symbolize_reader(reader: &PerfSpoolReader, symbolizer: &mut PerfSymbolizer) -> usize {
+fn symbolize_reader(reader: &Snapshot, symbolizer: &mut Symbolizer) -> usize {
     let mut checksum = 0usize;
-    for stack in reader.sample_stacks() {
+    for stack in reader.stacks() {
         let mut sample_score = 0usize;
-        let frames = symbolizer.for_each_sample_stack(stack, |frame| {
+        let resolved = symbolizer.resolve(stack).expect("symbolize stack");
+        let frames = resolved.len();
+        for frame in resolved {
             sample_score = sample_score.wrapping_add(resolved_frame_score(frame));
-        });
+        }
         checksum = checksum.wrapping_add(sample_score).wrapping_add(frames);
     }
     checksum
 }
 
 fn score_resolved_frame_slice(
-    symbolizer: &mut PerfSymbolizer,
+    symbolizer: &mut Symbolizer,
     process_id: i32,
     frames: &[FrameRecord],
 ) -> usize {
     let mut score = 0usize;
-    let resolved = symbolizer.for_each_resolved_frame_slice(process_id, frames, |frame| {
+    let resolved = symbolizer
+        .resolve_raw(
+            stackpulse::Pid::try_from(process_id).expect("valid benchmark pid"),
+            frames,
+        )
+        .expect("symbolize frames");
+    let count = resolved.len();
+    for frame in resolved {
         score = score.wrapping_add(resolved_frame_score(frame));
-    });
-    score.wrapping_add(resolved)
+    }
+    score.wrapping_add(count)
 }
 
 fn raw_frames_score(frames: &[FrameRecord]) -> usize {
@@ -903,19 +925,15 @@ fn current_exe_symbolization_fixture() -> Option<(Vec<ModuleRecord>, Vec<FrameRe
     let maps = fs::read_to_string("/proc/self/maps").ok()?;
     let (start, end, file_offset, inode) = find_current_exe_mapping(&maps, &exe, abs_ip)?;
     let file_relative_ip = file_offset + abs_ip.saturating_sub(start);
-    let module = ModuleRecord {
-        id: 0,
-        process_id: std::process::id() as i32,
-        start,
-        end,
+    let module = ModuleRecord::new(
+        0,
+        stackpulse::Pid::try_from(std::process::id()).ok()?,
+        start..end,
         file_offset,
-        inode,
-        device_major: 0,
-        device_minor: 0,
-        inode_generation: 0,
-        path: exe.to_string_lossy().into_owned().into(),
-        is_kernel: false,
-    };
+        exe.to_string_lossy().into_owned(),
+    )
+    .ok()?
+    .file_identity(0, 0, inode, 0);
     let frames = current_exe_frame_batch(start, end, file_offset, abs_ip);
     let frames = if frames.is_empty() {
         vec![FrameRecord {
@@ -1001,7 +1019,10 @@ struct PerfMapFixture {
 
 impl PerfMapFixture {
     fn new(symbols: usize) -> Self {
-        let process_id = -(std::process::id() as i32) - 20_000;
+        let process_id = i32::try_from(std::process::id())
+            .expect("Linux process IDs fit in i32")
+            .checked_add(20_000)
+            .expect("benchmark process ID fits in i32");
         let path = PathBuf::from(format!("/tmp/perf-{process_id}.map"));
         let mut text = String::new();
         let mut frames = Vec::with_capacity(symbols);

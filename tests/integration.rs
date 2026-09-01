@@ -6,10 +6,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use stackpulse::{
-    is_python_module, AttachMode, FrameKind, PerfRecorder, PerfRecorderOptions, PerfSpoolReader,
-    PerfSummary, PerfSymbolizer, ResolvedFrame, SymbolOrigin,
+use stackpulse::profile::{
+    is_python_runtime_basename as is_python_module, FrameKind, ResolvedFrame, SymbolOrigin,
 };
+use stackpulse::{AttachMode, Recorder, RecorderOptions, RecordingSummary, Snapshot};
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,7 +129,7 @@ fn records_samples_from_real_python_process() -> TestResult {
             .reader
             .samples()
             .iter()
-            .any(|sample| sample.process_id == target_pid),
+            .any(|sample| sample.process_id.get() == target_pid),
         "profile should contain samples for pid {target_pid}; {}",
         capture.diagnostics()
     );
@@ -176,7 +176,7 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
             .reader
             .samples()
             .iter()
-            .any(|sample| sample.process_id == spawned_child_pid),
+            .any(|sample| sample.process_id.get() == spawned_child_pid),
         "expected inherited child pid {spawned_child_pid} in samples; seen pids: {:?}; {}",
         sample_pids(&capture.reader),
         capture.diagnostics()
@@ -367,8 +367,8 @@ impl StackAssertion {
 
 struct CapturedProfile {
     path: ProfilePath,
-    summary: PerfSummary,
-    reader: PerfSpoolReader,
+    summary: RecordingSummary,
+    reader: Snapshot,
     stacks: Vec<ResolvedSampleStack>,
 }
 
@@ -595,16 +595,15 @@ fn record_profile_with_options(
 
 fn finish_recording(
     profile_path: ProfilePath,
-    mut recorder: PerfRecorder,
+    mut recorder: Recorder,
     target_samples: u64,
 ) -> io::Result<CapturedProfile> {
     let deadline = Instant::now() + RECORD_TIMEOUT;
     while Instant::now() < deadline && recorder.summary().samples < target_samples {
-        recorder.wait()?;
-        recorder.consume_available()?;
+        recorder.poll(Duration::from_millis(100))?;
     }
     let summary = recorder.finish()?;
-    let reader = PerfSpoolReader::open(profile_path.as_ref())?;
+    let reader = Snapshot::open(profile_path.as_ref())?;
     let stacks = resolve_stacks(&reader)?;
     Ok(CapturedProfile {
         path: profile_path,
@@ -614,15 +613,12 @@ fn finish_recording(
     })
 }
 
-fn resolve_stacks(reader: &PerfSpoolReader) -> io::Result<Vec<ResolvedSampleStack>> {
-    let mut symbolizer = PerfSymbolizer::for_spool(reader);
+fn resolve_stacks(reader: &Snapshot) -> io::Result<Vec<ResolvedSampleStack>> {
+    let mut symbolizer = reader.symbolizer().build().expect("build symbolizer");
     let mut stacks = Vec::new();
-    for stack in reader.sample_stacks() {
-        let process_id = stack.sample.process_id;
-        let mut frames = Vec::new();
-        symbolizer.for_each_sample_stack(stack, |frame| {
-            frames.push(resolve_test_frame(frame));
-        });
+    for stack in reader.stacks() {
+        let process_id = stack.sample().process_id.get();
+        let frames = symbolizer.resolve(stack)?.map(resolve_test_frame).collect();
         stacks.push(ResolvedSampleStack { process_id, frames });
     }
     Ok(stacks)
@@ -638,7 +634,7 @@ fn resolve_test_frame(frame: &ResolvedFrame) -> ResolvedTestFrame {
             file: Some(frame.file_name.to_string()),
         },
         ResolvedFrame::Native(frame) => ResolvedTestFrame {
-            name: frame.func_name(),
+            name: frame.display_name(),
             kind: frame.kind,
             origin: frame.origin,
             module: frame
@@ -657,7 +653,7 @@ fn attach_recorder(
     pid: u32,
     profile_path: &Path,
     inherit_child_processes: bool,
-) -> io::Result<Option<PerfRecorder>> {
+) -> io::Result<Option<Recorder>> {
     attach_recorder_with_options(pid, profile_path, inherit_child_processes, false)
 }
 
@@ -666,18 +662,15 @@ fn attach_recorder_with_options(
     profile_path: &Path,
     inherit_child_processes: bool,
     include_kernel: bool,
-) -> io::Result<Option<PerfRecorder>> {
-    match PerfRecorder::attach(
-        pid,
+) -> io::Result<Option<Recorder>> {
+    match Recorder::attach(
+        stackpulse::Pid::try_from(pid).map_err(io::Error::other)?,
         profile_path,
-        AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions {
-            frequency: 499,
-            stack_size: 60 * 1024,
-            include_kernel,
-            inherit_child_processes,
-            ..PerfRecorderOptions::default()
-        },
+        AttachMode::StopWhileAttaching,
+        RecorderOptions::new(stackpulse::SampleRate::hz(499)?)
+            .stack_size(60 * 1024)
+            .include_kernel(include_kernel)
+            .inherit_children(inherit_child_processes),
     ) {
         Ok(recorder) => Ok(Some(recorder)),
         Err(err) if attach_is_not_allowed(&err) => {
@@ -685,13 +678,12 @@ fn attach_recorder_with_options(
                 eprintln!("skipping integration test: profiling is not allowed here: {err}");
                 Ok(None)
             } else {
-                Err(io::Error::new(
-                    err.kind(),
-                    format!("profiling is not available in CI: {err}"),
-                ))
+                Err(io::Error::other(format!(
+                    "profiling is not available in CI: {err}"
+                )))
             }
         }
-        Err(err) => Err(err),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1110,10 +1102,10 @@ fn parse_pid_line(buffer: &[u8], prefix: &str) -> io::Result<i32> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-fn attach_is_not_allowed(err: &io::Error) -> bool {
+fn attach_is_not_allowed(err: &stackpulse::Error) -> bool {
     if matches!(
         err.kind(),
-        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+        stackpulse::ErrorKind::Permission | stackpulse::ErrorKind::Unsupported
     ) {
         return true;
     }
@@ -1141,21 +1133,23 @@ fn skip_or_fail(message: &str) -> TestResult {
     }
 }
 
-fn sample_pids(reader: &PerfSpoolReader) -> Vec<i32> {
+fn sample_pids(reader: &Snapshot) -> Vec<i32> {
     let mut pids: Vec<_> = reader
         .samples()
         .iter()
-        .map(|sample| sample.process_id)
+        .map(|sample| sample.process_id.get())
         .collect();
     pids.sort_unstable();
     pids.dedup();
     pids
 }
 
-fn assert_has_python_module(reader: &PerfSpoolReader) {
+fn assert_has_python_module(reader: &Snapshot) {
     assert!(
         reader.modules().iter().any(|module| {
-            Path::new(&module.path)
+            module
+                .path()
+                .as_path()
                 .file_name()
                 .and_then(OsStr::to_str)
                 .is_some_and(is_python_module)

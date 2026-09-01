@@ -75,7 +75,7 @@ fn write_spool_samples<W: Write>(
     for runtime in python_runtime_records {
         writer.write_python_runtime(
             runtime.timestamp_ns,
-            runtime.process_id,
+            runtime.process_id.get(),
             runtime.is_python_runtime,
         )?;
     }
@@ -188,7 +188,7 @@ pub fn parse_sparse_kernel_symbols(fixture: &SparseKernelSymbolsFixture, rounds:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::{FrameMode, PerfSpoolReader};
+    use crate::spool::{FrameMode, Snapshot};
     use crate::test_support::TempDir;
     use std::fs;
 
@@ -211,7 +211,7 @@ mod tests {
         };
         let runtime = PythonRuntimeRecord {
             timestamp_ns: 1_700_000_000_000_001,
-            process_id: 42,
+            process_id: crate::Pid::new(42).unwrap(),
             is_python_runtime: true,
         };
         let frame = FrameRecord {
@@ -251,14 +251,20 @@ mod tests {
         .expect("persist spool bytes through real writer");
         let file_bytes = fs::read(&path).expect("read persisted spool bytes");
 
-        let reader = PerfSpoolReader::open(&path).expect("read generated spool");
+        let reader = Snapshot::open(&path).expect("read generated spool");
 
         assert_eq!(bytes.get(..8), Some(CURRENT_SPOOL_MAGIC.as_slice()));
         assert_eq!(file_bytes.get(..8), Some(CURRENT_SPOOL_MAGIC.as_slice()));
         assert_eq!(file_bytes, bytes);
         assert_eq!(reported_len, bytes.len());
-        assert_eq!(reader.start_timestamp_us(), FIXTURE_START_TIMESTAMP_US);
-        assert_eq!(reader.sample_interval_us(), FIXTURE_SAMPLE_INTERVAL_US);
+        assert_eq!(
+            reader.start_timestamp_us(),
+            Some(FIXTURE_START_TIMESTAMP_US)
+        );
+        assert_eq!(
+            reader.sample_interval_us(),
+            Some(FIXTURE_SAMPLE_INTERVAL_US)
+        );
         assert_eq!(reader.modules().len(), 1);
         assert_eq!(reader.modules()[0].path.as_str(), "/tmp/libstackpulse.so");
         assert_eq!(reader.modules()[0].file_offset, 0x100);
@@ -267,17 +273,20 @@ mod tests {
             reader.python_runtime_records()[0].timestamp_ns,
             runtime.timestamp_ns
         );
-        assert_eq!(reader.python_runtime_records()[0].process_id, 42);
+        assert_eq!(reader.python_runtime_records()[0].process_id.get(), 42);
         assert!(reader.python_runtime_records()[0].is_python_runtime);
         assert_eq!(reader.samples().len(), 1);
         assert_eq!(reader.samples()[0].timestamp_ns, samples[0].timestamp_ns);
-        assert_eq!(reader.samples()[0].process_id, 42);
-        assert_eq!(reader.samples()[0].thread_id, 43);
+        assert_eq!(reader.samples()[0].process_id.get(), 42);
+        assert_eq!(reader.samples()[0].thread_id.get(), 43);
 
         let mut frames = Vec::new();
-        reader
-            .stack_frames(reader.samples()[0].stack_id, &mut frames)
-            .expect("read sample stack");
+        frames.extend(
+            reader
+                .stack_frame_refs(reader.samples()[0].stack_id)
+                .expect("read sample stack")
+                .copied(),
+        );
         assert_eq!(frames, vec![frame, marker]);
     }
 

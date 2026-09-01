@@ -12,10 +12,8 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
-use stackpulse::{
-    AttachMode, ErrorStatsFormatter, FrameFlags, FrameKind, PerfRecorder, PerfRecorderOptions,
-    PerfSpoolReader, PerfSymbolizer, ResolvedFrame, SymbolOrigin,
-};
+use stackpulse::profile::{FrameFlags, FrameKind, ResolvedFrame, SymbolOrigin};
+use stackpulse::{AttachMode, Recorder, RecorderOptions, Snapshot};
 
 const TOP_FUNCS: usize = 10;
 const TOP_STACKS: usize = 6;
@@ -193,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 999 Hz is plenty for a human-readable summary. Cap to the kernel max if
     // it's lower (sample writer can choke at very high rates with kernel on).
-    let kernel_cap = stackpulse::max_sample_rate().unwrap_or(999);
+    let kernel_cap = stackpulse::record::max_sample_rate().unwrap_or(999);
     let frequency = kernel_cap.min(999) as u32;
     if frequency == 0 {
         return Err(
@@ -204,16 +202,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut recorder = PerfRecorder::attach(
-        pid,
+    let mut recorder = Recorder::attach(
+        stackpulse::Pid::try_from(pid)?,
         spool,
-        AttachMode::StopAttachEnableResume,
-        PerfRecorderOptions {
-            frequency,
-            stack_size: 32 * 1024,
-            include_kernel: true,
-            ..Default::default()
-        },
+        AttachMode::StopWhileAttaching,
+        RecorderOptions::new(stackpulse::SampleRate::hz(frequency)?)
+            .stack_size(32 * 1024)
+            .include_kernel(true),
     )?;
     let kernel_on = recorder.summary().kernel_enabled;
     let kallsyms_visible = kallsyms_addresses_visible();
@@ -246,9 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a final drain and exit promptly.
     let wait_slack = Duration::from_millis(100);
 
-    while Instant::now() + wait_slack < deadline && recorder.process_is_active(pid as i32) {
-        recorder.wait()?;
-        recorder.consume_available()?;
+    let pid = stackpulse::Pid::try_from(pid)?;
+    while Instant::now() + wait_slack < deadline && recorder.process_is_active(pid)? {
+        recorder.poll(wait_slack)?;
 
         if live && last_redraw.elapsed() >= Duration::from_millis(120) {
             let now = Instant::now();
@@ -291,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Drain once for responsive final counters. `finish()` performs the final
     // sorter flush before closing the spool.
-    recorder.consume_available()?;
+    recorder.poll(Duration::ZERO)?;
 
     if live {
         eprint!("\r\x1b[K");
@@ -299,8 +294,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let summary = recorder.finish()?;
 
-    let reader = PerfSpoolReader::open(spool)?;
-    let mut symbolizer = PerfSymbolizer::for_spool(&reader);
+    let reader = Snapshot::open(spool)?;
+    let mut symbolizer = reader.symbolizer().build()?;
 
     let mut leaf_counts: HashMap<(String, Kind), u64> = HashMap::new();
     let mut stack_counts: HashMap<Vec<(String, Kind)>, u64> = HashMap::new();
@@ -308,9 +303,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut origin_counts: HashMap<&'static str, u64> = HashMap::new();
     let mut total_frames: u64 = 0;
 
-    for stack in reader.sample_stacks() {
+    for stack in reader.stacks() {
         let mut visible = Vec::new();
-        symbolizer.for_each_sample_stack(stack, |f| {
+        for f in symbolizer.resolve(stack)? {
             total_frames += 1;
             let origin = match f {
                 ResolvedFrame::Python(_) => "perfmap",
@@ -325,9 +320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *origin_counts.entry(origin).or_default() += 1;
 
             if !is_hidden(f) {
-                visible.push((f.func_name(), classify(f)));
+                visible.push((f.display_name(), classify(f)));
             }
-        });
+        }
 
         visible.reverse();
         visible.dedup_by(|a, b| a.0 == b.0);
@@ -547,15 +542,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if summary.error_stats.has_errors() {
-        let report =
-            ErrorStatsFormatter::new(&summary.error_stats, raw_events, written).to_string();
-        let indented: String = report
-            .lines()
-            .map(|l| format!("    {l}"))
-            .collect::<Vec<_>>()
-            .join("\n");
         println!("  {}", c.dim("error stats"));
-        println!("{}", c.dim(&indented));
+        for (kind, count) in summary.error_stats.nonzero_counts() {
+            println!("    {}: {}", kind.description(), count);
+        }
     }
 
     if c.0 {

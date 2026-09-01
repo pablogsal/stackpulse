@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stackpulse::{
-    FrameRecord, PerfSpoolReader, PerfSpoolReplayReader, PerfSymbolizer, PerfSymbolizerBuilder,
-    ReplaySampleStack, ResolvedFrame, SampleStack,
-};
+use stackpulse::profile::ResolvedFrame;
+use stackpulse::spool::{FrameRecord, SampleStack};
+use stackpulse::{Replay, Snapshot, StackCache, Symbolizer};
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -37,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..options.iterations {
         if matches!(options.reader, ReaderMode::Replay) {
-            let reader = PerfSpoolReplayReader::open(&options.spool)?;
+            let reader = Replay::open(&options.spool)?;
             checksum = checksum
                 .wrapping_add(reader.modules().len())
                 .wrapping_add(reader.python_runtime_records().len());
@@ -45,26 +44,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match options.mode {
                 Mode::Open => {}
                 Mode::Read => {
-                    for stack in reader.sample_stacks() {
-                        frames += stack.frames.len();
-                        checksum = checksum.wrapping_add(raw_frame_score(stack.frames));
+                    for stack in reader.stacks() {
+                        let raw_frames = stack.frames();
+                        frames += raw_frames.len();
+                        checksum = checksum.wrapping_add(raw_frame_score(raw_frames));
                     }
                 }
                 Mode::Symbolize => {
-                    let mut symbolizer = PerfSymbolizerBuilder::for_replay(&reader)
+                    let mut symbolizer = reader
+                        .symbolizer()
                         .disable_perf_maps()
-                        .build();
-                    symbolize_replay_samples(
-                        reader.sample_stacks(),
-                        &mut symbolizer,
-                        &mut frames,
-                        &mut checksum,
-                        options.without_stack_cache,
-                    );
+                        .stack_cache(if options.without_stack_cache {
+                            StackCache::External
+                        } else {
+                            StackCache::Internal
+                        })
+                        .build()?;
+                    symbolize_samples(reader.stacks(), &mut symbolizer, &mut frames, &mut checksum);
                 }
             }
         } else {
-            let reader = PerfSpoolReader::open(&options.spool)?;
+            let reader = Snapshot::open(&options.spool)?;
             checksum = checksum
                 .wrapping_add(reader.modules().len())
                 .wrapping_add(reader.python_runtime_records().len());
@@ -72,22 +72,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match options.mode {
                 Mode::Open => {}
                 Mode::Read => {
-                    for stack in reader.sample_stacks() {
-                        frames += stack.frames.len();
-                        checksum = checksum.wrapping_add(raw_frame_score(stack.frames));
+                    for stack in reader.stacks() {
+                        let raw_frames = stack.frames();
+                        frames += raw_frames.len();
+                        checksum = checksum.wrapping_add(raw_frame_score(raw_frames));
                     }
                 }
                 Mode::Symbolize => {
-                    let mut symbolizer = PerfSymbolizerBuilder::for_spool(&reader)
+                    let mut symbolizer = reader
+                        .symbolizer()
                         .disable_perf_maps()
-                        .build();
-                    symbolize_samples(
-                        reader.sample_stacks(),
-                        &mut symbolizer,
-                        &mut frames,
-                        &mut checksum,
-                        options.without_stack_cache,
-                    );
+                        .stack_cache(if options.without_stack_cache {
+                            StackCache::External
+                        } else {
+                            StackCache::Internal
+                        })
+                        .build()?;
+                    symbolize_samples(reader.stacks(), &mut symbolizer, &mut frames, &mut checksum);
                 }
             }
         }
@@ -114,43 +115,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn symbolize_samples<'a>(
     stacks: impl IntoIterator<Item = SampleStack<'a>>,
-    symbolizer: &mut PerfSymbolizer,
+    symbolizer: &mut Symbolizer,
     frames: &mut usize,
     checksum: &mut usize,
-    without_stack_cache: bool,
 ) {
     for stack in stacks {
         let mut stack_checksum = 0_usize;
-        let visit = |frame: &ResolvedFrame| {
+        let resolved = symbolizer.resolve(stack).expect("symbolize stack");
+        let count = resolved.len();
+        for frame in resolved {
             stack_checksum = stack_checksum.wrapping_add(resolved_frame_score(frame));
-        };
-        let count = if without_stack_cache {
-            symbolizer.for_each_sample_stack_without_stack_cache(stack, visit)
-        } else {
-            symbolizer.for_each_sample_stack(stack, visit)
-        };
-        *frames += count;
-        *checksum = checksum.wrapping_add(stack_checksum);
-    }
-}
-
-fn symbolize_replay_samples<'a>(
-    stacks: impl IntoIterator<Item = ReplaySampleStack<'a>>,
-    symbolizer: &mut PerfSymbolizer,
-    frames: &mut usize,
-    checksum: &mut usize,
-    without_stack_cache: bool,
-) {
-    for stack in stacks {
-        let mut stack_checksum = 0_usize;
-        let visit = |frame: &ResolvedFrame| {
-            stack_checksum = stack_checksum.wrapping_add(resolved_frame_score(frame));
-        };
-        let count = if without_stack_cache {
-            symbolizer.for_each_replay_sample_stack_without_stack_cache(stack, visit)
-        } else {
-            symbolizer.for_each_replay_sample_stack(stack, visit)
-        };
+        }
         *frames += count;
         *checksum = checksum.wrapping_add(stack_checksum);
     }
