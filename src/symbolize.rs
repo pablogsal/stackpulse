@@ -521,6 +521,7 @@ impl Symbolizer {
     #[cfg(test)]
     fn new(modules: &[ModuleRecord]) -> Self {
         SymbolizerBuilder::for_modules(modules)
+            .perf_map_dir(std::env::temp_dir())
             .build()
             .expect("valid test modules")
     }
@@ -1302,7 +1303,10 @@ mod tests {
     }
 
     fn temp_perf_map_path(process_id: i32) -> String {
-        format!("/tmp/perf-{process_id}.map")
+        std::env::temp_dir()
+            .join(format!("perf-{process_id}.map"))
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn frame(abs_ip: u64) -> FrameRecord {
@@ -1908,6 +1912,7 @@ mod tests {
             .expect("write blocked perf map");
 
         let mut symbolizer = SymbolizerBuilder::for_modules(&[])
+            .perf_map_dir(std::env::temp_dir())
             .perf_maps_for([crate::Pid::new(allowed_process).unwrap()])
             .build()
             .unwrap();
@@ -2456,6 +2461,7 @@ mod tests {
         let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let mut symbolizer = SymbolizerBuilder::for_spool(&reader)
+            .perf_map_dir(std::env::temp_dir())
             .perf_maps_for(
                 reader
                     .python_runtime_records()
