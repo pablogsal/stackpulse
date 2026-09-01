@@ -94,6 +94,7 @@ pub struct Symbolizer {
     stack_cache_mode: StackCache,
     stack_cache: FxHashMap<StackKey, Range<usize>>,
     resolved_stack_scratch: Vec<usize>,
+    invalidated_process_ids: FxHashSet<crate::Pid>,
     invalidated_processes: Vec<crate::Pid>,
     native_factory: Option<NativeSymbolizerFactory>,
 }
@@ -660,6 +661,7 @@ impl Symbolizer {
             stack_cache_mode: StackCache::Internal,
             stack_cache: FxHashMap::default(),
             resolved_stack_scratch: Vec::new(),
+            invalidated_process_ids: FxHashSet::default(),
             invalidated_processes: Vec::new(),
             native_factory,
         })
@@ -677,9 +679,10 @@ impl Symbolizer {
             ));
         }
 
+        self.invalidated_process_ids.clear();
         self.invalidated_processes.clear();
-        let mut invalidated = FxHashSet::default();
-        invalidated.extend(batch.mapping_processes().iter().copied());
+        self.invalidated_process_ids
+            .extend(batch.mapping_processes().iter().copied());
 
         if !batch.modules().is_empty() {
             for module in batch.modules() {
@@ -707,7 +710,7 @@ impl Symbolizer {
                 );
             }
             if changed && had_map {
-                invalidated.insert(*process);
+                self.invalidated_process_ids.insert(*process);
             }
         }
 
@@ -726,13 +729,15 @@ impl Symbolizer {
             self.resolved_stack_scratch.clear();
         } else {
             self.frame_cache.retain(|(process_id, _), _| {
-                !invalidated.iter().any(|pid| pid.get() == *process_id)
+                !crate::Pid::new(*process_id)
+                    .is_some_and(|pid| self.invalidated_process_ids.contains(&pid))
             });
             self.stack_cache
-                .retain(|key, _| !invalidated.contains(&key.process_id()));
+                .retain(|key, _| !self.invalidated_process_ids.contains(&key.process_id()));
         }
 
-        self.invalidated_processes.extend(invalidated);
+        self.invalidated_processes
+            .extend(self.invalidated_process_ids.iter().copied());
         Ok(Invalidation {
             all,
             processes: &self.invalidated_processes,
@@ -1084,6 +1089,7 @@ impl Symbolizer {
                 }
                 let template = NativeModule::from_recording(
                     module.path.clone(),
+                    module.start..module.end,
                     image_base,
                     is_python_runtime,
                     NativeFileIdentity::new(

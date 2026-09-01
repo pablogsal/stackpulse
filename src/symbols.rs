@@ -44,6 +44,7 @@ struct NativeImage {
 pub(crate) struct NativeModuleData {
     pub(crate) path: ModulePath,
     pub(crate) name: Rc<str>,
+    pub(crate) address_range: std::ops::Range<u64>,
     pub(crate) image_base: ModuleImageBase,
     pub(crate) is_python_runtime: bool,
     pub(crate) file_identity: NativeFileIdentity,
@@ -84,6 +85,7 @@ impl NativeModule {
     ) -> Self {
         Self::from_recording(
             path.into(),
+            0..u64::MAX,
             ModuleImageBase::new(0, 0),
             false,
             file_identity,
@@ -94,6 +96,7 @@ impl NativeModule {
 
     pub(crate) fn from_recording(
         path: ModulePath,
+        address_range: std::ops::Range<u64>,
         image_base: ModuleImageBase,
         is_python_runtime: bool,
         file_identity: NativeFileIdentity,
@@ -105,6 +108,7 @@ impl NativeModule {
             data: Rc::new(NativeModuleData {
                 path,
                 name,
+                address_range,
                 image_base,
                 is_python_runtime,
                 file_identity,
@@ -162,14 +166,22 @@ impl NativeModule {
         self.image.as_ref().map(|image| image.path.as_path())
     }
 
+    /// Return the process-absolute address range for this mapping.
+    #[must_use]
+    pub fn address_range(&self) -> std::ops::Range<u64> {
+        self.data.address_range.clone()
+    }
+
+    /// Return the correlated runtime and static image bases.
+    #[must_use]
+    pub fn image_base(&self) -> ModuleImageBase {
+        self.data.image_base
+    }
+
     /// Return whether this image is the Python runtime.
     #[must_use]
     pub fn is_python_runtime(&self) -> bool {
         self.data.is_python_runtime
-    }
-
-    pub(crate) fn image_base(&self) -> ModuleImageBase {
-        self.data.image_base
     }
 
     /// Return the recorded filesystem identity.
