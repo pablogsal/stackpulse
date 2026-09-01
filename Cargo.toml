@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
