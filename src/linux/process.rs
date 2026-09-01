@@ -38,11 +38,16 @@ impl SuspendedLaunchedProcess {
     /// Fork a child process that waits before executing `command_name`.
     ///
     /// This lets the parent attach a recorder before the child starts running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when arguments contain a NUL byte or the process and
+    /// synchronization pipes cannot be created.
     pub fn launch_in_suspended_state(
         command_name: &OsStr,
         command_args: &[OsString],
         env_vars: &[(OsString, OsString)],
-    ) -> io::Result<Self> {
+    ) -> crate::Result<Self> {
         let argv_strings: Vec<CString> = std::iter::once(command_name)
             .chain(command_args.iter().map(OsString::as_os_str))
             .map(cstring_from_os_str)
@@ -52,12 +57,12 @@ impl SuspendedLaunchedProcess {
             .then(|| build_env(env_vars))
             .transpose()?;
         let envp: Option<Vec<*const c_char>> = envp_strings.as_deref().map(null_terminated_ptrs);
-        let (resume_rp, resume_sp) = pipe2(OFlag::O_CLOEXEC)?;
-        let (execerr_rp, execerr_sp) = pipe2(OFlag::O_CLOEXEC)?;
+        let (resume_rp, resume_sp) = pipe2(OFlag::O_CLOEXEC).map_err(nix_error)?;
+        let (execerr_rp, execerr_sp) = pipe2(OFlag::O_CLOEXEC).map_err(nix_error)?;
 
         // SAFETY: The child branch enters run_child immediately. Before exec it
         // performs no Rust allocation or locking and only uses pre-created FDs.
-        match unsafe { fork() }? {
+        match unsafe { fork() }.map_err(nix_error)? {
             ForkResult::Child => {
                 drop((resume_sp, execerr_rp));
                 Self::run_child(resume_rp, execerr_sp, &argv, envp.as_deref())
@@ -67,7 +72,7 @@ impl SuspendedLaunchedProcess {
                 let Some(public_pid) = Pid::new(child.as_raw()) else {
                     drop((resume_sp, execerr_rp));
                     reap(child);
-                    return Err(io::Error::other("fork returned a non-positive child pid"));
+                    return Err(io::Error::other("fork returned a non-positive child pid").into());
                 };
                 Ok(Self {
                     pid: child,
@@ -89,8 +94,12 @@ impl SuspendedLaunchedProcess {
     const EXECERR_MSG_FOOTER: [u8; 4] = *b"NOEX";
 
     /// Allow the child to execute and return a handle for waiting on it.
-    pub fn unsuspend_and_run(mut self) -> io::Result<RunningProcess> {
-        let result = self.unsuspend_inner();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the child cannot be resumed or `exec` fails.
+    pub fn unsuspend_and_run(mut self) -> crate::Result<RunningProcess> {
+        let result = self.unsuspend_inner().map_err(crate::Error::from);
         if result.is_err() {
             // Reap the child on any failure after we took ownership of the
             // pipes; Drop's reap path is gated on the pipes still being Some.
@@ -198,6 +207,10 @@ fn waitpid_retry(pid: NixPid, flags: Option<WaitPidFlag>) -> nix::Result<WaitSta
     }
 }
 
+fn nix_error(error: Errno) -> crate::Error {
+    io::Error::from(error).into()
+}
+
 fn reap(pid: NixPid) {
     let _ = waitpid_retry(pid, None);
 }
@@ -259,7 +272,11 @@ impl std::fmt::Debug for RunningProcess {
 
 impl RunningProcess {
     /// Check whether the process has exited without blocking.
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `waitpid` fails or reports an invalid state.
+    pub fn try_wait(&mut self) -> crate::Result<Option<ExitStatus>> {
         let pid = match self.state {
             ChildState::Running(pid) => pid,
             ChildState::Exited(status) => return Ok(Some(status)),
@@ -272,16 +289,23 @@ impl RunningProcess {
                 self.state = ChildState::Exited(status);
                 Ok(Some(status))
             }
-            Err(err) => Err(err.into()),
+            Err(err) => Err(nix_error(err)),
         }
     }
 
     /// Wait until the process exits.
-    pub fn wait(mut self) -> io::Result<ExitStatus> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `waitpid` fails or reports an invalid state.
+    pub fn wait(mut self) -> crate::Result<ExitStatus> {
         match std::mem::replace(&mut self.state, ChildState::Waited) {
-            ChildState::Running(pid) => process_exit_status(waitpid_retry(pid, None)?),
+            ChildState::Running(pid) => {
+                let status = waitpid_retry(pid, None).map_err(nix_error)?;
+                Ok(process_exit_status(status)?)
+            }
             ChildState::Exited(status) => Ok(status),
-            ChildState::Waited => Err(io::Error::other("process was already waited")),
+            ChildState::Waited => Err(io::Error::other("process was already waited").into()),
         }
     }
 }

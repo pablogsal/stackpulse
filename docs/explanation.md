@@ -231,7 +231,8 @@ Sampling has predictable limits:
   is restricted to PIDs whose latest runtime record marks them as Python.
 
 Check `RecordingSummary` before interpreting a profile. It reports the sample count,
-lost events, empty stacks, truncation markers, and unwind errors.
+lost events, effective data-ring capacity, empty stacks, truncation markers, and
+unwind errors.
 
 ## Overhead
 

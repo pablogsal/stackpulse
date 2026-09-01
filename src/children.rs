@@ -29,12 +29,16 @@ pub fn discover_descendant_edges(root: Pid) -> Vec<(Pid, Pid)> {
 }
 
 pub(crate) fn discover_descendant_edges_raw(root: i32) -> Vec<(i32, i32)> {
-    descendant_edges_via_proc_children(root).unwrap_or_else(|| descendant_edges_via_stat(root))
+    discover_descendant_edges_raw_for_roots(&[root])
 }
 
-fn descendant_edges_via_proc_children(root: i32) -> Option<Vec<(i32, i32)>> {
-    let mut visited = std::collections::HashSet::from([root]);
-    let mut stack = vec![root];
+pub(crate) fn discover_descendant_edges_raw_for_roots(roots: &[i32]) -> Vec<(i32, i32)> {
+    descendant_edges_via_proc_children(roots).unwrap_or_else(|| descendant_edges_via_stat(roots))
+}
+
+fn descendant_edges_via_proc_children(roots: &[i32]) -> Option<Vec<(i32, i32)>> {
+    let mut visited: std::collections::HashSet<_> = roots.iter().copied().collect();
+    let mut stack = roots.to_vec();
     let mut out = Vec::new();
     while let Some(parent) = stack.pop() {
         let children = read_children_fast(parent)?;
@@ -73,11 +77,11 @@ fn discover_children_via_proc_children(entries: std::fs::ReadDir) -> Option<Vec<
     any_children_file_read.then_some(children)
 }
 
-fn descendant_edges_via_stat(root: i32) -> Vec<(i32, i32)> {
-    descendant_edges_via_stat_from_proc(root, Path::new("/proc"))
+fn descendant_edges_via_stat(roots: &[i32]) -> Vec<(i32, i32)> {
+    descendant_edges_via_stat_from_proc(roots, Path::new("/proc"))
 }
 
-fn descendant_edges_via_stat_from_proc(root: i32, proc_root: &Path) -> Vec<(i32, i32)> {
+fn descendant_edges_via_stat_from_proc(roots: &[i32], proc_root: &Path) -> Vec<(i32, i32)> {
     let mut children_of: std::collections::HashMap<i32, Vec<i32>> =
         std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -97,10 +101,14 @@ fn descendant_edges_via_stat_from_proc(root: i32, proc_root: &Path) -> Vec<(i32,
     }
 
     let mut out = Vec::new();
-    let mut stack = vec![root];
+    let mut visited: std::collections::HashSet<_> = roots.iter().copied().collect();
+    let mut stack = roots.to_vec();
     while let Some(pid) = stack.pop() {
         if let Some(kids) = children_of.get(&pid) {
             for &kid in kids {
+                if !visited.insert(kid) {
+                    continue;
+                }
                 out.push((kid, pid));
                 stack.push(kid);
             }
@@ -190,10 +198,31 @@ mod tests {
         }
         fs::create_dir_all(temp.path().join("self")).expect("create non-pid proc entry");
 
-        let mut descendants = descendant_edges_via_stat_from_proc(10, temp.path());
+        let mut descendants = descendant_edges_via_stat_from_proc(&[10], temp.path());
         descendants.sort_unstable();
 
         assert_eq!(descendants, vec![(11, 10), (12, 10), (13, 11)]);
+    }
+
+    #[test]
+    fn multi_root_stat_scan_visits_shared_descendants_once() {
+        let temp = TempDir::new("proc-stat-multi-root");
+        for (pid, stat) in [
+            (10, "10 (root) S 1 1 1 1"),
+            (11, "11 (tracked child) S 10 1 1 1"),
+            (12, "12 (grandchild) S 11 1 1 1"),
+            (20, "20 (other root) S 1 1 1 1"),
+            (21, "21 (other child) S 20 1 1 1"),
+        ] {
+            let dir = temp.path().join(pid.to_string());
+            fs::create_dir_all(&dir).expect("create proc pid dir");
+            fs::write(dir.join("stat"), stat).expect("write proc stat");
+        }
+
+        let mut descendants = descendant_edges_via_stat_from_proc(&[10, 11, 20], temp.path());
+        descendants.sort_unstable();
+
+        assert_eq!(descendants, vec![(12, 11), (21, 20)]);
     }
 
     #[test]

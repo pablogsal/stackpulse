@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -35,17 +37,37 @@ impl From<&ModuleRecord> for ModuleIdentity {
     }
 }
 
-struct ModuleSlot {
-    module: ModuleRecord,
-    active: bool,
+#[derive(Default)]
+pub(crate) struct ModuleTable {
+    active: FxHashMap<u32, ModuleRecord>,
+    next_id: usize,
+    active_by_key: FxHashMap<ModuleIdentity, u32>,
+    active_by_process: FxHashMap<i32, ProcessModules>,
+    index: ModuleIndex,
+    index_dirty: bool,
 }
 
 #[derive(Default)]
-pub(crate) struct ModuleTable {
-    slots: Vec<ModuleSlot>,
-    active_by_key: FxHashMap<ModuleIdentity, u32>,
-    index: ModuleIndex,
-    index_dirty: bool,
+struct ProcessModules {
+    by_start: BTreeSet<(u64, u32)>,
+}
+
+impl ProcessModules {
+    fn insert(&mut self, module: &ModuleRecord) {
+        self.by_start.insert((module.start, module.id));
+    }
+
+    fn remove(&mut self, module: &ModuleRecord) {
+        self.by_start.remove(&(module.start, module.id));
+    }
+
+    fn len(&self) -> usize {
+        self.by_start.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_start.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -60,7 +82,17 @@ pub(crate) struct ModuleActivation {
     pub(crate) source_module_id: Option<u32>,
 }
 
+pub(crate) struct ClonedProcessModules {
+    pub(crate) update: ModuleUpdate,
+    pub(crate) inherited_unwinder_layout: bool,
+}
+
 impl ModuleTable {
+    #[cfg(test)]
+    pub(crate) fn active_module_count(&self) -> usize {
+        self.active.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn intern_module<W: Write>(
         &mut self,
@@ -76,17 +108,17 @@ impl ModuleTable {
 
     pub(crate) fn process_modules_match(&self, process_id: i32, snapshot: &[ModuleRecord]) -> bool {
         let active_count = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                slot.active && slot.module.pid().is_some_and(|pid| pid.get() == process_id)
-            })
-            .count();
+            .active_by_process
+            .get(&process_id)
+            .map_or(0, ProcessModules::len);
+        if active_count != snapshot.len() {
+            return false;
+        }
         let matched: FxHashSet<_> = snapshot
             .iter()
             .filter_map(|module| self.find_compatible_active(module))
             .collect();
-        active_count == snapshot.len() && matched.len() == snapshot.len()
+        matched.len() == snapshot.len()
     }
 
     pub(crate) fn apply_module<W: Write>(
@@ -100,7 +132,7 @@ impl ModuleTable {
         if let Some(id) = self.find_compatible_active(&module) {
             return Ok(ModuleUpdate {
                 active: vec![ModuleActivation {
-                    module: self.slots[id as usize].module.clone(),
+                    module: self.active[&id].clone(),
                     source_module_id: None,
                 }],
                 ..ModuleUpdate::default()
@@ -117,14 +149,12 @@ impl ModuleTable {
         // fragments before activating the replacement.
         if let Some(module_pid) = module.pid() {
             let overlapping: Vec<_> = self
-                .slots
-                .iter()
-                .filter(|slot| {
-                    slot.active
-                        && slot.module.pid() == Some(module_pid)
-                        && module_ranges_overlap(&slot.module, &module)
+                .overlapping_module_ids(module_pid.get(), &module)
+                .into_iter()
+                .filter_map(|id| {
+                    let known = &self.active[&id];
+                    module_ranges_overlap(known, &module).then(|| (id, known.clone()))
                 })
-                .map(|slot| (slot.module.id, slot.module.clone()))
                 .collect();
             if !overlapping.is_empty() {
                 let survivors: Vec<_> = overlapping
@@ -136,10 +166,10 @@ impl ModuleTable {
                     })
                     .collect();
                 for (id, known) in overlapping {
-                    let slot = &mut self.slots[id as usize];
-                    debug_assert!(slot.active);
-                    slot.active = false;
+                    let removed = self.active.remove(&id);
+                    debug_assert!(removed.is_some());
                     self.active_by_key.remove(&ModuleIdentity::from(&known));
+                    self.remove_process_active(&known);
                     writer.write_module_deactivation_one(id)?;
                     update.retired.push(known);
                 }
@@ -147,7 +177,7 @@ impl ModuleTable {
                 for (source_id, survivor) in survivors {
                     let id = self.intern_without_overlap(survivor, writer)?;
                     update.active.push(ModuleActivation {
-                        module: self.slots[id as usize].module.clone(),
+                        module: self.active[&id].clone(),
                         source_module_id: Some(source_id),
                     });
                 }
@@ -156,7 +186,7 @@ impl ModuleTable {
 
         let id = self.intern_without_overlap(module, writer)?;
         update.active.push(ModuleActivation {
-            module: self.slots[id as usize].module.clone(),
+            module: self.active[&id].clone(),
             source_module_id: None,
         });
         Ok(update)
@@ -168,14 +198,27 @@ impl ModuleTable {
             if module.inode_generation != 0 {
                 return None;
             }
-            self.slots
+            if let Some(pid) = module.pid() {
+                return self
+                    .active_by_process
+                    .get(&pid.get())?
+                    .by_start
+                    .range((module.start, 0)..=(module.start, u32::MAX))
+                    .map(|(_, id)| *id)
+                    .find(|id| {
+                        let known = &self.active[id];
+                        known.inode_generation != 0
+                            && same_mapping_except_inode_generation(known, module)
+                    });
+            }
+            self.active
                 .iter()
-                .find(|slot| {
-                    slot.active
-                        && slot.module.inode_generation != 0
-                        && same_mapping_except_inode_generation(&slot.module, module)
+                .filter(|(_, known)| {
+                    known.inode_generation != 0
+                        && same_mapping_except_inode_generation(known, module)
                 })
-                .map(|slot| slot.module.id)
+                .map(|(&id, _)| id)
+                .min()
         })
     }
 
@@ -188,14 +231,18 @@ impl ModuleTable {
         if let Some(&id) = self.active_by_key.get(&key) {
             return Ok(id);
         }
-        let id = next_spool_id(self.slots.len(), "module")?;
+        let id = next_spool_id(self.next_id, "module")?;
         module.id = id;
         writer.write_module(&module)?;
+        self.next_id += 1;
         self.active_by_key.insert(key, id);
-        self.slots.push(ModuleSlot {
-            module,
-            active: true,
-        });
+        if let Some(pid) = module.pid() {
+            self.active_by_process
+                .entry(pid.get())
+                .or_default()
+                .insert(&module);
+        }
+        self.active.insert(id, module);
         self.index_dirty = true;
         Ok(id)
     }
@@ -204,21 +251,57 @@ impl ModuleTable {
         &mut self,
         process_id: i32,
         writer: &mut PerfSpoolWriter<W>,
+        mut retire: impl FnMut(u32),
     ) -> io::Result<()> {
-        let mut changed = false;
-        for slot in &mut self.slots {
-            if slot.active && slot.module.pid().is_some_and(|pid| pid.get() == process_id) {
-                changed = true;
-                slot.active = false;
-                self.active_by_key
-                    .remove(&ModuleIdentity::from(&slot.module));
-            }
+        let Some(active_ids) = self.active_by_process.remove(&process_id) else {
+            return Ok(());
+        };
+        for &(_, id) in &active_ids.by_start {
+            let module = self.active.remove(&id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active process module index was inconsistent",
+                )
+            })?;
+            self.active_by_key.remove(&ModuleIdentity::from(&module));
         }
-        self.index_dirty |= changed;
-        if changed {
-            writer.write_module_deactivation(process_id)?;
+        self.index_dirty = true;
+        writer.write_module_deactivation(process_id)?;
+        for (_, id) in active_ids.by_start {
+            retire(id);
         }
         Ok(())
+    }
+
+    pub(crate) fn process_module_ids(&self, process_id: i32) -> Vec<u32> {
+        self.active_by_process
+            .get(&process_id)
+            .map(|modules| modules.by_start.iter().map(|(_, id)| *id).collect())
+            .unwrap_or_default()
+    }
+
+    fn overlapping_module_ids(&self, process_id: i32, module: &ModuleRecord) -> Vec<u32> {
+        let Some(modules) = self.active_by_process.get(&process_id) else {
+            return Vec::new();
+        };
+        let mut overlapping = Vec::new();
+        if let Some(&(_, id)) = modules
+            .by_start
+            .range(..=(module.start, u32::MAX))
+            .next_back()
+        {
+            if self.active[&id].end > module.start {
+                overlapping.push(id);
+            }
+        }
+        overlapping.extend(
+            modules
+                .by_start
+                .range((Excluded((module.start, u32::MAX)), Unbounded))
+                .take_while(|(start, _)| *start < module.end)
+                .map(|(_, id)| *id),
+        );
+        overlapping
     }
 
     pub(crate) fn clone_process_modules<W: Write>(
@@ -226,39 +309,46 @@ impl ModuleTable {
         parent_process_id: i32,
         child_process_id: i32,
         writer: &mut PerfSpoolWriter<W>,
-    ) -> io::Result<Vec<ModuleUpdate>> {
+    ) -> io::Result<ClonedProcessModules> {
         let child_pid = crate::Pid::try_from(child_process_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let inherited: Vec<_> = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                slot.active
-                    && slot
-                        .module
-                        .pid()
-                        .is_some_and(|pid| pid.get() == parent_process_id)
-            })
-            .map(|slot| {
-                (
-                    slot.module.id,
-                    ModuleRecord {
-                        id: 0,
-                        owner: ModuleOwner::Process(child_pid),
-                        ..slot.module.clone()
-                    },
-                )
-            })
-            .collect();
-        let mut updates = Vec::with_capacity(inherited.len());
-        for (source_id, inherited) in inherited {
-            let mut update = self.apply_module(inherited, writer)?;
-            if let Some(activation) = update.active.last_mut() {
+        let source_ids = self.process_module_ids(parent_process_id);
+        let mut combined = ModuleUpdate {
+            active: Vec::with_capacity(source_ids.len()),
+            ..ModuleUpdate::default()
+        };
+        let child_has_modules = self.active_by_process.contains_key(&child_process_id);
+        for source_id in source_ids {
+            let inherited = ModuleRecord {
+                id: 0,
+                owner: ModuleOwner::Process(child_pid),
+                ..self.active[&source_id].clone()
+            };
+            if child_has_modules {
+                let mut update = self.apply_module(inherited, writer)?;
+                let activation = update.active.last_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "inherited module produced no activation",
+                    )
+                })?;
                 activation.source_module_id = Some(source_id);
+                combined.mapping_changed |= update.mapping_changed;
+                combined.retired.extend(update.retired);
+                combined.active.extend(update.active);
+            } else {
+                let id = self.intern_without_overlap(inherited, writer)?;
+                combined.active.push(ModuleActivation {
+                    module: self.active[&id].clone(),
+                    source_module_id: Some(source_id),
+                });
+                combined.mapping_changed = true;
             }
-            updates.push(update);
         }
-        Ok(updates)
+        Ok(ClonedProcessModules {
+            update: combined,
+            inherited_unwinder_layout: !child_has_modules,
+        })
     }
 
     pub(crate) fn resolve_frame(
@@ -271,7 +361,7 @@ impl ModuleTable {
         let module = self
             .index
             .find(process_id, abs_ip, mode)
-            .and_then(|id| self.slots.get(id as usize).map(|slot| (id, &slot.module)));
+            .and_then(|id| self.active.get(&id).map(|module| (id, module)));
         let (module_id, file_relative_ip) = module
             .and_then(|(id, module)| {
                 abs_ip
@@ -297,8 +387,23 @@ impl ModuleTable {
 
     fn rebuild_index_if_needed(&mut self) {
         if self.index_dirty {
-            self.index = ModuleIndex::build(&self.slots);
+            let mut active_ids: Vec<_> = self.active.keys().copied().collect();
+            active_ids.sort_unstable();
+            self.index = ModuleIndex::build(&self.active, active_ids.into_iter());
             self.index_dirty = false;
+        }
+    }
+
+    fn remove_process_active(&mut self, module: &ModuleRecord) {
+        let Some(pid) = module.pid() else {
+            return;
+        };
+        let pid = pid.get();
+        if let Some(ids) = self.active_by_process.get_mut(&pid) {
+            ids.remove(module);
+            if ids.is_empty() {
+                self.active_by_process.remove(&pid);
+            }
         }
     }
 }
@@ -346,10 +451,10 @@ struct ModuleIndex {
 }
 
 impl ModuleIndex {
-    fn build(slots: &[ModuleSlot]) -> Self {
+    fn build(active: &FxHashMap<u32, ModuleRecord>, active_ids: impl Iterator<Item = u32>) -> Self {
         let mut index = Self::default();
-        for slot in slots.iter().filter(|slot| slot.active) {
-            let module = &slot.module;
+        for id in active_ids {
+            let module = &active[&id];
             let entry = ModuleIndexEntry {
                 start: module.start,
                 end: module.end,

@@ -22,7 +22,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_SYNTHETIC_IMAGE_ID: AtomicU64 = AtomicU64::new(1 << 63);
 
 /// Module information for symbolization.
 #[derive(Clone, Debug)]
@@ -66,7 +69,30 @@ pub struct NativeFileIdentity {
 pub struct NativeImageId(u64);
 
 impl NativeModule {
-    pub(crate) fn new(
+    /// Construct a module value for testing a custom native symbolizer.
+    ///
+    /// `mapping_id` should be unique within the synthetic spool fixture. Each
+    /// call receives a distinct opaque [`NativeImageId`], even when its path
+    /// and file identity match another module. The synthetic module has an
+    /// image base of zero, is not marked as a Python runtime, and has no
+    /// [`Self::image_path`]. Recorded modules are constructed by StackPulse.
+    #[must_use]
+    pub fn new(
+        path: impl Into<ModulePath>,
+        file_identity: NativeFileIdentity,
+        mapping_id: u32,
+    ) -> Self {
+        Self::from_recording(
+            path.into(),
+            ModuleImageBase::new(0, 0),
+            false,
+            file_identity,
+            mapping_id,
+            NEXT_SYNTHETIC_IMAGE_ID.fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn from_recording(
         path: ModulePath,
         image_base: ModuleImageBase,
         is_python_runtime: bool,
@@ -123,12 +149,14 @@ impl NativeModule {
         &self.data.name
     }
 
-    /// Return a process-local path to the validated mapped image, when the
-    /// image came from a file.
+    /// Return a process-local path to the exact validated mapped image.
     ///
-    /// The path remains valid while this module is alive. It can differ from
-    /// [`Self::path`] when the recorded pathname was replaced or came from
-    /// another mount namespace.
+    /// This is `Some` only on Linux when StackPulse successfully reopened and
+    /// retained the file backing a recorded mapping. It is `None` for synthetic
+    /// modules, anonymous or deleted mappings that could not be reopened, and
+    /// modules loaded from a spool without a validated file descriptor. The
+    /// returned `/proc/self/fd/...` path remains valid while this module is
+    /// alive and can differ from [`Self::path`].
     #[must_use]
     pub fn image_path(&self) -> Option<&Path> {
         self.image.as_ref().map(|image| image.path.as_path())
@@ -164,7 +192,11 @@ impl NativeModule {
 }
 
 impl NativeFileIdentity {
-    pub(crate) const fn new(
+    /// Construct a recorded filesystem identity.
+    ///
+    /// Use zeros for fields unavailable in a synthetic test fixture.
+    #[must_use]
+    pub const fn new(
         device_major: u32,
         device_minor: u32,
         inode: u64,
@@ -214,6 +246,28 @@ pub struct NativeLookup {
 }
 
 impl NativeLookup {
+    /// Construct one request for testing a custom native symbolizer.
+    ///
+    /// The addresses have the same meanings as their accessors. StackPulse
+    /// computes them for recorded frames; fixture authors are responsible for
+    /// keeping them consistent with the synthetic module.
+    #[must_use]
+    pub fn new(
+        process_id: crate::Pid,
+        module: NativeModule,
+        absolute_address: u64,
+        relative_address: u64,
+        image_address: u64,
+    ) -> Self {
+        Self {
+            process_id,
+            module,
+            absolute_address,
+            relative_address,
+            image_address,
+        }
+    }
+
     /// Return the process that owns the mapping.
     #[must_use]
     pub fn process_id(&self) -> crate::Pid {
@@ -984,6 +1038,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_native_fixture_constructors_preserve_identity_and_addresses() {
+        let identity = NativeFileIdentity::new(8, 1, 42, 3);
+        let first = NativeModule::new("/fixture/libexample.so", identity, 7);
+        let second = NativeModule::new("/fixture/libexample.so", identity, 8);
+        assert_ne!(first.image_id(), second.image_id());
+        assert_eq!(first.file_identity(), identity);
+        assert_eq!(first.mapping_id(), 7);
+        assert_eq!(first.path(), Path::new("/fixture/libexample.so"));
+        assert!(first.image_path().is_none());
+
+        let pid = crate::Pid::new(42).unwrap();
+        let lookup = NativeLookup::new(pid, first, 0x1200, 0x200, 0x2200);
+        assert_eq!(lookup.process_id(), pid);
+        assert_eq!(lookup.absolute_address(), 0x1200);
+        assert_eq!(lookup.relative_address(), 0x200);
+        assert_eq!(lookup.image_address(), 0x2200);
+        assert_eq!(lookup.file_identity(), identity);
+        assert_eq!(lookup.mapping_id(), 7);
+    }
+
+    #[test]
     fn block_on_runtime_falls_back_to_a_thread_inside_tokio() {
         let outer = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
@@ -1075,7 +1150,7 @@ mod tests {
             .map(|symbol| symbol.address())
             .unwrap();
         let file = Arc::new(std::fs::File::open(&binary).unwrap());
-        let module = NativeModule::new(
+        let module = NativeModule::from_recording(
             binary.to_string_lossy().into_owned().into(),
             ModuleImageBase::new(0, 0),
             false,

@@ -43,6 +43,13 @@ impl ElfSectionData {
             range,
         })
     }
+
+    pub(crate) fn owned_storage_identity(&self) -> Option<(usize, usize)> {
+        match &self.storage {
+            ElfSectionStorage::Owned(data) => Some((data.as_ptr() as usize, data.len())),
+            ElfSectionStorage::Mmap(_) => None,
+        }
+    }
 }
 
 impl Deref for ElfSectionData {
@@ -132,5 +139,18 @@ mod tests {
         let end = 1;
         assert!(ElfSectionData::mmap(mmap.clone(), start..end).is_none());
         assert!(ElfSectionData::mmap(mmap, 0..6).is_none());
+    }
+
+    #[test]
+    fn owned_ranges_report_the_shared_backing_allocation() {
+        let data: Arc<[u8]> = vec![1, 2, 3, 4, 5].into();
+        let first = ElfSectionData::owned_range(Arc::clone(&data), 0..2).unwrap();
+        let second = ElfSectionData::owned_range(data, 2..5).unwrap();
+
+        assert_eq!(
+            first.owned_storage_identity(),
+            second.owned_storage_identity()
+        );
+        assert_eq!(first.owned_storage_identity().unwrap().1, 5);
     }
 }

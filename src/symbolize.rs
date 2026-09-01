@@ -616,6 +616,12 @@ impl Symbolizer {
 
     /// Resolve one sample stack and borrow its resolved frames.
     ///
+    /// A result can be provisional when opening a validated native image fails
+    /// with a retryable error. StackPulse does not permanently cache that
+    /// fallback frame, so resolving the stack again after the image becomes
+    /// available can return more specific symbols. Callers using
+    /// [`StackCache::External`] should apply the same rule to their own cache.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-input error when `stack` belongs to another spool.
@@ -686,6 +692,9 @@ impl Symbolizer {
     }
 
     /// Resolve a caller-owned raw frame slice without retaining a stack entry.
+    ///
+    /// A fallback caused by a retryable native-image open failure is
+    /// provisional and can improve on a later call.
     ///
     /// # Errors
     ///
@@ -938,7 +947,7 @@ impl Symbolizer {
                         ..NativeLookupPreparation::default()
                     };
                 }
-                let template = NativeModule::new(
+                let template = NativeModule::from_recording(
                     module.path.clone(),
                     image_base,
                     is_python_runtime,

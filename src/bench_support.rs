@@ -49,7 +49,7 @@ pub fn write_spool_samples_to_memory(
     python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
     capacity: usize,
-) -> io::Result<usize> {
+) -> crate::Result<usize> {
     let bytes = write_spool_samples_to_writer(
         Vec::with_capacity(capacity.max(1024)),
         modules,
@@ -65,11 +65,11 @@ pub fn write_spool_samples_to_path(
     modules: &[ModuleRecord],
     python_runtime_records: &[PythonRuntimeRecord],
     samples: &[BenchSpoolSample],
-) -> io::Result<()> {
+) -> crate::Result<()> {
     let mut writer =
         PerfSpoolWriter::create(path, FIXTURE_START_TIMESTAMP_US, FIXTURE_SAMPLE_INTERVAL_US)?;
     write_spool_samples(&mut writer, modules, python_runtime_records, samples)?;
-    writer.flush()
+    Ok(writer.flush()?)
 }
 
 fn write_spool_samples_to_writer<W: Write>(
@@ -151,11 +151,27 @@ pub fn parse_live_perf_samples(fixture: &LivePerfSampleFixture, rounds: u64) -> 
 }
 
 #[doc(hidden)]
+pub fn consume_perf_ring_records(
+    fixture: &LivePerfSampleFixture,
+    ring_count: usize,
+    rounds: u64,
+) -> crate::Result<usize> {
+    Ok(linux::bench_perf_ring_record_lifecycle(
+        &fixture.inner,
+        ring_count,
+        rounds,
+    )?)
+}
+
+#[doc(hidden)]
 pub fn replay_live_perf_ring_records_to_spool(
     fixture: &LivePerfSampleFixture,
     rounds: u64,
-) -> io::Result<usize> {
-    linux::bench_replay_live_perf_ring_records(&fixture.inner, rounds)
+) -> crate::Result<usize> {
+    Ok(linux::bench_replay_live_perf_ring_records(
+        &fixture.inner,
+        rounds,
+    )?)
 }
 
 #[doc(hidden)]
