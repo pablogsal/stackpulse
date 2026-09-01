@@ -36,13 +36,13 @@ fn record(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && recorder.process_is_active(pid) {
+    while Instant::now() < deadline && recorder.process_is_active(pid)? {
         recorder.poll(Duration::from_millis(100))?;
     }
     recorder.finish()?;
 
     let reader = Snapshot::open("profile.spool")?;
-    let mut symbolizer = reader.symbolizer().build();
+    let mut symbolizer = reader.symbolizer().build()?;
 
     for stack in reader.stacks().take(10) {
         println!("pid={} tid={}", stack.pid(), stack.tid());
@@ -62,7 +62,7 @@ you stop polling, the kernel buffers fill and subsequent samples appear as
 Samples reference stack IDs, not inline frame data, which is why profiles
 stay small when hot code keeps producing the same stacks. It is also why you
 should reuse a single [`Symbolizer`](crate::Symbolizer): it caches resolved frames keyed by
-`(process_id, stack_id)`.
+the opaque [`StackKey`](crate::spool::StackKey).
 
 ## Capture process startup
 
@@ -74,7 +74,7 @@ first instruction, launch the child suspended, attach with
 use std::ffi::{OsStr, OsString};
 use std::time::{Duration, Instant};
 use stackpulse::{
-    process::SuspendedLaunchedProcess, AttachMode, Pid, Recorder, RecorderOptions,
+    process::SuspendedLaunchedProcess, AttachMode, Recorder, RecorderOptions,
     SampleRate,
 };
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,13 +87,13 @@ let launched = SuspendedLaunchedProcess::launch_in_suspended_state(
 )?;
 
 let mut recorder = Recorder::attach(
-    Pid::try_from(launched.pid())?,
+    launched.pid(),
     "startup.spool",
     AttachMode::OnExec,
     RecorderOptions::new(SampleRate::hz(199)?).stack_size(60 * 1024),
 )?;
 
-let running = launched.unsuspend_and_run()?;
+let mut running = launched.unsuspend_and_run()?;
 let timeout = Instant::now() + Duration::from_secs(30);
 
 let status = loop {
@@ -124,7 +124,7 @@ use std::collections::BTreeMap;
 use stackpulse::Snapshot;
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = Snapshot::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build();
+let mut symbolizer = reader.symbolizer().build()?;
 let mut counts = BTreeMap::<String, u64>::new();
 
 for stack in reader.stacks() {

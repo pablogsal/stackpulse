@@ -112,19 +112,17 @@ record references.
 
 | Method | What it returns |
 | --- | --- |
-| `start_timestamp_us()` | Profile timeline anchor stored in the spool header. |
+| `start_timestamp_us()` | Optional profile timeline anchor stored in the spool header. |
 | `sample_interval_us()` | Optional sample interval metadata stored in the spool header. |
 | `modules()` | Recorded executable memory ranges. |
 | `frames()` | Interned raw frame records. Useful for precomputing symbolization caches. |
 | `samples()` | Timestamped samples. |
 | `python_runtime_records()` | Python-runtime status changes. |
 | `recovered_from_truncated_tail()` | Whether the spool ended mid-record and the reader kept only the intact prefix. |
-| `kernel_frame_addresses()` | Iterator over absolute kernel IPs in interned frames. Used by [`Symbolizer::for_spool`](crate::Symbolizer::for_spool) for sparse `kallsyms` loading. |
-| `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`](crate::spool::FrameRecord)s for an interned stack without copying. |
-| `stack_frame_contexts(pid, stack_id)` | Borrow raw frames with recorded module context for an interned stack. |
+| `kernel_frame_addresses()` | Iterator over absolute kernel IPs in interned frames. |
 | `stacks()` | Iterate samples with borrowed raw stacks. |
-| `stack_frames(stack_id, out)` | Expand an interned stack into [`FrameRecord`](crate::spool::FrameRecord)s. Clears `out` first. |
-| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds. |
+| `stack(index)` | Borrow one indexed sample with its raw stack. |
+| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds, or `None` without an anchor. |
 
 Frame iteration order is leaf to root. `FrameModuleRef::file_relative_ip` and
 `FrameRecord::file_relative_ip` share the same file-offset coordinate space,
@@ -140,7 +138,7 @@ scans validated records with constant additional memory.
 
 | Method | What it returns |
 | --- | --- |
-| `start_timestamp_us()` | Profile timeline anchor stored in the spool header. |
+| `start_timestamp_us()` | Optional profile timeline anchor stored in the spool header. |
 | `sample_interval_us()` | Optional sample interval metadata stored in the spool header. |
 | `modules()` | Recorded executable memory ranges. |
 | `frames()` | Interned raw frame records. |
@@ -149,24 +147,22 @@ scans validated records with constant additional memory.
 | `stacks()` | Sequential iterator of [`SampleStack`](crate::spool::SampleStack) values with borrowed raw frames. |
 | `python_runtime_records()` | Python-runtime status changes. |
 | `recovered_from_truncated_tail()` | Whether the spool ended mid-record and only the intact prefix is available. |
-| `stack_frame_refs(stack_id)` | Borrow raw [`FrameRecord`](crate::spool::FrameRecord)s for an interned stack without copying. |
-| `stack_frame_contexts(pid, stack_id)` | Borrow raw frames with their recorded module context. |
-| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds. |
+| `timestamp_us(sample)` | Sample timestamp in profile-timeline microseconds, or `None` without an anchor. |
 
 The spool file must not be truncated or modified while either reader is alive.
 Use [`Snapshot`](crate::Snapshot) when sample random access is required.
 
 ### [`ModuleRecord`](crate::spool::ModuleRecord)
 
-| Field | Meaning |
+| Accessor | Meaning |
 | --- | --- |
-| `id` | Stable module ID within this profile. |
-| `process_id` | Owning PID (or a kernel marker for kernel code). |
-| `start`, `end` | Runtime address range. |
-| `file_offset` | File offset matching `start`. |
-| `inode` | Backing file inode, when known. |
-| `path` | Path or display name as [`ModulePath`](crate::spool::ModulePath). Spool-read paths can borrow from the mmap-backed profile. |
-| `is_kernel` | Whether this mapping is a kernel range. |
+| `id()` | Stable module ID within this profile. |
+| `pid()` | Owning PID, or `None` for kernel code. |
+| `address_range()` | Runtime address range. |
+| `file_offset()` | File offset matching the mapping start. |
+| `inode()` and device accessors | Recorded file identity, when known. |
+| `path()` | Path or display name as [`ModulePath`](crate::spool::ModulePath). Spool-read paths can borrow from the mmap-backed profile. |
+| `is_kernel()` | Whether this mapping is a kernel range. |
 
 ### [`FrameRecord`](crate::spool::FrameRecord)
 
@@ -188,7 +184,6 @@ native unwinding stopped before the stack root. Use
 | `timestamp_ns` | Monotonic perf timestamp (ns). |
 | `process_id` | PID. |
 | `thread_id` | TID. |
-| `stack_id` | Pass to [`Snapshot::stack_frames`](crate::Snapshot::stack_frames). |
 
 ### [`PythonRuntimeRecord`](crate::spool::PythonRuntimeRecord)
 
@@ -206,17 +201,17 @@ Resolves raw frames into displayable frames. Reuse one symbolizer per profile.
 
 | Constructor or method | Use |
 | --- | --- |
-| `new(modules)` | Default: ELF, kernel symbols, plus Python perf maps for any PID. |
-| `for_spool(reader)` | Create a symbolizer for a loaded spool, including sparse kernel-symbol loading. |
-| `for_replay(reader)` | Create a symbolizer for a sequential replay reader. |
+| `source.symbolizer()` | Configure a symbolizer associated with a [`Replay`](crate::Replay) or [`Snapshot`](crate::Snapshot). |
 | `SymbolizerBuilder::for_modules(modules)` | Configure symbolization for module records. |
-| `SymbolizerBuilder::for_spool(reader)` | Configure symbolization with spool metadata. |
-| `SymbolizerBuilder::for_replay(reader)` | Configure symbolization with sequential replay metadata. |
+| `SymbolizerBuilder::from_modules(modules)` | Transfer an owned module table without copying it. |
 | `disable_perf_maps()` | Disable Python perf-map lookup. |
 | `perf_maps_for(pids)` | Allow perf maps only for the listed PIDs. |
 | `perf_map_dir(path)` | Read preserved `perf-<pid>.map` files from `path` instead of `/tmp`. |
 | `native(factory)` | Replace the bundled native symbolizer with a [`NativeSymbolizer`](crate::symbolize::NativeSymbolizer). |
+| `kernel_symbols(source)` | Use host symbols, a preserved `kallsyms` file, or no kernel symbols. |
 | `stack_cache(mode)` | Choose whether StackPulse or the caller caches resolved stacks. |
+| `build()` | Validate the configuration and construct the symbolizer. |
+| `has_native_backend()` | Report whether native ELF symbolization is configured. |
 | `resolve(stack)` | Resolve a [`SampleStack`](crate::spool::SampleStack) and return borrowed frames as a [`ResolvedStack`](crate::symbolize::ResolvedStack). |
 | `resolve_raw(pid, frames)` | Resolve a caller-owned raw-frame slice without retaining a stack entry. |
 
@@ -332,6 +327,24 @@ directory.
 | `interrupt_process(pid)` | `SIGINT`. |
 | `kill_process(pid)` | `SIGKILL`. |
 
+## Workflow errors
+
+Recording, spool reading, and symbolization return
+[`stackpulse::Result`](crate::Result). Inspect [`Error::kind`](crate::Error::kind)
+for stable control flow and include a wildcard arm when matching
+[`ErrorKind`](crate::ErrorKind), which is non-exhaustive.
+
+[`Error::frequency_limit`](crate::Error::frequency_limit) returns the requested
+and permitted rates for a frequency-limit failure. [`Error::io_error`](crate::Error::io_error)
+and [`Error::raw_os_error`](crate::Error::raw_os_error) retain OS details. A
+custom native symbolizer's concrete error remains in the standard
+[`Error::source`](std::error::Error::source) chain and can be downcast there.
+
+Converting a StackPulse error into [`std::io::Error`] preserves the StackPulse
+error as the inner source while mapping its category to the closest
+[`std::io::ErrorKind`]. Prefer the crate error when exact classification
+matters.
+
 ## Error statistics
 
 [`SampleErrorStats`](crate::record::SampleErrorStats) records per-kind failures. It can
@@ -342,10 +355,10 @@ be cloned or reset.
 | [`SampleErrorKind`](crate::record::SampleErrorKind) | Native-unwinding failure kinds (register capture, missing user registers, stack read, stack truncation, framehop errors). |
 | `record(kind)` | Bump a counter. |
 | `record_with_log(kind, ctx)` | Bump and emit a throttled debug log. |
-| `get(kind)` | Read one counter. |
+| `count(kind)` | Read one counter. |
 | `total()` | Sum across kinds. |
 | `has_errors()` | Report whether any counter is non-zero. |
-| `iter_nonzero()` | Iterate the non-zero counters. |
+| `nonzero_counts()` | Iterate the non-zero counters. |
 | `reset()` | Zero everything. |
 
 ## Constants and helpers
@@ -353,11 +366,10 @@ be cloned or reset.
 | Item | Meaning |
 | --- | --- |
 | [`MAX_SAMPLE_USER_STACK`](crate::record::MAX_SAMPLE_USER_STACK) | Maximum user stack bytes perf will accept. |
-| [`max_sample_rate`](crate::max_sample_rate) | Reads `/proc/sys/kernel/perf_event_max_sample_rate`, `None` if unavailable. |
-| [`is_python_module`](crate::is_python_module) | Report whether a basename looks like a Python executable or `libpython`. |
-| [`path_to_name`](crate::path_to_name) | Display name from a path. |
+| [`max_sample_rate`](crate::record::max_sample_rate) | Reads `/proc/sys/kernel/perf_event_max_sample_rate`, `None` if unavailable. |
+| [`is_python_runtime_basename`](crate::profile::is_python_runtime_basename) | Report whether a basename looks like a Python executable or `libpython`. |
 | [`ModuleImageBase`](crate::symbolize::ModuleImageBase) | Translates runtime AVMA addresses to static VMAs. |
-| [`PerfFrequencyLimit`](crate::PerfFrequencyLimit) | Error payload when requested frequency exceeds the kernel cap. |
+| [`PerfFrequencyLimit`](crate::record::PerfFrequencyLimit) | Error payload when requested frequency exceeds the kernel cap. |
 
 ## Spool format invariants
 

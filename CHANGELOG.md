@@ -9,16 +9,19 @@
 - Rustdoc now links tutorials, recipes, reference material, design notes, and the SPULSE format contract. GitHub Pages publishes the generated documentation.
 - Perf-map parsing moved to `symbolize::perf_map`; executable module tracking moved to `linux::module_tracking`.
 - AArch64 unwinding now strips pointer-authentication bits from recovered return addresses.
+- Recording, spool reading, and symbolization now use the `Recorder`, `Snapshot`, `Replay`, and `Symbolizer` APIs. Typed `Pid` and `Tid` values reject invalid identifiers at the boundary, and `Recorder::poll` combines waiting with event draining.
+- Native symbolizers now receive batched `NativeLookup` requests. `Symbolizer::resolve` returns borrowed resolved stacks and supports caller-owned stack caching.
+- Recording, spool reading, and symbolization return `stackpulse::Result`, whose `ErrorKind` separates invalid input, permissions, spool corruption, frequency limits, unsupported behavior, and native-symbolizer failures.
 
 ## 0.8.0 - 2026-08-22
 
 ### Added
 
-- Consumers that provide a `native_symbolizer_factory` can omit Stackpulse's Wholesym and Tokio dependencies by disabling the default `builtin-wholesym` feature.
+- Consumers that provide a `native_symbolizer_factory` can omit StackPulse's Wholesym and Tokio dependencies by disabling the default `builtin-wholesym` feature.
 
 ### Changed
 
-- `RunningProcess` returns `std::process::ExitStatus` instead of Nix's `WaitStatus`, and Stackpulse now uses Nix 0.31 internally.
+- `RunningProcess` returns `std::process::ExitStatus` instead of Nix's `WaitStatus`, and StackPulse now uses Nix 0.31 internally.
 - Framehop is built without Mach-O and PE unwind support.
 
 ## 0.7.1 - 2026-08-20

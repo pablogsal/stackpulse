@@ -20,13 +20,13 @@ let mut recorder = Recorder::attach(
 )?;
 
 let deadline = Instant::now() + Duration::from_secs(10);
-while Instant::now() < deadline && recorder.process_is_active(pid) {
+while Instant::now() < deadline && recorder.process_is_active(pid)? {
     recorder.poll(Duration::from_millis(100))?;
 }
 recorder.finish()?;
 
 let reader = Snapshot::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build();
+let mut symbolizer = reader.symbolizer().build()?;
 
 for stack in reader.stacks() {
     for frame in symbolizer.resolve(stack)? {
@@ -44,8 +44,8 @@ for stack in reader.stacks() {
 | [`Recorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
 | [`Snapshot`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
 | [`Replay`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
-| [`Symbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`NativeSymbolizer`]. |
-| [`NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`Symbolizer`] still handles kernel and perf-map frames. |
+| [`Symbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`symbolize::NativeSymbolizer`]. |
+| [`symbolize::NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`Symbolizer`] still handles kernel and perf-map frames. |
 | [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
 
 The recorder writes a self-contained spool file. Symbolization reads it later
@@ -57,7 +57,7 @@ and can run on another host if the same binaries and perf maps are available.
 - A module is an executable memory range: a binary, shared object,
   anonymous JIT mapping, or kernel range.
 - A raw frame is an address recorded in the spool file.
-- A resolved frame is a displayable [`ResolvedFrame`] produced by
+- A resolved frame is a displayable [`profile::ResolvedFrame`] produced by
   [`Symbolizer`].
 - A spool file is the compact on-disk profile written by [`Recorder`].
 
@@ -72,8 +72,8 @@ application that already has its own symbol pipeline can skip
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = stackpulse::Snapshot::open("profile.spool")?;
 
-for sample in reader.samples() {
-    for context in reader.stack_frame_contexts(sample.process_id, sample.stack_id)? {
+for stack in reader.stacks() {
+    for context in stack.contexts() {
         let ip = context.frame.abs_ip;
         if let Some(module) = context.module {
             // Pass `ip`, `module.module`, and `module.file_relative_ip` to your symbolizer.
@@ -84,20 +84,20 @@ for sample in reader.samples() {
 # }
 ```
 
-`stack_frame_contexts` does not symbolize anything. It binds each borrowed raw
+`SampleStack::contexts` does not symbolize anything. It binds each borrowed raw
 frame to the module mapping StackPulse recorded at capture time, which is what
 an external symbolizer needs to translate the address, even across remaps.
 
 # Sequential replay
 
 For large profiles, use [`Replay`] to avoid retaining every
-[`SampleRecord`] in memory:
+[`spool::SampleRecord`] in memory:
 
 ```rust,no_run
 use stackpulse::Replay;
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = Replay::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build();
+let mut symbolizer = reader.symbolizer().build()?;
 
 for stack in reader.stacks() {
     for frame in symbolizer.resolve(stack)? {
@@ -117,9 +117,9 @@ random access to `samples()`.
 # Plugging in an external native symbolizer
 
 The default constructors install the bundled `wholesym` backend for native
-ELF symbol lookup. To replace it, implement [`NativeSymbolizer`] and pass a
+ELF symbol lookup. To replace it, implement [`symbolize::NativeSymbolizer`] and pass a
 factory to [`SymbolizerBuilder::native`]. StackPulse groups native lookups by
-process and passes them to the backend in batches. Each [`NativeLookup`]
+process and passes them to the backend in batches. Each [`symbolize::NativeLookup`]
 contains the selected module and the absolute, relative, and image addresses:
 
 ```rust,no_run
@@ -148,7 +148,7 @@ impl NativeSymbolizer for MySymbolizer {
 let reader = Snapshot::open("profile.spool")?;
 let mut symbolizer = reader.symbolizer()
     .native(|_pid| MySymbolizer { /* ... */ })
-    .build();
+    .build()?;
 # Ok(())
 # }
 ```
@@ -156,7 +156,9 @@ let mut symbolizer = reader.symbolizer()
 Kernel frames (`/proc/kallsyms`) and Python or JIT perf maps
 (`/tmp/perf-<pid>.map`) stay inside [`Symbolizer`]; the plug-in only sees
 native module addresses. Consumers that always supply a native symbolizer can
-disable StackPulse's default features to omit `wholesym` and Tokio.
+disable StackPulse's default features to omit `wholesym` and Tokio. In that
+configuration [`Symbolizer::has_native_backend`] is `false` until `native(...)`
+installs one; native frames otherwise resolve to address-only values.
 
 # Runtime requirements
 

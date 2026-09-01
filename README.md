@@ -49,13 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && recorder.process_is_active(pid) {
+    while Instant::now() < deadline && recorder.process_is_active(pid)? {
         recorder.poll(Duration::from_millis(100))?;
     }
     recorder.finish()?;
 
     let reader = Snapshot::open("profile.spool")?;
-    let mut symbolizer = reader.symbolizer().build();
+    let mut symbolizer = reader.symbolizer().build()?;
 
     if let Some(stack) = reader.stacks().next() {
         for frame in symbolizer.resolve(stack)? {

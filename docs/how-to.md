@@ -41,7 +41,7 @@ Call `poll` regularly while the target runs:
 # use std::time::Duration;
 # use stackpulse::{Pid, Recorder};
 # fn run(pid: Pid, mut recorder: Recorder) -> stackpulse::Result<()> {
-while recorder.process_is_active(pid) {
+while recorder.process_is_active(pid)? {
     recorder.poll(Duration::from_millis(100))?;
 }
 let summary = recorder.finish()?;
@@ -76,9 +76,8 @@ To pick up everything under a known root:
 
 ```rust,no_run
 # use stackpulse::AttachMode;
-# fn run(mut recorder: stackpulse::Recorder, root_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
+# fn run(mut recorder: stackpulse::Recorder, root_pid: stackpulse::Pid) -> Result<(), Box<dyn std::error::Error>> {
 for child in stackpulse::children::discover_all_descendants(root_pid) {
-    let child = stackpulse::Pid::try_from(child)?;
     recorder.attach_process(child, AttachMode::StopWhileAttaching)?;
 }
 # Ok(())
@@ -119,7 +118,7 @@ One symbolizer per profile, reused for every sample:
 ```rust,no_run
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = stackpulse::Snapshot::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build();
+let mut symbolizer = reader.symbolizer().build()?;
 
 for stack in reader.stacks() {
     for frame in symbolizer.resolve(stack)? {
@@ -142,7 +141,7 @@ distinguishes resolved symbols from address-only fallbacks.
 ## Use your own symbolizer
 
 If your application already owns symbolization, skip [`Symbolizer`](crate::Symbolizer)
-entirely. `stack_frame_contexts` yields each raw frame together with the
+entirely. [`SampleStack::contexts`](crate::spool::SampleStack::contexts) yields each raw frame together with the
 module mapping recorded at capture time, which is everything an external
 symbolizer needs:
 
@@ -150,8 +149,8 @@ symbolizer needs:
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let reader = stackpulse::Snapshot::open("profile.spool")?;
 
-for sample in reader.samples() {
-    for context in reader.stack_frame_contexts(sample.process_id, sample.stack_id)? {
+for stack in reader.stacks() {
+    for context in stack.contexts() {
         let frame = context.frame;
         let module = context.module;
         // Resolve `frame.abs_ip` using your own native, JIT, or kernel symbolizer.
@@ -162,8 +161,8 @@ for sample in reader.samples() {
 # }
 ```
 
-When raw addresses and sample metadata are enough, `stacks()` is
-lighter because it skips the module lookup:
+When raw addresses and sample metadata are enough, `frames()` is lighter
+because it skips the module lookup:
 
 ```rust,no_run
 # fn run(reader: &stackpulse::Snapshot) {
@@ -195,7 +194,7 @@ To avoid stale perf maps from PID reuse, restrict lookup to processes the
 recorder last saw as Python runtimes:
 
 ```rust,no_run
-# fn run(reader: &stackpulse::Snapshot) {
+# fn run(reader: &stackpulse::Snapshot) -> stackpulse::Result<()> {
 let mut python_pids = std::collections::BTreeSet::new();
 for runtime in reader.python_runtime_records() {
     if runtime.is_python_runtime {
@@ -207,7 +206,8 @@ for runtime in reader.python_runtime_records() {
 
 let mut symbolizer = reader.symbolizer()
     .perf_maps_for(python_pids)
-    .build();
+    .build()?;
+# Ok(())
 # }
 ```
 
@@ -217,10 +217,11 @@ avoids accepting an older Python status after a PID is reused.
 Or skip perf maps entirely:
 
 ```rust,no_run
-# fn run(reader: &stackpulse::Snapshot) {
+# fn run(reader: &stackpulse::Snapshot) -> stackpulse::Result<()> {
 let mut symbolizer = reader.symbolizer()
     .disable_perf_maps()
-    .build();
+    .build()?;
+# Ok(())
 # }
 ```
 
@@ -250,6 +251,24 @@ if !summary.kernel_enabled {
 
 Kernel names come from `/proc/kallsyms` when readable; otherwise kernel
 frames render as addresses.
+
+For cross-host analysis, preserve the recording host's address-bearing
+`kallsyms` data and select it explicitly:
+
+```rust,no_run
+use stackpulse::symbolize::KernelSymbolSource;
+# fn run(reader: &stackpulse::Replay) -> stackpulse::Result<()> {
+let symbolizer = reader
+    .symbolizer()
+    .kernel_symbols(KernelSymbolSource::File("recording.kallsyms".into()))
+    .build()?;
+# let _ = symbolizer;
+# Ok(())
+# }
+```
+
+Use `KernelSymbolSource::Disabled` when resolving against the analysis host's
+kernel would be misleading.
 
 ## Diagnose bad profiles
 
@@ -282,7 +301,7 @@ For a breakdown:
 
 ```rust,no_run
 # fn run(summary: &stackpulse::RecordingSummary) {
-for (kind, count) in summary.error_stats.iter_nonzero() {
+for (kind, count) in summary.error_stats.nonzero_counts() {
     println!("{}: {count}", kind.description());
 }
 # }
