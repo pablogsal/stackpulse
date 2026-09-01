@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
@@ -13,6 +14,7 @@ mod modules;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
+    ThreadRecord,
 };
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
@@ -30,6 +32,11 @@ const REC_PYTHON_RUNTIME: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
 const MAX_REPLAY_SAMPLE_RANGES: usize = 512 * 1024;
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_source_id() -> u64 {
+    NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+}
 // Pinned frames use even tags and unpinned frames use 1 or 3, leaving 5 as a
 // distinct marker outside both frame encodings.
 const TRUNCATED_STACK_MARKER_TAG: u64 = 5;
@@ -42,7 +49,7 @@ struct StackNodeRecord {
     depth: usize,
 }
 
-pub struct PerfSpoolWriter<W: Write> {
+pub(crate) struct PerfSpoolWriter<W: Write> {
     writer: W,
     last_timestamp_ns: u64,
     // Frames pinned to a module id resolve through that id on the read side
@@ -58,7 +65,7 @@ pub struct PerfSpoolWriter<W: Write> {
 }
 
 impl PerfSpoolWriter<BufWriter<File>> {
-    pub fn create<P: AsRef<Path>>(
+    pub(crate) fn create<P: AsRef<Path>>(
         path: P,
         start_timestamp_us: u64,
         sample_interval_us: u64,
@@ -97,7 +104,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer
     }
 
-    pub fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
+    pub(crate) fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
         self.writer.write_all(&[REC_MODULE])?;
         self.writer.write_varint(module.id as u64)?;
         self.writer.write_varint(module.process_id as i64)?;
@@ -114,7 +121,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(())
     }
 
-    pub fn write_sample_frames<I>(
+    pub(crate) fn write_sample_frames<I>(
         &mut self,
         timestamp_ns: u64,
         process_id: i32,
@@ -145,7 +152,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(Some(stack_id))
     }
 
-    pub fn write_python_runtime(
+    pub(crate) fn write_python_runtime(
         &mut self,
         timestamp_ns: u64,
         process_id: i32,
@@ -171,7 +178,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 
@@ -248,19 +255,20 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 }
 
-/// Reader for spool files written by [`crate::PerfRecorder`].
-pub struct PerfSpoolReader {
+/// Reader for spool files written by [`crate::Recorder`].
+pub struct Snapshot {
     definitions: SpoolDefinitions,
+    threads: Vec<ThreadRecord>,
     samples: Vec<SampleRecord>,
 }
 
-/// Sequential replay reader for spool files written by [`crate::PerfRecorder`].
+/// Sequential replay reader for spool files written by [`crate::Recorder`].
 ///
-/// Unlike [`PerfSpoolReader`], this reader validates sample metadata without
+/// Unlike [`Snapshot`], this reader validates sample metadata without
 /// retaining it. Iteration decodes samples again from the memory-mapped spool.
-pub struct PerfSpoolReplayReader {
+pub struct Replay {
     definitions: SpoolDefinitions,
-    threads: Vec<(i32, u64)>,
+    threads: Vec<ThreadRecord>,
     mmap: Arc<Mmap>,
     sample_ranges: Box<[Range<usize>]>,
     scan_start: Option<ReplayScanStart>,
@@ -268,7 +276,32 @@ pub struct PerfSpoolReplayReader {
     first_sample_timestamp_ns: Option<u64>,
 }
 
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("modules", &self.definitions.modules.len())
+            .field("frames", &self.definitions.frames.len())
+            .field("threads", &self.threads.len())
+            .field("samples", &self.samples.len())
+            .field("truncated_tail", &self.definitions.truncated_tail)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Replay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replay")
+            .field("modules", &self.definitions.modules.len())
+            .field("frames", &self.definitions.frames.len())
+            .field("threads", &self.threads.len())
+            .field("samples", &self.sample_count)
+            .field("truncated_tail", &self.definitions.truncated_tail)
+            .finish()
+    }
+}
+
 struct SpoolDefinitions {
+    source_id: u64,
     start_timestamp_us: u64,
     sample_interval_us: u64,
     modules: Vec<ModuleRecord>,
@@ -280,11 +313,11 @@ struct SpoolDefinitions {
 }
 
 impl SpoolDefinitions {
-    fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
+    fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrames<'_>> {
         let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
             invalid_data(format!("sample references missing stack node {stack_id}"))
         })?;
-        Ok(StackFrameRefs {
+        Ok(StackFrames {
             frames: &self.frames,
             stack_nodes: &self.stack_nodes,
             current: Some(stack_id),
@@ -296,11 +329,20 @@ impl SpoolDefinitions {
         clippy::expect_used,
         reason = "replay sample stack ids are validated during reader construction"
     )]
-    fn replay_sample_stack(&self, sample: SampleRecord) -> ReplaySampleStack<'_> {
+    fn sample_stack(&self, sample: SampleRecord) -> SampleStack<'_> {
         let frames = self
             .stack_frame_refs(sample.stack_id)
             .expect("sample stack ids were validated while opening the spool");
-        ReplaySampleStack { sample, frames }
+        SampleStack {
+            definitions: self,
+            key: StackKey {
+                source_id: self.source_id,
+                process_id: sample.process_id,
+                stack_id: sample.stack_id,
+            },
+            sample,
+            frames,
+        }
     }
 
     fn module_for_frame(
@@ -400,36 +442,115 @@ pub struct FrameContext<'a> {
 }
 
 /// Borrowed raw frames with recorded module context for one interned stack.
+#[derive(Clone)]
 pub struct StackFrameContexts<'a> {
     definitions: &'a SpoolDefinitions,
     process_id: i32,
-    frames: StackFrameRefs<'a>,
+    frames: StackFrames<'a>,
+}
+
+impl std::fmt::Debug for StackFrameContexts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StackFrameContexts")
+            .field("process_id", &self.process_id)
+            .field("remaining", &self.frames.len())
+            .finish()
+    }
+}
+
+/// Opaque identity for one interned stack in one spool source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StackKey {
+    source_id: u64,
+    process_id: crate::Pid,
+    stack_id: u32,
+}
+
+impl StackKey {
+    /// Return the process that owns this stack.
+    #[must_use]
+    pub fn process_id(self) -> crate::Pid {
+        self.process_id
+    }
+
+    pub(crate) fn belongs_to(self, source_id: u64) -> bool {
+        self.source_id == source_id
+    }
 }
 
 /// Sample metadata and its no-copy raw stack iterator.
+#[derive(Clone)]
 pub struct SampleStack<'a> {
-    /// Sample metadata.
-    pub sample: &'a SampleRecord,
-    /// Borrowed raw frames for `sample.stack_id`.
-    pub frames: StackFrameRefs<'a>,
+    definitions: &'a SpoolDefinitions,
+    key: StackKey,
+    sample: SampleRecord,
+    frames: StackFrames<'a>,
 }
 
-/// No-copy iterator over all samples and their raw stacks.
-pub struct SampleStacks<'a> {
-    reader: &'a PerfSpoolReader,
-    samples: std::slice::Iter<'a, SampleRecord>,
+impl std::fmt::Debug for SampleStack<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SampleStack")
+            .field("key", &self.key)
+            .field("sample", &self.sample)
+            .field("frames", &self.frames.len())
+            .finish()
+    }
 }
 
-/// Sequentially decoded sample metadata and its no-copy raw stack iterator.
-pub struct ReplaySampleStack<'a> {
-    /// Sample metadata.
-    pub sample: SampleRecord,
-    /// Borrowed raw frames for `sample.stack_id`.
-    pub frames: StackFrameRefs<'a>,
+impl<'a> SampleStack<'a> {
+    /// Return this sample's metadata.
+    #[must_use]
+    pub fn sample(&self) -> SampleRecord {
+        self.sample
+    }
+
+    /// Return the stable stack identity for caching within this spool.
+    #[must_use]
+    pub fn key(&self) -> StackKey {
+        self.key
+    }
+
+    /// Return the sampled process.
+    #[must_use]
+    pub fn pid(&self) -> crate::Pid {
+        self.sample.process_id
+    }
+
+    /// Return the sampled thread.
+    #[must_use]
+    pub fn tid(&self) -> crate::Tid {
+        self.sample.thread_id
+    }
+
+    /// Return the monotonic timestamp recorded for this sample.
+    #[must_use]
+    pub fn timestamp(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.sample.timestamp_ns)
+    }
+
+    /// Borrow the raw stack frames.
+    #[must_use]
+    pub fn frames(&self) -> StackFrames<'_> {
+        self.frames.clone()
+    }
+
+    /// Borrow raw frames together with their recorded module mappings.
+    #[must_use]
+    pub fn contexts(&self) -> StackFrameContexts<'_> {
+        StackFrameContexts {
+            definitions: self.definitions,
+            process_id: self.sample.process_id.get(),
+            frames: self.frames.clone(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (StackKey, SampleRecord, StackFrames<'a>) {
+        (self.key, self.sample, self.frames)
+    }
 }
 
 struct ReplaySamples<'a> {
-    reader: &'a PerfSpoolReplayReader,
+    reader: &'a Replay,
     cursor: MmapSpoolCursor,
     last_timestamp_ns: u64,
     remaining: usize,
@@ -457,7 +578,8 @@ struct ReplayRecordState {
 }
 
 /// Borrowed raw frames for one interned stack.
-pub struct StackFrameRefs<'a> {
+#[derive(Clone, Debug)]
+pub struct StackFrames<'a> {
     frames: &'a [FrameRecord],
     stack_nodes: &'a [StackNodeRecord],
     current: Option<u32>,
@@ -469,7 +591,7 @@ pub(crate) struct StackFrameRef<'a> {
     pub(crate) frame: &'a FrameRecord,
 }
 
-impl<'a> StackFrameRefs<'a> {
+impl<'a> StackFrames<'a> {
     pub(crate) fn next_with_id(&mut self) -> Option<StackFrameRef<'a>> {
         let id = self.current?;
         let node = self.stack_nodes.get(id as usize)?;
@@ -484,7 +606,7 @@ impl<'a> StackFrameRefs<'a> {
     }
 }
 
-impl<'a> Iterator for StackFrameRefs<'a> {
+impl<'a> Iterator for StackFrames<'a> {
     type Item = &'a FrameRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -496,7 +618,7 @@ impl<'a> Iterator for StackFrameRefs<'a> {
     }
 }
 
-impl ExactSizeIterator for StackFrameRefs<'_> {
+impl ExactSizeIterator for StackFrames<'_> {
     fn len(&self) -> usize {
         self.remaining
     }
@@ -521,33 +643,6 @@ impl<'a> Iterator for StackFrameContexts<'a> {
 impl ExactSizeIterator for StackFrameContexts<'_> {
     fn len(&self) -> usize {
         self.frames.len()
-    }
-}
-
-impl<'a> Iterator for SampleStacks<'a> {
-    type Item = SampleStack<'a>;
-
-    #[expect(
-        clippy::expect_used,
-        reason = "sample stack ids are validated during reader construction"
-    )]
-    fn next(&mut self) -> Option<Self::Item> {
-        let sample = self.samples.next()?;
-        let frames = self
-            .reader
-            .stack_frame_refs(sample.stack_id)
-            .expect("sample stack ids are validated when opening the spool");
-        Some(SampleStack { sample, frames })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.samples.size_hint()
-    }
-}
-
-impl ExactSizeIterator for SampleStacks<'_> {
-    fn len(&self) -> usize {
-        self.samples.len()
     }
 }
 
@@ -628,51 +723,81 @@ impl ExactSizeIterator for ReplaySamples<'_> {
     }
 }
 
-impl PerfSpoolReader {
+impl Snapshot {
+    pub(crate) fn source_id(&self) -> u64 {
+        self.definitions.source_id
+    }
+
+    /// Configure a symbolizer bound to this snapshot.
+    #[must_use]
+    pub fn symbolizer(&self) -> crate::SymbolizerBuilder<'_> {
+        crate::SymbolizerBuilder::for_spool(self)
+    }
     /// Open and read a spool file.
     ///
     /// The reader borrows path strings from a memory map of the file. The file
-    /// must not be truncated or mutated while the reader is alive.
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let opened = open_spool(path, SampleStorage::Retain)?;
+    /// must not be truncated or mutated while the reader, its symbolizer, or
+    /// any cloned [`ModulePath`] from it remains alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::CorruptSpool`](crate::ErrorKind::CorruptSpool) for
+    /// malformed input, or an I/O category when the file cannot be opened or
+    /// mapped.
+    pub fn open<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+        let opened = open_spool(path, SampleStorage::Retain).map_err(crate::Error::spool)?;
         Ok(Self {
             definitions: opened.definitions,
+            threads: opened.threads,
             samples: opened.samples,
         })
     }
 
     /// Return the profile timeline anchor in microseconds.
-    pub fn start_timestamp_us(&self) -> u64 {
-        self.definitions.start_timestamp_us
+    #[must_use]
+    pub fn start_timestamp_us(&self) -> Option<u64> {
+        (self.definitions.start_timestamp_us != 0).then_some(self.definitions.start_timestamp_us)
     }
 
     /// Return the optional sample interval metadata in microseconds.
-    pub fn sample_interval_us(&self) -> u64 {
-        self.definitions.sample_interval_us
+    #[must_use]
+    pub fn sample_interval_us(&self) -> Option<u64> {
+        (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
     }
 
     /// Return code areas recorded in the profile.
+    #[must_use]
     pub fn modules(&self) -> &[ModuleRecord] {
         &self.definitions.modules
     }
 
     /// Return all interned raw frame records.
+    #[must_use]
     pub fn frames(&self) -> &[FrameRecord] {
         &self.definitions.frames
     }
 
     /// Return samples recorded in the profile.
+    #[must_use]
     pub fn samples(&self) -> &[SampleRecord] {
         &self.samples
     }
 
+    /// Return the process and thread identities interned in this spool.
+    #[must_use]
+    pub fn threads(&self) -> &[ThreadRecord] {
+        &self.threads
+    }
+
     /// Return recorded Python-runtime status changes.
+    #[must_use]
     pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
         &self.definitions.python_runtime_records
     }
 
     /// Whether the file ended mid-record (e.g. the recorder crashed while
     /// writing) and the reader recovered by keeping only the intact prefix.
+    #[must_use]
     pub fn recovered_from_truncated_tail(&self) -> bool {
         self.definitions.truncated_tail
     }
@@ -689,63 +814,79 @@ impl PerfSpoolReader {
         self.definitions.frame_contexts.clone()
     }
 
-    /// Borrow raw frames for `stack_id` without copying them.
-    pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
-        self.definitions.stack_frame_refs(stack_id)
+    #[cfg(test)]
+    pub(crate) fn stack_frame_refs(&self, stack_id: u32) -> crate::Result<StackFrames<'_>> {
+        Ok(self.definitions.stack_frame_refs(stack_id)?)
     }
 
-    /// Borrow raw frame contexts for `stack_id` without copying them.
-    pub fn stack_frame_contexts(
+    #[cfg(test)]
+    pub(crate) fn stack_frame_contexts(
         &self,
-        process_id: i32,
+        process_id: crate::Pid,
         stack_id: u32,
-    ) -> io::Result<StackFrameContexts<'_>> {
+    ) -> crate::Result<StackFrameContexts<'_>> {
         Ok(StackFrameContexts {
             definitions: &self.definitions,
-            process_id,
-            frames: self.stack_frame_refs(stack_id)?,
+            process_id: process_id.get(),
+            frames: self.definitions.stack_frame_refs(stack_id)?,
         })
     }
 
     /// Iterate over all samples with borrowed raw frames.
-    pub fn sample_stacks(&self) -> SampleStacks<'_> {
-        SampleStacks {
-            reader: self,
-            samples: self.samples.iter(),
-        }
+    pub fn stacks(&self) -> impl ExactSizeIterator<Item = SampleStack<'_>> + '_ {
+        self.samples
+            .iter()
+            .copied()
+            .map(|sample| self.definitions.sample_stack(sample))
     }
 
-    /// Expand `stack_id` into raw frames.
-    ///
-    /// `out` is cleared before the frames are written.
-    pub fn stack_frames(&self, stack_id: u32, out: &mut Vec<FrameRecord>) -> io::Result<()> {
-        out.clear();
-        out.extend(self.stack_frame_refs(stack_id)?.copied());
-        Ok(())
+    /// Borrow one sample and its raw frames by sample index.
+    #[must_use]
+    pub fn stack(&self, index: usize) -> Option<SampleStack<'_>> {
+        self.samples
+            .get(index)
+            .copied()
+            .map(|sample| self.definitions.sample_stack(sample))
     }
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> u64 {
+    #[must_use]
+    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+        let anchor = self.start_timestamp_us()?;
         let first = self
             .samples
             .first()
             .map_or(sample.timestamp_ns, |s| s.timestamp_ns);
-        self.definitions
-            .start_timestamp_us
-            .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
+        Some(anchor.saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000))
     }
 }
 
-impl PerfSpoolReplayReader {
+impl Replay {
+    pub(crate) fn source_id(&self) -> u64 {
+        self.definitions.source_id
+    }
+
+    /// Configure a symbolizer bound to this replay.
+    #[must_use]
+    pub fn symbolizer(&self) -> crate::SymbolizerBuilder<'_> {
+        crate::SymbolizerBuilder::for_replay(self)
+    }
     /// Open and validate a spool for bounded-memory sequential replay.
     ///
     /// Definitions and a bounded sample byte-range index are retained in
     /// memory. If that index reaches its limit, iteration scans validated
     /// records instead. Sample metadata is validated during open and decoded
     /// again during iteration. The file must not be truncated or mutated while
-    /// the reader is alive.
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let opened = open_spool(path, SampleStorage::Replay)?;
+    /// the reader, its symbolizer, or any cloned [`ModulePath`] from it remains
+    /// alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::CorruptSpool`](crate::ErrorKind::CorruptSpool) for
+    /// malformed input, or an I/O category when the file cannot be opened or
+    /// mapped.
+    pub fn open<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+        let opened = open_spool(path, SampleStorage::Replay).map_err(crate::Error::spool)?;
         Ok(Self::from_opened(opened))
     }
 
@@ -762,36 +903,49 @@ impl PerfSpoolReplayReader {
     }
 
     /// Return the profile timeline anchor in microseconds.
-    pub fn start_timestamp_us(&self) -> u64 {
-        self.definitions.start_timestamp_us
+    #[must_use]
+    pub fn start_timestamp_us(&self) -> Option<u64> {
+        (self.definitions.start_timestamp_us != 0).then_some(self.definitions.start_timestamp_us)
     }
 
     /// Return the optional sample interval metadata in microseconds.
-    pub fn sample_interval_us(&self) -> u64 {
-        self.definitions.sample_interval_us
+    #[must_use]
+    pub fn sample_interval_us(&self) -> Option<u64> {
+        (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
     }
 
     /// Return code areas recorded in the profile.
+    #[must_use]
     pub fn modules(&self) -> &[ModuleRecord] {
         &self.definitions.modules
     }
 
     /// Return all interned raw frame records.
+    #[must_use]
     pub fn frames(&self) -> &[FrameRecord] {
         &self.definitions.frames
     }
 
     /// Return the number of samples in the validated spool prefix.
+    #[must_use]
     pub fn sample_count(&self) -> usize {
         self.sample_count
     }
 
+    /// Return the process and thread identities interned in this spool.
+    #[must_use]
+    pub fn threads(&self) -> &[ThreadRecord] {
+        &self.threads
+    }
+
     /// Return recorded Python-runtime status changes.
+    #[must_use]
     pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
         &self.definitions.python_runtime_records
     }
 
     /// Whether the file ended mid-record and the reader kept its intact prefix.
+    #[must_use]
     pub fn recovered_from_truncated_tail(&self) -> bool {
         self.definitions.truncated_tail
     }
@@ -800,21 +954,16 @@ impl PerfSpoolReplayReader {
         self.definitions.frame_contexts.clone()
     }
 
-    /// Borrow raw frames for `stack_id` without copying them.
-    pub fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrameRefs<'_>> {
-        self.definitions.stack_frame_refs(stack_id)
-    }
-
-    /// Borrow raw frame contexts for `stack_id` without copying them.
-    pub fn stack_frame_contexts(
+    #[cfg(test)]
+    pub(crate) fn stack_frame_contexts(
         &self,
-        process_id: i32,
+        process_id: crate::Pid,
         stack_id: u32,
-    ) -> io::Result<StackFrameContexts<'_>> {
+    ) -> crate::Result<StackFrameContexts<'_>> {
         Ok(StackFrameContexts {
             definitions: &self.definitions,
-            process_id,
-            frames: self.stack_frame_refs(stack_id)?,
+            process_id: process_id.get(),
+            frames: self.definitions.stack_frame_refs(stack_id)?,
         })
     }
 
@@ -841,26 +990,26 @@ impl PerfSpoolReplayReader {
     }
 
     /// Decode samples and borrow their raw frames sequentially.
-    pub fn sample_stacks(&self) -> impl ExactSizeIterator<Item = ReplaySampleStack<'_>> + '_ {
+    pub fn stacks(&self) -> impl ExactSizeIterator<Item = SampleStack<'_>> + '_ {
         self.replay_samples()
-            .map(|sample| self.definitions.replay_sample_stack(sample))
+            .map(|sample| self.definitions.sample_stack(sample))
     }
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> u64 {
+    #[must_use]
+    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+        let anchor = self.start_timestamp_us()?;
         let first = self
             .first_sample_timestamp_ns
             .unwrap_or(sample.timestamp_ns);
-        self.definitions
-            .start_timestamp_us
-            .saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000)
+        Some(anchor.saturating_add(sample.timestamp_ns.saturating_sub(first) / 1_000))
     }
 }
 
 struct OpenedSpool {
     definitions: SpoolDefinitions,
     samples: Vec<SampleRecord>,
-    threads: Vec<(i32, u64)>,
+    threads: Vec<ThreadRecord>,
     mmap: Arc<Mmap>,
     sample_ranges: Box<[Range<usize>]>,
     scan_start: Option<ReplayScanStart>,
@@ -1013,6 +1162,7 @@ fn open_spool_with_range_limit(
     let frame_contexts = SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
     Ok(OpenedSpool {
         definitions: SpoolDefinitions {
+            source_id: next_source_id(),
             start_timestamp_us,
             sample_interval_us,
             modules,
@@ -1241,7 +1391,8 @@ fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeR
     reader.read_exact_spool(&mut flag)?;
     Ok(PythonRuntimeRecord {
         timestamp_ns,
-        process_id,
+        process_id: crate::Pid::try_from(process_id)
+            .map_err(|error| invalid_data(error.to_string()))?,
         is_python_runtime: flag[0] != 0,
     })
 }
@@ -1498,11 +1649,16 @@ fn read_stack_node(
     })
 }
 
-fn read_thread(reader: &mut impl SpoolRead, expected_id: usize) -> io::Result<(i32, u64)> {
+fn read_thread(reader: &mut impl SpoolRead, expected_id: usize) -> io::Result<ThreadRecord> {
     check_id(reader, expected_id, "thread")?;
     let process_id = read_process_id(reader)?;
     let thread_id = reader.read_varint::<u64>()?;
-    Ok((process_id, thread_id))
+    Ok(ThreadRecord {
+        process_id: crate::Pid::try_from(process_id)
+            .map_err(|error| invalid_data(error.to_string()))?,
+        thread_id: crate::Tid::try_from(thread_id)
+            .map_err(|error| invalid_data(error.to_string()))?,
+    })
 }
 
 fn read_process_id(reader: &mut impl SpoolRead) -> io::Result<i32> {
@@ -1519,7 +1675,7 @@ fn checked_sample_timestamp_delta(last_timestamp_ns: u64, timestamp_ns: u64) -> 
 
 fn read_sample(
     reader: &mut impl SpoolRead,
-    threads: &[(i32, u64)],
+    threads: &[ThreadRecord],
     stack_count: usize,
     last_timestamp_ns: &mut u64,
 ) -> io::Result<SampleRecord> {
@@ -1529,12 +1685,12 @@ fn read_sample(
         .ok_or_else(|| invalid_data(format!("sample timestamp delta {delta} out of range")))?;
     *last_timestamp_ns = timestamp_ns;
     let thread_ref = read_index_within(reader, threads.len(), "sample thread")?;
-    let (process_id, thread_id) = threads[thread_ref];
+    let thread = threads[thread_ref];
     let stack_id = read_id_within(reader, stack_count, "sample stack")?;
     Ok(SampleRecord {
         timestamp_ns,
-        process_id,
-        thread_id,
+        process_id: thread.process_id,
+        thread_id: thread.thread_id,
         stack_id,
     })
 }
@@ -1613,9 +1769,8 @@ mod tests {
             .set_len(len - 1)
             .unwrap();
 
-        let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
-        let replay =
-            PerfSpoolReplayReader::open(&path).expect("truncated replay spool still opens");
+        let reader = Snapshot::open(&path).expect("truncated spool still opens");
+        let replay = Replay::open(&path).expect("truncated replay spool still opens");
         let _ = std::fs::remove_file(&path);
         assert!(!reader.samples().is_empty());
         assert!(reader.recovered_from_truncated_tail());
@@ -1648,7 +1803,7 @@ mod tests {
             .set_len(boundary + 8)
             .unwrap();
 
-        let reader = PerfSpoolReader::open(&path).expect("truncated spool still opens");
+        let reader = Snapshot::open(&path).expect("truncated spool still opens");
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(reader.samples().len(), 1);
@@ -1677,12 +1832,12 @@ mod tests {
             .copy_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
         std::fs::write(&path, &bytes).unwrap();
 
-        let err = match PerfSpoolReader::open(&path) {
+        let err = match Snapshot::open(&path) {
             Ok(_) => panic!("corruption must not open"),
             Err(err) => err,
         };
         let _ = std::fs::remove_file(&path);
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), crate::ErrorKind::CorruptSpool);
     }
 
     #[test]
@@ -1731,9 +1886,9 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let eager = PerfSpoolReader::open(&path).unwrap();
-        let replay = PerfSpoolReplayReader::open(&path).unwrap();
-        let scanned = PerfSpoolReplayReader::from_opened(
+        let eager = Snapshot::open(&path).unwrap();
+        let replay = Replay::open(&path).unwrap();
+        let scanned = Replay::from_opened(
             open_spool_with_range_limit(&path, SampleStorage::Replay, 1).unwrap(),
         );
         let _ = std::fs::remove_file(&path);
@@ -1765,11 +1920,11 @@ mod tests {
         }
 
         let eager_stacks: Vec<_> = eager
-            .sample_stacks()
+            .stacks()
             .map(|stack| stack.frames.copied().collect::<Vec<_>>())
             .collect();
         let replay_stacks: Vec<_> = replay
-            .sample_stacks()
+            .stacks()
             .map(|stack| stack.frames.copied().collect::<Vec<_>>())
             .collect();
         assert_eq!(replay_stacks, eager_stacks);
@@ -1793,11 +1948,11 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
         let mut frames = Vec::new();
-        reader.stack_frames(stack_id, &mut frames).unwrap();
+        frames.extend(reader.stack_frame_refs(stack_id).unwrap().copied());
 
         assert_eq!(frames, vec![frame(0x1000), marker]);
         assert!(frames[1].is_truncated_stack_marker());
@@ -1815,11 +1970,11 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
         let mut frames = Vec::new();
-        reader.stack_frames(stack_id, &mut frames).unwrap();
+        frames.extend(reader.stack_frame_refs(stack_id).unwrap().copied());
 
         assert_eq!(frames, vec![marker]);
     }
@@ -1951,20 +2106,20 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
-        assert_eq!(reader.start_timestamp_us(), 123);
-        assert_eq!(reader.sample_interval_us(), 10);
+        assert_eq!(reader.start_timestamp_us(), Some(123));
+        assert_eq!(reader.sample_interval_us(), Some(10));
         assert_eq!(reader.frames().len(), 3);
-        assert_eq!(reader.sample_stacks().len(), 1);
+        assert_eq!(reader.stacks().len(), 1);
 
-        let sample_stack = reader.sample_stacks().next().unwrap();
+        let sample_stack = reader.stacks().next().unwrap();
         assert_eq!(sample_stack.sample.stack_id, stack_id);
         assert_eq!(sample_stack.frames.len(), 3);
 
         let contexts: Vec<_> = reader
-            .stack_frame_contexts(7, stack_id)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
             .unwrap()
             .map(|context| {
                 (
@@ -2018,7 +2173,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let mut frames = reader.stack_frame_refs(stack_id).unwrap();
         let frame_ref = frames.next_with_id().unwrap();
@@ -2029,7 +2184,7 @@ mod tests {
             .module_for_frame(7, frame_ref.id, frame_ref.frame)
             .is_none());
         assert!(reader
-            .stack_frame_contexts(7, stack_id)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
             .unwrap()
             .next()
             .unwrap()
@@ -2053,7 +2208,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let mut frames = reader.stack_frame_refs(stack_id).unwrap();
         let frame_ref = frames.next_with_id().unwrap();
@@ -2063,7 +2218,7 @@ mod tests {
             .module_for_frame(7, frame_ref.id, frame_ref.frame)
             .is_none());
         assert!(reader
-            .stack_frame_contexts(7, stack_id)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
             .unwrap()
             .next()
             .unwrap()
@@ -2086,10 +2241,10 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let context = reader
-            .stack_frame_contexts(7, stack_id)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
             .unwrap()
             .next()
             .unwrap();
@@ -2118,15 +2273,15 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let first = reader
-            .stack_frame_contexts(7, first_stack)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), first_stack)
             .unwrap()
             .next()
             .unwrap();
         let second = reader
-            .stack_frame_contexts(7, second_stack)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), second_stack)
             .unwrap()
             .next()
             .unwrap();
@@ -2165,7 +2320,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
         assert_eq!(first_stack, second_stack);
@@ -2223,7 +2378,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let result = PerfSpoolReader::open(&path);
+        let result: io::Result<_> = Snapshot::open(&path).map_err(Into::into);
         let _ = std::fs::remove_file(path);
         assert_invalid_data_contains(
             result,
@@ -2290,7 +2445,15 @@ mod tests {
         bytes.write_varint(delta).unwrap();
         bytes.write_varint(0_u64).unwrap();
         bytes.write_varint(0_u64).unwrap();
-        read_sample(&mut bytes.as_slice(), &[(7, 11)], 1, last_timestamp_ns)
+        read_sample(
+            &mut bytes.as_slice(),
+            &[ThreadRecord {
+                process_id: crate::Pid::new(7).unwrap(),
+                thread_id: crate::Tid::new(11).unwrap(),
+            }],
+            1,
+            last_timestamp_ns,
+        )
     }
 
     #[test]
@@ -2544,7 +2707,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(reader.modules()[0].device_major, 8);
         assert_eq!(reader.modules()[0].device_minor, 2);
@@ -2568,7 +2731,7 @@ mod tests {
         write_bytes(&mut bytes, b"/module").unwrap();
         std::fs::write(&path, bytes).unwrap();
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(reader.modules()[0].inode, 99);
         assert_eq!(reader.modules()[0].device_major, 0);
@@ -2631,22 +2794,22 @@ mod tests {
             bytes.write_varint(1_u64).unwrap();
             std::fs::write(&path, bytes).unwrap();
 
-            let reader = PerfSpoolReplayReader::open(&path).unwrap();
-            let scanned = PerfSpoolReplayReader::from_opened(
+            let reader = Replay::open(&path).unwrap();
+            let scanned = Replay::from_opened(
                 open_spool_with_range_limit(&path, SampleStorage::Replay, 0).unwrap(),
             );
             let _ = std::fs::remove_file(path);
             let expected = vec![
                 SampleRecord {
                     timestamp_ns: 1_000,
-                    process_id: 7,
-                    thread_id: 11,
+                    process_id: crate::Pid::try_from(7).unwrap(),
+                    thread_id: crate::Tid::try_from(11).unwrap(),
                     stack_id: 0,
                 },
                 SampleRecord {
                     timestamp_ns: 2_000,
-                    process_id: 7,
-                    thread_id: 11,
+                    process_id: crate::Pid::try_from(7).unwrap(),
+                    thread_id: crate::Tid::try_from(11).unwrap(),
                     stack_id: 1,
                 },
             ];
@@ -2700,7 +2863,7 @@ mod tests {
         spool.flush().unwrap();
         drop(spool);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let paths: Vec<_> = reader
             .samples()
@@ -2781,10 +2944,10 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let reader = PerfSpoolReader::open(&path).unwrap();
+        let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let context = reader
-            .stack_frame_contexts(7, stack_id)
+            .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
             .unwrap()
             .next()
             .unwrap();

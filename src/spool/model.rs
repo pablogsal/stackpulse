@@ -4,6 +4,7 @@ use std::ops::{Deref, Range};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::{Pid, Tid};
 use memmap2::Mmap;
 
 pub(crate) const VDSO_PATH: &str = "[vdso]";
@@ -147,30 +148,177 @@ impl Hash for ModulePath {
 }
 
 /// One executable memory mapping recorded in a spool file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct ModuleRecord {
     /// Stable module id within the spool.
-    pub id: u32,
+    pub(crate) id: u32,
     /// Process that owned this code area, or a kernel marker for kernel code.
-    pub process_id: i32,
+    pub(crate) process_id: i32,
     /// Start address in memory.
-    pub start: u64,
+    pub(crate) start: u64,
     /// End address in memory.
-    pub end: u64,
+    pub(crate) end: u64,
     /// File offset backing the start address.
-    pub file_offset: u64,
+    pub(crate) file_offset: u64,
     /// File inode, when available.
-    pub inode: u64,
+    pub(crate) inode: u64,
     /// Device major number, when available.
-    pub device_major: u32,
+    pub(crate) device_major: u32,
     /// Device minor number, when available.
-    pub device_minor: u32,
+    pub(crate) device_minor: u32,
     /// Inode generation reported by `PERF_RECORD_MMAP2`, when available.
-    pub inode_generation: u64,
+    pub(crate) inode_generation: u64,
     /// File path or display name.
-    pub path: ModulePath,
+    pub(crate) path: ModulePath,
     /// Whether this record is kernel code.
-    pub is_kernel: bool,
+    pub(crate) is_kernel: bool,
+}
+
+impl ModuleRecord {
+    /// Return the spool-local mapping id.
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Return the process that owns this mapping, or `None` for kernel code.
+    #[must_use]
+    pub fn pid(&self) -> Option<Pid> {
+        if self.is_kernel {
+            None
+        } else {
+            Pid::new(self.process_id)
+        }
+    }
+
+    /// Return the mapped absolute address range.
+    #[must_use]
+    pub const fn address_range(&self) -> std::ops::Range<u64> {
+        self.start..self.end
+    }
+
+    /// Return the file offset backing the mapping start.
+    #[must_use]
+    pub const fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    /// Return the recorded inode, or zero when unavailable.
+    #[must_use]
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    /// Return the recorded device major number, or zero when unavailable.
+    #[must_use]
+    pub const fn device_major(&self) -> u32 {
+        self.device_major
+    }
+
+    /// Return the recorded device minor number, or zero when unavailable.
+    #[must_use]
+    pub const fn device_minor(&self) -> u32 {
+        self.device_minor
+    }
+
+    /// Return the inode generation, or zero when unavailable.
+    #[must_use]
+    pub const fn inode_generation(&self) -> u64 {
+        self.inode_generation
+    }
+
+    /// Borrow the recorded path or mapping name.
+    #[must_use]
+    pub const fn path(&self) -> &ModulePath {
+        &self.path
+    }
+
+    /// Return whether this mapping contains kernel code.
+    #[must_use]
+    pub const fn is_kernel(&self) -> bool {
+        self.is_kernel
+    }
+
+    /// Construct a user-space mapping with unknown file identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error when `addresses` is empty or reversed.
+    pub fn new(
+        id: u32,
+        process_id: Pid,
+        addresses: std::ops::Range<u64>,
+        file_offset: u64,
+        path: impl Into<ModulePath>,
+    ) -> crate::Result<Self> {
+        if addresses.start >= addresses.end {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "module address range must be non-empty",
+            ));
+        }
+        Ok(Self {
+            id,
+            process_id: process_id.get(),
+            start: addresses.start,
+            end: addresses.end,
+            file_offset,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: path.into(),
+            is_kernel: false,
+        })
+    }
+
+    /// Attach verified filesystem identity to this mapping.
+    #[must_use]
+    pub fn file_identity(
+        mut self,
+        device_major: u32,
+        device_minor: u32,
+        inode: u64,
+        inode_generation: u64,
+    ) -> Self {
+        self.device_major = device_major;
+        self.device_minor = device_minor;
+        self.inode = inode;
+        self.inode_generation = inode_generation;
+        self
+    }
+
+    /// Construct a kernel mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error when `addresses` is empty or reversed.
+    pub fn kernel(
+        id: u32,
+        addresses: std::ops::Range<u64>,
+        path: impl Into<ModulePath>,
+    ) -> crate::Result<Self> {
+        if addresses.start >= addresses.end {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "module address range must be non-empty",
+            ));
+        }
+        Ok(Self {
+            id,
+            process_id: -1,
+            start: addresses.start,
+            end: addresses.end,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: path.into(),
+            is_kernel: true,
+        })
+    }
 }
 
 /// Whether a frame came from user code or kernel code.
@@ -221,25 +369,34 @@ impl FrameRecord {
 }
 
 /// A sample record loaded from a spool file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SampleRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// Process id for the sample.
-    pub process_id: i32,
+    pub process_id: Pid,
     /// Thread id for the sample.
-    pub thread_id: u64,
+    pub thread_id: Tid,
     /// Stack id used with spool-reader stack accessors.
-    pub stack_id: u32,
+    pub(crate) stack_id: u32,
+}
+
+/// Process and thread identity interned by a spool.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ThreadRecord {
+    /// Process that owns the thread.
+    pub process_id: Pid,
+    /// Linux thread id.
+    pub thread_id: Tid,
 }
 
 /// Marker for a process's Python-runtime status during recording.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PythonRuntimeRecord {
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// Process id.
-    pub process_id: i32,
+    pub process_id: Pid,
     /// Whether the process looked like a Python runtime.
     pub is_python_runtime: bool,
 }
