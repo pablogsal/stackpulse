@@ -44,12 +44,12 @@ Records stack samples for one or more processes and writes a spool file.
 | `refresh_threads(pid)` | Discover new threads when perf inheritance isn't doing it. |
 | `disable()` | Stop sampling for all attached events. |
 | `enable()` | Resume sampling for all attached events. |
-| `flush()` | Drain ready events and flush the spool writer. |
+| `flush()` | Drain events and flush the writer. After observed loss it can also scan `/proc`, rebuild mappings, discover descendants, and reopen perf events. |
 | `has_pending_events()` | Report whether perf data is ready to drain. |
 | `summary()` | Snapshot of recording counters. |
 | `process_is_active(pid)` | Report whether the given PID is still alive. |
-| `has_active_processes_except(pid)` | Report whether any attached PID other than the given one is still alive. |
-| `active_process_count()` | Return the number of processes believed to be alive. |
+| `has_active_processes_except(pid)` | Fallibly report whether any attached PID other than the given one is alive. |
+| `active_process_count()` | Fallibly count attached processes that are still alive. |
 | `finish()` | Flush, return final counters, consume the recorder. |
 
 The recorder does not drain itself. Call `poll` while the target runs or the
@@ -59,6 +59,7 @@ kernel buffers will fill and drop samples.
 
 | Variant | Use |
 | --- | --- |
+| `Running` | Attach without stopping. Initial mapping discovery can race with concurrent mmap, munmap, and exec activity. |
 | `StopWhileAttaching` | Attaching to a running process. The target is briefly stopped while events open, then resumed. |
 | `OnExec` | Attaching to a forked-but-not-yet-exec'd child. Pair with [`process::SuspendedLaunchedProcess`](crate::process::SuspendedLaunchedProcess). |
 
@@ -71,6 +72,7 @@ current kernel maximum when recording starts.
 | --- | --- |
 | `new(sample_rate)` | Start with a 32 KiB stack snapshot and optional features disabled. |
 | `stack_size(bytes)` | Set user stack bytes copied per sample. Capped at [`MAX_SAMPLE_USER_STACK`](crate::record::MAX_SAMPLE_USER_STACK). |
+| `ring_buffer_stacks(count)` | Target capacity in stack-sized records. Capacity is `max(stack_size, system_page_size) * count`, with a floor for one maximum-size perf record and power-of-two page rounding. On 4 KiB-page hosts, the default count of 32 gives 1 MiB at 32 KiB stacks and 2 MiB at 64 KiB stacks. Rings are capped at 256 MiB per CPU and share a 1 GiB recorder data-ring budget. `EPERM` or `ENOMEM` while mapping causes progressive fallback to the minimum valid ring. |
 | `include_kernel(bool)` | Capture kernel frames when allowed. |
 | `inherit_children(bool)` | Follow children forked after recording starts. |
 | `start_timestamp_us(value)` | Set the timeline anchor stored in the spool. |
@@ -93,8 +95,9 @@ Counter snapshot for quality checks.
 | `sample_events` | Raw perf sample records seen. |
 | `samples` | Samples written to the spool. |
 | `lost_events` | Kernel-reported losses. |
-| `lifecycle_gaps` | Recovery passes triggered by one or more lost records. |
+| `lifecycle_gaps` | Nonzero loss batches that made lifecycle state potentially incomplete. Several batches can share one recovery sweep. |
 | `kernel_enabled` | Whether kernel capture stayed on after attach. |
+| `minimum_ring_buffer_bytes` / `maximum_ring_buffer_bytes` | Effective per-CPU perf data-ring capacity range. The metadata page is excluded. |
 | `missing_pid_samples` / `missing_tid_samples` | Samples dropped for missing IDs. |
 | `idle_tid_samples` | Samples attributed to idle TID 0. |
 | `missing_timestamp_samples` | Samples without a perf timestamp. |
@@ -223,7 +226,17 @@ lookup should follow the runtime metadata captured in the spool.
 [`NativeLookup`](crate::symbolize::NativeLookup) values and appends one
 [`NativeSymbols`](crate::symbolize::NativeSymbols) result per lookup, in the same order.
 Each lookup provides the selected module plus its absolute, relative, and
-image addresses.
+image addresses. `NativeModule::new` and `NativeLookup::new` construct
+realistic requests for backend tests without recording a process. Synthetic
+modules receive distinct opaque image identities and never have an
+`image_path()`.
+
+An `image_path()` is available only when StackPulse reopened and retained the
+exact file backing a Linux mapping. It is absent for synthetic modules,
+anonymous mappings, files that could not be reopened, and modules without a
+validated file descriptor. An address-only result caused by a retryable native
+image open failure is provisional; a later resolution attempt can return more
+specific symbols.
 
 Resolution order, top to bottom:
 
@@ -323,7 +336,8 @@ directory.
 | --- | --- |
 | `ProcessExitWatcher::try_new(pid)` | pidfd-based exit watcher. |
 | `ProcessExitWatcher::poll()` | Non-blocking exit check. |
-| `process_exists(pid)` | Report whether the PID looks alive. |
+| `process_exists(pid)` | Fallibly report whether the PID is observable in `/proc`. |
+| `process_is_alive(watcher, pid)` | Fallibly check a pidfd, or `/proc` when no watcher exists. |
 | `interrupt_process(pid)` | `SIGINT`. |
 | `kill_process(pid)` | `SIGKILL`. |
 
@@ -339,6 +353,12 @@ and permitted rates for a frequency-limit failure. [`Error::io_error`](crate::Er
 and [`Error::raw_os_error`](crate::Error::raw_os_error) retain OS details. A
 custom native symbolizer's concrete error remains in the standard
 [`Error::source`](std::error::Error::source) chain and can be downcast there.
+Process operations classify `ESRCH`, and contextual `/proc` or perf `ENOENT`,
+as [`ErrorKind::TargetGone`](crate::ErrorKind::TargetGone). Ordinary missing
+files remain [`ErrorKind::Io`](crate::ErrorKind::Io).
+[`Pid::try_from`](crate::Pid::try_from) and [`Tid::try_from`](crate::Tid::try_from)
+errors convert to `ErrorKind::InvalidInput`, so they work with `?` in a
+`stackpulse::Result` function.
 
 Converting a StackPulse error into [`std::io::Error`] preserves the StackPulse
 error as the inner source while mapping its category to the closest

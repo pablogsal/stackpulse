@@ -160,6 +160,17 @@ disable StackPulse's default features to omit `wholesym` and Tokio. In that
 configuration [`Symbolizer::has_native_backend`] is `false` until `native(...)`
 installs one; native frames otherwise resolve to address-only values.
 
+Backend tests can construct requests directly with
+[`symbolize::NativeModule::new`] and [`symbolize::NativeLookup::new`]. Each
+synthetic module gets a distinct opaque image identity. Its `image_path()` is
+`None`; recorded modules expose that path only when StackPulse retained the
+exact validated file backing the Linux mapping.
+
+Symbol results can be provisional when a retryable error prevents StackPulse
+from opening a validated native image. A later resolution attempt can replace
+that address-only fallback with more specific symbols. External stack caches
+should avoid permanently caching those temporary fallbacks.
+
 # Runtime requirements
 
 StackPulse runs on Linux and uses `perf_event_open`, `/proc`, ELF metadata,
