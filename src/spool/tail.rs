@@ -5,15 +5,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use memmap2::Mmap;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::native_module::ExactImageStore;
 
 use super::{
-    invalid_data, next_source_id, read_frame, read_index_within, read_module_mmap, read_process_id,
-    read_python_runtime, read_sample, read_stack_node, read_thread, MmapSpoolCursor, ModulePath,
-    PythonRuntimeRecord, SampleRecord, SampleStack, SpoolDefinitions, ThreadRecord, REC_FRAME,
-    REC_MODULE, REC_MODULE_DEACTIVATE, REC_MODULE_DEACTIVATE_ONE, REC_PYTHON_RUNTIME, REC_SAMPLE,
-    REC_STACK, REC_THREAD,
+    decode_spool_record, invalid_data, next_source_id, DecodedSpoolRecord, MmapSpoolCursor,
+    SampleRecord, SampleStack, SpoolDefinitions, ThreadRecord,
 };
+
+const MAX_BATCH_SAMPLES: usize = 16 * 1024;
 
 /// Incremental reader for an append-only StackPulse spool.
 ///
@@ -29,15 +30,16 @@ pub struct Tail {
     threads: Vec<ThreadRecord>,
     last_timestamp_ns: u64,
     first_sample_timestamp_ns: Option<u64>,
-    sample_count: usize,
     samples: Vec<SampleRecord>,
     initial_samples_pending: bool,
     observed_processes: Vec<crate::Pid>,
     observed_process_set: FxHashSet<crate::Pid>,
-    mapping_processes: Vec<crate::Pid>,
-    mapping_process_set: FxHashSet<crate::Pid>,
-    definitions_changed: bool,
-    kernel_changed: bool,
+    retired_processes: Vec<crate::Pid>,
+    retired_modules: Vec<u32>,
+    active_modules_by_process: FxHashMap<crate::Pid, Vec<usize>>,
+    kernel_mappings_changed: bool,
+    more_available: bool,
+    exact_images: Option<ExactImageStore>,
 }
 
 impl std::fmt::Debug for Tail {
@@ -47,7 +49,7 @@ impl std::fmt::Debug for Tail {
             .field("position", &self.position)
             .field("modules", &self.definitions.modules.len())
             .field("frames", &self.definitions.frames.len())
-            .field("samples", &self.sample_count)
+            .field("pending_samples", &self.samples.len())
             .finish_non_exhaustive()
     }
 }
@@ -60,9 +62,6 @@ pub struct TailBatch<'a> {
     tail: &'a Tail,
     modules: Range<usize>,
     frames: Range<usize>,
-    python_runtime_records: Range<usize>,
-    definitions_changed: bool,
-    kernel_changed: bool,
 }
 
 impl std::fmt::Debug for TailBatch<'_> {
@@ -72,14 +71,15 @@ impl std::fmt::Debug for TailBatch<'_> {
             .field("samples", &self.tail.samples.len())
             .field("modules", &self.modules.len())
             .field("frames", &self.frames.len())
-            .field("python_runtime_records", &self.python_runtime_records.len())
-            .field("kernel_changed", &self.kernel_changed)
+            .field("kernel_mappings_changed", &self.kernel_mappings_changed())
             .finish()
     }
 }
 
 impl Tail {
     /// Open a growing spool and decode its current complete prefix.
+    ///
+    /// The writer must flush the spool header before this call.
     ///
     /// # Errors
     ///
@@ -90,10 +90,17 @@ impl Tail {
     }
 
     fn open_inner(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
-        // SAFETY: module paths are copied into owned storage before a remap can
-        // release this mapping. The current mapping stays alive for every
-        // cursor that borrows it.
+        Self::from_file_inner(File::open(path)?, None)
+    }
+
+    pub(crate) fn from_file(file: File, exact_images: ExactImageStore) -> crate::Result<Self> {
+        Self::from_file_inner(file, Some(exact_images)).map_err(crate::Error::spool)
+    }
+
+    fn from_file_inner(file: File, exact_images: Option<ExactImageStore>) -> io::Result<Self> {
+        // SAFETY: the spool's existing bytes remain immutable under Tail's
+        // append-only contract. Each cursor retains its mapping, and decoded
+        // module paths are copied before a remap can release the old one.
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let mut cursor = MmapSpoolCursor::new(Arc::clone(&mmap));
         cursor.check_magic()?;
@@ -118,24 +125,24 @@ impl Tail {
             threads: Vec::new(),
             last_timestamp_ns: 0,
             first_sample_timestamp_ns: None,
-            sample_count: 0,
             samples: Vec::new(),
             initial_samples_pending: true,
             observed_processes: Vec::new(),
             observed_process_set: FxHashSet::default(),
-            mapping_processes: Vec::new(),
-            mapping_process_set: FxHashSet::default(),
-            definitions_changed: false,
-            kernel_changed: false,
+            retired_processes: Vec::new(),
+            retired_modules: Vec::new(),
+            active_modules_by_process: FxHashMap::default(),
+            kernel_mappings_changed: false,
+            more_available: false,
+            exact_images,
         };
-        tail.parse_available()?;
+        tail.more_available = tail.parse_available()?;
 
         // A symbolizer built before the first poll starts from all definitions
-        // decoded above. The first batch therefore reports only its samples.
-        tail.mapping_processes.clear();
-        tail.mapping_process_set.clear();
-        tail.definitions_changed = false;
-        tail.kernel_changed = false;
+        // decoded above. Mapping additions therefore need no update, while
+        // retirements remain in the first batch so their resources can be
+        // released after its historical samples are resolved.
+        tail.kernel_mappings_changed = false;
         Ok(tail)
     }
 
@@ -150,6 +157,9 @@ impl Tail {
 
     /// Decode records appended since the previous poll.
     ///
+    /// The first poll returns samples that were already complete when the tail
+    /// was opened. Later polls return only newly appended samples.
+    ///
     /// The returned batch borrows storage owned by this reader. A poll with no
     /// appended records performs no allocation once the reader is warm.
     /// Call [`TailBatch::has_more`] to determine whether another complete
@@ -158,8 +168,8 @@ impl Tail {
     ///
     /// # Errors
     ///
-    /// Returns a corrupt-spool error for malformed appended data. Shrinking or
-    /// replacing the file is rejected because tailing supports append only.
+    /// Returns a corrupt-spool error for malformed appended data. Shrinking
+    /// the opened file is rejected because tailing supports append only.
     pub fn poll(&mut self) -> crate::Result<TailBatch<'_>> {
         self.poll_inner().map_err(crate::Error::spool)
     }
@@ -168,28 +178,26 @@ impl Tail {
         let initial = std::mem::take(&mut self.initial_samples_pending);
         let module_start = self.definitions.modules.len();
         let frame_start = self.definitions.frames.len();
-        let python_runtime_start = self.definitions.python_runtime_records.len();
 
-        if !initial {
+        if initial {
+            let mapped_len = self.mmap.len();
+            self.remap_if_grown()?;
+            self.more_available |= self.mmap.len() > mapped_len;
+        } else {
             self.samples.clear();
             self.observed_processes.clear();
             self.observed_process_set.clear();
-            self.mapping_processes.clear();
-            self.mapping_process_set.clear();
-            self.definitions_changed = false;
-            self.kernel_changed = false;
+            self.retired_processes.clear();
+            self.retired_modules.clear();
+            self.kernel_mappings_changed = false;
             self.remap_if_grown()?;
-            self.parse_available()?;
+            self.more_available = self.parse_available()?;
         }
 
         Ok(TailBatch {
             tail: self,
             modules: module_start..self.definitions.modules.len(),
             frames: frame_start..self.definitions.frames.len(),
-            python_runtime_records: python_runtime_start
-                ..self.definitions.python_runtime_records.len(),
-            definitions_changed: self.definitions_changed,
-            kernel_changed: self.kernel_changed,
         })
     }
 
@@ -205,39 +213,15 @@ impl Tail {
         (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
     }
 
-    /// Return code areas decoded so far.
-    #[must_use]
-    pub fn modules(&self) -> &[super::ModuleRecord] {
+    pub(crate) fn modules(&self) -> &[super::ModuleRecord] {
         &self.definitions.modules
     }
 
-    /// Return frame definitions decoded so far.
-    #[must_use]
-    pub fn frames(&self) -> &[super::FrameRecord] {
+    pub(crate) fn frames(&self) -> &[super::FrameRecord] {
         &self.definitions.frames
     }
 
-    /// Return process and thread identities decoded so far.
-    #[must_use]
-    pub fn threads(&self) -> &[ThreadRecord] {
-        &self.threads
-    }
-
-    /// Return Python-runtime status records decoded so far.
-    #[must_use]
-    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
-        &self.definitions.python_runtime_records
-    }
-
-    /// Return the total number of samples decoded across all polls.
-    #[must_use]
-    pub fn sample_count(&self) -> usize {
-        self.sample_count
-    }
-
-    /// Convert a sample timestamp to the profile timeline in microseconds.
-    #[must_use]
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+    fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
         let anchor = self.start_timestamp_us()?;
         let first = self
             .first_sample_timestamp_ns
@@ -249,20 +233,19 @@ impl Tail {
         self.definitions.source_id
     }
 
+    pub(crate) fn exact_images(&self) -> Option<ExactImageStore> {
+        self.exact_images.clone()
+    }
+
     pub(crate) fn frame_module_contexts(&self) -> super::SpoolFrameModuleContexts {
         self.definitions.frame_contexts.clone()
     }
 
     fn observe_process(&mut self, process: crate::Pid) {
-        if self.observed_process_set.insert(process) {
+        if self.observed_processes.last() != Some(&process)
+            && self.observed_process_set.insert(process)
+        {
             self.observed_processes.push(process);
-        }
-    }
-
-    fn observe_mapping_process(&mut self, process: crate::Pid) {
-        self.observe_process(process);
-        if self.mapping_process_set.insert(process) {
-            self.mapping_processes.push(process);
         }
     }
 
@@ -273,124 +256,112 @@ impl Tail {
             return Err(invalid_data("spool file shrank while being tailed"));
         }
         if file_len > self.mmap.len() {
-            // SAFETY: see `open_inner`; decoded paths never borrow an old map.
+            // SAFETY: see `open_inner`; the mapped prefix is immutable and
+            // decoded paths never borrow an old mapping.
             self.mmap = Arc::new(unsafe { Mmap::map(&self.file)? });
         }
         Ok(())
     }
 
-    fn parse_available(&mut self) -> io::Result<()> {
+    fn parse_available(&mut self) -> io::Result<bool> {
         let mut cursor = MmapSpoolCursor::at_position(Arc::clone(&self.mmap), self.position);
         loop {
-            let record_start = cursor.position;
-            let Some(tag) = cursor.read_tag()? else {
-                break;
-            };
-            let parsed = (|| -> io::Result<()> {
-                match tag {
-                    REC_MODULE => {
-                        let mut module =
-                            read_module_mmap(&mut cursor, self.definitions.modules.len())?;
-                        module.path = ModulePath::from(module.path.as_str());
-                        let process = module.pid();
-                        self.kernel_changed |= module.is_kernel();
-                        self.definitions.modules.push(module);
-                        self.definitions.frame_contexts.push_module();
-                        if let Some(process) = process {
-                            self.observe_mapping_process(process);
-                        }
-                        self.definitions_changed = true;
-                    }
-                    REC_FRAME => {
-                        let module_limit = self.definitions.modules.len();
-                        let frame = read_frame(
-                            &mut cursor,
-                            &self.definitions.modules,
-                            self.definitions.frames.len(),
-                        )?;
-                        self.kernel_changed |= frame.mode == super::FrameMode::Kernel;
-                        self.definitions.frames.push(frame);
-                        self.definitions.frame_contexts.push_frame(module_limit);
-                        self.definitions_changed = true;
-                    }
-                    REC_STACK => self.definitions.stack_nodes.push(read_stack_node(
-                        &mut cursor,
-                        &self.definitions.stack_nodes,
-                        self.definitions.frames.len(),
-                    )?),
-                    REC_THREAD => self
-                        .threads
-                        .push(read_thread(&mut cursor, self.threads.len())?),
-                    REC_SAMPLE => {
-                        let sample = read_sample(
-                            &mut cursor,
-                            &self.threads,
-                            self.definitions.stack_nodes.len(),
-                            &mut self.last_timestamp_ns,
-                        )?;
-                        self.first_sample_timestamp_ns
-                            .get_or_insert(sample.timestamp_ns);
-                        self.sample_count = self
-                            .sample_count
-                            .checked_add(1)
-                            .ok_or_else(|| invalid_data("sample count exceeds address space"))?;
-                        self.observe_process(sample.process_id);
-                        self.samples.push(sample);
-                    }
-                    REC_PYTHON_RUNTIME => {
-                        let record = read_python_runtime(&mut cursor)?;
-                        self.observe_process(record.process_id);
-                        self.definitions.python_runtime_records.push(record);
-                    }
-                    REC_MODULE_DEACTIVATE => {
-                        let process_id = read_process_id(&mut cursor)?;
-                        let process = crate::Pid::try_from(process_id)
-                            .map_err(|error| invalid_data(error.to_string()))?;
-                        self.definitions.frame_contexts.deactivate_process(
-                            &self.definitions.modules,
-                            process_id,
-                            self.definitions.frames.len(),
-                        );
-                        self.observe_mapping_process(process);
-                        self.definitions_changed = true;
-                    }
-                    REC_MODULE_DEACTIVATE_ONE => {
-                        let module_id = read_index_within(
-                            &mut cursor,
-                            self.definitions.modules.len(),
-                            "module deactivation",
-                        )?;
-                        let process = self.definitions.modules[module_id].pid();
-                        self.kernel_changed |= self.definitions.modules[module_id].is_kernel();
-                        self.definitions
-                            .frame_contexts
-                            .deactivate_module(module_id, self.definitions.frames.len());
-                        if let Some(process) = process {
-                            self.observe_mapping_process(process);
-                        }
-                        self.definitions_changed = true;
-                    }
-                    other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
-                }
-                Ok(())
-            })();
-            if let Err(error) = parsed {
-                if error.kind() == io::ErrorKind::UnexpectedEof && cursor.at_eof() {
-                    cursor.position = record_start;
+            let record = match decode_spool_record(
+                &mut cursor,
+                &self.definitions.modules,
+                self.definitions.frames.len(),
+                &self.definitions.stack_nodes,
+                &self.threads,
+                &mut self.last_timestamp_ns,
+            ) {
+                Ok(Some(record)) => record,
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof && cursor.at_eof() => {
                     break;
                 }
-                return Err(error);
+                Err(error) => return Err(error),
+            };
+            let ends_batch = matches!(
+                &record,
+                DecodedSpoolRecord::DeactivateProcess(_) | DecodedSpoolRecord::DeactivateModule(_)
+            );
+            match record {
+                DecodedSpoolRecord::Module(module) => {
+                    let process = module.pid();
+                    let module_index = self.definitions.modules.len();
+                    self.kernel_mappings_changed |= module.is_kernel();
+                    self.definitions.modules.push(module);
+                    self.definitions.frame_contexts.push_module();
+                    if let Some(process) = process {
+                        self.active_modules_by_process
+                            .entry(process)
+                            .or_default()
+                            .push(module_index);
+                        self.observe_process(process);
+                    }
+                }
+                DecodedSpoolRecord::Frame(frame) => {
+                    let module_limit = self.definitions.modules.len();
+                    self.definitions.frames.push(frame);
+                    self.definitions.frame_contexts.push_frame(module_limit);
+                }
+                DecodedSpoolRecord::Stack(stack) => self.definitions.stack_nodes.push(stack),
+                DecodedSpoolRecord::Thread(thread) => self.threads.push(thread),
+                DecodedSpoolRecord::Sample(sample) => {
+                    self.first_sample_timestamp_ns
+                        .get_or_insert(sample.timestamp_ns);
+                    self.observe_process(sample.process_id);
+                    self.samples.push(sample);
+                }
+                DecodedSpoolRecord::PythonRuntime(record) => {
+                    self.observe_process(record.process_id);
+                }
+                DecodedSpoolRecord::DeactivateProcess(process_id) => {
+                    for module_index in self
+                        .active_modules_by_process
+                        .remove(&process_id)
+                        .unwrap_or_default()
+                    {
+                        self.retired_modules
+                            .push(self.definitions.modules[module_index].id);
+                        self.definitions
+                            .frame_contexts
+                            .deactivate_module(module_index, self.definitions.frames.len());
+                    }
+                    self.observe_process(process_id);
+                    self.retired_processes.push(process_id);
+                }
+                DecodedSpoolRecord::DeactivateModule(module_id) => {
+                    let module = &self.definitions.modules[module_id];
+                    let process = module.pid();
+                    self.retired_modules.push(module.id);
+                    self.kernel_mappings_changed |= module.is_kernel();
+                    self.definitions
+                        .frame_contexts
+                        .deactivate_module(module_id, self.definitions.frames.len());
+                    if let Some(process) = process {
+                        if let Some(modules) = self.active_modules_by_process.get_mut(&process) {
+                            modules.retain(|&active| active != module_id);
+                            if modules.is_empty() {
+                                self.active_modules_by_process.remove(&process);
+                            }
+                        }
+                        self.observe_process(process);
+                    }
+                }
             }
             self.position = cursor.position;
+            if self.samples.len() == MAX_BATCH_SAMPLES || ends_batch {
+                return Ok(self.position < self.mmap.len());
+            }
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 impl<'a> TailBatch<'a> {
-    /// Return samples decoded by this poll.
-    #[must_use]
-    pub fn samples(&self) -> &[SampleRecord] {
+    #[cfg(test)]
+    pub(crate) fn samples(&self) -> &[SampleRecord] {
         &self.tail.samples
     }
 
@@ -403,28 +374,30 @@ impl<'a> TailBatch<'a> {
             .map(|sample| self.tail.definitions.sample_stack(sample))
     }
 
-    /// Return processes observed in samples or definition updates.
+    /// Return the process IDs observed in this batch.
+    ///
+    /// IDs are deduplicated in first-seen order and include sample, module,
+    /// Python-runtime, and mapping-retirement records.
     #[must_use]
     pub fn processes(&self) -> &[crate::Pid] {
         &self.tail.observed_processes
     }
 
-    /// Return module definitions added by this poll.
+    /// Return whether another poll can decode an already-visible batch.
+    ///
+    /// Consumers should poll again without waiting when this is true. This
+    /// keeps each sample batch bounded when the writer gets ahead.
     #[must_use]
-    pub fn modules(&self) -> &[super::ModuleRecord] {
+    pub fn has_more(&self) -> bool {
+        self.tail.more_available
+    }
+
+    pub(crate) fn modules(&self) -> &[super::ModuleRecord] {
         &self.tail.definitions.modules[self.modules.clone()]
     }
 
-    /// Return frame definitions added by this poll.
-    #[must_use]
-    pub fn frames(&self) -> &[super::FrameRecord] {
+    pub(crate) fn frames(&self) -> &[super::FrameRecord] {
         &self.tail.definitions.frames[self.frames.clone()]
-    }
-
-    /// Return Python-runtime records added by this poll.
-    #[must_use]
-    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
-        &self.tail.definitions.python_runtime_records[self.python_runtime_records.clone()]
     }
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
@@ -449,16 +422,20 @@ impl<'a> TailBatch<'a> {
         self.tail.definitions.frame_contexts.clone()
     }
 
-    pub(crate) fn mapping_processes(&self) -> &[crate::Pid] {
-        &self.tail.mapping_processes
+    pub(crate) fn retired_processes(&self) -> &[crate::Pid] {
+        &self.tail.retired_processes
     }
 
-    pub(crate) fn definitions_changed(&self) -> bool {
-        self.definitions_changed
+    pub(crate) fn retired_modules(&self) -> &[u32] {
+        &self.tail.retired_modules
     }
 
-    pub(crate) fn kernel_changed(&self) -> bool {
-        self.kernel_changed
+    pub(crate) fn frame_contexts_changed(&self) -> bool {
+        !self.modules.is_empty() || !self.frames.is_empty() || !self.tail.retired_modules.is_empty()
+    }
+
+    pub(crate) fn kernel_mappings_changed(&self) -> bool {
+        self.tail.kernel_mappings_changed
     }
 }
 
@@ -493,6 +470,11 @@ mod tests {
         }
     }
 
+    fn assert_no_invalidation(invalidation: crate::symbolize::Invalidation<'_>) {
+        assert!(!invalidation.all());
+        assert!(invalidation.processes().next().is_none());
+    }
+
     #[test]
     fn polls_flushed_prefixes_and_matches_finished_reader() {
         let dir = TempDir::new("tail-prefixes");
@@ -500,25 +482,82 @@ mod tests {
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
         writer.flush().unwrap();
         let mut tail = Tail::open(&path).unwrap();
-        assert!(tail.poll().unwrap().samples().is_empty());
+        assert!(format!("{tail:?}").contains("pending_samples: 0"));
+        assert_eq!(tail.start_timestamp_us(), Some(123));
+        assert_eq!(tail.sample_interval_us(), Some(10));
+        let mut symbolizer = tail
+            .symbolizer()
+            .disable_perf_maps()
+            .stack_cache(crate::StackCache::External)
+            .build()
+            .unwrap();
+        let initial = tail.poll().unwrap();
+        assert!(initial.samples().is_empty());
+        assert!(!initial.has_more());
+        assert!(initial.processes().is_empty());
+        let other_tail = Tail::open(&path).unwrap();
+        let mut other_symbolizer = other_tail.symbolizer().build().unwrap();
+        let error = other_symbolizer
+            .update(&initial)
+            .err()
+            .expect("a symbolizer must reject batches from another tail");
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        assert_no_invalidation(symbolizer.update(&initial).unwrap());
 
         writer.write_module(&module()).unwrap();
         writer.write_sample_frames(1_000, 7, 8, [frame()]).unwrap();
+        writer.write_python_runtime(1_500, 9, true).unwrap();
         writer.flush().unwrap();
         let first = tail.poll().unwrap();
+        assert!(format!("{first:?}").contains("samples: 1"));
         assert_eq!(first.samples().len(), 1);
+        assert_eq!(
+            first.processes(),
+            &[crate::Pid::new(7).unwrap(), crate::Pid::new(9).unwrap()]
+        );
         assert_eq!(first.timestamp_us(&first.samples()[0]), Some(123));
+        assert!(!symbolizer.update(&first).unwrap().all());
+        let native_backend = symbolizer.has_native_backend();
+        let mut stack = symbolizer.resolve(first.stacks().next().unwrap()).unwrap();
+        assert_eq!(stack.is_cacheable(), !native_backend);
+        assert!(stack.next_with_id().is_some());
+        assert!(stack.next().is_none());
 
         writer.write_sample_frames(3_000, 7, 8, [frame()]).unwrap();
+        writer.write_module_deactivation(7).unwrap();
         writer.flush().unwrap();
         let second = tail.poll().unwrap();
         assert_eq!(second.timestamp_us(&second.samples()[0]), Some(125));
+        symbolizer.update(&second).unwrap();
+        assert_eq!(
+            symbolizer
+                .resolve(second.stacks().next().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let after_retirement = tail.poll().unwrap();
+        let invalidation = symbolizer.update(&after_retirement).unwrap();
+        let pid = crate::Pid::new(7).unwrap();
+        assert_eq!(invalidation.processes().collect::<Vec<_>>(), vec![pid]);
+        assert!(invalidation.affects_process(pid));
         drop(writer);
 
         let finished = Snapshot::open(&path).unwrap();
         assert_eq!(tail.modules(), finished.modules());
         assert_eq!(tail.frames(), finished.frames());
-        assert_eq!(tail.sample_count(), finished.samples().len());
+        assert_eq!(finished.samples().len(), 2);
+        assert_eq!(finished.python_runtime_records().len(), 1);
+
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        append.write_all(&[u8::MAX]).unwrap();
+        append.flush().unwrap();
+        let error = tail.poll().unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::CorruptSpool);
     }
 
     #[test]
@@ -551,8 +590,16 @@ mod tests {
             .unwrap();
         append.write_all(&bytes[split..]).unwrap();
         append.flush().unwrap();
-        let batch = tail.poll().unwrap();
-        assert_eq!(batch.samples().len(), 1);
-        assert_eq!(batch.samples()[0].timestamp_ns, 1_000);
+        {
+            let batch = tail.poll().unwrap();
+            let mut stacks = batch.stacks();
+            let stack = stacks.next().expect("expected one sample");
+            assert!(stacks.next().is_none());
+            assert_eq!(stack.sample().timestamp_ns, 1_000);
+        }
+
+        append.set_len(8).unwrap();
+        let error = tail.poll().unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::CorruptSpool);
     }
 }

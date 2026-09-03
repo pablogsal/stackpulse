@@ -35,9 +35,25 @@ pub struct NativeModule {
 }
 
 #[derive(Debug)]
-struct NativeImage {
+pub(crate) struct NativeImage {
     path: PathBuf,
-    _file: Arc<std::fs::File>,
+    file: Arc<std::fs::File>,
+}
+
+impl NativeImage {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new(file: Arc<std::fs::File>) -> Self {
+        use std::os::fd::AsRawFd;
+
+        Self {
+            path: PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+            file,
+        }
+    }
+
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
 }
 
 #[derive(Debug)]
@@ -103,7 +119,8 @@ impl NativeModule {
         mapping_id: u32,
         image_token: u64,
     ) -> Self {
-        let name = crate::path_name(path.as_path()).into();
+        let normalized_path = normalized_module_path(path.as_str());
+        let name = crate::path_name(Path::new(normalized_path)).into();
         Self {
             data: Rc::new(NativeModuleData {
                 path,
@@ -119,20 +136,7 @@ impl NativeModule {
         }
     }
 
-    pub(crate) fn with_image_file(&self, image_file: Option<Arc<std::fs::File>>) -> Self {
-        #[cfg(target_os = "linux")]
-        let image = image_file.map(|file| {
-            use std::os::fd::AsRawFd;
-            Arc::new(NativeImage {
-                path: PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
-                _file: file,
-            })
-        });
-        #[cfg(not(target_os = "linux"))]
-        let image = {
-            let _ = image_file;
-            None
-        };
+    pub(crate) fn with_image(&self, image: Option<Arc<NativeImage>>) -> Self {
         Self {
             data: Rc::clone(&self.data),
             image,
@@ -141,10 +145,16 @@ impl NativeModule {
 }
 
 impl NativeModule {
-    /// Return the mapped object's recorded path.
+    /// Return the path stored in the recording.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.data.path.as_path()
+    }
+
+    /// Return the recorded path without Linux's `" (deleted)"` suffix.
+    #[must_use]
+    pub fn normalized_path(&self) -> &Path {
+        Path::new(normalized_module_path(self.data.path.as_str()))
     }
 
     /// Borrow the shared module display name without copying it.
@@ -201,6 +211,10 @@ impl NativeModule {
     pub fn image_id(&self) -> NativeImageId {
         self.data.image_id
     }
+}
+
+pub(crate) fn normalized_module_path(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
 impl NativeFileIdentity {
@@ -440,6 +454,13 @@ pub trait NativeSymbolizer {
         requests: &[NativeLookup],
         output: &mut Vec<NativeSymbols>,
     ) -> Result<(), Self::Error>;
+
+    /// Release mapping-specific state after a live tail retires a module.
+    ///
+    /// Other mappings can still refer to the same [`NativeModule::image_id`],
+    /// so shared parsed-image state should remain until its final mapping is
+    /// retired. The module reference is valid only for this call.
+    fn retire_module(&mut self, _module: &NativeModule) {}
 }
 
 pub(crate) trait ErasedNativeSymbolizer {
@@ -448,6 +469,8 @@ pub(crate) trait ErasedNativeSymbolizer {
         requests: &[NativeLookup],
         output: &mut Vec<NativeSymbols>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    fn retire_module(&mut self, module: &NativeModule);
 }
 
 struct NativeSymbolizerAdapter<S>(S);
@@ -461,6 +484,10 @@ impl<S: NativeSymbolizer> ErasedNativeSymbolizer for NativeSymbolizerAdapter<S> 
         self.0
             .symbolize(requests, output)
             .map_err(|error| Box::new(error) as _)
+    }
+
+    fn retire_module(&mut self, module: &NativeModule) {
+        self.0.retire_module(module);
     }
 }
 
@@ -479,6 +506,7 @@ impl NativeSymbolizer for SymbolizerWrapper {
         requests: &[NativeLookup],
         output: &mut Vec<NativeSymbols>,
     ) -> Result<(), Self::Error> {
+        self.register_mappings(requests);
         self.preload_symbol_maps(requests);
         output.reserve(requests.len());
         output.extend(
@@ -487,6 +515,22 @@ impl NativeSymbolizer for SymbolizerWrapper {
                 .map(|request| self.symbolize_lookup(request)),
         );
         Ok(())
+    }
+
+    fn retire_module(&mut self, module: &NativeModule) {
+        if !self.mappings.remove(&module.mapping_id()) {
+            return;
+        }
+        let image = module.image_id();
+        let Some(references) = self.image_mapping_counts.get_mut(&image) else {
+            return;
+        };
+        *references -= 1;
+        if *references == 0 {
+            self.image_mapping_counts.remove(&image);
+            self.symbol_maps.remove(&image);
+            self.redirect_cache.remove(&image);
+        }
     }
 }
 
@@ -511,6 +555,12 @@ impl NativeSymbolizer for SharedSymbolizerWrapper {
         symbolizer
             .symbolize(requests, output)
             .map_err(|error| match error {})
+    }
+
+    fn retire_module(&mut self, module: &NativeModule) {
+        if let Some(symbolizer) = self.0.borrow_mut().as_mut() {
+            symbolizer.retire_module(module);
+        }
     }
 }
 
@@ -545,7 +595,6 @@ pub(crate) fn is_eval_frame(func_name: &str) -> bool {
         && func_name.contains(".llvm.")
 }
 
-#[cfg(feature = "builtin-wholesym")]
 /// Standard system debug directory on Linux.
 #[cfg(feature = "builtin-wholesym")]
 const DEFAULT_DEBUG_DIR: &str = "/usr/lib/debug";
@@ -734,6 +783,9 @@ struct SymbolizerWrapper {
     /// Loaded wholesym maps keyed by StackPulse's validated image identity.
     symbol_maps: HashMap<NativeImageId, Option<WholeSymbolMap>>,
 
+    mappings: HashSet<u32>,
+    image_mapping_counts: HashMap<NativeImageId, usize>,
+
     /// Tokio runtime for wholesym async APIs. Wrapped so Drop can hand it to
     /// `shutdown_background`, which is safe even inside another tokio runtime
     /// (a plain runtime drop there panics mid-unwind and aborts the process).
@@ -881,8 +933,21 @@ impl SymbolizerWrapper {
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
+            mappings: HashSet::new(),
+            image_mapping_counts: HashMap::new(),
             runtime: std::mem::ManuallyDrop::new(runtime),
         })
+    }
+
+    fn register_mappings(&mut self, requests: &[NativeLookup]) {
+        for request in requests {
+            let mapping = request.module().mapping_id();
+            if !self.mappings.insert(mapping) {
+                continue;
+            }
+            let image = request.image_id();
+            *self.image_mapping_counts.entry(image).or_default() += 1;
+        }
     }
 
     fn rebuild_symbol_manager(&mut self, binary_redirects: &[(PathBuf, PathBuf)]) {
@@ -967,7 +1032,7 @@ impl SymbolizerWrapper {
                     self.symbol_maps.insert(image, None);
                     continue;
                 };
-                if !logical_paths.insert(module.path()) {
+                if !logical_paths.insert(module.normalized_path()) {
                     deferred.push(request);
                     continue;
                 }
@@ -978,7 +1043,10 @@ impl SymbolizerWrapper {
                         &self.local_debug_dirs,
                     )
                 });
-                binary_redirects.push((module.path().to_path_buf(), image_path.to_path_buf()));
+                binary_redirects.push((
+                    module.normalized_path().to_path_buf(),
+                    image_path.to_path_buf(),
+                ));
                 round.push(request);
             }
 
@@ -986,7 +1054,7 @@ impl SymbolizerWrapper {
             for request in round {
                 let image = request.image_id();
                 let module = request.module();
-                let path = module.path();
+                let path = module.normalized_path();
                 let loaded = self.load_symbol_map(path, module.image_path().unwrap_or(path));
                 if let Err(err) = &loaded {
                     tracing::debug!(
@@ -1052,12 +1120,13 @@ mod tests {
     #[test]
     fn public_native_fixture_constructors_preserve_identity_and_addresses() {
         let identity = NativeFileIdentity::new(8, 1, 42, 3);
-        let first = NativeModule::new("/fixture/libexample.so", identity, 7);
-        let second = NativeModule::new("/fixture/libexample.so", identity, 8);
+        let first = NativeModule::new("/fixture/libexample.so (deleted)", identity, 7);
+        let second = NativeModule::new("/fixture/libexample.so (deleted)", identity, 8);
         assert_ne!(first.image_id(), second.image_id());
         assert_eq!(first.file_identity(), identity);
         assert_eq!(first.mapping_id(), 7);
-        assert_eq!(first.path(), Path::new("/fixture/libexample.so"));
+        assert_eq!(first.path(), Path::new("/fixture/libexample.so (deleted)"));
+        assert_eq!(first.normalized_path(), Path::new("/fixture/libexample.so"));
         assert!(first.image_path().is_none());
 
         let pid = crate::Pid::new(42).unwrap();
@@ -1068,6 +1137,39 @@ mod tests {
         assert_eq!(lookup.image_address(), 0x2200);
         assert_eq!(lookup.file_identity(), identity);
         assert_eq!(lookup.mapping_id(), 7);
+    }
+
+    #[test]
+    fn shared_image_state_outlives_each_mapping() {
+        let identity = NativeFileIdentity::new(8, 1, 42, 3);
+        let module = |mapping_id| {
+            NativeModule::from_recording(
+                "/fixture/libexample.so".into(),
+                0..u64::MAX,
+                ModuleImageBase::new(0, 0),
+                false,
+                identity,
+                mapping_id,
+                99,
+            )
+        };
+        let first = module(7);
+        let second = module(8);
+        let pid = crate::Pid::new(42).unwrap();
+        let requests = [
+            NativeLookup::new(pid, first.clone(), 1, 1, 1),
+            NativeLookup::new(pid, second.clone(), 2, 2, 2),
+        ];
+        let mut symbolizer = SymbolizerWrapper::try_new().unwrap();
+        symbolizer.register_mappings(&requests);
+        symbolizer.symbol_maps.insert(first.image_id(), None);
+        symbolizer.redirect_cache.insert(first.image_id(), None);
+
+        symbolizer.retire_module(&first);
+        assert!(symbolizer.symbol_maps.contains_key(&second.image_id()));
+        symbolizer.retire_module(&second);
+        assert!(!symbolizer.symbol_maps.contains_key(&second.image_id()));
+        assert!(!symbolizer.redirect_cache.contains_key(&second.image_id()));
     }
 
     #[test]
@@ -1164,13 +1266,14 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&binary).unwrap());
         let module = NativeModule::from_recording(
             binary.to_string_lossy().into_owned().into(),
+            0..u64::MAX,
             ModuleImageBase::new(0, 0),
             false,
             NativeFileIdentity::new(0, 0, 0, 0),
             0,
             0,
         )
-        .with_image_file(Some(file));
+        .with_image(Some(Arc::new(NativeImage::new(file))));
         let replacement = temp.path().join("replacement");
         std::fs::write(&replacement, b"replacement").unwrap();
         std::fs::rename(&replacement, &binary).unwrap();

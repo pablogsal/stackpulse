@@ -44,6 +44,7 @@ const _: fn() = || {
     assert_send::<Recorder>();
     assert_send_sync::<Replay>();
     assert_send_sync::<Snapshot>();
+    assert_send_sync::<Tail>();
     assert_send_sync::<process::RunningProcess>();
     assert_send_sync::<process::SuspendedLaunchedProcess>();
 };
