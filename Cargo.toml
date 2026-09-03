@@ -41,7 +41,7 @@ memmap2 = "0.9"
 mio = { version = "1", features = ["os-ext", "os-poll"] }
 nix = { version = "0.31", features = ["fs", "process", "signal"] }
 object = { version = "0.40", default-features = false, features = ["std", "read_core", "elf", "compression"] }
-perf-event-open = { version = "0.5", features = ["linux-6.0"] }
+perf-event-open = { version = "0.6", features = ["linux-6.0"] }
 perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
 tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"], optional = true }
