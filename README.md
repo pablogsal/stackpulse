@@ -10,7 +10,8 @@
 </div>
 
 StackPulse records CPU stack samples from Linux processes and writes them to a
-compact file. After capture, it resolves native, Python, JIT, and kernel frames
+compact file. Profiles can be replayed after capture or tailed incrementally
+while recording. StackPulse resolves native, Python, JIT, and kernel frames
 into names and source locations for your profiler.
 
 StackPulse is a library, not a command-line tool, and it requires Linux 6.0 or

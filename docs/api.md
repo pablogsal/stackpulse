@@ -42,8 +42,9 @@ for stack in reader.stacks() {
 | Type | Role |
 | --- | --- |
 | [`Recorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
-| [`Snapshot`] | Reads a spool file back into samples, modules, Python-runtime records, interned stack frames, and borrowed frame contexts. |
+| [`Snapshot`] | Reads a completed spool into memory for random access. |
 | [`Replay`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
+| [`Tail`] | Decodes bounded batches from a growing spool for live processing. |
 | [`Symbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`symbolize::NativeSymbolizer`]. |
 | [`symbolize::NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`Symbolizer`] still handles kernel and perf-map frames. |
 | [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
@@ -114,6 +115,72 @@ decoded on the fly as the iterator advances. The file must remain unchanged
 while the reader is alive. Use [`Snapshot`] instead when you need
 random access to `samples()`.
 
+# Live tailing
+
+Use [`Tail`] when recording and processing run concurrently. Apply each batch
+to its symbolizer before resolving the batch's stacks. With
+[`StackCache::External`], discard prepared stacks selected by the returned
+[`symbolize::Invalidation`] before resolving more samples.
+
+Prefer [`Recorder::tail`] when the recorder and tail live in one process. It
+shares handles still held by the recorder's bounded image cache, so deleted or
+replaced files can still be symbolized exactly while their images remain in
+that cache. `Tail::open` has only the paths stored in the spool.
+
+```rust,no_run
+use stackpulse::{StackCache, Tail};
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let mut tail = Tail::open("profile.spool")?;
+let mut symbolizer = tail.symbolizer().stack_cache(StackCache::External).build()?;
+
+// Call this function after each writer flush and once after the writer finishes.
+fn process_visible(
+    tail: &mut Tail,
+    symbolizer: &mut stackpulse::Symbolizer,
+) -> stackpulse::Result<()> {
+  loop {
+    let batch = tail.poll()?;
+    let invalidation = symbolizer.update(&batch)?;
+    invalidate_prepared_stacks(|pid| invalidation.affects_process(pid));
+
+    for stack in batch.stacks() {
+        for frame in symbolizer.resolve(stack)? {
+            aggregate(frame);
+        }
+    }
+
+    if !batch.has_more() {
+        break;
+    }
+  }
+  Ok(())
+}
+# Ok(())
+# }
+# fn invalidate_prepared_stacks(_: impl Fn(stackpulse::Pid) -> bool) {}
+# fn aggregate(_: &stackpulse::profile::ResolvedFrame) {}
+```
+
+`TailBatch` borrows the tail's reusable sample storage. Finish processing and
+drop the batch before polling again. `has_more()` means another complete batch
+may already be visible, not that the writer is still running. Poll again
+promptly when it is true. When it is false, wait for the writer to flush or
+finish before polling again. A final incomplete record is retried after the
+writer appends the remainder.
+
+`Symbolizer::update` verifies that the batch and symbolizer came from the same
+tail. It installs new definitions, refreshes live perf maps and kernel symbols,
+and retires resources only after the last batch that can reference them has
+been processed. An invalidation can target individual processes or every
+prepared stack. Callers using `StackCache::Internal` do not maintain that
+external state, but must still call `update` before `resolve`.
+
+External caches can use [`symbolize::ResolvedFrameId`] to reuse converted
+frames across different stacks. IDs are unique for one symbolizer and are
+never reused. Cache a whole resolved stack only when
+[`symbolize::ResolvedStack::is_cacheable`] is true; otherwise a temporary
+native-image failure would preserve an address-only result permanently.
+
 # Plugging in an external native symbolizer
 
 The default constructors install the bundled `wholesym` backend for native
@@ -165,6 +232,11 @@ Backend tests can construct requests directly with
 synthetic module gets a distinct opaque image identity. Its `image_path()` is
 `None`; recorded modules expose that path only when StackPulse retained the
 exact validated file backing the Linux mapping.
+
+During live tailing, [`symbolize::NativeSymbolizer::retire_module`] reports
+when a mapping is no longer active. Backends should use it to discard
+mapping-specific indexes. State shared by `NativeModule::image_id()` can stay
+cached until the last mapping for that image is retired.
 
 Symbol results can be provisional when a retryable error prevents StackPulse
 from opening a validated native image. A later resolution attempt can replace

@@ -5,7 +5,8 @@ append-only binary stream designed so that recording only ever issues small
 writes. If recording dies partway through the final record, readers keep the
 complete prefix that precedes it. A finished file can be read fully in memory
 through `Snapshot` or replayed sequentially with bounded memory through
-`Replay`.
+`Replay`. `Tail` reads the complete prefix incrementally while the writer is
+still appending records.
 
 ## Recovery
 
@@ -14,6 +15,10 @@ the complete prefix and reports recovery through
 `Snapshot::recovered_from_truncated_tail` or
 `Replay::recovered_from_truncated_tail`. Corruption within the complete prefix
 remains an error.
+
+`Tail` handles an incomplete final record differently: it leaves the reader
+position before that record and retries it after the file grows. The writer
+must not modify or truncate bytes that were already visible to the reader.
 
 ## Stream header
 
@@ -66,5 +71,12 @@ then decodes sample records sequentially. Once the range index reaches its
 configured limit, replay scans the validated suffix without retaining one
 index entry per sample.
 
-Both readers validate the complete retained prefix when opened. Sequential
-iteration only visits records and references that passed those checks.
+`Tail` retains definitions but returns samples in batches of at most 16,384.
+The next poll clears and reuses the previous sample storage. Definitions stay
+resident because later records can refer to any earlier module, frame, stack,
+or thread definition.
+
+`Snapshot` and `Replay` validate the complete retained prefix when opened.
+`Tail` performs the same checks as each complete record becomes visible.
+Sequential iteration only visits records and references that passed those
+checks.

@@ -23,7 +23,8 @@ target threads
   → Recorder::poll
   → native unwinding + module tracking
   → compact spool file
-  → Snapshot
+      ├─ completed: Snapshot or Replay
+      └─ growing: Tail::poll
   → Symbolizer
   → your aggregator / UI / exporter
 ```
@@ -214,6 +215,27 @@ many times. The format exploits that:
 
 Writes stay small and repeated stacks are cheap. `Snapshot` expands
 stack IDs back into frame records when an analysis needs them.
+
+## Processing while recording
+
+`Tail` reads complete records from a spool that is still growing. Each poll
+returns a bounded sample batch and any definitions needed by those samples.
+The batch borrows reusable storage from the reader, so processing finishes
+before the next poll reuses that storage.
+
+Live symbolization has one extra step. `Symbolizer::update` installs the
+batch's new definitions, refreshes changing symbol sources such as Python perf
+maps, and reports which caller-owned prepared stacks are stale. Resource
+retirement is ordered after the last batch that can refer to the retired
+mapping. Recording and symbolization remain separate: the recorder only
+unwinds and writes raw frames, while the tail-side consumer resolves them.
+
+Definitions accumulate for the lifetime of a tail because later samples can
+refer to earlier frame and stack IDs. Sample storage stays bounded and is
+reused across polls. A consumer that falls behind reads consecutive batches
+until `TailBatch::has_more()` becomes false, then waits for another writer
+flush. That flag reports already-visible input; it does not report whether the
+writer is alive.
 
 ## Accuracy and bias
 

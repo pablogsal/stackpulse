@@ -59,6 +59,57 @@ An existing event loop can check
 [`Recorder::has_pending_events`](crate::Recorder::has_pending_events), then
 call `poll(Duration::ZERO)` to drain without blocking.
 
+## Process a profile while recording
+
+Create a tail from a file-backed recorder, then process every complete batch
+after flushing the writer:
+
+```rust,no_run
+# use std::time::Duration;
+# use stackpulse::{Pid, Recorder, Symbolizer, Tail};
+# fn run(pid: Pid, mut recorder: Recorder) -> stackpulse::Result<()> {
+fn process_visible(tail: &mut Tail, symbolizer: &mut Symbolizer) -> stackpulse::Result<()> {
+    loop {
+        let batch = tail.poll()?;
+        symbolizer.update(&batch)?;
+        for stack in batch.stacks() {
+            for frame in symbolizer.resolve(stack)? {
+                consume(frame);
+            }
+        }
+        if !batch.has_more() {
+            return Ok(());
+        }
+    }
+}
+
+let mut tail = recorder.tail()?;
+let mut symbolizer = tail.symbolizer().build()?;
+
+while recorder.process_is_active(pid)? {
+    recorder.poll(Duration::from_millis(100))?;
+    recorder.flush()?;
+    process_visible(&mut tail, &mut symbolizer)?;
+}
+
+recorder.finish()?;
+process_visible(&mut tail, &mut symbolizer)?;
+# Ok(())
+# }
+# fn consume(_: &stackpulse::profile::ResolvedFrame) {}
+```
+
+`Recorder::tail` can be called once. It transfers the recorder's retained
+exact-image handles to the reader so deleted or replaced mappings can still be
+symbolized from the file that was actually sampled. `Tail::open` is available
+when the writer lives elsewhere, but then only paths recorded in the spool are
+available.
+
+The example uses StackPulse's internal stack cache. If the application keeps
+prepared stacks itself, configure `StackCache::External`, consume the
+`Invalidation` returned by every `update`, and do not cache a resolved stack
+when `ResolvedStack::is_cacheable()` is false.
+
 ## Profile more than one process
 
 After attaching the first PID, add the others:
