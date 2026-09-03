@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+mod tail;
 pub(crate) use model::ModuleOwner;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
@@ -22,6 +23,7 @@ pub(crate) use modules::ClonedProcessModules;
 pub(crate) use modules::ModuleActivation;
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
+pub use tail::{Tail, TailBatch};
 
 pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
 const REC_MODULE: u8 = 1;
@@ -391,17 +393,90 @@ pub(crate) struct FrameLookupContext {
     module_limit: usize,
 }
 
+const FRAME_CONTEXT_CHUNK_SIZE: usize = 1_024;
+
+/// Copy-on-write chunks make snapshots cheap and limit later copies to one chunk.
+/// Every chunk except the last contains exactly `FRAME_CONTEXT_CHUNK_SIZE` entries.
+#[derive(Clone, Default)]
+struct ChunkedFrameContext<T> {
+    chunks: Arc<Vec<Arc<Vec<T>>>>,
+}
+
+impl<T> ChunkedFrameContext<T> {
+    fn get(&self, index: usize) -> Option<&T> {
+        self.chunks
+            .get(index / FRAME_CONTEXT_CHUNK_SIZE)?
+            .get(index % FRAME_CONTEXT_CHUNK_SIZE)
+    }
+}
+
+impl<T: Clone> ChunkedFrameContext<T> {
+    fn push(&mut self, value: T) {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if let Some(chunk) = chunks
+            .last_mut()
+            .filter(|chunk| chunk.len() < FRAME_CONTEXT_CHUNK_SIZE)
+        {
+            let chunk = Arc::make_mut(chunk);
+            chunk.reserve(FRAME_CONTEXT_CHUNK_SIZE - chunk.len());
+            chunk.push(value);
+        } else {
+            let mut chunk = Vec::with_capacity(FRAME_CONTEXT_CHUNK_SIZE);
+            chunk.push(value);
+            chunks.push(Arc::new(chunk));
+        }
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        Arc::make_mut(&mut self.chunks)
+            .get_mut(index / FRAME_CONTEXT_CHUNK_SIZE)
+            .and_then(|chunk| Arc::make_mut(chunk).get_mut(index % FRAME_CONTEXT_CHUNK_SIZE))
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct SpoolFrameModuleContexts {
-    frame_module_limits: Arc<[usize]>,
-    module_deactivated_at: Arc<[Option<usize>]>,
+    frame_module_limits: ChunkedFrameContext<usize>,
+    module_deactivated_at: ChunkedFrameContext<Option<usize>>,
 }
 
 impl SpoolFrameModuleContexts {
-    fn new(frame_module_limits: Vec<usize>, module_deactivated_at: Vec<Option<usize>>) -> Self {
-        Self {
-            frame_module_limits: frame_module_limits.into(),
-            module_deactivated_at: module_deactivated_at.into(),
+    fn push_module(&mut self) {
+        self.module_deactivated_at.push(None);
+    }
+
+    fn push_frame(&mut self, module_limit: usize) {
+        self.frame_module_limits.push(module_limit);
+    }
+
+    fn deactivate_process(
+        &mut self,
+        modules: &[ModuleRecord],
+        process_id: i32,
+        deactivated_at: usize,
+    ) {
+        for (module_id, module) in modules.iter().enumerate() {
+            if module.pid().is_some_and(|pid| pid.get() == process_id) {
+                self.deactivate_module(module_id, deactivated_at);
+            }
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "module contexts are appended atomically with module records"
+    )]
+    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) {
+        if self
+            .module_deactivated_at
+            .get(module_id)
+            .expect("every module has a context")
+            .is_none()
+        {
+            *self
+                .module_deactivated_at
+                .get_mut(module_id)
+                .expect("every module has a context") = Some(deactivated_at);
         }
     }
 
@@ -1035,9 +1110,7 @@ fn open_spool_with_range_limit(
     let sample_interval_us = reader.read_varint::<u64>()?;
     let (
         mut modules,
-        mut module_deactivated_at,
         mut frames,
-        mut frame_module_limits,
         mut stack_nodes,
         mut threads,
         mut samples,
@@ -1049,9 +1122,8 @@ fn open_spool_with_range_limit(
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
     );
+    let mut frame_contexts = SpoolFrameModuleContexts::default();
     let mut sample_count = 0_usize;
     let mut sample_ranges =
         (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
@@ -1071,12 +1143,12 @@ fn open_spool_with_range_limit(
             match tag {
                 REC_MODULE => {
                     modules.push(read_module_mmap(&mut reader, modules.len())?);
-                    module_deactivated_at.push(None);
+                    frame_contexts.push_module();
                 }
                 REC_FRAME => {
                     let module_limit = modules.len();
                     frames.push(read_frame(&mut reader, &modules, frames.len())?);
-                    frame_module_limits.push(module_limit);
+                    frame_contexts.push_frame(module_limit);
                 }
                 REC_STACK => {
                     stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
@@ -1102,17 +1174,12 @@ fn open_spool_with_range_limit(
                 }
                 REC_MODULE_DEACTIVATE => {
                     let process_id = read_process_id(&mut reader)?;
-                    let deactivated_at = frames.len();
-                    for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at) {
-                        if module.pid().is_some_and(|pid| pid.get() == process_id) {
-                            deactivated.get_or_insert(deactivated_at);
-                        }
-                    }
+                    frame_contexts.deactivate_process(&modules, process_id, frames.len());
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
                     let module_id =
                         read_index_within(&mut reader, modules.len(), "module deactivation")?;
-                    module_deactivated_at[module_id].get_or_insert(frames.len());
+                    frame_contexts.deactivate_module(module_id, frames.len());
                 }
                 other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
             }
@@ -1146,7 +1213,6 @@ fn open_spool_with_range_limit(
             }
         }
     }
-    let frame_contexts = SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
     Ok(OpenedSpool {
         definitions: SpoolDefinitions {
             source_id: next_source_id(),
@@ -1659,10 +1725,12 @@ fn read_sample(
     let timestamp_ns = last_timestamp_ns
         .checked_add_signed(delta)
         .ok_or_else(|| invalid_data(format!("sample timestamp delta {delta} out of range")))?;
-    *last_timestamp_ns = timestamp_ns;
     let thread_ref = read_index_within(reader, threads.len(), "sample thread")?;
     let thread = threads[thread_ref];
     let stack_id = read_id_within(reader, stack_count, "sample stack")?;
+    // A growing spool can end in the middle of this record. Only commit the
+    // delta after every field has been decoded.
+    *last_timestamp_ns = timestamp_ns;
     Ok(SampleRecord {
         timestamp_ns,
         process_id: thread.process_id,

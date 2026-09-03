@@ -28,7 +28,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::native_module::{ElfLoadError, ElfSectionCache};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, Replay, SampleStack, Snapshot,
-    SpoolFrameModuleContexts, StackKey,
+    SpoolFrameModuleContexts, StackKey, Tail, TailBatch,
 };
 
 mod kernel;
@@ -39,8 +39,8 @@ pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
 use kernel::KernelSymbol;
 use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 use perf_map::{
-    find_perf_map_symbol, load_perf_map, perf_map_module_allowed, perf_map_symbol_to_frame,
-    PerfMap, PerfMapProcesses, PerfMapSymbol,
+    find_perf_map_symbol, load_perf_map, perf_map_file_identity, perf_map_module_allowed,
+    perf_map_symbol_to_frame, PerfMap, PerfMapFileIdentity, PerfMapProcesses, PerfMapSymbol,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +85,7 @@ pub struct Symbolizer {
     transient_frame_slots: FxHashMap<(i32, FrameCacheKey), usize>,
     vacant_frame_slots: Vec<usize>,
     perf_map_cache: FxHashMap<i32, Option<PerfMap>>,
+    perf_map_identities: FxHashMap<i32, Option<PerfMapFileIdentity>>,
     kernel_symbols: Option<KernelSymbolTable>,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
     frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
@@ -93,6 +94,7 @@ pub struct Symbolizer {
     stack_cache_mode: StackCache,
     stack_cache: FxHashMap<StackKey, Range<usize>>,
     resolved_stack_scratch: Vec<usize>,
+    invalidated_processes: Vec<crate::Pid>,
     native_factory: Option<NativeSymbolizerFactory>,
 }
 
@@ -259,6 +261,24 @@ impl SpoolSymbolizationInput for Replay {
     }
 }
 
+impl SpoolSymbolizationInput for Tail {
+    fn source_id(&self) -> u64 {
+        self.source_id()
+    }
+
+    fn modules(&self) -> &[ModuleRecord] {
+        self.modules()
+    }
+
+    fn frames(&self) -> &[FrameRecord] {
+        self.frames()
+    }
+
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.frame_module_contexts()
+    }
+}
+
 /// Configures a [`Symbolizer`].
 pub struct SymbolizerBuilder<'a> {
     input: SymbolizerInput<'a>,
@@ -309,6 +329,32 @@ pub enum StackCache {
     External,
 }
 
+/// Prepared-stack invalidation caused by one live tail update.
+pub struct Invalidation<'a> {
+    all: bool,
+    processes: &'a [crate::Pid],
+}
+
+impl Invalidation<'_> {
+    /// Return whether every externally cached stack must be discarded.
+    #[must_use]
+    pub fn all(&self) -> bool {
+        self.all
+    }
+
+    /// Return processes whose externally cached stacks must be discarded.
+    #[must_use]
+    pub fn processes(&self) -> &[crate::Pid] {
+        self.processes
+    }
+
+    /// Return whether no externally cached stack changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.all && self.processes.is_empty()
+    }
+}
+
 impl<'a> SymbolizerBuilder<'a> {
     fn with_input(input: SymbolizerInput<'a>) -> Self {
         Self {
@@ -337,6 +383,19 @@ impl<'a> SymbolizerBuilder<'a> {
     #[must_use]
     pub(crate) fn for_replay(reader: &'a Replay) -> Self {
         Self::with_input(SymbolizerInput::Spool(reader))
+    }
+
+    /// Configure symbolization for an append-only spool tail.
+    #[must_use]
+    pub(crate) fn for_tail(reader: &'a Tail) -> Self {
+        Self {
+            input: SymbolizerInput::Spool(reader),
+            perf_map_processes: PerfMapProcesses::All,
+            perf_map_dir: PathBuf::from("/tmp"),
+            native_factory: None,
+            kernel_symbols: KernelSymbolSource::Host,
+            stack_cache: StackCache::Internal,
+        }
     }
 
     /// Disable Python perf-map lookup.
@@ -592,6 +651,7 @@ impl Symbolizer {
             transient_frame_slots: FxHashMap::default(),
             vacant_frame_slots: Vec::new(),
             perf_map_cache: FxHashMap::default(),
+            perf_map_identities: FxHashMap::default(),
             kernel_symbols,
             spool_frame_contexts: None,
             frame_cache: FxHashMap::default(),
@@ -600,7 +660,82 @@ impl Symbolizer {
             stack_cache_mode: StackCache::Internal,
             stack_cache: FxHashMap::default(),
             resolved_stack_scratch: Vec::new(),
+            invalidated_processes: Vec::new(),
             native_factory,
+        })
+    }
+
+    /// Apply definitions and live symbol-source changes from one tail poll.
+    ///
+    /// The returned process slice borrows reusable symbolizer storage. Consume
+    /// it before resolving another stack.
+    pub fn update<'a>(&'a mut self, batch: &TailBatch<'_>) -> crate::Result<Invalidation<'a>> {
+        if self.source_id != Some(batch.source_id()) {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "tail batch belongs to a different spool source",
+            ));
+        }
+
+        self.invalidated_processes.clear();
+        let mut invalidated = FxHashSet::default();
+        invalidated.extend(batch.mapping_processes().iter().copied());
+
+        if !batch.modules().is_empty() {
+            for module in batch.modules() {
+                self.modules.push(module.clone())?;
+            }
+        }
+        if batch.definitions_changed() {
+            self.spool_frame_contexts = Some(batch.frame_module_contexts());
+        }
+
+        for process in batch.processes() {
+            if !self.perf_maps_allowed_for(process.get()) {
+                continue;
+            }
+            let identity = perf_map_file_identity(&self.perf_map_dir, process.get());
+            let had_map = self.perf_map_cache.contains_key(&process.get());
+            let changed = self
+                .perf_map_identities
+                .insert(process.get(), identity)
+                .is_some_and(|previous| previous != identity);
+            if changed || !had_map {
+                self.perf_map_cache.insert(
+                    process.get(),
+                    load_perf_map(&self.perf_map_dir, process.get()),
+                );
+            }
+            if changed && had_map {
+                invalidated.insert(*process);
+            }
+        }
+
+        let all = batch.kernel_changed();
+        if all {
+            self.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
+                batch
+                    .all_frames()
+                    .iter()
+                    .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip)),
+                batch.all_modules(),
+            ));
+            self.frame_cache.clear();
+            self.stack_cache.clear();
+            self.resolved_stack_frame_ids.clear();
+            self.resolved_stack_scratch.clear();
+        } else {
+            self.frame_cache.retain(|(process_id, _), _| {
+                !invalidated.iter().any(|pid| pid.get() == *process_id)
+            });
+            self.stack_cache
+                .retain(|key, _| !invalidated.contains(&key.process_id()));
+        }
+
+        self.invalidated_processes.extend(invalidated);
+        Ok(Invalidation {
+            all,
+            processes: &self.invalidated_processes,
         })
     }
 
