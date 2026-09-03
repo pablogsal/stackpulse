@@ -34,7 +34,7 @@ mod test_support;
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{Pid, Tid};
 pub use linux::{process, AttachMode, Recorder, RecorderOptions, RecordingSummary, SampleRate};
-pub use spool::{Replay, Snapshot};
+pub use spool::{Replay, Snapshot, Tail};
 pub use symbolize::{StackCache, Symbolizer, SymbolizerBuilder};
 
 const _: fn() = || {
@@ -44,6 +44,7 @@ const _: fn() = || {
     assert_send::<Recorder>();
     assert_send_sync::<Replay>();
     assert_send_sync::<Snapshot>();
+    assert_send_sync::<Tail>();
     assert_send_sync::<process::RunningProcess>();
     assert_send_sync::<process::SuspendedLaunchedProcess>();
 };

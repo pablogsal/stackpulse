@@ -56,6 +56,13 @@ impl KernelSymbolTable {
     pub(super) fn empty() -> Self {
         Self::Sparse(Arc::from([]))
     }
+
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Full(symbols) => symbols.is_empty(),
+            Self::Sparse(symbols) => symbols.is_empty(),
+        }
+    }
 }
 
 const MAX_KERNEL_SYMBOL_FILE_SIZE: u64 = 64 * 1024 * 1024;
@@ -180,6 +187,29 @@ pub(super) fn load_sparse_kernel_symbols_for_spool(
     modules: &[ModuleRecord],
 ) -> KernelSymbolTable {
     load_sparse_kernel_symbols_with_rebase_anchors(addresses, kernel_rebase_anchors(modules))
+}
+
+pub(super) fn extend_sparse_kernel_symbols_for_spool(
+    table: &mut KernelSymbolTable,
+    addresses: impl IntoIterator<Item = u64>,
+    modules: &[ModuleRecord],
+) {
+    let KernelSymbolTable::Sparse(existing) = table else {
+        return;
+    };
+    let KernelSymbolTable::Sparse(added) = load_sparse_kernel_symbols_for_spool(addresses, modules)
+    else {
+        return;
+    };
+    if added.is_empty() {
+        return;
+    }
+    let mut combined = Vec::with_capacity(existing.len() + added.len());
+    combined.extend(existing.iter().cloned());
+    combined.extend(added.iter().cloned());
+    combined.sort_unstable_by_key(|(address, _)| *address);
+    combined.dedup_by_key(|(address, _)| *address);
+    *existing = Arc::from(combined.into_boxed_slice());
 }
 
 fn load_sparse_kernel_symbols_with_rebase_anchors(

@@ -4,13 +4,14 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::elf::{
     load_elf_sections_from_bytes, load_elf_sections_from_file, resolve_mapping_image_base,
     ElfSectionInfo,
 };
 use crate::module_base::ModuleImageBase;
+use crate::symbols::NativeImage;
 use rustc_hash::FxHashMap;
 
 use crate::spool::{ModuleRecord, VDSO_PATH};
@@ -18,6 +19,111 @@ use crate::spool::{ModuleRecord, VDSO_PATH};
 const MAX_ELF_OPEN_ATTEMPTS: u8 = 2;
 const MAX_SHARED_ELF_IMAGES: usize = 256;
 const MAX_SHARED_ELF_OWNED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXACT_IMAGE_ALIASES: usize = 4_096;
+static NEXT_EXACT_IMAGE_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 63);
+
+#[derive(Clone, Default)]
+pub(crate) struct ExactImageStore(Arc<Mutex<ExactImageStoreInner>>);
+
+#[derive(Default)]
+struct ExactImageStoreInner {
+    by_module: FxHashMap<u32, RetainedElfImage>,
+    order: VecDeque<u32>,
+    image_refs: FxHashMap<usize, (usize, usize, u64)>,
+    owned_bytes: usize,
+}
+
+#[derive(Clone)]
+struct RetainedElfImage {
+    sections: Arc<ElfSectionInfo>,
+    image: Arc<NativeImage>,
+    token: u64,
+    identity: ElfFileIdentity,
+}
+
+impl ExactImageStore {
+    fn get(&self, module_id: u32) -> Option<RetainedElfImage> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .by_module
+            .get(&module_id)
+            .cloned()
+    }
+
+    fn insert(
+        &self,
+        module_id: u32,
+        sections: Arc<ElfSectionInfo>,
+        image: Arc<NativeImage>,
+        identity: ElfFileIdentity,
+    ) {
+        let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let token = store.add_ref(&sections, &image);
+        let retained = RetainedElfImage {
+            sections,
+            image,
+            token,
+            identity,
+        };
+        let previous = store.by_module.insert(module_id, retained);
+        debug_assert!(previous.is_none(), "module image IDs are never reused");
+        store.order.push_back(module_id);
+        while store.by_module.len() > MAX_EXACT_IMAGE_ALIASES
+            || store.image_refs.len() > MAX_SHARED_ELF_IMAGES
+            || store.owned_bytes > MAX_SHARED_ELF_OWNED_BYTES
+        {
+            let Some(oldest) = store.order.pop_front() else {
+                break;
+            };
+            store.remove_entry(oldest);
+        }
+    }
+
+    fn alias(&self, source_id: u32, module_id: u32) {
+        if let Some(retained) = self.get(source_id) {
+            self.insert(
+                module_id,
+                retained.sections,
+                retained.image,
+                retained.identity,
+            );
+        }
+    }
+}
+
+impl ExactImageStoreInner {
+    fn add_ref(&mut self, sections: &Arc<ElfSectionInfo>, exact: &Arc<NativeImage>) -> u64 {
+        let image = Arc::as_ptr(exact) as usize;
+        let (references, _, token) = self.image_refs.entry(image).or_insert_with(|| {
+            let owned_bytes = elf_image_owned_bytes(sections);
+            self.owned_bytes = self.owned_bytes.saturating_add(owned_bytes);
+            (
+                0,
+                owned_bytes,
+                NEXT_EXACT_IMAGE_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        *references += 1;
+        *token
+    }
+
+    fn remove_entry(&mut self, module_id: u32) {
+        let Some(retained) = self.by_module.remove(&module_id) else {
+            return;
+        };
+        let image = Arc::as_ptr(&retained.image) as usize;
+        let Some((references, owned_bytes, _)) = self.image_refs.get_mut(&image) else {
+            return;
+        };
+        *references -= 1;
+        if *references == 0 {
+            self.owned_bytes = self.owned_bytes.saturating_sub(*owned_bytes);
+            self.image_refs.remove(&image);
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ElfSectionCache {
@@ -27,6 +133,8 @@ pub(crate) struct ElfSectionCache {
     retained_owned_bytes: usize,
     open_failures: FxHashMap<u32, u8>,
     next_image_token: u64,
+    exact_images: Option<ExactImageStore>,
+    publish_exact_images: bool,
     #[cfg(test)]
     file_parse_count: usize,
 }
@@ -35,23 +143,24 @@ pub(crate) struct ElfSectionCache {
 struct CachedElfImage {
     sections: Arc<ElfSectionInfo>,
     token: u64,
-    file: Weak<File>,
+    image: Weak<NativeImage>,
     identity: Option<ElfFileIdentity>,
+    trusted: bool,
 }
 
 struct SharedElfImage {
     sections: Arc<ElfSectionInfo>,
     token: u64,
-    file: Arc<File>,
+    image: Arc<NativeImage>,
     owned_bytes: usize,
 }
 
 impl SharedElfImage {
-    fn from_cached(image: &CachedElfImage, file: Arc<File>) -> Self {
+    fn from_cached(image: &CachedElfImage, exact: Arc<NativeImage>) -> Self {
         Self {
             sections: Arc::clone(&image.sections),
             token: image.token,
-            file,
+            image: exact,
             owned_bytes: elf_image_owned_bytes(&image.sections),
         }
     }
@@ -75,16 +184,16 @@ enum ElfImageIdentity {
         file: ElfFileIdentity,
         mount_namespace: u64,
     },
-    Mapping {
+    Process {
         file: ElfFileIdentity,
-        mapping_id: u32,
+        process_id: crate::Pid,
     },
 }
 
 impl ElfImageIdentity {
     fn file(&self) -> &ElfFileIdentity {
         match self {
-            Self::Namespaced { file, .. } | Self::Mapping { file, .. } => file,
+            Self::Namespaced { file, .. } | Self::Process { file, .. } => file,
         }
     }
 }
@@ -92,7 +201,7 @@ impl ElfImageIdentity {
 pub(crate) struct LoadedElfMapping {
     pub(crate) image_base: Option<ModuleImageBase>,
     pub(crate) sections: Arc<ElfSectionInfo>,
-    pub(crate) file: Option<Arc<File>>,
+    pub(crate) image: Option<Arc<NativeImage>>,
     pub(crate) image_token: u64,
 }
 
@@ -103,6 +212,21 @@ pub(crate) enum ElfLoadError {
 }
 
 impl ElfSectionCache {
+    pub(crate) fn publishing_exact_images_to(images: ExactImageStore) -> Self {
+        Self {
+            exact_images: Some(images),
+            publish_exact_images: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn using_exact_images(images: ExactImageStore) -> Self {
+        Self {
+            exact_images: Some(images),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn load_mapping(
         &mut self,
         module: &ModuleRecord,
@@ -118,12 +242,12 @@ impl ElfSectionCache {
             return Ok(LoadedElfMapping {
                 image_base: resolve_image_base(module, &image.sections),
                 sections: Arc::clone(&image.sections),
-                file: image.file.upgrade(),
+                image: image.image.upgrade(),
                 image_token: image.token,
             });
         }
 
-        let (image, file) = if module.path.is_vdso() {
+        let (image, exact) = if module.path.is_vdso() {
             let bytes = local_vdso_bytes().ok_or(ElfLoadError::Unsupported)?;
             (
                 CachedElfImage {
@@ -132,10 +256,26 @@ impl ElfSectionCache {
                             .map_err(|_| ElfLoadError::Unsupported)?,
                     ),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
-                    file: Weak::new(),
+                    image: Weak::new(),
                     identity: None,
+                    trusted: false,
                 },
                 None,
+            )
+        } else if let Some(retained) = self
+            .exact_images
+            .as_ref()
+            .and_then(|images| images.get(module.id))
+        {
+            (
+                CachedElfImage {
+                    sections: Arc::clone(&retained.sections),
+                    token: retained.token,
+                    image: Arc::downgrade(&retained.image),
+                    identity: Some(retained.identity),
+                    trusted: true,
+                },
+                Some(retained.image),
             )
         } else {
             self.ensure_open_attempt_allowed(module.id)?;
@@ -144,44 +284,59 @@ impl ElfSectionCache {
             let identity =
                 elf_image_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
             let cached = self.by_image.get(&identity).map(|shared| {
-                let retained_file = Arc::clone(&shared.file);
+                let retained_image = Arc::clone(&shared.image);
                 (
                     CachedElfImage {
                         sections: Arc::clone(&shared.sections),
                         token: shared.token,
-                        file: Arc::downgrade(&retained_file),
+                        image: Arc::downgrade(&retained_image),
                         identity: Some(identity.file().clone()),
+                        trusted: false,
                     },
-                    retained_file,
+                    retained_image,
                 )
             });
             if cached.is_some() {
                 self.touch_shared_image(&identity);
             }
-            let (image, file) = if let Some(cached) = cached {
+            let (image, exact) = if let Some(cached) = cached {
                 cached
             } else {
+                let exact = Arc::new(NativeImage::new(Arc::clone(&file)));
                 let image = CachedElfImage {
                     sections: Arc::new(self.parse_file(&file, module.path.as_path())?),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
-                    file: Arc::downgrade(&file),
+                    image: Arc::downgrade(&exact),
                     identity: Some(identity.file().clone()),
+                    trusted: false,
                 };
                 self.insert_shared_image(
                     identity,
-                    SharedElfImage::from_cached(&image, Arc::clone(&file)),
+                    SharedElfImage::from_cached(&image, Arc::clone(&exact)),
                 );
-                (image, file)
+                (image, exact)
             };
-            (image, Some(file))
+            (image, Some(exact))
         };
         self.open_failures.remove(&module.id);
         self.by_module.insert(module.id, image.clone());
+        if self.publish_exact_images {
+            if let (Some(images), Some(exact), Some(identity)) =
+                (&self.exact_images, exact.as_ref(), image.identity.as_ref())
+            {
+                images.insert(
+                    module.id,
+                    Arc::clone(&image.sections),
+                    Arc::clone(exact),
+                    identity.clone(),
+                );
+            }
+        }
 
         Ok(LoadedElfMapping {
             image_base: resolve_image_base(module, &image.sections),
             sections: image.sections,
-            file,
+            image: exact,
             image_token: image.token,
         })
     }
@@ -262,20 +417,24 @@ impl ElfSectionCache {
         self.retained_owned_bytes = self.retained_owned_bytes.saturating_sub(image.owned_bytes);
     }
 
-    pub(crate) fn acquire_file(
+    pub(crate) fn acquire_image(
         &mut self,
         module: &ModuleRecord,
-    ) -> Result<Arc<File>, ElfLoadError> {
+    ) -> Result<Arc<NativeImage>, ElfLoadError> {
         if module.path.is_vdso() {
             return Err(ElfLoadError::Unsupported);
         }
-        if let Some((file, identity)) = self
-            .by_module
-            .get(&module.id)
-            .and_then(|image| Some((image.file.upgrade()?, image.identity.as_ref()?.clone())))
+        if let Some((image, trusted, identity)) =
+            self.by_module.get(&module.id).and_then(|cached| {
+                Some((
+                    cached.image.upgrade()?,
+                    cached.trusted,
+                    cached.identity.as_ref(),
+                ))
+            })
         {
-            if elf_file_identity(module, &file).as_ref() == Some(&identity) {
-                return Ok(file);
+            if trusted || elf_file_identity(module, image.file()).as_ref() == identity {
+                return Ok(image);
             }
         }
         self.ensure_open_attempt_allowed(module.id)?;
@@ -292,29 +451,21 @@ impl ElfSectionCache {
             if image.identity.as_ref() != Some(&identity) || *image.sections != current_sections {
                 return Err(ElfLoadError::Unsupported);
             }
-            image.file = Arc::downgrade(&file);
-            SharedElfImage::from_cached(image, Arc::clone(&file))
+            let exact = Arc::new(NativeImage::new(Arc::clone(&file)));
+            image.image = Arc::downgrade(&exact);
+            SharedElfImage::from_cached(image, exact)
         };
+        let exact = Arc::clone(&shared.image);
         if let Some(shared_identity) = shared_identity {
             self.insert_shared_image(shared_identity, shared);
         }
         self.open_failures.remove(&module.id);
-        Ok(file)
+        Ok(exact)
     }
 
     pub(crate) fn remove(&mut self, module_id: u32) {
         self.by_module.remove(&module_id);
         self.open_failures.remove(&module_id);
-        let mapping_identity = self.by_image.keys().find_map(|identity| match identity {
-            ElfImageIdentity::Mapping { mapping_id, .. } if *mapping_id == module_id => {
-                Some(identity.clone())
-            }
-            _ => None,
-        });
-        if let Some(identity) = mapping_identity {
-            self.remove_shared_image(&identity);
-            self.image_order.retain(|cached| cached != &identity);
-        }
     }
 
     pub(crate) fn contains(&self, module_id: u32) -> bool {
@@ -325,6 +476,9 @@ impl ElfSectionCache {
         if let Some(image) = self.by_module.get(&source_id).cloned() {
             self.by_module.insert(module_id, image);
             self.open_failures.remove(&module_id);
+            if let Some(images) = &self.exact_images {
+                images.alias(source_id, module_id);
+            }
             true
         } else {
             false
@@ -348,7 +502,8 @@ fn elf_image_owned_bytes(sections: &ElfSectionInfo) -> usize {
     // unique decompressed buffers that the cache owns instead.
     let mut owned = std::mem::size_of::<ElfSectionInfo>()
         .saturating_add(std::mem::size_of_val(sections.load_segments.as_ref()));
-    let mut owned_sections = Vec::with_capacity(3);
+    let mut owned_sections = [0; 3];
+    let mut owned_section_count = 0;
     for section in [
         sections.text.as_ref(),
         sections.eh_frame.as_ref(),
@@ -360,10 +515,11 @@ fn elf_image_owned_bytes(sections: &ElfSectionInfo) -> usize {
         let Some((identity, bytes)) = section.owned_storage_identity() else {
             continue;
         };
-        if owned_sections.contains(&identity) {
+        if owned_sections[..owned_section_count].contains(&identity) {
             continue;
         }
-        owned_sections.push(identity);
+        owned_sections[owned_section_count] = identity;
+        owned_section_count += 1;
         owned = owned.saturating_add(bytes);
     }
     owned
@@ -380,9 +536,9 @@ fn elf_image_identity(module: &ModuleRecord, file: &File) -> Option<ElfImageIden
             file,
             mount_namespace,
         },
-        None => ElfImageIdentity::Mapping {
+        None => ElfImageIdentity::Process {
             file,
-            mapping_id: module.id,
+            process_id: pid,
         },
     })
 }
@@ -520,6 +676,10 @@ mod tests {
             got_svma: None,
             load_segments: Box::default(),
         })
+    }
+
+    fn exact_image(file: Arc<File>) -> Arc<NativeImage> {
+        Arc::new(NativeImage::new(file))
     }
 
     fn namespaced_identity(inode: u64, size: u64, mount_namespace: u64) -> ElfImageIdentity {
@@ -748,9 +908,10 @@ mod tests {
         let mut cache = ElfSectionCache::default();
         let loaded = cache.load_mapping(&module).unwrap();
         let modified = loaded
-            .file
+            .image
             .as_ref()
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .modified()
@@ -763,7 +924,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cache.acquire_file(&module).unwrap_err(),
+            cache.acquire_image(&module).unwrap_err(),
             ElfLoadError::Unsupported
         );
     }
@@ -791,7 +952,7 @@ mod tests {
         cache.image_order.clear();
         cache.retained_owned_bytes = 0;
         drop(loaded);
-        assert!(cache.by_module[&module.id].file.upgrade().is_none());
+        assert!(cache.by_module[&module.id].image.upgrade().is_none());
         cache.by_module.get_mut(&module.id).unwrap().sections = Arc::new(ElfSectionInfo {
             base_svma: u64::MAX,
             text_svma: None,
@@ -806,10 +967,10 @@ mod tests {
         });
 
         assert_eq!(
-            cache.acquire_file(&module).unwrap_err(),
+            cache.acquire_image(&module).unwrap_err(),
             ElfLoadError::Unsupported
         );
-        assert!(cache.by_module[&module.id].file.upgrade().is_none());
+        assert!(cache.by_module[&module.id].image.upgrade().is_none());
     }
 
     #[test]
@@ -835,7 +996,7 @@ mod tests {
 
         module.owner = user_owner(2_000_000_000);
 
-        assert!(cache.acquire_file(&module).is_ok());
+        assert!(cache.acquire_image(&module).is_ok());
     }
 
     #[test]
@@ -882,19 +1043,20 @@ mod tests {
         let mut cache = ElfSectionCache::default();
         let LoadedElfMapping {
             sections: first_sections,
-            file: first_file,
+            image: first_image,
             image_token: first_token,
             ..
         } = cache.load_mapping(&module).unwrap();
         assert_eq!(cache.file_parse_count(), 1);
-        drop(first_file);
+        drop(first_image);
         cache.remove(module.id);
         assert!(cache
             .by_image
             .values()
             .next()
             .unwrap()
-            .file
+            .image
+            .file()
             .metadata()
             .is_ok());
 
@@ -904,16 +1066,16 @@ mod tests {
         assert_eq!(cache.file_parse_count(), 1);
         assert!(Arc::ptr_eq(&first_sections, &second.sections));
         assert_eq!(first_token, second.image_token);
-        let retained_file = Arc::clone(&cache.by_image.values().next().unwrap().file);
-        let acquired_file = cache.acquire_file(&module).unwrap();
-        assert!(Arc::ptr_eq(&retained_file, &acquired_file));
+        let retained_image = Arc::clone(&cache.by_image.values().next().unwrap().image);
+        let acquired_image = cache.acquire_image(&module).unwrap();
+        assert!(Arc::ptr_eq(&retained_image, &acquired_image));
         assert_eq!(cache.len(), 1);
     }
 
     #[test]
     fn shared_image_cache_is_bounded() {
         let sections = empty_sections();
-        let file = Arc::new(File::open("/bin/true").unwrap());
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         for mount_namespace in 0..=MAX_SHARED_ELF_IMAGES as u64 {
             cache.insert_shared_image(
@@ -921,7 +1083,7 @@ mod tests {
                 SharedElfImage {
                     sections: Arc::clone(&sections),
                     token: mount_namespace,
-                    file: Arc::clone(&file),
+                    image: Arc::clone(&image),
                     owned_bytes: 1,
                 },
             );
@@ -932,9 +1094,46 @@ mod tests {
     }
 
     #[test]
+    fn tail_consumers_share_retained_images_independently() {
+        let store = ExactImageStore::default();
+        let sections = empty_sections();
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
+        store.insert(
+            1,
+            Arc::clone(&sections),
+            Arc::clone(&image),
+            namespaced_identity(1, 1, 1).file().clone(),
+        );
+        let module = ModuleRecord {
+            id: 1,
+            owner: user_owner(i32::try_from(std::process::id()).unwrap()),
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            inode: 0,
+            device_major: 0,
+            device_minor: 0,
+            inode_generation: 0,
+            path: "/definitely/missing/image".into(),
+        };
+        let mut first = ElfSectionCache::using_exact_images(store.clone());
+        let mut second = ElfSectionCache::using_exact_images(store);
+
+        assert!(Arc::ptr_eq(
+            &first.load_mapping(&module).unwrap().image.unwrap(),
+            &image
+        ));
+        first.remove(module.id);
+        assert!(Arc::ptr_eq(
+            &second.load_mapping(&module).unwrap().image.unwrap(),
+            &image
+        ));
+    }
+
+    #[test]
     fn shared_image_cache_refreshes_recently_used_images() {
         let sections = empty_sections();
-        let file = Arc::new(File::open("/bin/true").unwrap());
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         for inode in 0..MAX_SHARED_ELF_IMAGES as u64 {
             cache.insert_shared_image(
@@ -942,7 +1141,7 @@ mod tests {
                 SharedElfImage {
                     sections: Arc::clone(&sections),
                     token: inode,
-                    file: Arc::clone(&file),
+                    image: Arc::clone(&image),
                     owned_bytes: 1,
                 },
             );
@@ -954,7 +1153,7 @@ mod tests {
             SharedElfImage {
                 sections,
                 token: MAX_SHARED_ELF_IMAGES as u64,
-                file,
+                image,
                 owned_bytes: 1,
             },
         );
@@ -967,7 +1166,7 @@ mod tests {
     fn shared_image_cache_honors_its_byte_budget() {
         let sections = empty_sections();
         let identity = |inode| namespaced_identity(inode, 1, 1);
-        let file = Arc::new(File::open("/bin/true").unwrap());
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         for inode in 1..=3 {
             cache.insert_shared_image(
@@ -975,7 +1174,7 @@ mod tests {
                 SharedElfImage {
                     sections: Arc::clone(&sections),
                     token: inode,
-                    file: Arc::clone(&file),
+                    image: Arc::clone(&image),
                     owned_bytes: MAX_SHARED_ELF_OWNED_BYTES / 2,
                 },
             );
@@ -990,15 +1189,16 @@ mod tests {
     fn oversized_owned_image_is_not_shared() {
         let sections = empty_sections();
         let identity = namespaced_identity(1, 190 * 1024 * 1024, 1);
-        let file = Arc::new(File::open("/bin/true").unwrap());
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         cache.by_module.insert(
             1,
             CachedElfImage {
                 sections: Arc::clone(&sections),
                 token: 1,
-                file: Arc::downgrade(&file),
+                image: Arc::downgrade(&image),
                 identity: Some(identity.file().clone()),
+                trusted: false,
             },
         );
         cache.insert_shared_image(
@@ -1006,7 +1206,7 @@ mod tests {
             SharedElfImage {
                 sections,
                 token: 1,
-                file,
+                image,
                 owned_bytes: MAX_SHARED_ELF_OWNED_BYTES + 1,
             },
         );
@@ -1022,16 +1222,17 @@ mod tests {
     fn large_file_backed_image_is_charged_only_for_owned_data() {
         let sections = empty_sections();
         let identity = namespaced_identity(1, 190 * 1024 * 1024, 1);
-        let file = Arc::new(File::open("/bin/true").unwrap());
+        let exact = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let image = CachedElfImage {
             sections,
             token: 1,
-            file: Arc::downgrade(&file),
+            image: Arc::downgrade(&exact),
             identity: Some(identity.file().clone()),
+            trusted: false,
         };
         let owned_bytes = elf_image_owned_bytes(&image.sections);
         let mut cache = ElfSectionCache::default();
-        cache.insert_shared_image(identity.clone(), SharedElfImage::from_cached(&image, file));
+        cache.insert_shared_image(identity.clone(), SharedElfImage::from_cached(&image, exact));
 
         assert!(cache.by_image.contains_key(&identity));
         assert_eq!(cache.retained_owned_bytes, owned_bytes);

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.10.0 - 2026-09-03
+
+### Added
+
+- `Tail` incrementally reads a growing spool into bounded, reusable sample batches. `Symbolizer::update` applies definition and symbol-source changes and reports invalidations for caller-owned prepared-stack caches.
+- `Recorder::tail` shares validated image handles with a live reader, and native symbolizer plug-ins receive module-retirement notifications.
+
 ### Changed
 
 - `Snapshot` and `Replay` now accept only the current SPULSE3 format.

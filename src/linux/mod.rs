@@ -403,6 +403,7 @@ pub struct Recorder<W: std::io::Write = std::io::BufWriter<std::fs::File>> {
     writer: PerfSpoolWriter<W>,
     modules: ModuleTable,
     processes: ProcessTable,
+    exact_images: Option<crate::native_module::ExactImageStore>,
     stack_scratch: Vec<StackFrame>,
     callchain_scratch: Vec<StackFrame>,
     capture_pacing: CapturePacing,
@@ -756,9 +757,7 @@ impl ProcessTable {
         let Ok(proc_pid) = u32::try_from(pid) else {
             return;
         };
-        let image = read_process_image_identity(proc_pid)
-            .ok()
-            .map(|(identity, _)| identity);
+        let image = read_process_image_identity(proc_pid).ok();
         let start_time = read_process_start_time(proc_pid).ok();
         let Some(state) = self.states.get_mut(&pid) else {
             return;
@@ -779,20 +778,21 @@ impl ProcessTable {
     }
 }
 
-fn read_process_image_identity(pid: u32) -> io::Result<(ProcessImageIdentity, Vec<u8>)> {
+fn read_process_image_identity(pid: u32) -> io::Result<ProcessImageIdentity> {
     let exe = format!("/proc/{pid}/exe");
     let metadata = std::fs::metadata(exe)?;
+    Ok(ProcessImageIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn read_process_comm(pid: u32) -> io::Result<Vec<u8>> {
     let mut comm = std::fs::read(format!("/proc/{pid}/comm"))?;
     while matches!(comm.last(), Some(b'\n' | b'\r')) {
         comm.pop();
     }
-    Ok((
-        ProcessImageIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        },
-        comm,
-    ))
+    Ok(comm)
 }
 
 enum PreparedEvent {
@@ -951,6 +951,32 @@ impl Recorder {
         .map_err(|err| perf.resume_error_or(err))?;
         Self::finish_attach(pid, attach_mode, perf, writer)
     }
+
+    /// Flush the spool and create an incremental reader that shares exact
+    /// module images still held by this recorder's bounded image cache.
+    ///
+    /// A recorder can create one live tail. Continue polling and flushing the
+    /// recorder, then call [`crate::Tail::poll`] to consume newly visible
+    /// batches. Build the symbolizer through [`crate::Tail::symbolizer`] and
+    /// update it before resolving each batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error after a tail has already been created.
+    /// Returns an I/O error when the spool cannot be flushed, cloned, or read.
+    pub fn tail(&mut self) -> crate::Result<crate::Tail> {
+        let exact_images = self.exact_images.clone().ok_or_else(|| {
+            crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "this recorder already has a live tail",
+            )
+        })?;
+        self.writer.flush()?;
+        let file = self.writer.open_reader()?;
+        let tail = crate::spool::Tail::from_file(file, exact_images)?;
+        self.exact_images = None;
+        Ok(tail)
+    }
 }
 
 impl<W: std::io::Write> Recorder<W> {
@@ -991,7 +1017,11 @@ impl<W: std::io::Write> Recorder<W> {
         let raw_pid = pid.get_u32();
         let kernel_enabled = perf.kernel_enabled();
         let mut modules = ModuleTable::default();
-        let mut processes = ProcessTable::default();
+        let exact_images = crate::native_module::ExactImageStore::default();
+        let mut processes = ProcessTable {
+            elf_sections: ElfSectionCache::publishing_exact_images_to(exact_images.clone()),
+            ..ProcessTable::default()
+        };
         if let Some(pid_i32) = i32_from_u32(raw_pid) {
             processes.ensure_tracked(pid_i32);
             processes.capture_available_generation(pid_i32);
@@ -1032,6 +1062,7 @@ impl<W: std::io::Write> Recorder<W> {
             writer,
             modules,
             processes,
+            exact_images: Some(exact_images),
             stack_scratch: Vec::with_capacity(128),
             callchain_scratch: Vec::with_capacity(32),
             capture_pacing: CapturePacing::default(),
@@ -1065,6 +1096,7 @@ impl<W: std::io::Write> Recorder<W> {
             capture_pacing,
             writer,
             summary,
+            exact_images: _,
             disable_on_drop: _,
         } = self;
         let mut lifecycle_actions = Vec::new();
@@ -1674,8 +1706,8 @@ fn handle_non_sample_record<W: std::io::Write>(
             let Some(pid) = i32_from_u32(comm.task.pid) else {
                 return Ok(());
             };
-            let current = read_process_image_identity(comm.task.pid).ok();
-            let identity_changed = current.as_ref().is_some_and(|(identity, current_comm)| {
+            let current_identity = read_process_image_identity(comm.task.pid).ok();
+            let identity_changed = current_identity.as_ref().is_some_and(|identity| {
                 ctx.processes
                     .states
                     .get(&pid)
@@ -1683,7 +1715,8 @@ fn handle_non_sample_record<W: std::io::Write>(
                     .is_some_and(|previous| {
                         previous.device != identity.device || previous.inode != identity.inode
                     })
-                    && current_comm.as_slice() == comm.comm.as_bytes()
+                    && read_process_comm(comm.task.pid).ok().as_deref()
+                        == Some(comm.comm.as_bytes())
             });
             if !comm.by_execve && !identity_changed {
                 return Ok(());
@@ -1696,7 +1729,7 @@ fn handle_non_sample_record<W: std::io::Write>(
                 state.python_perf_support = None;
             }
             end_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
-            ctx.processes.state_mut(pid).image = current.map(|(identity, _)| identity);
+            ctx.processes.state_mut(pid).image = current_identity;
             Ok(())
         }
         Record::Exit(exit) => {
@@ -1803,9 +1836,7 @@ fn reconcile_process_image<W: std::io::Write>(
     // /proc/<tgid>/exe can disappear after the thread-group leader exits even
     // while sibling threads remain alive. Start time and the maps snapshot,
     // not the exe symlink alone, determine whether this generation survives.
-    let current_identity = read_process_image_identity(pid)
-        .ok()
-        .map(|(identity, _)| identity);
+    let current_identity = read_process_image_identity(pid).ok();
 
     let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
         Ok(maps) => maps,
@@ -2827,6 +2858,18 @@ mod tests {
             .expect("repeat process attachment");
 
         assert_eq!(recorder.perf.resource_counts(), before);
+
+        let mut tail = recorder.tail().expect("create live tail");
+        assert!(tail
+            .poll()
+            .expect("poll initial tail batch")
+            .stacks()
+            .next()
+            .is_none());
+        let error = recorder
+            .tail()
+            .expect_err("a recorder creates one live tail");
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3044,7 +3087,7 @@ mod tests {
             .module_id
             .expect("registered mapping");
         let state = processes.state_mut(pid_i32);
-        state.image = Some(read_process_image_identity(pid).unwrap().0);
+        state.image = Some(read_process_image_identity(pid).unwrap());
         state.start_time = Some(read_process_start_time(pid).unwrap());
 
         assert!(
@@ -3062,7 +3105,8 @@ mod tests {
     fn ordinary_leader_comm_does_not_create_an_exec_epoch() {
         let pid_u32 = std::process::id();
         let pid = i32::try_from(pid_u32).unwrap();
-        let (identity, current_comm) = read_process_image_identity(pid_u32).unwrap();
+        let identity = read_process_image_identity(pid_u32).unwrap();
+        let current_comm = read_process_comm(pid_u32).unwrap();
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         processes.state_mut(pid).image = Some(identity);
@@ -3118,7 +3162,7 @@ mod tests {
             device: u64::MAX,
             inode: u64::MAX,
         };
-        let (_, current_comm) = read_process_image_identity(child_pid_u32).unwrap();
+        let current_comm = read_process_comm(child_pid_u32).unwrap();
         let mut modules = ModuleTable::default();
         let mut processes = ProcessTable::default();
         processes.state_mut(parent_pid).image = Some(inherited_identity);

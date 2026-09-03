@@ -10,8 +10,7 @@ The crate root re-exports the recording, reading, and symbolization types:
 
 ```rust,no_run
 use stackpulse::{
-    AttachMode, Recorder, RecorderOptions, Snapshot,
-    Replay,
+    AttachMode, Recorder, RecorderOptions, Replay, Snapshot, Tail,
 };
 ```
 
@@ -40,6 +39,7 @@ Records stack samples for one or more processes and writes a spool file.
 | `attach(pid, output, mode, options)` | Open perf events, create the spool, register known mappings, start sampling. |
 | `attach_with_writer(pid, writer, mode, options)` | Record to a caller-owned writer. |
 | `poll(timeout)` | Wait up to `timeout`, then drain ready perf data, unwind samples, and write records. |
+| `tail()` | Flush the spool and create its one in-process incremental reader. |
 | `attach_process(pid, mode)` | Add another process to the same recording. |
 | `refresh_threads(pid)` | Discover new threads when perf inheritance isn't doing it. |
 | `disable()` | Stop sampling for all attached events. |
@@ -155,6 +155,33 @@ scans validated records with constant additional memory.
 The spool file must not be truncated or modified while either reader is alive.
 Use [`Snapshot`](crate::Snapshot) when sample random access is required.
 
+### [`Tail`](crate::Tail)
+
+`Tail` reads complete records from an append-only spool while its writer is
+still active. [`Recorder::tail`](crate::Recorder::tail) is preferred for an
+in-process reader because it also shares the recorder's retained exact-image
+handles. `Tail::open(path)` works for a separate reader after the writer has
+flushed the spool header.
+
+| Method | What it returns |
+| --- | --- |
+| `symbolizer()` | A symbolizer bound to this tail's growing definitions. |
+| `poll()` | A borrowed [`TailBatch`](crate::spool::TailBatch) containing the next bounded group of visible samples and definition changes. |
+| `start_timestamp_us()` | Optional profile timeline anchor stored in the spool header. |
+| `sample_interval_us()` | Optional sample interval metadata stored in the spool header. |
+
+`TailBatch::stacks()` yields borrowed raw stacks. Call
+`Symbolizer::update(&batch)` before resolving them. `TailBatch::has_more()` is
+true when another batch may already be decoded without waiting for the writer;
+it is not a writer-completion signal. The batch borrows reusable storage from
+the tail, so it must be dropped before the next poll.
+
+For external prepared-stack caches, apply every returned
+[`Invalidation`](crate::symbolize::Invalidation). `all()` requests a full
+reset; otherwise `processes()` lists the affected process IDs and
+`affects_process(pid)` performs either check. A resolved stack with
+`is_cacheable() == false` is provisional and must not be retained.
+
 ### [`ModuleRecord`](crate::spool::ModuleRecord)
 
 | Accessor | Meaning |
@@ -204,7 +231,7 @@ Resolves raw frames into displayable frames. Reuse one symbolizer per profile.
 
 | Constructor or method | Use |
 | --- | --- |
-| `source.symbolizer()` | Configure a symbolizer associated with a [`Replay`](crate::Replay) or [`Snapshot`](crate::Snapshot). |
+| `source.symbolizer()` | Configure a symbolizer associated with a [`Replay`](crate::Replay), [`Snapshot`](crate::Snapshot), or [`Tail`](crate::Tail). |
 | `SymbolizerBuilder::for_modules(modules)` | Configure symbolization for module records. |
 | `SymbolizerBuilder::from_modules(modules)` | Transfer an owned module table without copying it. |
 | `disable_perf_maps()` | Disable Python perf-map lookup. |
@@ -215,12 +242,20 @@ Resolves raw frames into displayable frames. Reuse one symbolizer per profile.
 | `kernel_symbols(source)` | Use host symbols, a preserved `kallsyms` file, or no kernel symbols. |
 | `stack_cache(mode)` | Choose whether StackPulse or the caller caches resolved stacks. |
 | `build()` | Validate the configuration and construct the symbolizer. |
+| `update(batch)` | Apply a live tail batch's definitions and symbol-source changes before resolving its stacks. |
 | `has_native_backend()` | Report whether native ELF symbolization is configured. |
 | `resolve(stack)` | Resolve a [`SampleStack`](crate::spool::SampleStack) and return borrowed frames as a [`ResolvedStack`](crate::symbolize::ResolvedStack). |
 | `resolve_raw(pid, frames)` | Resolve a caller-owned raw-frame slice without retaining a stack entry. |
 
 Use `perf_maps_for` with IDs from `python_runtime_records()` when perf-map
 lookup should follow the runtime metadata captured in the spool.
+
+For a live tail, call `update` once for every polled batch, including an empty
+batch. With `StackCache::Internal`, the symbolizer invalidates its own cached
+stacks. With `StackCache::External`, the caller applies the returned
+`Invalidation` to its prepared-stack cache. `ResolvedStack::next_with_id`
+provides stable, symbolizer-local frame IDs for a separate converted-frame
+cache.
 
 [`NativeSymbolizer`](crate::symbolize::NativeSymbolizer) receives a batch of
 [`NativeLookup`](crate::symbolize::NativeLookup) values and appends one

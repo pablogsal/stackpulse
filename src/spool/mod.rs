@@ -1,6 +1,7 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use rustc_hash::FxHashMap;
 
 mod model;
 mod modules;
+mod tail;
 pub(crate) use model::ModuleOwner;
 pub(crate) use model::VDSO_PATH;
 pub use model::{
@@ -22,6 +24,7 @@ pub(crate) use modules::ClonedProcessModules;
 pub(crate) use modules::ModuleActivation;
 pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
+pub use tail::{Tail, TailBatch};
 
 pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
 const REC_MODULE: u8 = 1;
@@ -71,11 +74,15 @@ impl PerfSpoolWriter<BufWriter<File>> {
         start_timestamp_us: u64,
         sample_interval_us: u64,
     ) -> io::Result<Self> {
-        Self::from_writer(
-            BufWriter::new(File::create(path)?),
-            start_timestamp_us,
-            sample_interval_us,
-        )
+        let file = File::create(path)?;
+        Self::from_writer(BufWriter::new(file), start_timestamp_us, sample_interval_us)
+    }
+
+    pub(crate) fn open_reader(&self) -> io::Result<File> {
+        OpenOptions::new().read(true).open(format!(
+            "/proc/self/fd/{}",
+            self.writer.get_ref().as_raw_fd()
+        ))
     }
 }
 
@@ -391,17 +398,97 @@ pub(crate) struct FrameLookupContext {
     module_limit: usize,
 }
 
+const FRAME_CONTEXT_CHUNK_SIZE: usize = 1_024;
+
+/// Copy-on-write chunks make snapshots cheap and limit later copies to one chunk.
+/// Every chunk except the last contains exactly `FRAME_CONTEXT_CHUNK_SIZE` entries.
+#[derive(Clone, Default)]
+struct ChunkedFrameContext<T> {
+    chunks: Arc<Vec<Arc<Vec<T>>>>,
+}
+
+impl<T> ChunkedFrameContext<T> {
+    fn get(&self, index: usize) -> Option<&T> {
+        self.chunks
+            .get(index / FRAME_CONTEXT_CHUNK_SIZE)?
+            .get(index % FRAME_CONTEXT_CHUNK_SIZE)
+    }
+}
+
+impl<T: Clone> ChunkedFrameContext<T> {
+    fn push(&mut self, value: T) {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if let Some(chunk) = chunks
+            .last_mut()
+            .filter(|chunk| chunk.len() < FRAME_CONTEXT_CHUNK_SIZE)
+        {
+            Arc::make_mut(chunk).push(value);
+        } else {
+            let mut chunk = Vec::with_capacity(FRAME_CONTEXT_CHUNK_SIZE);
+            chunk.push(value);
+            chunks.push(Arc::new(chunk));
+        }
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        Arc::make_mut(&mut self.chunks)
+            .get_mut(index / FRAME_CONTEXT_CHUNK_SIZE)
+            .and_then(|chunk| Arc::make_mut(chunk).get_mut(index % FRAME_CONTEXT_CHUNK_SIZE))
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct SpoolFrameModuleContexts {
-    frame_module_limits: Arc<[usize]>,
-    module_deactivated_at: Arc<[Option<usize>]>,
+    frame_module_limits: ChunkedFrameContext<usize>,
+    module_deactivated_at: ChunkedFrameContext<Option<usize>>,
 }
 
 impl SpoolFrameModuleContexts {
-    fn new(frame_module_limits: Vec<usize>, module_deactivated_at: Vec<Option<usize>>) -> Self {
-        Self {
-            frame_module_limits: frame_module_limits.into(),
-            module_deactivated_at: module_deactivated_at.into(),
+    fn push_module(&mut self) {
+        self.module_deactivated_at.push(None);
+    }
+
+    fn push_frame(&mut self, module_limit: usize) {
+        self.frame_module_limits.push(module_limit);
+    }
+
+    fn deactivate_process(
+        &mut self,
+        modules: &[ModuleRecord],
+        process_id: i32,
+        deactivated_at: usize,
+    ) {
+        for (module_id, module) in modules.iter().enumerate() {
+            if module.pid().is_some_and(|pid| pid.get() == process_id) {
+                let active = self.module_active(
+                    module_id,
+                    FrameLookupContext {
+                        frame_index: deactivated_at,
+                        module_limit: modules.len(),
+                    },
+                );
+                if active {
+                    self.deactivate_module(module_id, deactivated_at);
+                }
+            }
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "module contexts are appended atomically with module records"
+    )]
+    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) {
+        if self
+            .module_deactivated_at
+            .get(module_id)
+            .expect("every module has a context")
+            .is_none()
+        {
+            *self
+                .module_deactivated_at
+                .get_mut(module_id)
+                .expect("every module has a context") = Some(deactivated_at);
         }
     }
 
@@ -1016,6 +1103,50 @@ enum SampleStorage {
     Replay,
 }
 
+enum DecodedSpoolRecord {
+    Module(ModuleRecord),
+    Frame(FrameRecord),
+    Stack(StackNodeRecord),
+    Thread(ThreadRecord),
+    Sample(SampleRecord),
+    PythonRuntime(PythonRuntimeRecord),
+    DeactivateProcess(crate::Pid),
+    DeactivateModule(usize),
+}
+
+fn decode_spool_record(
+    reader: &mut MmapSpoolCursor,
+    modules: &[ModuleRecord],
+    frames_len: usize,
+    stack_nodes: &[StackNodeRecord],
+    threads: &[ThreadRecord],
+    last_timestamp_ns: &mut u64,
+) -> io::Result<Option<DecodedSpoolRecord>> {
+    let Some(tag) = reader.read_tag()? else {
+        return Ok(None);
+    };
+    Ok(Some(match tag {
+        REC_MODULE => DecodedSpoolRecord::Module(read_module_mmap(reader, modules.len())?),
+        REC_FRAME => DecodedSpoolRecord::Frame(read_frame(reader, modules, frames_len)?),
+        REC_STACK => DecodedSpoolRecord::Stack(read_stack_node(reader, stack_nodes, frames_len)?),
+        REC_THREAD => DecodedSpoolRecord::Thread(read_thread(reader, threads.len())?),
+        REC_SAMPLE => DecodedSpoolRecord::Sample(read_sample(
+            reader,
+            threads,
+            stack_nodes.len(),
+            last_timestamp_ns,
+        )?),
+        REC_PYTHON_RUNTIME => DecodedSpoolRecord::PythonRuntime(read_python_runtime(reader)?),
+        REC_MODULE_DEACTIVATE => DecodedSpoolRecord::DeactivateProcess(read_pid(reader)?),
+        REC_MODULE_DEACTIVATE_ONE => DecodedSpoolRecord::DeactivateModule(read_index_within(
+            reader,
+            modules.len(),
+            "module deactivation",
+        )?),
+        other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
+    }))
+}
+
 fn open_spool(path: impl AsRef<Path>, sample_storage: SampleStorage) -> io::Result<OpenedSpool> {
     open_spool_with_range_limit(path, sample_storage, MAX_REPLAY_SAMPLE_RANGES)
 }
@@ -1035,9 +1166,7 @@ fn open_spool_with_range_limit(
     let sample_interval_us = reader.read_varint::<u64>()?;
     let (
         mut modules,
-        mut module_deactivated_at,
         mut frames,
-        mut frame_module_limits,
         mut stack_nodes,
         mut threads,
         mut samples,
@@ -1049,9 +1178,8 @@ fn open_spool_with_range_limit(
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
     );
+    let mut frame_contexts = SpoolFrameModuleContexts::default();
     let mut sample_count = 0_usize;
     let mut sample_ranges =
         (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
@@ -1059,6 +1187,9 @@ fn open_spool_with_range_limit(
     let mut first_sample_timestamp_ns = None;
     let mut last_timestamp_ns = 0_u64;
     let mut truncated_tail = false;
+    // Decode completed spools in place. Tail uses `DecodedSpoolRecord` to
+    // commit only complete records, but that extra dispatch is measurable
+    // when scanning an entire file at once.
     loop {
         let record_start = reader.position;
         let Some(tag) = reader.read_tag()? else {
@@ -1071,12 +1202,12 @@ fn open_spool_with_range_limit(
             match tag {
                 REC_MODULE => {
                     modules.push(read_module_mmap(&mut reader, modules.len())?);
-                    module_deactivated_at.push(None);
+                    frame_contexts.push_module();
                 }
                 REC_FRAME => {
                     let module_limit = modules.len();
                     frames.push(read_frame(&mut reader, &modules, frames.len())?);
-                    frame_module_limits.push(module_limit);
+                    frame_contexts.push_frame(module_limit);
                 }
                 REC_STACK => {
                     stack_nodes.push(read_stack_node(&mut reader, &stack_nodes, frames.len())?)
@@ -1101,18 +1232,13 @@ fn open_spool_with_range_limit(
                     python_runtime_records.push(read_python_runtime(&mut reader)?)
                 }
                 REC_MODULE_DEACTIVATE => {
-                    let process_id = read_process_id(&mut reader)?;
-                    let deactivated_at = frames.len();
-                    for (module, deactivated) in modules.iter().zip(&mut module_deactivated_at) {
-                        if module.pid().is_some_and(|pid| pid.get() == process_id) {
-                            deactivated.get_or_insert(deactivated_at);
-                        }
-                    }
+                    let process_id = read_pid(&mut reader)?;
+                    frame_contexts.deactivate_process(&modules, process_id.get(), frames.len());
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
                     let module_id =
                         read_index_within(&mut reader, modules.len(), "module deactivation")?;
-                    module_deactivated_at[module_id].get_or_insert(frames.len());
+                    frame_contexts.deactivate_module(module_id, frames.len());
                 }
                 other => return Err(invalid_data(format!("unknown spool record tag {other}"))),
             }
@@ -1146,7 +1272,6 @@ fn open_spool_with_range_limit(
             }
         }
     }
-    let frame_contexts = SpoolFrameModuleContexts::new(frame_module_limits, module_deactivated_at);
     Ok(OpenedSpool {
         definitions: SpoolDefinitions {
             source_id: next_source_id(),
@@ -1312,7 +1437,7 @@ fn consume_validated_record(
             read_python_runtime(reader)?;
         }
         REC_MODULE_DEACTIVATE => {
-            read_process_id(reader)?;
+            read_pid(reader)?;
         }
         REC_MODULE_DEACTIVATE_ONE => {
             read_index_within(reader, state.module_count, "module deactivation")?;
@@ -1362,13 +1487,12 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
 
 fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeRecord> {
     let timestamp_ns = reader.read_varint::<u64>()?;
-    let process_id = read_process_id(reader)?;
+    let process_id = read_pid(reader)?;
     let mut flag = [0_u8; 1];
     reader.read_exact_spool(&mut flag)?;
     Ok(PythonRuntimeRecord {
         timestamp_ns,
-        process_id: crate::Pid::try_from(process_id)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        process_id,
         is_python_runtime: flag[0] != 0,
     })
 }
@@ -1397,6 +1521,7 @@ pub(crate) fn module_for_frame_unbounded<'a>(
     modules: &'a [ModuleRecord],
     process_id: i32,
     frame: &FrameRecord,
+    mut is_active: impl FnMut(&ModuleRecord) -> bool,
 ) -> Option<FrameModuleRef<'a>> {
     if frame.mode == FrameMode::TruncatedStackMarker {
         return None;
@@ -1410,7 +1535,7 @@ pub(crate) fn module_for_frame_unbounded<'a>(
     let module = modules
         .iter()
         .rev()
-        .find(|module| module_owns_frame(module, process_id, frame))?;
+        .find(|module| is_active(module) && module_owns_frame(module, process_id, frame))?;
     frame_module_ref(module, frame)
 }
 
@@ -1627,11 +1752,10 @@ fn read_stack_node(
 
 fn read_thread(reader: &mut impl SpoolRead, expected_id: usize) -> io::Result<ThreadRecord> {
     check_id(reader, expected_id, "thread")?;
-    let process_id = read_process_id(reader)?;
+    let process_id = read_pid(reader)?;
     let thread_id = reader.read_varint::<u64>()?;
     Ok(ThreadRecord {
-        process_id: crate::Pid::try_from(process_id)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        process_id,
         thread_id: crate::Tid::try_from(thread_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     })
@@ -1641,6 +1765,11 @@ fn read_process_id(reader: &mut impl SpoolRead) -> io::Result<i32> {
     let process_id = reader.read_varint::<i64>()?;
     i32::try_from(process_id)
         .map_err(|_| invalid_data(format!("process id {process_id} out of range")))
+}
+
+fn read_pid(reader: &mut impl SpoolRead) -> io::Result<crate::Pid> {
+    crate::Pid::try_from(read_process_id(reader)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn checked_sample_timestamp_delta(last_timestamp_ns: u64, timestamp_ns: u64) -> io::Result<i64> {
@@ -1659,10 +1788,12 @@ fn read_sample(
     let timestamp_ns = last_timestamp_ns
         .checked_add_signed(delta)
         .ok_or_else(|| invalid_data(format!("sample timestamp delta {delta} out of range")))?;
-    *last_timestamp_ns = timestamp_ns;
     let thread_ref = read_index_within(reader, threads.len(), "sample thread")?;
     let thread = threads[thread_ref];
     let stack_id = read_id_within(reader, stack_count, "sample stack")?;
+    // A growing spool can end in the middle of this record. Only commit the
+    // delta after every field has been decoded.
+    *last_timestamp_ns = timestamp_ns;
     Ok(SampleRecord {
         timestamp_ns,
         process_id: thread.process_id,
@@ -1985,10 +2116,13 @@ mod tests {
     fn module_for_frame_ignores_truncated_stack_marker() {
         let modules = [module(7, 0, 1, "/module", false)];
 
-        assert!(
-            module_for_frame_unbounded(&modules, 7, &FrameRecord::truncated_stack_marker())
-                .is_none()
-        );
+        assert!(module_for_frame_unbounded(
+            &modules,
+            7,
+            &FrameRecord::truncated_stack_marker(),
+            |_| true,
+        )
+        .is_none());
     }
 
     #[test]

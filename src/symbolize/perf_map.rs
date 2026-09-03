@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -38,6 +38,33 @@ enum PerfMapPayload {
 pub(super) struct PerfMap {
     symbols: Vec<PerfMapSymbol>,
     module: Rc<str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PerfMapFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+pub(super) fn perf_map_file_identity(
+    directory: &Path,
+    process_id: i32,
+) -> Option<PerfMapFileIdentity> {
+    let metadata =
+        std::fs::symlink_metadata(directory.join(format!("perf-{process_id}.map"))).ok()?;
+    metadata
+        .file_type()
+        .is_file()
+        .then_some(PerfMapFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
 }
 
 pub(super) fn perf_map_module_allowed(module: &ModuleRecord) -> bool {

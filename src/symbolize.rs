@@ -14,21 +14,25 @@ use std::slice;
 #[cfg(test)]
 use std::sync::Arc;
 
+pub use crate::module_base::ModuleImageBase;
 use crate::profile::{
     FrameFlags, FrameKind, NativeFrame, NativeSymbol, ResolvedFrame, SourceLocation, SymbolOrigin,
 };
 #[cfg(feature = "builtin-wholesym")]
 use crate::symbols::default_native_symbolizer_factory;
-use crate::symbols::{erase_native_symbolizer, ErasedNativeSymbolizer, NativeSymbolizerFactory};
+use crate::symbols::{
+    erase_native_symbolizer, normalized_module_path, ErasedNativeSymbolizer,
+    NativeSymbolizerFactory,
+};
 pub use crate::symbols::{
     NativeFileIdentity, NativeImageId, NativeLookup, NativeModule, NativeSymbolizer, NativeSymbols,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::native_module::{ElfLoadError, ElfSectionCache};
+use crate::native_module::{ElfLoadError, ElfSectionCache, ExactImageStore};
 use crate::spool::{
     self, FrameMode, FrameModuleRef, FrameRecord, ModuleRecord, Replay, SampleStack, Snapshot,
-    SpoolFrameModuleContexts, StackKey,
+    SpoolFrameModuleContexts, StackKey, Tail, TailBatch,
 };
 
 mod kernel;
@@ -39,9 +43,11 @@ pub(crate) use kernel::bench_parse_sparse_kernel_symbols;
 use kernel::KernelSymbol;
 use kernel::{KernelSymbolTable, ResolvedKernelSymbol};
 use perf_map::{
-    find_perf_map_symbol, load_perf_map, perf_map_module_allowed, perf_map_symbol_to_frame,
-    PerfMap, PerfMapProcesses, PerfMapSymbol,
+    find_perf_map_symbol, load_perf_map, perf_map_file_identity, perf_map_module_allowed,
+    perf_map_symbol_to_frame, PerfMap, PerfMapFileIdentity, PerfMapProcesses, PerfMapSymbol,
 };
+
+const LIVE_RESOLVED_FRAME_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 enum NativeContractError {
@@ -84,16 +90,32 @@ pub struct Symbolizer {
     transient_frame_keys: Vec<(i32, FrameCacheKey)>,
     transient_frame_slots: FxHashMap<(i32, FrameCacheKey), usize>,
     vacant_frame_slots: Vec<usize>,
-    perf_map_cache: FxHashMap<i32, Option<PerfMap>>,
+    perf_maps: FxHashMap<i32, PerfMapState>,
+    tracks_perf_map_updates: bool,
+    pending_retired_processes: Vec<crate::Pid>,
+    pending_retired_modules: Vec<u32>,
+    inactive_modules: FxHashSet<u32>,
     kernel_symbols: Option<KernelSymbolTable>,
+    refresh_host_kernel_symbols: bool,
     spool_frame_contexts: Option<SpoolFrameModuleContexts>,
-    frame_cache: FxHashMap<(i32, FrameCacheKey), Range<usize>>,
+    frame_cache: FxHashMap<(i32, FrameCacheKey), ResolvedFrameRange>,
     resolved_frames: Vec<ResolvedFrame>,
+    resolved_frame_ids: Vec<ResolvedFrameId>,
+    resolution_cache_limit: Option<usize>,
+    next_resolved_frame_id: u64,
     resolved_stack_frame_ids: Vec<usize>,
     stack_cache_mode: StackCache,
-    stack_cache: FxHashMap<StackKey, Range<usize>>,
+    stack_cache: FxHashMap<StackKey, ResolvedStackFrameRange>,
     resolved_stack_scratch: Vec<usize>,
+    invalidated_process_ids: FxHashSet<crate::Pid>,
+    perf_map_changed_process_ids: FxHashSet<crate::Pid>,
+    mapping_changed_process_ids: FxHashSet<i32>,
     native_factory: Option<NativeSymbolizerFactory>,
+}
+
+struct PerfMapState {
+    identity: Option<PerfMapFileIdentity>,
+    map: Option<PerfMap>,
 }
 
 struct ModuleMetadata {
@@ -191,7 +213,7 @@ impl SymbolizerModules {
 }
 
 fn module_metadata(record: &ModuleRecord) -> ModuleMetadata {
-    let path = record.path.as_str();
+    let path = normalized_module_path(record.path.as_str());
     let basename_start = crate::profile::basename_start(path);
     ModuleMetadata {
         path: None,
@@ -223,6 +245,12 @@ trait SpoolSymbolizationInput {
     fn modules(&self) -> &[ModuleRecord];
     fn frames(&self) -> &[FrameRecord];
     fn frame_module_contexts(&self) -> SpoolFrameModuleContexts;
+    fn is_growing(&self) -> bool {
+        false
+    }
+    fn exact_images(&self) -> Option<ExactImageStore> {
+        None
+    }
 }
 
 impl SpoolSymbolizationInput for Snapshot {
@@ -256,6 +284,32 @@ impl SpoolSymbolizationInput for Replay {
 
     fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
         self.frame_module_contexts()
+    }
+}
+
+impl SpoolSymbolizationInput for Tail {
+    fn source_id(&self) -> u64 {
+        self.source_id()
+    }
+
+    fn modules(&self) -> &[ModuleRecord] {
+        self.modules()
+    }
+
+    fn frames(&self) -> &[FrameRecord] {
+        self.frames()
+    }
+
+    fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
+        self.frame_module_contexts()
+    }
+
+    fn is_growing(&self) -> bool {
+        true
+    }
+
+    fn exact_images(&self) -> Option<ExactImageStore> {
+        self.exact_images()
     }
 }
 
@@ -309,6 +363,34 @@ pub enum StackCache {
     External,
 }
 
+/// Prepared-stack invalidation caused by one live tail update.
+///
+/// This is relevant when the builder uses [`StackCache::External`]. Apply it
+/// before looking up or inserting prepared stacks from the updated batch.
+pub struct Invalidation<'a> {
+    all: bool,
+    processes: &'a FxHashSet<crate::Pid>,
+}
+
+impl Invalidation<'_> {
+    /// Return whether every externally cached stack must be discarded.
+    #[must_use]
+    pub fn all(&self) -> bool {
+        self.all
+    }
+
+    /// Iterate over processes whose externally cached stacks must be discarded.
+    pub fn processes(&self) -> impl Iterator<Item = crate::Pid> + '_ {
+        self.processes.iter().copied()
+    }
+
+    /// Return whether cached stacks for `process` must be discarded.
+    #[must_use]
+    pub fn affects_process(&self, process: crate::Pid) -> bool {
+        self.all || self.processes.contains(&process)
+    }
+}
+
 impl<'a> SymbolizerBuilder<'a> {
     fn with_input(input: SymbolizerInput<'a>) -> Self {
         Self {
@@ -330,12 +412,22 @@ impl<'a> SymbolizerBuilder<'a> {
     /// Configure symbolization for a loaded spool.
     #[must_use]
     pub(crate) fn for_spool(reader: &'a Snapshot) -> Self {
-        Self::with_input(SymbolizerInput::Spool(reader))
+        Self::for_spool_input(reader)
     }
 
     /// Configure symbolization for a sequential spool replay.
     #[must_use]
     pub(crate) fn for_replay(reader: &'a Replay) -> Self {
+        Self::for_spool_input(reader)
+    }
+
+    /// Configure symbolization for an append-only spool tail.
+    #[must_use]
+    pub(crate) fn for_tail(reader: &'a Tail) -> Self {
+        Self::for_spool_input(reader)
+    }
+
+    fn for_spool_input(reader: &'a dyn SpoolSymbolizationInput) -> Self {
         Self::with_input(SymbolizerInput::Spool(reader))
     }
 
@@ -474,6 +566,52 @@ struct PendingFrame {
     frame: FrameRecord,
     resolution: PendingResolution,
     transient: bool,
+    perf_map_dependent: bool,
+}
+
+#[derive(Clone)]
+struct ResolvedFrameRange {
+    indices: Range<usize>,
+    perf_map_dependent: bool,
+}
+
+impl ResolvedFrameRange {
+    fn indices(&self) -> Range<usize> {
+        self.indices.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn relocate(&mut self, start: usize) {
+        self.indices = start..start + self.len();
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedStackFrameRange(Range<usize>);
+
+impl ResolvedStackFrameRange {
+    fn new(indices: Range<usize>) -> Self {
+        Self(indices)
+    }
+
+    fn indices(&self) -> Range<usize> {
+        self.0.clone()
+    }
+
+    fn start(&self) -> usize {
+        self.0.start
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn relocate(&mut self, start: usize) {
+        self.0 = start..start + self.len();
+    }
 }
 
 #[derive(Default)]
@@ -490,17 +628,46 @@ enum PendingResolution {
     },
 }
 
+/// Opaque identity of one frame retained by a [`Symbolizer`].
+///
+/// Consumers can use this to cache their own representation of a resolved
+/// frame. IDs are never reused by the symbolizer that created them.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResolvedFrameId(u64);
+
 /// Borrowed resolved frames for one sample stack.
 pub struct ResolvedStack<'a> {
     frames: &'a [ResolvedFrame],
+    frame_ids: &'a [ResolvedFrameId],
     ids: slice::Iter<'a, usize>,
+    cacheable: bool,
+}
+
+impl<'a> ResolvedStack<'a> {
+    /// Return whether this result may be retained beyond the current lookup.
+    ///
+    /// A result is transient when an exact native image was temporarily
+    /// unavailable. External stack caches should retry those lookups instead
+    /// of preserving the unresolved result.
+    #[must_use]
+    pub fn is_cacheable(&self) -> bool {
+        self.cacheable
+    }
+
+    /// Return the next frame together with its stable symbolizer-local ID.
+    ///
+    /// This advances the same iterator as [`Iterator::next`].
+    pub fn next_with_id(&mut self) -> Option<(ResolvedFrameId, &'a ResolvedFrame)> {
+        let &index = self.ids.next()?;
+        Some((self.frame_ids[index], &self.frames[index]))
+    }
 }
 
 impl<'a> Iterator for ResolvedStack<'a> {
     type Item = &'a ResolvedFrame;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ids.next().map(|&id| &self.frames[id])
+        self.ids.next().map(|&index| &self.frames[index])
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -515,6 +682,24 @@ impl ExactSizeIterator for ResolvedStack<'_> {
 }
 
 impl std::iter::FusedIterator for ResolvedStack<'_> {}
+
+fn retain_ranges<T>(values: &mut Vec<T>, ranges: &[Range<usize>]) {
+    let mut old_index = 0;
+    let mut range_index = 0;
+    values.retain(|_| {
+        while ranges
+            .get(range_index)
+            .is_some_and(|range| old_index >= range.end)
+        {
+            range_index += 1;
+        }
+        let retained = ranges
+            .get(range_index)
+            .is_some_and(|range| range.contains(&old_index));
+        old_index += 1;
+        retained
+    });
+}
 
 impl Symbolizer {
     /// Create a resolver for the modules in a profile.
@@ -540,6 +725,9 @@ impl Symbolizer {
             native_factory,
             kernel_source,
         )?;
+        if let Some(images) = reader.exact_images() {
+            symbolizer.elf_sections = ElfSectionCache::using_exact_images(images);
+        }
         symbolizer.source_id = Some(reader.source_id());
         symbolizer.kernel_symbols = match kernel_source {
             KernelSymbolSource::Host => Some(kernel::load_sparse_kernel_symbols_for_spool(
@@ -553,10 +741,22 @@ impl Symbolizer {
                 symbolizer.kernel_symbols.take()
             }
         };
+        if reader.is_growing() && matches!(kernel_source, KernelSymbolSource::Host) {
+            let kernel_symbols = kernel::load_shared_kernel_symbols();
+            if !kernel_symbols.is_empty() {
+                symbolizer.kernel_symbols = Some(kernel_symbols);
+                symbolizer.refresh_host_kernel_symbols = false;
+            }
+        }
+        if reader.is_growing() {
+            symbolizer.resolution_cache_limit = Some(LIVE_RESOLVED_FRAME_LIMIT);
+        }
+        symbolizer.tracks_perf_map_updates = reader.is_growing();
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
         let frame_count = reader.frames().len();
         symbolizer.frame_cache.reserve(frame_count);
         symbolizer.resolved_frames.reserve(frame_count);
+        symbolizer.resolved_frame_ids.reserve(frame_count);
         Ok(symbolizer)
     }
 
@@ -591,17 +791,278 @@ impl Symbolizer {
             transient_frame_keys: Vec::new(),
             transient_frame_slots: FxHashMap::default(),
             vacant_frame_slots: Vec::new(),
-            perf_map_cache: FxHashMap::default(),
+            perf_maps: FxHashMap::default(),
+            tracks_perf_map_updates: false,
+            pending_retired_processes: Vec::new(),
+            pending_retired_modules: Vec::new(),
+            inactive_modules: FxHashSet::default(),
             kernel_symbols,
+            refresh_host_kernel_symbols: matches!(kernel_source, KernelSymbolSource::Host),
             spool_frame_contexts: None,
             frame_cache: FxHashMap::default(),
             resolved_frames: Vec::new(),
+            resolved_frame_ids: Vec::new(),
+            resolution_cache_limit: None,
+            next_resolved_frame_id: 0,
             resolved_stack_frame_ids: Vec::new(),
             stack_cache_mode: StackCache::Internal,
             stack_cache: FxHashMap::default(),
             resolved_stack_scratch: Vec::new(),
+            invalidated_process_ids: FxHashSet::default(),
+            perf_map_changed_process_ids: FxHashSet::default(),
+            mapping_changed_process_ids: FxHashSet::default(),
             native_factory,
         })
+    }
+
+    /// Apply definitions and live symbol-source changes from one tail poll.
+    ///
+    /// Call this exactly once for every batch before resolving that batch's
+    /// stacks. Internal stack caches are invalidated automatically. Callers
+    /// using [`StackCache::External`] must apply the returned invalidation to
+    /// their prepared-stack cache.
+    ///
+    /// The invalidation borrows reusable symbolizer storage. Consume it before
+    /// resolving another stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error when the batch belongs to a different
+    /// tail.
+    pub fn update<'a>(&'a mut self, batch: &TailBatch<'_>) -> crate::Result<Invalidation<'a>> {
+        if self.source_id != Some(batch.source_id()) {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "tail batch belongs to a different spool source",
+            ));
+        }
+
+        self.invalidated_process_ids.clear();
+        self.perf_map_changed_process_ids.clear();
+        self.mapping_changed_process_ids.clear();
+        for module_id in self.pending_retired_modules.drain(..) {
+            if let Some(process) = self.modules.get(module_id).and_then(ModuleRecord::pid) {
+                self.mapping_changed_process_ids.insert(process.get());
+                if let (Some(symbolizer), Some(module)) = (
+                    self.native_symbolizers.get_mut(&process.get()),
+                    self.native_modules.get(&module_id),
+                ) {
+                    symbolizer.retire_module(module);
+                }
+            }
+            self.inactive_modules.insert(module_id);
+            self.native_modules.remove(&module_id);
+            self.unsupported_native_modules.remove(&module_id);
+            self.retryable_native_modules.remove(&module_id);
+            self.elf_sections.remove(module_id);
+        }
+        for process in self.pending_retired_processes.drain(..) {
+            self.invalidated_process_ids.insert(process);
+            self.native_symbolizers.remove(&process.get());
+            self.perf_maps.remove(&process.get());
+        }
+
+        let new_modules = batch.modules();
+        if !new_modules.is_empty() {
+            for module in new_modules {
+                if let Some(process) = module.pid() {
+                    self.mapping_changed_process_ids.insert(process.get());
+                }
+                self.modules.push(module.clone())?;
+            }
+        }
+        if !self.mapping_changed_process_ids.is_empty() {
+            self.frame_cache.retain(|(process_id, key), _| {
+                !matches!(key, FrameCacheKey::Raw(_))
+                    || !self.mapping_changed_process_ids.contains(process_id)
+            });
+        }
+        if batch.frame_contexts_changed() {
+            self.spool_frame_contexts = Some(batch.frame_module_contexts());
+        }
+
+        for process in batch.processes() {
+            if !self.perf_maps_allowed_for(process.get()) {
+                continue;
+            }
+            let identity = perf_map_file_identity(&self.perf_map_dir, process.get());
+            if batch.retired_processes().contains(process) && identity.is_none() {
+                self.perf_maps.entry(process.get()).or_insert(PerfMapState {
+                    identity: None,
+                    map: None,
+                });
+                continue;
+            }
+            let state = self.perf_maps.entry(process.get());
+            let had_map = matches!(state, std::collections::hash_map::Entry::Occupied(_));
+            let state = state.or_insert_with(|| PerfMapState {
+                identity,
+                map: load_perf_map(&self.perf_map_dir, process.get()),
+            });
+            let retry_failed_load = identity.is_some() && state.map.is_none();
+            let changed = state.identity != identity;
+            let recovered = if had_map && (changed || retry_failed_load) {
+                let map = load_perf_map(&self.perf_map_dir, process.get());
+                let recovered = retry_failed_load && map.is_some();
+                state.identity = identity;
+                state.map = map;
+                recovered
+            } else {
+                false
+            };
+            if (changed && had_map) || recovered {
+                self.invalidated_process_ids.insert(*process);
+                self.perf_map_changed_process_ids.insert(*process);
+            }
+        }
+
+        let kernel_changed = batch.kernel_mappings_changed() && self.refresh_host_kernel_symbols;
+        let resolution_cache_full = self.resolution_cache_full();
+        let all = kernel_changed;
+        if kernel_changed {
+            self.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
+                batch
+                    .all_frames()
+                    .iter()
+                    .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip)),
+                batch.all_modules(),
+            ));
+        } else if self.refresh_host_kernel_symbols {
+            if let Some(symbols) = self.kernel_symbols.as_mut() {
+                kernel::extend_sparse_kernel_symbols_for_spool(
+                    symbols,
+                    batch.frames().iter().filter_map(|frame| {
+                        (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip)
+                    }),
+                    batch.all_modules(),
+                );
+            }
+        }
+        if kernel_changed || resolution_cache_full {
+            self.clear_resolution_cache();
+        } else if !self.invalidated_process_ids.is_empty() {
+            self.frame_cache.retain(|&(process_id, _), cached| {
+                let Some(process) = crate::Pid::new(process_id) else {
+                    return true;
+                };
+                !self.invalidated_process_ids.contains(&process)
+                    || (self.perf_map_changed_process_ids.contains(&process)
+                        && !cached.perf_map_dependent)
+            });
+            if self.stack_cache_mode == StackCache::Internal {
+                self.stack_cache
+                    .retain(|key, _| !self.invalidated_process_ids.contains(&key.process_id()));
+                self.compact_resolved_stack_frame_ids();
+            }
+            self.compact_resolved_frames_if_needed();
+        }
+
+        // This batch can contain samples immediately before retirement. Drop
+        // process-owned symbol state only after callers have resolved them.
+        self.pending_retired_processes
+            .extend_from_slice(batch.retired_processes());
+        self.pending_retired_modules
+            .extend_from_slice(batch.retired_modules());
+        Ok(Invalidation {
+            all,
+            processes: &self.invalidated_process_ids,
+        })
+    }
+
+    fn clear_resolution_cache(&mut self) {
+        self.clear_transient_frame_cache();
+        self.transient_frame_slots.clear();
+        self.vacant_frame_slots.clear();
+        self.frame_cache.clear();
+        self.resolved_frames.clear();
+        self.resolved_frame_ids.clear();
+        self.clear_stack_resolution_cache();
+    }
+
+    fn resolution_cache_full(&self) -> bool {
+        self.resolution_cache_limit.is_some_and(|limit| {
+            self.resolved_frames.len() >= limit
+                || self.resolved_stack_frame_ids.len() >= limit
+                || self.stack_cache.len() >= limit
+        })
+    }
+
+    fn clear_stack_resolution_cache(&mut self) {
+        self.stack_cache.clear();
+        self.resolved_stack_frame_ids.clear();
+        self.resolved_stack_scratch.clear();
+    }
+
+    fn compact_resolved_stack_frame_ids(&mut self) {
+        let retained = self
+            .stack_cache
+            .values()
+            .map(ResolvedStackFrameRange::len)
+            .sum::<usize>();
+        if retained == self.resolved_stack_frame_ids.len() {
+            return;
+        }
+        let mut ranges = self
+            .stack_cache
+            .iter()
+            .map(|(&key, range)| (key, range.clone()))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|(_, range)| range.start());
+
+        let mut next = 0;
+        for (key, mut range) in ranges {
+            let len = range.len();
+            self.resolved_stack_frame_ids
+                .copy_within(range.indices(), next);
+            range.relocate(next);
+            self.stack_cache.insert(key, range);
+            next += len;
+        }
+        self.resolved_stack_frame_ids.truncate(next);
+    }
+
+    fn compact_resolved_frames_if_needed(&mut self) {
+        const MIN_STALE_FRAMES: usize = 4_096;
+
+        let retained = self
+            .frame_cache
+            .values()
+            .map(ResolvedFrameRange::len)
+            .sum::<usize>();
+        let stale = self.resolved_frames.len().saturating_sub(retained);
+        if stale == 0 || (stale < MIN_STALE_FRAMES && stale < retained / 2) {
+            return;
+        }
+
+        // Retry slots are indices into `resolved_frames`. Compaction changes
+        // those indices, so a later retry must append a fresh result.
+        self.transient_frame_slots.clear();
+        self.vacant_frame_slots.clear();
+
+        let mut ranges = self
+            .frame_cache
+            .values()
+            .map(ResolvedFrameRange::indices)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|range| range.start);
+
+        retain_ranges(&mut self.resolved_frames, &ranges);
+        retain_ranges(&mut self.resolved_frame_ids, &ranges);
+
+        let mut cached_frames = self.frame_cache.values_mut().collect::<Vec<_>>();
+        cached_frames.sort_unstable_by_key(|range| range.indices.start);
+        let mut next = 0;
+        for range in cached_frames {
+            let len = range.len();
+            range.relocate(next);
+            next += len;
+        }
+        debug_assert_eq!(self.resolved_frames.len(), next);
+        debug_assert_eq!(self.resolved_frame_ids.len(), next);
+
+        // Frame results remain cached, but stack indices change during
+        // compaction and must be rebuilt on the next lookup.
+        self.clear_stack_resolution_cache();
     }
 
     /// Return whether native ELF symbolization has a configured backend.
@@ -644,9 +1105,15 @@ impl Symbolizer {
             if let Some(range) = self.stack_cache.get(&key).cloned() {
                 return Ok(ResolvedStack {
                     frames: &self.resolved_frames,
-                    ids: self.resolved_stack_frame_ids[range].iter(),
+                    frame_ids: &self.resolved_frame_ids,
+                    ids: self.resolved_stack_frame_ids[range.indices()].iter(),
+                    cacheable: true,
                 });
             }
+        }
+
+        if self.resolution_cache_full() {
+            self.clear_resolution_cache();
         }
 
         self.begin_frame_batch(frames.len());
@@ -670,14 +1137,17 @@ impl Symbolizer {
                 )?;
                 self.resolved_stack_frame_ids.extend(frame_ids);
             }
-            let range = start..self.resolved_stack_frame_ids.len();
+            let range = ResolvedStackFrameRange::new(start..self.resolved_stack_frame_ids.len());
             self.stack_cache.insert(key, range.clone());
             return Ok(ResolvedStack {
                 frames: &self.resolved_frames,
-                ids: self.resolved_stack_frame_ids[range].iter(),
+                frame_ids: &self.resolved_frame_ids,
+                ids: self.resolved_stack_frame_ids[range.indices()].iter(),
+                cacheable: true,
             });
         }
 
+        let cacheable = self.transient_frame_keys.is_empty();
         self.resolved_stack_scratch.clear();
         while let Some(frame_ref) = frames.next_with_id() {
             let frame_ids =
@@ -687,7 +1157,9 @@ impl Symbolizer {
         self.clear_transient_frame_cache();
         Ok(ResolvedStack {
             frames: &self.resolved_frames,
+            frame_ids: &self.resolved_frame_ids,
             ids: self.resolved_stack_scratch.iter(),
+            cacheable,
         })
     }
 
@@ -705,17 +1177,23 @@ impl Symbolizer {
         process_id: crate::Pid,
         frames: &[FrameRecord],
     ) -> crate::Result<ResolvedStack<'_>> {
+        if frames.iter().any(|frame| {
+            frame.mode == FrameMode::TruncatedStackMarker && !frame.is_truncated_stack_marker()
+        }) {
+            return Err(crate::Error::message(
+                crate::ErrorKind::InvalidInput,
+                "invalid truncated stack marker frame",
+            ));
+        }
+        if self.resolution_cache_full() {
+            self.clear_resolution_cache();
+        }
         self.begin_frame_batch(frames.len());
         for frame in frames {
-            if frame.mode == FrameMode::TruncatedStackMarker && !frame.is_truncated_stack_marker() {
-                return Err(crate::Error::message(
-                    crate::ErrorKind::InvalidInput,
-                    "invalid truncated stack marker frame",
-                ));
-            }
             self.prepare_frame(process_id.get(), *frame, FrameCacheKey::Raw(*frame), None);
         }
         self.finish_frame_batch(process_id.get())?;
+        let cacheable = self.transient_frame_keys.is_empty();
         self.resolved_stack_scratch.clear();
         self.resolved_stack_scratch.reserve(frames.len());
         for frame in frames {
@@ -725,7 +1203,9 @@ impl Symbolizer {
         self.clear_transient_frame_cache();
         Ok(ResolvedStack {
             frames: &self.resolved_frames,
+            frame_ids: &self.resolved_frame_ids,
             ids: self.resolved_stack_scratch.iter(),
+            cacheable,
         })
     }
 
@@ -746,8 +1226,8 @@ impl Symbolizer {
         spool_frame_id: Option<u32>,
     ) -> crate::Result<Range<usize>> {
         let cache_key = (process_id, cache_key);
-        if let Some(frame_ids) = self.frame_cache.get(&cache_key) {
-            return Ok(frame_ids.clone());
+        if let Some(cached) = self.frame_cache.get(&cache_key) {
+            return Ok(cached.indices());
         }
         self.begin_frame_batch(1);
         self.prepare_frame(process_id, *frame, cache_key.1, spool_frame_id);
@@ -764,7 +1244,7 @@ impl Symbolizer {
     ) -> crate::Result<Range<usize>> {
         self.frame_cache
             .get(&(process_id, cache_key))
-            .cloned()
+            .map(ResolvedFrameRange::indices)
             .ok_or_else(|| NativeContractError::MissingCachedFrame.into_public())
     }
 
@@ -821,16 +1301,18 @@ impl Symbolizer {
                     request_index: native.request_index,
                 },
                 transient: native.transient,
+                perf_map_dependent: false,
             });
             return;
         }
 
-        let perf_map_symbol =
-            if self.perf_maps_allowed_for(process_id) && frame.mode == FrameMode::User {
-                self.lookup_perf_map_symbol(process_id, frame.abs_ip)
-            } else {
-                None
-            };
+        let perf_map_dependent =
+            self.perf_maps_allowed_for(process_id) && frame.mode == FrameMode::User;
+        let perf_map_symbol = if perf_map_dependent {
+            self.lookup_perf_map_symbol(process_id, frame.abs_ip)
+        } else {
+            None
+        };
 
         if let Some((symbol, perf_map_module)) = perf_map_symbol {
             let blocked_module = self
@@ -849,6 +1331,7 @@ impl Symbolizer {
                         request_index: request_index.request_index,
                     },
                     transient: request_index.transient,
+                    perf_map_dependent: false,
                 });
                 return;
             }
@@ -862,6 +1345,7 @@ impl Symbolizer {
                     perf_map_module,
                 )),
                 transient: false,
+                perf_map_dependent: true,
             });
             return;
         }
@@ -879,6 +1363,7 @@ impl Symbolizer {
                 request_index: native.request_index,
             },
             transient: native.transient,
+            perf_map_dependent,
         });
     }
 
@@ -912,15 +1397,22 @@ impl Symbolizer {
                 return NativeLookupPreparation::default();
             }
             let batch_module = if let Some(template) = self.native_modules.get(&module.id) {
-                let image_file = match self.elf_sections.acquire_file(module) {
-                    Ok(file) => Some(file),
+                let image = match self.elf_sections.acquire_image(module) {
+                    Ok(image) => Some(image),
                     Err(ElfLoadError::Retryable) => {
                         self.retryable_native_modules.insert(module.id);
-                        None
+                        return NativeLookupPreparation {
+                            transient: true,
+                            ..NativeLookupPreparation::default()
+                        };
                     }
-                    Err(ElfLoadError::Unsupported) => None,
+                    Err(ElfLoadError::Unsupported) if module.path.is_vdso() => None,
+                    Err(ElfLoadError::Unsupported) => {
+                        self.unsupported_native_modules.insert(module.id);
+                        return NativeLookupPreparation::default();
+                    }
                 };
-                template.with_image_file(image_file)
+                template.with_image(image)
             } else {
                 let mapping = match self.elf_sections.load_mapping(module) {
                     Ok(mapping) => mapping,
@@ -940,8 +1432,8 @@ impl Symbolizer {
                     self.unsupported_native_modules.insert(module.id);
                     return NativeLookupPreparation::default();
                 };
-                let image_file = mapping.file;
-                if image_file.is_none() && !module.path.is_vdso() {
+                let image = mapping.image;
+                if image.is_none() && !module.path.is_vdso() {
                     return NativeLookupPreparation {
                         transient: true,
                         ..NativeLookupPreparation::default()
@@ -949,6 +1441,7 @@ impl Symbolizer {
                 }
                 let template = NativeModule::from_recording(
                     module.path.clone(),
+                    module.start..module.end,
                     image_base,
                     is_python_runtime,
                     NativeFileIdentity::new(
@@ -960,7 +1453,7 @@ impl Symbolizer {
                     module.id,
                     mapping.image_token,
                 );
-                let batch_module = template.with_image_file(image_file);
+                let batch_module = template.with_image(image);
                 self.native_modules.insert(module.id, template);
                 batch_module
             };
@@ -996,6 +1489,10 @@ impl Symbolizer {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "resolved frames and their IDs are appended and removed together"
+    )]
     fn finish_frame_batch(&mut self, process_id: i32) -> crate::Result<()> {
         if !self.native_requests.is_empty() {
             self.native_results.reserve(self.native_requests.len());
@@ -1039,7 +1536,7 @@ impl Symbolizer {
             let appended_start = self.resolved_frames.len();
             let mut retry = false;
             match pending.resolution {
-                PendingResolution::PerfMap(frame) => self.resolved_frames.push(frame),
+                PendingResolution::PerfMap(frame) => self.push_resolved_frame(frame),
                 PendingResolution::Native {
                     module,
                     request_index,
@@ -1059,6 +1556,11 @@ impl Symbolizer {
                 if let Some(slot) = reusable_slot {
                     if let Some(replacement) = self.resolved_frames.pop() {
                         self.resolved_frames[slot] = replacement;
+                        let replacement_id = self
+                            .resolved_frame_ids
+                            .pop()
+                            .expect("every resolved frame has an ID");
+                        self.resolved_frame_ids[slot] = replacement_id;
                         slot..slot + 1
                     } else {
                         appended_range
@@ -1073,7 +1575,13 @@ impl Symbolizer {
                 appended_range
             };
             let frame_start = frame_range.start;
-            self.frame_cache.insert(pending.cache_key, frame_range);
+            self.frame_cache.insert(
+                pending.cache_key,
+                ResolvedFrameRange {
+                    indices: frame_range,
+                    perf_map_dependent: pending.perf_map_dependent,
+                },
+            );
             if retry {
                 self.transient_frame_slots
                     .insert(pending.cache_key, frame_start);
@@ -1087,6 +1595,20 @@ impl Symbolizer {
         self.native_batch_modules.clear();
         self.retryable_native_modules.clear();
         Ok(())
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "a process cannot produce u64::MAX unique resolved frames"
+    )]
+    fn push_resolved_frame(&mut self, frame: ResolvedFrame) {
+        let id = ResolvedFrameId(self.next_resolved_frame_id);
+        self.next_resolved_frame_id = self
+            .next_resolved_frame_id
+            .checked_add(1)
+            .expect("resolved frame ID space exhausted");
+        self.resolved_frames.push(frame);
+        self.resolved_frame_ids.push(id);
     }
 
     fn module_key_for_frame(
@@ -1122,7 +1644,12 @@ impl Symbolizer {
                     frame,
                 )
             }
-            _ => spool::module_for_frame_unbounded(self.modules.records(), process_id, frame),
+            _ => spool::module_for_frame_unbounded(
+                self.modules.records(),
+                process_id,
+                frame,
+                |module| !self.inactive_modules.contains(&module.id),
+            ),
         }
     }
 
@@ -1152,8 +1679,7 @@ impl Symbolizer {
         symbols: Option<NativeSymbols>,
     ) {
         if frame.is_truncated_stack_marker() {
-            self.resolved_frames
-                .push(ResolvedFrame::Native(NativeFrame::truncated_stack_marker()));
+            self.push_resolved_frame(ResolvedFrame::Native(NativeFrame::truncated_stack_marker()));
             return;
         }
         let is_kernel_frame = frame.mode == FrameMode::Kernel
@@ -1165,10 +1691,9 @@ impl Symbolizer {
 
         match (is_kernel_frame, module) {
             (false, None) => {
-                self.resolved_frames
-                    .push(ResolvedFrame::Native(NativeFrame::from_address(
-                        frame.abs_ip,
-                    )));
+                self.push_resolved_frame(ResolvedFrame::Native(NativeFrame::from_address(
+                    frame.abs_ip,
+                )));
             }
             (true, _) => {
                 // Unresolved kernel frames get offset 0: the fallback name
@@ -1190,14 +1715,13 @@ impl Symbolizer {
                     };
                 let symbol =
                     NativeSymbol::new(symbol_name, SourceLocation::default(), module_name, offset);
-                self.resolved_frames
-                    .push(ResolvedFrame::Native(NativeFrame {
-                        pc: frame.abs_ip,
-                        symbol: Some(symbol),
-                        kind: FrameKind::Kernel,
-                        origin,
-                        flags: FrameFlags::empty(),
-                    }));
+                self.push_resolved_frame(ResolvedFrame::Native(NativeFrame {
+                    pc: frame.abs_ip,
+                    symbol: Some(symbol),
+                    kind: FrameKind::Kernel,
+                    origin,
+                    flags: FrameFlags::empty(),
+                }));
             }
             (false, Some((module_id, file_relative_ip))) => {
                 let is_python_runtime = frame.mode == FrameMode::User
@@ -1206,33 +1730,31 @@ impl Symbolizer {
                         .metadata(module_id)
                         .is_some_and(|metadata| metadata.is_python_runtime);
                 if let Some(symbols) = symbols {
-                    self.resolved_frames
-                        .extend(symbols.into_symbols().map(|symbol| {
-                            let mut flags = FrameFlags::empty();
-                            flags.set(FrameFlags::PYTHON_RUNTIME, is_python_runtime);
-                            flags.set(FrameFlags::HIDDEN_DEFAULT, symbol.should_ignore());
-                            ResolvedFrame::Native(NativeFrame {
-                                pc: frame.abs_ip,
-                                symbol: Some(symbol),
-                                kind: FrameKind::Native,
-                                origin: SymbolOrigin::Elf,
-                                flags,
-                            })
+                    for symbol in symbols.into_symbols() {
+                        let mut flags = FrameFlags::empty();
+                        flags.set(FrameFlags::PYTHON_RUNTIME, is_python_runtime);
+                        flags.set(FrameFlags::HIDDEN_DEFAULT, symbol.should_ignore());
+                        self.push_resolved_frame(ResolvedFrame::Native(NativeFrame {
+                            pc: frame.abs_ip,
+                            symbol: Some(symbol),
+                            kind: FrameKind::Native,
+                            origin: SymbolOrigin::Elf,
+                            flags,
                         }));
+                    }
                     return;
                 }
 
                 let Some((module, module_metadata)) = self.modules.get_with_metadata_mut(module_id)
                 else {
-                    self.resolved_frames
-                        .push(ResolvedFrame::Native(NativeFrame::from_address(
-                            frame.abs_ip,
-                        )));
+                    self.push_resolved_frame(ResolvedFrame::Native(NativeFrame::from_address(
+                        frame.abs_ip,
+                    )));
                     return;
                 };
                 let path = module_metadata
                     .path
-                    .get_or_insert_with(|| module.path.as_str().into());
+                    .get_or_insert_with(|| normalized_module_path(module.path.as_str()).into());
                 let symbol_name =
                     format_hex_suffix(&path[module_metadata.basename_start..], file_relative_ip);
                 // Pseudo-symbol without a function: the name embeds the
@@ -1248,18 +1770,17 @@ impl Symbolizer {
                 } else {
                     symbol
                 };
-                self.resolved_frames
-                    .push(ResolvedFrame::Native(NativeFrame {
-                        pc: frame.abs_ip,
-                        symbol: Some(symbol),
-                        kind: FrameKind::Native,
-                        origin: SymbolOrigin::AddressOnly,
-                        flags: if is_python_runtime {
-                            FrameFlags::PYTHON_RUNTIME | FrameFlags::HIDDEN_DEFAULT
-                        } else {
-                            FrameFlags::empty()
-                        },
-                    }));
+                self.push_resolved_frame(ResolvedFrame::Native(NativeFrame {
+                    pc: frame.abs_ip,
+                    symbol: Some(symbol),
+                    kind: FrameKind::Native,
+                    origin: SymbolOrigin::AddressOnly,
+                    flags: if is_python_runtime {
+                        FrameFlags::PYTHON_RUNTIME | FrameFlags::HIDDEN_DEFAULT
+                    } else {
+                        FrameFlags::empty()
+                    },
+                }));
             }
         }
     }
@@ -1284,9 +1805,16 @@ impl Symbolizer {
         process_id: i32,
         abs_ip: u64,
     ) -> Option<(PerfMapSymbol, std::rc::Rc<str>)> {
-        self.perf_map_cache
+        self.perf_maps
             .entry(process_id)
-            .or_insert_with(|| load_perf_map(&self.perf_map_dir, process_id))
+            .or_insert_with(|| PerfMapState {
+                identity: self
+                    .tracks_perf_map_updates
+                    .then(|| perf_map_file_identity(&self.perf_map_dir, process_id))
+                    .flatten(),
+                map: load_perf_map(&self.perf_map_dir, process_id),
+            })
+            .map
             .as_ref()
             .and_then(|perf_map| find_perf_map_symbol(perf_map, abs_ip))
             .map(|(symbol, module)| (symbol.clone(), module.clone()))
@@ -1394,6 +1922,27 @@ mod tests {
             );
             output.extend(requests.iter().map(|_| NativeSymbols::unresolved()));
             Ok(())
+        }
+    }
+
+    struct RetirementRecordingSymbolizer {
+        retired_modules: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl NativeSymbolizer for RetirementRecordingSymbolizer {
+        type Error = std::convert::Infallible;
+
+        fn symbolize(
+            &mut self,
+            requests: &[NativeLookup],
+            output: &mut Vec<NativeSymbols>,
+        ) -> Result<(), Self::Error> {
+            output.extend(requests.iter().map(|_| NativeSymbols::unresolved()));
+            Ok(())
+        }
+
+        fn retire_module(&mut self, module: &NativeModule) {
+            self.retired_modules.borrow_mut().push(module.mapping_id());
         }
     }
 
@@ -1585,6 +2134,53 @@ mod tests {
     }
 
     #[test]
+    fn live_module_retirement_notifies_backend_without_invalidating_stack() {
+        let temp = crate::test_support::TempDir::new("symbolize-narrow-invalidation");
+        let path = temp.path().join("recording.spool");
+        let pid = crate::Pid::try_from(std::process::id()).unwrap();
+        let retired_modules = Rc::new(RefCell::new(Vec::new()));
+        let backend_retired_modules = Rc::clone(&retired_modules);
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        writer.flush().unwrap();
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.poll().unwrap().stacks().count(), 0);
+        let mut symbolizer = tail
+            .symbolizer()
+            .stack_cache(StackCache::External)
+            .disable_perf_maps()
+            .native(move |_| RetirementRecordingSymbolizer {
+                retired_modules: Rc::clone(&backend_retired_modules),
+            })
+            .build()
+            .unwrap();
+
+        let module = current_executable_module(0, pid.get());
+        let frame = pinned_frame(0, module.start + 8);
+        writer.write_module(&module).unwrap();
+        writer.flush().unwrap();
+        {
+            let batch = tail.poll().unwrap();
+            let invalidation = symbolizer.update(&batch).unwrap();
+            assert!(!invalidation.all());
+            assert!(!invalidation.affects_process(pid));
+        }
+        assert_eq!(symbolizer.resolve_raw(pid, &[frame]).unwrap().count(), 1);
+
+        writer.write_module_deactivation_one(0).unwrap();
+        writer.flush().unwrap();
+        {
+            let batch = tail.poll().unwrap();
+            let invalidation = symbolizer.update(&batch).unwrap();
+            assert!(!invalidation.affects_process(pid));
+        }
+        assert!(retired_modules.borrow().is_empty());
+        let batch = tail.poll().unwrap();
+        let invalidation = symbolizer.update(&batch).unwrap();
+        assert!(!invalidation.affects_process(pid));
+        assert_eq!(&*retired_modules.borrow(), &[0]);
+    }
+
+    #[test]
     fn transient_module_open_is_retried_without_retaining_image_descriptors() {
         let temp = crate::test_support::TempDir::new("symbolize-native-retry");
         let path = temp.path().join("late-image");
@@ -1701,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_native_backend_can_resolve_after_the_image_disappears() {
+    fn cached_native_backend_is_not_called_after_the_image_disappears() {
         let temp = crate::test_support::TempDir::new("symbolize-native-cached-image");
         let path = temp.path().join("image");
         fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
@@ -1733,19 +2329,14 @@ mod tests {
             "cached-image"
         );
         fs::remove_file(&path).unwrap();
-        assert_eq!(
-            symbolizer
-                .resolve_raw(pid, &[second])
-                .unwrap()
-                .next()
-                .unwrap()
-                .display_name(),
-            "cached-image"
-        );
-        assert_eq!(&*descriptors.borrow(), &[true, false]);
+        assert!(matches!(
+            symbolizer.resolve_raw(pid, &[second]).unwrap().next(),
+            Some(ResolvedFrame::Native(frame)) if frame.origin == SymbolOrigin::AddressOnly
+        ));
+        assert_eq!(&*descriptors.borrow(), &[true]);
 
         assert_eq!(symbolizer.resolve_raw(pid, &[second]).unwrap().count(), 1);
-        assert_eq!(&*descriptors.borrow(), &[true, false]);
+        assert_eq!(&*descriptors.borrow(), &[true]);
     }
 
     #[test]
@@ -2108,17 +2699,30 @@ mod tests {
         fs::write(&path, "3000 20 jit_func\n").expect("write perf map");
 
         let mut symbolizer = Symbolizer::new(&[]);
-        let frame = frame(0x3008);
+        let cached_frame = frame(0x3008);
         let first = symbolizer
-            .resolve_cached_frame_ref(process_id, &frame)
+            .resolve_cached_frame_ref(process_id, &cached_frame)
             .display_name();
         let second = symbolizer
-            .resolve_cached_frame_ref(process_id, &frame)
+            .resolve_cached_frame_ref(process_id, &cached_frame)
             .display_name();
+
+        symbolizer.resolution_cache_limit = Some(1);
+        let replacement = frame(0x4008);
+        assert_eq!(
+            symbolizer
+                .resolve_raw(crate::Pid::new(process_id).unwrap(), &[replacement])
+                .unwrap()
+                .count(),
+            1
+        );
         let _ = fs::remove_file(&path);
 
         assert_eq!(symbolizer.frame_cache.len(), 1);
         assert_eq!(first, second);
+        assert!(symbolizer
+            .frame_cache
+            .contains_key(&(process_id, FrameCacheKey::Raw(replacement))));
     }
 
     #[test]
@@ -2520,5 +3124,132 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn perf_map_growth_preserves_unrelated_elf_frames() {
+        use std::io::Write as _;
+        let temp = crate::test_support::TempDir::new("perf-map-eviction");
+        let path = temp.path().join("recording.spool");
+        let pid_i32 = i32::try_from(std::process::id()).unwrap();
+        let pid = crate::Pid::new(pid_i32).unwrap();
+        let other_pid_i32 = pid_i32.checked_add(1).unwrap();
+        let other_pid = crate::Pid::new(other_pid_i32).unwrap();
+        let perf_map = temp.path().join(format!("perf-{pid_i32}.map"));
+        fs::write(&perf_map, "1000 10 existing_jit_symbol\n").unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let backend_calls = Rc::clone(&calls);
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        writer.flush().unwrap();
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.poll().unwrap().stacks().count(), 0);
+        let mut symbolizer = tail
+            .symbolizer()
+            .stack_cache(StackCache::External)
+            .perf_map_dir(temp.path())
+            .native(move |_| CountingNativeSymbolizer {
+                calls: Rc::clone(&backend_calls),
+            })
+            .build()
+            .unwrap();
+        let module = current_executable_module(0, pid_i32);
+        let other_module = current_executable_module(1, other_pid_i32);
+        let elf_frame = FrameRecord {
+            module_id: Some(0),
+            file_relative_ip: module.file_offset + 8,
+            abs_ip: module.start + 8,
+            mode: FrameMode::User,
+        };
+        let other_elf_frame = FrameRecord {
+            module_id: Some(1),
+            file_relative_ip: other_module.file_offset + 8,
+            abs_ip: other_module.start + 8,
+            mode: FrameMode::User,
+        };
+        writer.write_module(&module).unwrap();
+        writer.write_module(&other_module).unwrap();
+        writer.flush().unwrap();
+        {
+            let batch = tail.poll().unwrap();
+            let invalidation = symbolizer.update(&batch).unwrap();
+            assert!(!invalidation.affects_process(pid));
+        }
+        assert_eq!(
+            symbolizer.resolve_raw(pid, &[elf_frame]).unwrap().count(),
+            1
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            symbolizer
+                .resolve_raw(other_pid, &[other_elf_frame])
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(calls.get(), 2);
+        let jit_frame = frame(0x2000);
+        let unresolved = symbolizer
+            .resolve_raw(pid, &[jit_frame])
+            .unwrap()
+            .next()
+            .unwrap();
+        assert!(matches!(unresolved, ResolvedFrame::Native(frame) if frame.symbol.is_none()));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&perf_map).unwrap();
+        file.write_all(b"2000 10 jitted_fn_b\n").unwrap();
+        drop(file);
+        writer
+            .write_sample_frames(1_000, pid_i32, 1, [elf_frame])
+            .unwrap();
+        writer.flush().unwrap();
+        {
+            let batch = tail.poll().unwrap();
+            let invalidation = symbolizer.update(&batch).unwrap();
+            assert!(
+                invalidation.affects_process(pid),
+                "perf map growth invalidates the pid again"
+            );
+        }
+        assert_eq!(
+            symbolizer.resolve_raw(pid, &[elf_frame]).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "perf map growth must preserve cached ELF frames"
+        );
+        assert_eq!(
+            symbolizer
+                .resolve_raw(other_pid, &[other_elf_frame])
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(calls.get(), 2, "other processes must remain cached");
+        let resolved = symbolizer
+            .resolve_raw(pid, &[jit_frame])
+            .unwrap()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            resolved,
+            ResolvedFrame::Native(frame)
+                if frame.symbol.as_ref().is_some_and(|symbol| symbol.name() == "jitted_fn_b")
+        ));
+
+        writer.write_module_deactivation(pid_i32).unwrap();
+        writer.flush().unwrap();
+        let batch = tail.poll().unwrap();
+        symbolizer.update(&batch).unwrap();
+        let batch = tail.poll().unwrap();
+        let invalidation = symbolizer.update(&batch).unwrap();
+        assert!(invalidation.affects_process(pid));
+        assert!(!symbolizer
+            .frame_cache
+            .contains_key(&(pid_i32, FrameCacheKey::Raw(elf_frame))));
+        assert!(symbolizer
+            .frame_cache
+            .contains_key(&(other_pid_i32, FrameCacheKey::Raw(other_elf_frame))));
     }
 }
