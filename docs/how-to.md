@@ -334,6 +334,7 @@ println!("lost: {}",     summary.lost_events);
 println!("empty: {}",    summary.empty_stack_samples);
 println!("truncated: {}", summary.truncated_frame_markers);
 println!("errors: {}",   summary.error_stats.total());
+println!("frame-pointer fallbacks: {}", summary.unwind_fallbacks.total());
 # Ok(())
 # }
 ```
@@ -354,6 +355,9 @@ For a breakdown:
 # fn run(summary: &stackpulse::RecordingSummary) {
 for (kind, count) in summary.error_stats.nonzero_counts() {
     println!("{}: {count}", kind.description());
+}
+for (kind, count) in summary.unwind_fallbacks.nonzero_counts() {
+    println!("fallback {kind:?}: {count}");
 }
 # }
 ```

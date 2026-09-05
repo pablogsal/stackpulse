@@ -105,6 +105,7 @@ Counter snapshot for quality checks.
 | `truncated_frame_markers` | Unwind truncation markers observed. |
 | `ignored_user_callchain_frames` | Unexpected user callchain frames discarded because user stacks are unwound from DWARF. |
 | `error_stats` | Per-kind sample error counters. |
+| `unwind_fallbacks` | Successful frame-pointer unwind steps, grouped by the reason module unwind data could not be used. |
 
 ## Reading spool files
 

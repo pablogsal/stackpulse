@@ -30,12 +30,16 @@ use std::time::{Duration, Instant};
 
 use crate::state::ProcessExitWatcher;
 use crate::stats::{SampleErrorKind, SampleErrorStats};
+use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};
 
 fn try_new_exit_watcher(pid: i32) -> Option<ProcessExitWatcher> {
     crate::Pid::new(pid).and_then(|pid| ProcessExitWatcher::try_new(pid).ok())
 }
 
-use framehop::{Error as FramehopError, FrameAddress, Unwinder};
+use framehop::{
+    DwarfUnwinderError, Error as FramehopError, FrameAddress, FramePointerFallbackReason, Unwinder,
+    UnwinderError,
+};
 use perf_event_open::sample::record::mmap::Mmap;
 use perf_event_open::sample::record::sample::Abi as SampleRegsAbi;
 use perf_event_open::sample::record::sample::{CallChain, Sample};
@@ -346,6 +350,8 @@ pub struct RecordingSummary {
     pub ignored_user_callchain_frames: u64,
     /// Per-kind sample error counts.
     pub error_stats: SampleErrorStats,
+    /// Successful unwind steps that used frame pointers, grouped by reason.
+    pub unwind_fallbacks: UnwindFallbackStats,
 }
 
 /// Work completed by one [`Recorder::poll`] call.
@@ -2447,6 +2453,42 @@ fn sample_error_for_framehop(error: FramehopError) -> SampleErrorKind {
     }
 }
 
+fn fallback_kind(reason: FramePointerFallbackReason) -> UnwindFallbackKind {
+    match reason {
+        FramePointerFallbackReason::NoModule => UnwindFallbackKind::NoModule,
+        // Other Framehop format features can be enabled by another crate in the
+        // dependency graph even though this Linux recorder cannot produce them.
+        #[allow(unreachable_patterns)]
+        FramePointerFallbackReason::UnwindInfo(error) => match error {
+            UnwinderError::NoModuleUnwindData => UnwindFallbackKind::NoModuleUnwindData,
+            UnwinderError::EhFrameHdrCouldNotFindAddress => UnwindFallbackKind::EhFrameHdrLookup,
+            UnwinderError::DwarfCfiIndexCouldNotFindAddress => {
+                UnwindFallbackKind::DwarfCfiIndexLookup
+            }
+            UnwinderError::Dwarf(error) => match error {
+                DwarfUnwinderError::FdeFromOffsetFailed(_) => UnwindFallbackKind::DwarfFdeRead,
+                DwarfUnwinderError::UnwindInfoForAddressFailed(_) => {
+                    UnwindFallbackKind::DwarfUnwindInfo
+                }
+                DwarfUnwinderError::StackPointerMovedBackwards => {
+                    UnwindFallbackKind::DwarfStackPointerMovedBackwards
+                }
+                DwarfUnwinderError::DidNotAdvance => UnwindFallbackKind::DwarfDidNotAdvance,
+                DwarfUnwinderError::CouldNotRecoverCfa => {
+                    UnwindFallbackKind::DwarfCouldNotRecoverCfa
+                }
+                DwarfUnwinderError::CouldNotRecoverReturnAddress => {
+                    UnwindFallbackKind::DwarfCouldNotRecoverReturnAddress
+                }
+                DwarfUnwinderError::CouldNotRecoverFramePointer => {
+                    UnwindFallbackKind::DwarfCouldNotRecoverFramePointer
+                }
+            },
+            _ => UnwindFallbackKind::OtherUnwindFormat,
+        },
+    }
+}
+
 fn is_kernel_mode(privilege: Priv) -> bool {
     matches!(privilege, Priv::Kernel | Priv::GuestKernel)
 }
@@ -2545,13 +2587,19 @@ fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::
                         dwarf_truncated = true;
                         break;
                     }
-                    match frames.next() {
+                    match frames.next_with_details() {
                         Ok(None) => break,
-                        Ok(Some(FrameAddress::InstructionPointer(a))) => {
-                            stack.push(StackFrame::InstructionPointer(a, StackMode::User))
-                        }
-                        Ok(Some(FrameAddress::ReturnAddress(a))) => {
-                            stack.push(StackFrame::ReturnAddress(a.into(), StackMode::User))
+                        Ok(Some(frame)) => {
+                            if let Some(reason) = frame.fallback_reason() {
+                                summary.unwind_fallbacks.record(fallback_kind(reason));
+                            }
+                            match frame.address() {
+                                FrameAddress::InstructionPointer(address) => stack
+                                    .push(StackFrame::InstructionPointer(address, StackMode::User)),
+                                FrameAddress::ReturnAddress(address) => stack.push(
+                                    StackFrame::ReturnAddress(address.into(), StackMode::User),
+                                ),
+                            }
                         }
                         Err(err) => {
                             record_unwind_error(summary, sample_error_for_framehop(err), || {
