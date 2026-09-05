@@ -90,6 +90,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                     if new_sp <= sp {
                         return Err(Error::FramepointerUnwindingMovedBackwards);
                     }
+                    regs.set_sp_is_fp_derived(true);
                     (new_lr, new_sp, new_fp)
                 }
             }
@@ -127,6 +128,18 @@ impl UnwindRule for UnwindRuleAarch64 {
                 fp_storage_offset_from_sp_by_8,
                 lr_storage_offset_from_sp_by_8,
             } => {
+                let fp_storage_offset = i64::from(fp_storage_offset_from_sp_by_8) * 8;
+                // Frame-pointer fallback estimates the caller SP as `fp + 16`.
+                // Use DWARF's saved-x29 offset to correct that estimate.
+                let sp = if regs.sp_is_fp_derived()
+                    && fp != 0
+                    && checked_add_signed(sp, fp_storage_offset) != Some(fp)
+                {
+                    checked_add_signed(fp, -fp_storage_offset).unwrap_or(sp)
+                } else {
+                    sp
+                };
+
                 let sp_offset = u64::from(sp_offset_by_16) * 16;
                 let new_sp = sp.checked_add(sp_offset).ok_or(Error::IntegerOverflow)?;
                 let lr_storage_offset = i64::from(lr_storage_offset_from_sp_by_8) * 8;
@@ -134,11 +147,11 @@ impl UnwindRule for UnwindRuleAarch64 {
                     checked_add_signed(sp, lr_storage_offset).ok_or(Error::IntegerOverflow)?;
                 let new_lr =
                     read_stack(lr_location).map_err(|_| Error::CouldNotReadStack(lr_location))?;
-                let fp_storage_offset = i64::from(fp_storage_offset_from_sp_by_8) * 8;
                 let fp_location =
                     checked_add_signed(sp, fp_storage_offset).ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
+                regs.set_sp_is_fp_derived(false);
                 (new_lr, new_sp, new_fp)
             }
             UnwindRuleAarch64::UseFramePointer => {
@@ -190,6 +203,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                 if new_fp <= fp || new_sp <= sp {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
+                regs.set_sp_is_fp_derived(true);
                 (new_lr, new_sp, new_fp)
             }
             UnwindRuleAarch64::UseFramepointerWithOffsets {
@@ -218,6 +232,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                 if new_fp <= fp || new_sp <= sp {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
+                regs.set_sp_is_fp_derived(false);
                 (new_lr, new_sp, new_fp)
             }
         };
@@ -260,5 +275,63 @@ mod test {
         assert_eq!(regs.fp(), 0x70);
         let res = UnwindRuleAarch64::UseFramePointer.exec(false, &mut regs, &mut read_stack);
         assert_eq!(res, Ok(None));
+    }
+
+    #[test]
+    fn frame_pointer_fallback_marks_sp_as_derived() {
+        let stack = [0u64, 0, 0, 0, 0x40, 0x100200, 0, 0];
+        let mut read_stack = |addr| Ok(stack[(addr / 8) as usize]);
+        let mut regs = UnwindRegsAarch64::new(0x100300, 0x10, 0x20);
+
+        let result = UnwindRuleAarch64::UseFramePointer.exec(false, &mut regs, &mut read_stack);
+
+        assert_eq!(result, Ok(Some(0x100200)));
+        assert!(regs.sp_is_fp_derived());
+    }
+
+    #[test]
+    fn sp_relative_rule_reanchors_an_fp_derived_sp() {
+        let index = |addr: u64| (addr / 8) as usize;
+        let mut stack = [0u64; 64];
+        stack[index(0x80)] = 0x200;
+        stack[index(0x88)] = 0x100200;
+        stack[index(0x70)] = 0x1111;
+        stack[index(0x78)] = 0xdead;
+        let mut read_stack = |addr| Ok(stack[index(addr)]);
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x70, 0x80);
+        regs.set_sp_is_fp_derived(true);
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 9,
+            fp_storage_offset_from_sp_by_8: 0,
+            lr_storage_offset_from_sp_by_8: 1,
+        };
+
+        let result = rule.exec(false, &mut regs, &mut read_stack);
+
+        assert_eq!(result, Ok(Some(0x100200)));
+        assert_eq!(regs.sp(), 0x110);
+        assert_eq!(regs.fp(), 0x200);
+        assert!(!regs.sp_is_fp_derived());
+    }
+
+    #[test]
+    fn sp_relative_rule_keeps_a_captured_sp() {
+        let index = |addr: u64| (addr / 8) as usize;
+        let mut stack = [0u64; 64];
+        stack[index(0x80)] = 0x200;
+        stack[index(0x88)] = 0x100200;
+        let mut read_stack = |addr| Ok(stack[index(addr)]);
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x80, 0x9999);
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 9,
+            fp_storage_offset_from_sp_by_8: 0,
+            lr_storage_offset_from_sp_by_8: 1,
+        };
+
+        let result = rule.exec(false, &mut regs, &mut read_stack);
+
+        assert_eq!(result, Ok(Some(0x100200)));
+        assert_eq!(regs.sp(), 0x110);
+        assert_eq!(regs.fp(), 0x200);
     }
 }

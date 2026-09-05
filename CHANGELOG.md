@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- AArch64 unwinding can recover the stack pointer when a frame-pointer fallback is followed by an SP-relative DWARF rule.
+- Frame-pointer fallback diagnostics are tested through the rule cache, including retry after sample-dependent DWARF failures.
+
 ## 0.10.2 - 2026-09-05
 
 ### Added
