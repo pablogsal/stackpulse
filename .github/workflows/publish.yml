@@ -60,7 +60,7 @@ jobs:
         run: |
           crate_version="$(
             cargo metadata --locked --no-deps --format-version 1 |
-              python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+              python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "stackpulse"))'
           )"
           tag_version="${GITHUB_REF_NAME#v}"
           if [ "$crate_version" != "$tag_version" ]; then
