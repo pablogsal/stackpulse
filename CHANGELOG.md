@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.10.1 - 2026-09-05
+
+### Changed
+
+- StackPulse now maintains its Framehop integration as the separately published `framehop-stackpulse` workspace crate.
+- Linux perf samples now capture every x86-64 general-purpose register needed by DWARF CFA expressions.
+- Recording summaries report why native unwinding used frame-pointer fallback.
+
 ## 0.10.0 - 2026-09-03
 
 ### Added

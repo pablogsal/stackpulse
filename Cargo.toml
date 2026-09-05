@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
@@ -31,7 +31,7 @@ workspace = true
 
 [dependencies]
 bitflags = "2.4"
-framehop = { version = "0.16.0", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "crates/framehop-stackpulse", version = "0.16.2", default-features = false, features = ["std"] }
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 goblin = "0.10"
 integer-encoding = { version = "4.1.0", default-features = false }
@@ -74,6 +74,10 @@ required-features = ["builtin-wholesym"]
 [[test]]
 name = "allocations"
 required-features = ["bench-support"]
+
+[workspace]
+members = ["crates/framehop-stackpulse"]
+resolver = "2"
 
 [workspace.lints.clippy]
 # Enable lint groups (priority -1 so specific lints take precedence)

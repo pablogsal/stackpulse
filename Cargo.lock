@@ -579,15 +579,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "framehop"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f54fe4785e899d4d6f43793b151c63c5647240fc630b005509d2614a939f693"
+name = "framehop-stackpulse"
+version = "0.16.2"
 dependencies = [
  "arrayvec",
  "cfg-if",
  "fallible-iterator",
+ "flate2",
  "gimli 0.33.0",
+ "itertools 0.14.0",
+ "macho-unwind-info",
+ "object 0.39.1",
+ "pe-unwind-info",
 ]
 
 [[package]]
@@ -1290,6 +1293,17 @@ dependencies = [
 
 [[package]]
 name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "flate2",
+ "memchr",
+ "ruzstd 0.8.3",
+]
+
+[[package]]
+name = "object"
 version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
@@ -1340,6 +1354,19 @@ dependencies = [
  "fallible-iterator",
  "scroll 0.12.0",
  "uuid",
+]
+
+[[package]]
+name = "pe-unwind-info"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97f6fccfd2d9d2df765ca23ff85fe5cc437fb0e6d3e164e4d3cbe09d14780c93"
+dependencies = [
+ "arrayvec",
+ "bitflags",
+ "thiserror",
+ "zerocopy",
+ "zerocopy-derive",
 ]
 
 [[package]]
@@ -1805,6 +1832,15 @@ dependencies = [
 
 [[package]]
 name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash 2.1.2",
+]
+
+[[package]]
+name = "ruzstd"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
@@ -2006,13 +2042,13 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stackpulse"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "allocation-counter",
  "bitflags",
  "codspeed-criterion-compat",
  "flate2",
- "framehop",
+ "framehop-stackpulse",
  "fxprof-processed-profile",
  "gimli 0.34.0",
  "goblin",

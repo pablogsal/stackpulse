@@ -30,6 +30,7 @@ pub mod symbolize;
 mod symbols;
 #[cfg(test)]
 mod test_support;
+mod unwind_stats;
 
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{Pid, Tid};
@@ -59,6 +60,7 @@ pub mod record {
         RefreshOutcome, SampleRate,
     };
     pub use crate::stats::{SampleErrorKind, SampleErrorStats};
+    pub use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};
 
     /// Read the kernel's current maximum perf sample rate.
     #[must_use]
