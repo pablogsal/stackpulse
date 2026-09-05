@@ -168,6 +168,7 @@ flushed the spool header.
 | --- | --- |
 | `symbolizer()` | A symbolizer bound to this tail's growing definitions. |
 | `poll()` | A borrowed [`TailBatch`](crate::spool::TailBatch) containing the next bounded group of visible samples and definition changes. |
+| `discard_consumed()` | Releases filesystem blocks for complete records already processed by a recorder-owned tail. |
 | `start_timestamp_us()` | Optional profile timeline anchor stored in the spool header. |
 | `sample_interval_us()` | Optional sample interval metadata stored in the spool header. |
 

@@ -105,6 +105,12 @@ symbolized from the file that was actually sampled. `Tail::open` is available
 when the writer lives elsewhere, but then only paths recorded in the spool are
 available.
 
+After a batch is dropped, `tail.discard_consumed()` can release the filesystem
+blocks occupied by records that will not be read again. This makes the spool
+disposable: the active tail can continue, but the file can no longer be opened
+or replayed from the beginning. If the filesystem does not support hole
+punching, the method returns an unsupported-operation error.
+
 The example uses StackPulse's internal stack cache. If the application keeps
 prepared stacks itself, configure `StackCache::External`, consume the
 `Invalidation` returned by every `update`, and do not cache a resolved stack
