@@ -14,6 +14,7 @@ pub struct UnwindRegsAarch64 {
     lr: u64,
     sp: u64,
     fp: u64,
+    sp_is_fp_derived: bool,
 }
 
 /// Aarch64 CPUs support special instructions which interpret pointers as pair
@@ -74,6 +75,7 @@ impl UnwindRegsAarch64 {
             lr,
             sp,
             fp,
+            sp_is_fp_derived: false,
         }
     }
 
@@ -90,6 +92,7 @@ impl UnwindRegsAarch64 {
             lr: code_ptr_auth_mask.strip_ptr_auth(lr),
             sp,
             fp,
+            sp_is_fp_derived: false,
         }
     }
 
@@ -134,6 +137,16 @@ impl UnwindRegsAarch64 {
     pub fn set_lr(&mut self, lr: u64) {
         self.lr = self.lr_mask.strip_ptr_auth(lr)
     }
+
+    #[inline(always)]
+    pub(crate) fn sp_is_fp_derived(&self) -> bool {
+        self.sp_is_fp_derived
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_sp_is_fp_derived(&mut self, fp_derived: bool) {
+        self.sp_is_fp_derived = fp_derived
+    }
 }
 
 impl Debug for UnwindRegsAarch64 {
@@ -142,6 +155,7 @@ impl Debug for UnwindRegsAarch64 {
             .field("lr", &HexNum(self.lr))
             .field("sp", &HexNum(self.sp))
             .field("fp", &HexNum(self.fp))
+            .field("sp_is_fp_derived", &self.sp_is_fp_derived)
             .finish()
     }
 }

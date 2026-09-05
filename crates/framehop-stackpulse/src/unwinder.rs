@@ -1079,3 +1079,121 @@ impl<D: Deref<Target = [u8]>> Module<D> {
         &self.name
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::MayAllocateDuringUnwind;
+    use crate::x86_64::{ArchX86_64, UnwindRegsX86_64, UnwindRuleX86_64};
+
+    type TestUnwinder = UnwinderInternal<Vec<u8>, ArchX86_64, MayAllocateDuringUnwind>;
+    type TestCache = Cache<UnwindRuleX86_64, MayAllocateDuringUnwind>;
+
+    fn module_without_unwind_data() -> Module<Vec<u8>> {
+        Module {
+            name: "test".into(),
+            avma_range: 0x1000..0x2000,
+            base_avma: 0x1000,
+            base_svma: 0,
+            unwind_data: Arc::new(ModuleUnwindDataInternal::None),
+        }
+    }
+
+    #[test]
+    fn detailed_unwind_reports_a_successful_frame_pointer_fallback() {
+        let unwinder = TestUnwinder::new();
+        let mut cache = TestCache::new();
+        let mut regs = UnwindRegsX86_64::new(0x1100, 0x2000, 0x3000);
+        let mut read_stack = |address| match address {
+            0x3000 => Ok(0x4000),
+            0x3008 => Ok(0x5000),
+            _ => Err(()),
+        };
+
+        let outcome = unwinder
+            .unwind_frame_with_details(
+                FrameAddress::from_instruction_pointer(0x1100),
+                &mut regs,
+                &mut cache,
+                &mut read_stack,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.return_address(), Some(0x5000));
+        assert_eq!(
+            outcome.fallback_reason(),
+            Some(FramePointerFallbackReason::NoModule)
+        );
+    }
+
+    #[test]
+    fn sample_dependent_dwarf_failure_is_retried() {
+        let mut unwinder = TestUnwinder::new();
+        unwinder.add_module(module_without_unwind_data());
+        let mut cache = TestCache::new();
+        let address = FrameAddress::from_instruction_pointer(0x1100);
+
+        let mut regs = UnwindRegsX86_64::new(0x1100, 0x2000, 0x3000);
+        let mut fallback_stack = |stack_address| match stack_address {
+            0x3000 => Ok(0x4000),
+            0x3008 => Ok(0x5000),
+            _ => Err(()),
+        };
+        let outcome = unwinder
+            .with_cache(
+                address,
+                &mut regs,
+                &mut cache,
+                &mut fallback_stack,
+                |_, _, _, _, _, _| {
+                    Err(UnwinderError::Dwarf(DwarfUnwinderError::CouldNotRecoverCfa))
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.return_address(), Some(0x5000));
+        assert_eq!(
+            outcome.fallback_reason(),
+            Some(FramePointerFallbackReason::UnwindInfo(
+                UnwinderError::Dwarf(DwarfUnwinderError::CouldNotRecoverCfa)
+            ))
+        );
+
+        let mut regs = UnwindRegsX86_64::new(0x1100, 0x2000, 0x3000);
+        let mut dwarf_stack = |stack_address| match stack_address {
+            0x2008 => Ok(0x6000),
+            _ => Err(()),
+        };
+        let mut retried = false;
+        let outcome = unwinder
+            .with_cache(
+                address,
+                &mut regs,
+                &mut cache,
+                &mut dwarf_stack,
+                |_, _, _, _, _, _| {
+                    retried = true;
+                    Ok(UnwindResult::ExecRule(UnwindRuleX86_64::OffsetSp {
+                        sp_offset_by_8: 2,
+                    }))
+                },
+            )
+            .unwrap();
+        assert!(retried);
+        assert_eq!(outcome.return_address(), Some(0x6000));
+        assert_eq!(outcome.fallback_reason(), None);
+
+        let mut regs = UnwindRegsX86_64::new(0x1100, 0x2000, 0x3000);
+        let outcome = unwinder
+            .with_cache(
+                address,
+                &mut regs,
+                &mut cache,
+                &mut dwarf_stack,
+                |_, _, _, _, _, _| panic!("the successful rule should be cached"),
+            )
+            .unwrap();
+        assert_eq!(outcome.return_address(), Some(0x6000));
+        assert_eq!(cache.rule_cache.stats().misses(), 2);
+        assert_eq!(cache.rule_cache.stats().hits(), 1);
+    }
+}
