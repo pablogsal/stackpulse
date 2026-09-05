@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.10.2 - 2026-09-05
+
+### Added
+
+- `Tail::discard_consumed` can release filesystem blocks for batches already processed by a recorder-owned tail.
+
 ## 0.10.1 - 2026-09-05
 
 ### Changed

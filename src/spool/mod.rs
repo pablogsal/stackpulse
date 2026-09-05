@@ -84,6 +84,10 @@ impl PerfSpoolWriter<BufWriter<File>> {
             self.writer.get_ref().as_raw_fd()
         ))
     }
+
+    pub(crate) fn open_discarder(&self) -> io::Result<File> {
+        self.writer.get_ref().try_clone()
+    }
 }
 
 impl<W: Write> PerfSpoolWriter<W> {

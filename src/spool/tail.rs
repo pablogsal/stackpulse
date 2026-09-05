@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use nix::fcntl::{fallocate, FallocateFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::native_module::ExactImageStore;
@@ -16,6 +17,11 @@ use super::{
 
 const MAX_BATCH_SAMPLES: usize = 16 * 1024;
 
+struct SpoolDiscarder {
+    file: File,
+    position: usize,
+}
+
 /// Incremental reader for an append-only StackPulse spool.
 ///
 /// Each complete record is decoded once. A record cut off at the visible end
@@ -24,6 +30,7 @@ const MAX_BATCH_SAMPLES: usize = 16 * 1024;
 /// is bounded and reused between polls.
 pub struct Tail {
     file: File,
+    discarder: Option<SpoolDiscarder>,
     mmap: Arc<Mmap>,
     position: usize,
     definitions: SpoolDefinitions,
@@ -90,17 +97,27 @@ impl Tail {
     }
 
     fn open_inner(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::from_file_inner(File::open(path)?, None)
+        Self::from_file_inner(File::open(path)?, None, None)
     }
 
-    pub(crate) fn from_file(file: File, exact_images: ExactImageStore) -> crate::Result<Self> {
-        Self::from_file_inner(file, Some(exact_images)).map_err(crate::Error::spool)
+    pub(crate) fn from_recorder(
+        file: File,
+        discarder: File,
+        exact_images: ExactImageStore,
+    ) -> crate::Result<Self> {
+        Self::from_file_inner(file, Some(discarder), Some(exact_images))
+            .map_err(crate::Error::spool)
     }
 
-    fn from_file_inner(file: File, exact_images: Option<ExactImageStore>) -> io::Result<Self> {
-        // SAFETY: the spool's existing bytes remain immutable under Tail's
-        // append-only contract. Each cursor retains its mapping, and decoded
-        // module paths are copied before a remap can release the old one.
+    fn from_file_inner(
+        file: File,
+        discarder: Option<File>,
+        exact_images: Option<ExactImageStore>,
+    ) -> io::Result<Self> {
+        // SAFETY: writers do not modify the unread prefix represented by a
+        // mapping. Decoded module paths are copied, cursors do not outlive a
+        // parse, and `discard_consumed` requires exclusive access to Tail
+        // before it changes bytes that no later parse will read.
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let mut cursor = MmapSpoolCursor::new(Arc::clone(&mmap));
         cursor.check_magic()?;
@@ -109,6 +126,7 @@ impl Tail {
         let position = cursor.position;
         let mut tail = Self {
             file,
+            discarder: discarder.map(|file| SpoolDiscarder { file, position: 0 }),
             mmap,
             position,
             definitions: SpoolDefinitions {
@@ -172,6 +190,48 @@ impl Tail {
     /// the opened file is rejected because tailing supports append only.
     pub fn poll(&mut self) -> crate::Result<TailBatch<'_>> {
         self.poll_inner().map_err(crate::Error::spool)
+    }
+
+    /// Release filesystem blocks occupied by complete records already decoded.
+    ///
+    /// This makes the spool disposable: it remains usable by this tail and its
+    /// writer, but can no longer be reopened or replayed from the beginning.
+    /// This is supported by tails created with [`crate::Recorder::tail`]; a
+    /// tail opened with [`Tail::open`] holds a read-only file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the filesystem does not support hole punching
+    /// or the tail does not hold a writable file descriptor.
+    pub fn discard_consumed(&mut self) -> crate::Result<()> {
+        self.discard_consumed_inner().map_err(crate::Error::spool)
+    }
+
+    fn discard_consumed_inner(&mut self) -> io::Result<()> {
+        let discarder = self.discarder.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tail was not created by a recorder",
+            )
+        })?;
+        let page_size = usize::try_from(crate::elf::system_page_size())
+            .map_err(|_| invalid_data("system page size does not fit usize"))?;
+        let discard_end = self.position - self.position % page_size;
+        if discard_end <= discarder.position {
+            return Ok(());
+        }
+        let offset = libc::off_t::try_from(discarder.position)
+            .map_err(|_| invalid_data("spool discard offset is too large"))?;
+        let length = libc::off_t::try_from(discard_end - discarder.position)
+            .map_err(|_| invalid_data("spool discard length is too large"))?;
+        fallocate(
+            &discarder.file,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            offset,
+            length,
+        )?;
+        discarder.position = discard_end;
+        Ok(())
     }
 
     fn poll_inner(&mut self) -> io::Result<TailBatch<'_>> {
@@ -256,8 +316,8 @@ impl Tail {
             return Err(invalid_data("spool file shrank while being tailed"));
         }
         if file_len > self.mmap.len() {
-            // SAFETY: see `open_inner`; the mapped prefix is immutable and
-            // decoded paths never borrow an old mapping.
+            // SAFETY: see `from_file_inner`; only the unread suffix of an old
+            // mapping is accessed, and that suffix is never modified.
             self.mmap = Arc::new(unsafe { Mmap::map(&self.file)? });
         }
         Ok(())
@@ -601,5 +661,53 @@ mod tests {
         append.set_len(8).unwrap();
         let error = tail.poll().unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::CorruptSpool);
+    }
+
+    #[test]
+    fn discards_consumed_prefix_and_continues_tailing() {
+        let dir = TempDir::new("tail-discard");
+        let path = dir.path().join("recording.spool");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
+        let frame = FrameRecord {
+            module_id: None,
+            file_relative_ip: 0,
+            abs_ip: 0x1000,
+            mode: FrameMode::User,
+        };
+        for index in 0..20_000_u64 {
+            writer
+                .write_sample_frames(index + 1, 7, 8, [frame])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        let file = writer.open_reader().unwrap();
+        let discarder = writer.open_discarder().unwrap();
+        file.sync_all().unwrap();
+        let mut tail = Tail::from_file_inner(file, Some(discarder), None).unwrap();
+        {
+            let first = tail.poll().unwrap();
+            assert_eq!(first.samples().len(), MAX_BATCH_SAMPLES);
+        }
+
+        if let Err(error) = tail.discard_consumed() {
+            assert_eq!(error.kind(), crate::ErrorKind::Unsupported);
+            return;
+        }
+        tail.discard_consumed().unwrap();
+
+        {
+            let second = tail.poll().unwrap();
+            assert_eq!(second.samples().len(), 20_000 - MAX_BATCH_SAMPLES);
+        }
+
+        writer.write_sample_frames(20_001, 7, 8, [frame]).unwrap();
+        writer.flush().unwrap();
+        {
+            let appended = tail.poll().unwrap();
+            assert_eq!(appended.samples().len(), 1);
+            assert_eq!(appended.samples()[0].timestamp_ns, 20_001);
+        }
+
+        assert!(super::super::Replay::open(&path).is_err());
     }
 }

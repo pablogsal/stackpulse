@@ -979,7 +979,8 @@ impl Recorder {
         })?;
         self.writer.flush()?;
         let file = self.writer.open_reader()?;
-        let tail = crate::spool::Tail::from_file(file, exact_images)?;
+        let discarder = self.writer.open_discarder()?;
+        let tail = crate::spool::Tail::from_recorder(file, discarder, exact_images)?;
         self.exact_images = None;
         Ok(tail)
     }
