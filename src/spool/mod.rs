@@ -762,6 +762,7 @@ impl ExactSizeIterator for StackFrames<'_> {
 impl<'a> Iterator for StackFrameContexts<'a> {
     type Item = FrameContext<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let frame_ref = self.frames.next_with_id()?;
         Some(
@@ -1408,6 +1409,7 @@ impl MmapSpoolCursor {
         }
     }
 
+    #[inline]
     fn read_tag(&mut self) -> io::Result<Option<u8>> {
         if self.position == self.mmap.len() {
             return Ok(None);
@@ -1444,6 +1446,7 @@ impl MmapSpoolCursor {
         self.position == self.mmap.len()
     }
 
+    #[inline]
     fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
         let bytes = &self.mmap[self.position..];
         match VI::decode_var(bytes) {
@@ -3298,6 +3301,7 @@ impl<W> SpoolOutput<W> {
             .as_ref()
             .map(|error| io::Error::new(error.kind(), OutputFailure(Arc::clone(error))))
     }
+    #[cold]
     fn remember(&mut self, error: io::Error) -> io::Error {
         let failure = self.failure.get_or_insert_with(|| Arc::new(error));
         io::Error::new(failure.kind(), OutputFailure(Arc::clone(failure)))
@@ -3305,6 +3309,7 @@ impl<W> SpoolOutput<W> {
 }
 
 impl<W: Write> Write for SpoolOutput<W> {
+    #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if let Some(error) = self.failed() {
             return Err(error);
