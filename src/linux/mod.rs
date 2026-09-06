@@ -2864,7 +2864,10 @@ mod tests {
         processes.track_or_refresh(exited_pid).unwrap();
         processes.track_or_refresh(live_pid).unwrap();
 
-        crate::state::kill_process(crate::Pid::new(exited_pid).unwrap()).unwrap();
+        crate::state::Process::open(crate::Pid::new(exited_pid).unwrap())
+            .unwrap()
+            .kill()
+            .unwrap();
         exited
             .wait_timeout(Duration::from_secs(2))
             .unwrap()
