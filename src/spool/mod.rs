@@ -195,10 +195,10 @@ impl<W: Write> PerfSpoolWriter<W> {
         };
         let thread_id = self.intern_thread(process_id, thread_id)?;
 
-        self.writer.write_all(&[REC_SAMPLE])?;
-        self.writer.write_varint(delta)?;
-        self.writer.write_varint(u64::from(thread_id))?;
-        self.writer.write_varint(u64::from(stack_id))?;
+        self.writer.write_record(
+            REC_SAMPLE,
+            (delta, u64::from(thread_id), u64::from(stack_id)),
+        )?;
         // Advance the delta baseline only after the record is written; a failed
         // write would otherwise skew every later sample's timestamp.
         self.last_timestamp_ns = timestamp_ns;
@@ -253,10 +253,10 @@ impl<W: Write> PerfSpoolWriter<W> {
             return Ok(id);
         }
         let id = next_spool_id(self.thread_cache.len(), "thread")?;
-        self.writer.write_all(&[REC_THREAD])?;
-        self.writer.write_varint(u64::from(id))?;
-        self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_varint(thread_id)?;
+        self.writer.write_record(
+            REC_THREAD,
+            (u64::from(id), i64::from(process_id), thread_id),
+        )?;
         self.thread_cache.insert(key, id);
         Ok(id)
     }
@@ -283,9 +283,8 @@ impl<W: Write> PerfSpoolWriter<W> {
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
-        writer.write_all(&[REC_FRAME])?;
-        writer.write_varint(u64::from(id))?;
-        write_compact_frame(writer, frame)?;
+        let (tag, address) = compact_frame(frame)?;
+        writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
         cache.insert(*frame, id);
         *next_frame_id = next_frame_id
             .checked_add(1)
@@ -307,10 +306,10 @@ impl<W: Write> PerfSpoolWriter<W> {
                 continue;
             }
             let stack_id = next_spool_id(self.stack_cache.len(), "stack")?;
-            self.writer.write_all(&[REC_STACK])?;
-            self.writer.write_varint(u64::from(stack_id))?;
-            self.writer.write_varint(u64::from(prefix))?;
-            self.writer.write_varint(u64::from(frame_id))?;
+            self.writer.write_record(
+                REC_STACK,
+                (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
+            )?;
             self.stack_cache.insert(key, stack_id);
             prefix = stack_id;
         }
@@ -1585,24 +1584,21 @@ fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeR
     })
 }
 
-fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Result<()> {
+fn compact_frame(frame: &FrameRecord) -> io::Result<(u64, u64)> {
     if frame.mode == FrameMode::TruncatedStackMarker {
         if *frame != FrameRecord::truncated_stack_marker() {
             return Err(invalid_input("invalid truncated stack marker frame"));
         }
-        writer.write_varint(TRUNCATED_STACK_MARKER_TAG)?;
-        return writer.write_varint(0).map(drop);
+        return Ok((TRUNCATED_STACK_MARKER_TAG, 0));
     }
 
-    let (tag, address) = match frame.module_id {
+    Ok(match frame.module_id {
         Some(module_id) => (u64::from(module_id) << 1, frame.file_relative_ip),
         None => (
             1 | (u64::from(frame.mode == FrameMode::Kernel) << 1),
             frame.abs_ip,
         ),
-    };
-    writer.write_varint(tag)?;
-    writer.write_varint(address).map(drop)
+    })
 }
 
 pub(crate) fn module_for_frame_unbounded<'a>(
@@ -3308,6 +3304,22 @@ impl<W> SpoolOutput<W> {
     }
 }
 
+impl<W: Write> SpoolOutput<W> {
+    fn write_record(
+        &mut self,
+        tag: u8,
+        fields: (impl VarInt, impl VarInt, impl VarInt),
+    ) -> io::Result<()> {
+        let mut bytes = [0_u8; 31];
+        bytes[0] = tag;
+        let mut len = 1;
+        len += fields.0.encode_var(&mut bytes[len..]);
+        len += fields.1.encode_var(&mut bytes[len..]);
+        len += fields.2.encode_var(&mut bytes[len..]);
+        self.write_all(&bytes[..len])
+    }
+}
+
 impl<W: Write> Write for SpoolOutput<W> {
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -3750,6 +3762,40 @@ mod output_tests {
         assert!(writer.write_python_runtime(2, 7, false).is_err());
         assert_eq!(sink.0.lock().unwrap().bytes.len(), bytes);
         assert_eq!(writer.flush().unwrap_err().to_string(), "sink failed");
+    }
+
+    #[test]
+    fn partial_sample_records_preserve_the_written_prefix() {
+        let frame = FrameRecord {
+            module_id: None,
+            file_relative_ip: u64::MAX,
+            abs_ip: u64::MAX,
+            mode: FrameMode::User,
+        };
+        let timestamp = i64::MAX as u64;
+        let mut complete = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let header_len = complete.position() as usize;
+        complete
+            .write_sample_frames(timestamp, 7, 11, [frame])
+            .unwrap();
+        let expected = complete.into_inner();
+
+        for budget in 0..expected.len() - header_len {
+            let sink = Sink::default();
+            let mut writer = PerfSpoolWriter::from_writer(sink.clone(), 0, 0).unwrap();
+            sink.0.lock().unwrap().budget = Some(budget);
+            let error = writer
+                .write_sample_frames(timestamp, 7, 11, [frame])
+                .unwrap_err();
+            assert_eq!(error.to_string(), "sink failed");
+            assert_eq!(writer.last_timestamp_ns, 0);
+            assert!(writer.write_sample_frames(1, 7, 11, [frame]).is_err());
+            assert_eq!(writer.position() as usize, header_len + budget);
+            assert_eq!(
+                sink.0.lock().unwrap().bytes,
+                expected[..header_len + budget]
+            );
+        }
     }
 
     #[test]
