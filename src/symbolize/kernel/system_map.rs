@@ -290,7 +290,9 @@ fn kernel_text_module(module: &ModuleRecord) -> bool {
     if !module.is_kernel() {
         return false;
     }
-    let path = module.path.as_str();
+    let Some(path) = module.path.to_str() else {
+        return false;
+    };
     path.contains("kernel.kallsyms")
         || path.contains("_text")
         || path == "[kernel]"
@@ -339,7 +341,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "[kernel.kallsyms]_text".into(),
+            path: std::path::Path::new("[kernel.kallsyms]_text").into(),
         };
 
         let anchors = kernel_rebase_anchors(&[module]);

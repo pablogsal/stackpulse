@@ -5,6 +5,8 @@ use crate::profile::NativeSymbol;
 #[cfg(feature = "builtin-wholesym")]
 use crate::profile::SourceLocation;
 use crate::spool::ModulePath;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 #[cfg(feature = "builtin-wholesym")]
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
@@ -20,22 +22,26 @@ use wholesym::{
 use std::cell::RefCell;
 #[cfg(feature = "builtin-wholesym")]
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
 static NEXT_SYNTHETIC_IMAGE_ID: AtomicU64 = AtomicU64::new(1 << 63);
 
 /// Module information for symbolization.
 #[derive(Clone, Debug)]
-pub struct NativeModule {
-    data: Rc<NativeModuleData>,
+pub struct NativeMapping {
+    data: Rc<NativeMappingData>,
     image: Option<Arc<NativeImage>>,
 }
 
-#[derive(Debug)]
-pub(crate) struct NativeImage {
+/// Retained file backing an exact native image.
+#[derive(Clone, Debug)]
+pub struct NativeImage {
     path: PathBuf,
     file: Arc<std::fs::File>,
 }
@@ -51,13 +57,34 @@ impl NativeImage {
         }
     }
 
+    /// Borrow a process-local path usable while this retained image remains alive.
+    #[must_use]
+    pub fn proc_path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
     }
 }
 
+impl AsFd for NativeImage {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+/// Exact image source selected for a native lookup.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeImageSource<'a> {
+    /// A retained exact file.
+    File(&'a NativeImage),
+    /// The target process's virtual dynamic shared object.
+    Vdso,
+}
+
 #[derive(Debug)]
-pub(crate) struct NativeModuleData {
+pub(crate) struct NativeMappingData {
     pub(crate) path: ModulePath,
     pub(crate) name: Rc<str>,
     pub(crate) address_range: std::ops::Range<u64>,
@@ -85,22 +112,16 @@ pub struct NativeFileIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NativeImageId(u64);
 
-impl NativeModule {
-    /// Construct a module value for testing a custom native symbolizer.
-    ///
-    /// `mapping_id` should be unique within the synthetic spool fixture. Each
-    /// call receives a distinct opaque [`NativeImageId`], even when its path
-    /// and file identity match another module. The synthetic module has an
-    /// image base of zero, is not marked as a Python runtime, and has no
-    /// [`Self::image_path`]. Recorded modules are constructed by StackPulse.
+impl NativeMapping {
     #[must_use]
-    pub fn new(
-        path: impl Into<ModulePath>,
+    #[cfg(test)]
+    pub(crate) fn new(
+        path: impl AsRef<Path>,
         file_identity: NativeFileIdentity,
         mapping_id: u32,
     ) -> Self {
         Self::from_recording(
-            path.into(),
+            path.as_ref().into(),
             0..u64::MAX,
             ModuleImageBase::new(0, 0),
             false,
@@ -119,10 +140,10 @@ impl NativeModule {
         mapping_id: u32,
         image_token: u64,
     ) -> Self {
-        let normalized_path = normalized_module_path(path.as_str());
-        let name = crate::path_name(Path::new(normalized_path)).into();
+        let normalized_path = normalized_module_path(&path);
+        let name = crate::path_name(normalized_path).into();
         Self {
-            data: Rc::new(NativeModuleData {
+            data: Rc::new(NativeMappingData {
                 path,
                 name,
                 address_range,
@@ -144,17 +165,23 @@ impl NativeModule {
     }
 }
 
-impl NativeModule {
+impl NativeMapping {
     /// Return the path stored in the recording.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.data.path.as_path()
+        &self.data.path
     }
 
     /// Return the recorded path without Linux's `" (deleted)"` suffix.
     #[must_use]
     pub fn normalized_path(&self) -> &Path {
-        Path::new(normalized_module_path(self.data.path.as_str()))
+        normalized_module_path(&self.data.path)
+    }
+
+    /// Borrow the module display name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.data.name
     }
 
     /// Borrow the shared module display name without copying it.
@@ -172,7 +199,8 @@ impl NativeModule {
     /// returned `/proc/self/fd/...` path remains valid while this module is
     /// alive and can differ from [`Self::path`].
     #[must_use]
-    pub fn image_path(&self) -> Option<&Path> {
+    #[cfg(any(test, feature = "builtin-wholesym"))]
+    pub(crate) fn image_path(&self) -> Option<&Path> {
         self.image.as_ref().map(|image| image.path.as_path())
     }
 
@@ -213,8 +241,11 @@ impl NativeModule {
     }
 }
 
-pub(crate) fn normalized_module_path(path: &str) -> &str {
-    path.strip_suffix(" (deleted)").unwrap_or(path)
+pub(crate) fn normalized_module_path(path: &Path) -> &Path {
+    let bytes = path.as_os_str().as_bytes();
+    Path::new(OsStr::from_bytes(
+        bytes.strip_suffix(b" (deleted)").unwrap_or(bytes),
+    ))
 }
 
 impl NativeFileIdentity {
@@ -265,33 +296,30 @@ impl NativeFileIdentity {
 #[derive(Clone, Debug)]
 pub struct NativeLookup {
     pub(crate) process_id: crate::Pid,
-    pub(crate) module: NativeModule,
+    pub(crate) module: NativeMapping,
     pub(crate) absolute_address: u64,
     pub(crate) relative_address: u64,
     pub(crate) image_address: u64,
 }
 
 impl NativeLookup {
-    /// Construct one request for testing a custom native symbolizer.
-    ///
-    /// The addresses have the same meanings as their accessors. StackPulse
-    /// computes them for recorded frames; fixture authors are responsible for
-    /// keeping them consistent with the synthetic module.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         process_id: crate::Pid,
-        module: NativeModule,
+        module: NativeMapping,
         absolute_address: u64,
-        relative_address: u64,
-        image_address: u64,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if !module.address_range().contains(&absolute_address) {
+            return None;
+        }
+        let base = module.image_base();
+        Some(Self {
             process_id,
             module,
             absolute_address,
-            relative_address,
-            image_address,
-        }
+            relative_address: base.relative_address(absolute_address)?,
+            image_address: base.svma_for_avma(absolute_address)?,
+        })
     }
 
     /// Return the process that owns the mapping.
@@ -302,8 +330,17 @@ impl NativeLookup {
 
     /// Return the exact module selected for this address.
     #[must_use]
-    pub fn module(&self) -> &NativeModule {
+    pub fn mapping(&self) -> &NativeMapping {
         &self.module
+    }
+
+    /// Borrow the selected image resource; a file remains retained by this lookup.
+    #[must_use]
+    pub fn image(&self) -> NativeImageSource<'_> {
+        match self.module.image.as_deref() {
+            Some(image) => NativeImageSource::File(image),
+            None => NativeImageSource::Vdso,
+        }
     }
 
     /// Return the sampled process-absolute address.
@@ -356,32 +393,6 @@ enum NativeSymbolStorage {
 }
 
 impl NativeSymbols {
-    /// Construct a resolved result from innermost-first symbols.
-    #[must_use]
-    pub fn new(mut symbols: Vec<NativeSymbol>) -> Self {
-        set_inline_depths(&mut symbols);
-        match symbols.len() {
-            0 => Self::unresolved(),
-            1 => symbols.pop().map_or_else(Self::unresolved, |symbol| {
-                Self(NativeSymbolStorage::One(symbol))
-            }),
-            _ => Self(NativeSymbolStorage::Many(symbols)),
-        }
-    }
-
-    /// Construct a single-symbol result without allocating a vector.
-    #[must_use]
-    pub fn one(mut symbol: NativeSymbol) -> Self {
-        symbol.set_inline_depth(0);
-        Self(NativeSymbolStorage::One(symbol))
-    }
-
-    /// Construct an unresolved result without allocation.
-    #[must_use]
-    pub const fn unresolved() -> Self {
-        Self(NativeSymbolStorage::Unresolved)
-    }
-
     /// Borrow the resolved inline chain.
     #[must_use]
     pub fn as_slice(&self) -> &[NativeSymbol] {
@@ -398,12 +409,83 @@ impl NativeSymbols {
         matches!(self.0, NativeSymbolStorage::Unresolved)
     }
 
-    pub(crate) fn into_symbols(self) -> NativeSymbolsIntoIter {
-        match self.0 {
-            NativeSymbolStorage::Unresolved => NativeSymbolsIntoIter::Unresolved,
-            NativeSymbolStorage::One(symbol) => NativeSymbolsIntoIter::One(Some(symbol)),
-            NativeSymbolStorage::Many(symbols) => NativeSymbolsIntoIter::Many(symbols.into_iter()),
+    /// Iterate over the inline-expanded symbols.
+    pub fn iter(&self) -> std::slice::Iter<'_, NativeSymbol> {
+        self.as_slice().iter()
+    }
+
+    /// Number of symbols in the inline chain.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl From<NativeSymbol> for NativeSymbols {
+    fn from(mut symbol: NativeSymbol) -> Self {
+        symbol.set_inline_depth(0);
+        Self(NativeSymbolStorage::One(symbol))
+    }
+}
+
+impl From<Vec<NativeSymbol>> for NativeSymbols {
+    fn from(mut symbols: Vec<NativeSymbol>) -> Self {
+        set_inline_depths(&mut symbols);
+        match symbols.len() {
+            0 => Self::default(),
+            1 => symbols.pop().map_or_else(Self::default, |symbol| {
+                Self(NativeSymbolStorage::One(symbol))
+            }),
+            _ => Self(NativeSymbolStorage::Many(symbols)),
         }
+    }
+}
+
+impl FromIterator<NativeSymbol> for NativeSymbols {
+    fn from_iter<T: IntoIterator<Item = NativeSymbol>>(symbols: T) -> Self {
+        let mut symbols = symbols.into_iter();
+        let Some(first) = symbols.next() else {
+            return Self::default();
+        };
+        let Some(second) = symbols.next() else {
+            return Self::from(first);
+        };
+        Self::from(
+            std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(symbols)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+impl AsRef<[NativeSymbol]> for NativeSymbols {
+    fn as_ref(&self) -> &[NativeSymbol] {
+        self.as_slice()
+    }
+}
+
+impl IntoIterator for NativeSymbols {
+    type Item = NativeSymbol;
+    type IntoIter = NativeSymbolsIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        NativeSymbolsIntoIter(match self.0 {
+            NativeSymbolStorage::Unresolved => NativeSymbolsIterStorage::One(None),
+            NativeSymbolStorage::One(symbol) => NativeSymbolsIterStorage::One(Some(symbol)),
+            NativeSymbolStorage::Many(symbols) => {
+                NativeSymbolsIterStorage::Many(symbols.into_iter())
+            }
+        })
+    }
+}
+
+impl<'a> IntoIterator for &'a NativeSymbols {
+    type Item = &'a NativeSymbol;
+    type IntoIter = std::slice::Iter<'a, NativeSymbol>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -414,8 +496,10 @@ fn set_inline_depths(symbols: &mut [NativeSymbol]) {
     }
 }
 
-pub(crate) enum NativeSymbolsIntoIter {
-    Unresolved,
+/// Owning iterator over an inline-expanded native symbol chain.
+pub struct NativeSymbolsIntoIter(NativeSymbolsIterStorage);
+
+enum NativeSymbolsIterStorage {
     One(Option<NativeSymbol>),
     Many(std::vec::IntoIter<NativeSymbol>),
 }
@@ -424,70 +508,101 @@ impl Iterator for NativeSymbolsIntoIter {
     type Item = NativeSymbol;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Unresolved => None,
-            Self::One(symbol) => symbol.take(),
-            Self::Many(symbols) => symbols.next(),
+        match &mut self.0 {
+            NativeSymbolsIterStorage::One(symbol) => symbol.take(),
+            NativeSymbolsIterStorage::Many(symbols) => symbols.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = match self {
-            Self::Unresolved => 0,
-            Self::One(symbol) => usize::from(symbol.is_some()),
-            Self::Many(symbols) => symbols.len(),
+        let len = match &self.0 {
+            NativeSymbolsIterStorage::One(symbol) => usize::from(symbol.is_some()),
+            NativeSymbolsIterStorage::Many(symbols) => symbols.len(),
         };
         (len, Some(len))
     }
 }
 
+impl DoubleEndedIterator for NativeSymbolsIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            NativeSymbolsIterStorage::One(symbol) => symbol.take(),
+            NativeSymbolsIterStorage::Many(symbols) => symbols.next_back(),
+        }
+    }
+}
+
 impl ExactSizeIterator for NativeSymbolsIntoIter {}
+impl std::iter::FusedIterator for NativeSymbolsIntoIter {}
+
+/// Borrowed native requests with one reusable result slot per request.
+pub struct NativeBatch<'a> {
+    requests: &'a [NativeLookup],
+    output: &'a mut [NativeSymbols],
+}
+
+impl<'a> NativeBatch<'a> {
+    pub(crate) fn new(requests: &'a [NativeLookup], output: &'a mut [NativeSymbols]) -> Self {
+        assert_eq!(requests.len(), output.len());
+        Self { requests, output }
+    }
+
+    /// Borrow all lookups for bulk preparation.
+    #[must_use]
+    pub fn lookups(&self) -> &[NativeLookup] {
+        self.requests
+    }
+
+    /// Iterate over each lookup and its corresponding result slot.
+    pub fn entries(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = (&NativeLookup, &mut NativeSymbols)> + DoubleEndedIterator
+    {
+        self.requests.iter().zip(self.output.iter_mut())
+    }
+}
 
 /// Plug-in interface for batched native symbolization.
 pub trait NativeSymbolizer {
     /// Backend error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Resolve every request and append one ordered result per request.
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Self::Error>;
+    /// Resolve lookups into their paired result slots, initially unresolved.
+    fn symbolize(&mut self, batch: NativeBatch<'_>) -> Result<(), Self::Error>;
 
-    /// Release mapping-specific state after a live tail retires a module.
+    /// Refresh symbol sources and return a persistent generation identifier.
     ///
-    /// Other mappings can still refer to the same [`NativeModule::image_id`],
-    /// so shared parsed-image state should remain until its final mapping is
-    /// retired. The module reference is valid only for this call.
-    fn retire_module(&mut self, _module: &NativeModule) {}
+    /// The identifier changes whenever previously returned symbols may improve.
+    /// It must remain observable after an error in another backend's refresh.
+    fn refresh(&mut self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
+    /// Release retired mapping state, preserving images referenced by other mappings.
+    fn retire_mapping(&mut self, _mapping: &NativeMapping) {}
 }
 
 pub(crate) trait ErasedNativeSymbolizer {
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn retire_module(&mut self, module: &NativeModule);
+    fn symbolize(&mut self, batch: NativeBatch<'_>) -> Result<(), NativeBackendError>;
+    fn refresh(&mut self) -> Result<u64, NativeBackendError>;
+    fn retire_mapping(&mut self, mapping: &NativeMapping);
 }
 
 struct NativeSymbolizerAdapter<S>(S);
 
 impl<S: NativeSymbolizer> ErasedNativeSymbolizer for NativeSymbolizerAdapter<S> {
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn symbolize(&mut self, batch: NativeBatch<'_>) -> Result<(), NativeBackendError> {
         self.0
-            .symbolize(requests, output)
+            .symbolize(batch)
             .map_err(|error| Box::new(error) as _)
     }
 
-    fn retire_module(&mut self, module: &NativeModule) {
-        self.0.retire_module(module);
+    fn refresh(&mut self) -> Result<u64, NativeBackendError> {
+        self.0.refresh().map_err(|error| Box::new(error) as _)
+    }
+
+    fn retire_mapping(&mut self, mapping: &NativeMapping) {
+        self.0.retire_mapping(mapping);
     }
 }
 
@@ -501,23 +616,16 @@ pub(crate) fn erase_native_symbolizer(
 impl NativeSymbolizer for SymbolizerWrapper {
     type Error = std::convert::Infallible;
 
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Self::Error> {
-        self.register_mappings(requests);
-        self.preload_symbol_maps(requests);
-        output.reserve(requests.len());
-        output.extend(
-            requests
-                .iter()
-                .map(|request| self.symbolize_lookup(request)),
-        );
+    fn symbolize(&mut self, mut batch: NativeBatch<'_>) -> Result<(), Self::Error> {
+        self.register_mappings(batch.lookups());
+        self.preload_symbol_maps(batch.lookups());
+        for (request, result) in batch.entries() {
+            *result = self.symbolize_lookup(request);
+        }
         Ok(())
     }
 
-    fn retire_module(&mut self, module: &NativeModule) {
+    fn retire_mapping(&mut self, module: &NativeMapping) {
         if !self.mappings.remove(&module.mapping_id()) {
             return;
         }
@@ -541,25 +649,19 @@ struct SharedSymbolizerWrapper(Rc<RefCell<Option<SymbolizerWrapper>>>);
 impl NativeSymbolizer for SharedSymbolizerWrapper {
     type Error = std::io::Error;
 
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Self::Error> {
+    fn symbolize(&mut self, batch: NativeBatch<'_>) -> Result<(), Self::Error> {
         let mut shared = self.0.borrow_mut();
         let Some(symbolizer) = shared.as_mut() else {
             return Err(std::io::Error::other(
                 "shared native symbolizer was not initialized",
             ));
         };
-        symbolizer
-            .symbolize(requests, output)
-            .map_err(|error| match error {})
+        symbolizer.symbolize(batch).map_err(|error| match error {})
     }
 
-    fn retire_module(&mut self, module: &NativeModule) {
+    fn retire_mapping(&mut self, module: &NativeMapping) {
         if let Some(symbolizer) = self.0.borrow_mut().as_mut() {
-            symbolizer.retire_module(module);
+            symbolizer.retire_mapping(module);
         }
     }
 }
@@ -703,9 +805,9 @@ fn default_debuginfod_cache_dir() -> PathBuf {
 }
 
 #[cfg(feature = "builtin-wholesym")]
-fn build_symbol_manager_config(
+fn build_symbol_manager_config<'a>(
     debug_dirs: &[PathBuf],
-    redirect_paths: &[(PathBuf, PathBuf)],
+    redirect_paths: impl IntoIterator<Item = &'a (PathBuf, PathBuf)>,
 ) -> SymbolManagerConfig {
     let mut config = SymbolManagerConfig::new();
 
@@ -831,7 +933,9 @@ fn build_native_symbol(
     offset: u64,
     is_python_runtime: bool,
 ) -> NativeSymbol {
-    let symbol = NativeSymbol::new(name, source, Rc::clone(module), offset);
+    let symbol = NativeSymbol::new(name, Rc::clone(module))
+        .with_source(source)
+        .with_offset(offset);
     if is_python_runtime {
         symbol.hidden_by_default()
     } else {
@@ -861,59 +965,28 @@ fn build_native_symbols_from_wholesym_parts(
         (frame.function, source)
     };
 
-    match frames {
-        None => NativeSymbols::one(build_native_symbol(
+    let frames = frames.unwrap_or_default();
+    if frames.is_empty() {
+        return build_native_symbol(
             symbol_name,
             SourceLocation::default(),
             module,
             function_offset,
             is_python_runtime,
-        )),
-        Some(mut frames) if frames.len() == 1 => {
-            let Some(frame) = frames.pop() else {
-                return NativeSymbols::one(build_native_symbol(
-                    symbol_name,
-                    SourceLocation::default(),
-                    module,
-                    function_offset,
-                    is_python_runtime,
-                ));
-            };
-            let (function, source) = frame_parts(frame);
-            NativeSymbols::one(build_native_symbol(
-                function.unwrap_or(symbol_name),
-                source,
-                module,
-                function_offset,
-                is_python_runtime,
-            ))
-        }
-        Some(frames) if frames.is_empty() => NativeSymbols::one(build_native_symbol(
-            symbol_name,
-            SourceLocation::default(),
-            module,
-            function_offset,
-            is_python_runtime,
-        )),
-        Some(frames) => {
-            let fallback_name = frames
-                .iter()
-                .any(|frame| frame.function.is_none())
-                .then(|| Rc::<str>::from(symbol_name));
-            let symbols = frames
-                .into_iter()
-                .map(|frame| {
-                    let (function, source) = frame_parts(frame);
-                    let name = match function {
-                        Some(function) => Rc::<str>::from(function),
-                        None => fallback_name.as_ref().map_or_else(Rc::default, Rc::clone),
-                    };
-                    build_native_symbol(name, source, module, function_offset, is_python_runtime)
-                })
-                .collect();
-            NativeSymbols::new(symbols)
-        }
+        )
+        .into();
     }
+    let mut fallback_name = None;
+    frames
+        .into_iter()
+        .map(|frame| {
+            let (function, source) = frame_parts(frame);
+            let name = function.map(Rc::<str>::from).unwrap_or_else(|| {
+                Rc::clone(fallback_name.get_or_insert_with(|| Rc::from(symbol_name.as_str())))
+            });
+            build_native_symbol(name, source, module, function_offset, is_python_runtime)
+        })
+        .collect()
 }
 
 #[cfg(feature = "builtin-wholesym")]
@@ -941,7 +1014,7 @@ impl SymbolizerWrapper {
 
     fn register_mappings(&mut self, requests: &[NativeLookup]) {
         for request in requests {
-            let mapping = request.module().mapping_id();
+            let mapping = request.mapping().mapping_id();
             if !self.mappings.insert(mapping) {
                 continue;
             }
@@ -951,20 +1024,17 @@ impl SymbolizerWrapper {
     }
 
     fn rebuild_symbol_manager(&mut self, binary_redirects: &[(PathBuf, PathBuf)]) {
-        let mut all_redirects: Vec<(PathBuf, PathBuf)> = self
-            .redirect_cache
-            .values()
-            .filter_map(|redirect| redirect.clone())
-            .collect();
-        all_redirects.extend_from_slice(binary_redirects);
         self.symbol_manager = SymbolManager::with_config(build_symbol_manager_config(
             &self.local_debug_dirs,
-            &all_redirects,
+            self.redirect_cache
+                .values()
+                .filter_map(Option::as_ref)
+                .chain(binary_redirects),
         ));
     }
 
     fn symbolize_lookup(&mut self, lookup: &NativeLookup) -> NativeSymbols {
-        let module = lookup.module();
+        let module = lookup.mapping();
         let image = lookup.image_id();
         self.symbolize_with_wholesym(
             image,
@@ -1027,7 +1097,7 @@ impl SymbolizerWrapper {
 
             for request in pending.drain(..) {
                 let image = request.image_id();
-                let module = request.module();
+                let module = request.mapping();
                 let Some(image_path) = module.image_path() else {
                     self.symbol_maps.insert(image, None);
                     continue;
@@ -1053,7 +1123,7 @@ impl SymbolizerWrapper {
             self.rebuild_symbol_manager(&binary_redirects);
             for request in round {
                 let image = request.image_id();
-                let module = request.module();
+                let module = request.mapping();
                 let path = module.normalized_path();
                 let loaded = self.load_symbol_map(path, module.image_path().unwrap_or(path));
                 if let Err(err) = &loaded {
@@ -1118,10 +1188,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_native_fixture_constructors_preserve_identity_and_addresses() {
+    fn wholesym_conversion_preserves_missing_names_and_inline_metadata() {
+        let module = Rc::<str>::from("libpython.so");
+        let fallback = "_PyEval_EvalFrameDefault";
+        for frames in [None, Some(Vec::new())] {
+            let symbols = build_native_symbols_from_wholesym_parts(
+                fallback.into(),
+                frames,
+                &module,
+                17,
+                true,
+            );
+            assert_eq!(
+                symbols.as_slice(),
+                [NativeSymbol::new(fallback, Rc::clone(&module))
+                    .with_offset(17)
+                    .hidden_by_default(),]
+            );
+        }
+        for functions in [
+            vec![None],
+            vec![Some("named")],
+            vec![None, Some("named"), None],
+        ] {
+            let frames = functions
+                .iter()
+                .enumerate()
+                .map(|(index, function)| wholesym::FrameDebugInfo {
+                    function: function.map(str::to_owned),
+                    file_path: Some(wholesym::SourceFilePath::new("/src/eval.c".into(), None)),
+                    line_number: Some(10 + index as u32),
+                })
+                .collect();
+            let symbols = build_native_symbols_from_wholesym_parts(
+                fallback.into(),
+                Some(frames),
+                &module,
+                17,
+                true,
+            );
+            assert_eq!(symbols.len(), functions.len());
+            for (index, (symbol, function)) in symbols.iter().zip(&functions).enumerate() {
+                assert_eq!(symbol.name(), function.unwrap_or(fallback));
+                assert_eq!(symbol.inline_depth(), (functions.len() - index - 1) as u32);
+                assert_eq!(symbol.source.file.as_deref(), Some("/src/eval.c"));
+                assert_eq!(symbol.source.line, Some(10 + index as u32));
+                assert_eq!(symbol.offset, 17);
+                assert!(symbol.is_hidden_by_default());
+                assert_eq!(symbol.is_eval_frame(), function.is_none());
+                assert!(Rc::ptr_eq(&symbol.module, &module));
+            }
+            if functions.len() == 3 {
+                assert!(Rc::ptr_eq(
+                    symbols.as_slice()[0].name_rc(),
+                    symbols.as_slice()[2].name_rc()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn native_mapping_identity_and_addresses_are_preserved() {
         let identity = NativeFileIdentity::new(8, 1, 42, 3);
-        let first = NativeModule::new("/fixture/libexample.so (deleted)", identity, 7);
-        let second = NativeModule::new("/fixture/libexample.so (deleted)", identity, 8);
+        let first = NativeMapping::new("/fixture/libexample.so (deleted)", identity, 7);
+        let second = NativeMapping::new("/fixture/libexample.so (deleted)", identity, 8);
         assert_ne!(first.image_id(), second.image_id());
         assert_eq!(first.file_identity(), identity);
         assert_eq!(first.mapping_id(), 7);
@@ -1130,11 +1260,11 @@ mod tests {
         assert!(first.image_path().is_none());
 
         let pid = crate::Pid::new(42).unwrap();
-        let lookup = NativeLookup::new(pid, first, 0x1200, 0x200, 0x2200);
+        let lookup = NativeLookup::new(pid, first, 0x1200).unwrap();
         assert_eq!(lookup.process_id(), pid);
         assert_eq!(lookup.absolute_address(), 0x1200);
-        assert_eq!(lookup.relative_address(), 0x200);
-        assert_eq!(lookup.image_address(), 0x2200);
+        assert_eq!(lookup.relative_address(), 0x1200);
+        assert_eq!(lookup.image_address(), 0x1200);
         assert_eq!(lookup.file_identity(), identity);
         assert_eq!(lookup.mapping_id(), 7);
     }
@@ -1143,8 +1273,8 @@ mod tests {
     fn shared_image_state_outlives_each_mapping() {
         let identity = NativeFileIdentity::new(8, 1, 42, 3);
         let module = |mapping_id| {
-            NativeModule::from_recording(
-                "/fixture/libexample.so".into(),
+            NativeMapping::from_recording(
+                Path::new("/fixture/libexample.so").into(),
                 0..u64::MAX,
                 ModuleImageBase::new(0, 0),
                 false,
@@ -1157,17 +1287,17 @@ mod tests {
         let second = module(8);
         let pid = crate::Pid::new(42).unwrap();
         let requests = [
-            NativeLookup::new(pid, first.clone(), 1, 1, 1),
-            NativeLookup::new(pid, second.clone(), 2, 2, 2),
+            NativeLookup::new(pid, first.clone(), 1).unwrap(),
+            NativeLookup::new(pid, second.clone(), 2).unwrap(),
         ];
         let mut symbolizer = SymbolizerWrapper::try_new().unwrap();
         symbolizer.register_mappings(&requests);
         symbolizer.symbol_maps.insert(first.image_id(), None);
         symbolizer.redirect_cache.insert(first.image_id(), None);
 
-        symbolizer.retire_module(&first);
+        symbolizer.retire_mapping(&first);
         assert!(symbolizer.symbol_maps.contains_key(&second.image_id()));
-        symbolizer.retire_module(&second);
+        symbolizer.retire_mapping(&second);
         assert!(!symbolizer.symbol_maps.contains_key(&second.image_id()));
         assert!(!symbolizer.redirect_cache.contains_key(&second.image_id()));
     }
@@ -1264,8 +1394,8 @@ mod tests {
             .map(|symbol| symbol.address())
             .unwrap();
         let file = Arc::new(std::fs::File::open(&binary).unwrap());
-        let module = NativeModule::from_recording(
-            binary.to_string_lossy().into_owned().into(),
+        let module = NativeMapping::from_recording(
+            binary.as_path().into(),
             0..u64::MAX,
             ModuleImageBase::new(0, 0),
             false,
@@ -1285,9 +1415,11 @@ mod tests {
             image_address: address,
         };
         let mut symbolizer = SymbolizerWrapper::try_new().unwrap();
-        let mut output = Vec::new();
+        let mut output = [NativeSymbols::default()];
 
-        symbolizer.symbolize(&[request], &mut output).unwrap();
+        symbolizer
+            .symbolize(NativeBatch::new(&[request], &mut output))
+            .unwrap();
 
         assert_eq!(output.len(), 1);
         assert!(
@@ -1302,8 +1434,8 @@ mod tests {
 
     #[test]
     fn native_symbols_assign_innermost_first_inline_depths() {
-        let symbol = |name| NativeSymbol::new(name, SourceLocation::default(), "module", 0);
-        let symbols = NativeSymbols::new(vec![symbol("inner"), symbol("middle"), symbol("outer")]);
+        let symbol = |name| NativeSymbol::new(name, "module");
+        let symbols = NativeSymbols::from(vec![symbol("inner"), symbol("middle"), symbol("outer")]);
 
         assert_eq!(
             symbols
@@ -1314,7 +1446,7 @@ mod tests {
             [2, 1, 0]
         );
         assert_eq!(
-            NativeSymbols::one(symbol("only")).as_slice()[0].inline_depth(),
+            NativeSymbols::from(symbol("only")).as_slice()[0].inline_depth(),
             0
         );
     }
@@ -1431,5 +1563,120 @@ mod tests {
 
         assert!(!crate::is_python_runtime_module_path(""));
         assert!(!crate::is_python_runtime_module_path("/"));
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn symbol(name: &str) -> NativeSymbol {
+        NativeSymbol::new(name, "module")
+    }
+
+    #[test]
+    fn standard_symbol_conversions_normalize_depths_and_fuse() {
+        let symbols: NativeSymbols = [symbol("inner"), symbol("outer")].into_iter().collect();
+        assert_eq!(symbols.as_ref().len(), 2);
+        assert_eq!(
+            symbols
+                .iter()
+                .map(NativeSymbol::inline_depth)
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
+        let mut iterator = symbols.into_iter();
+        assert_eq!(iterator.next_back().unwrap().name(), "outer");
+        assert_eq!(iterator.len(), 1);
+        let inner = iterator.next().unwrap();
+        assert_eq!(iterator.len(), 0);
+        assert_eq!(iterator.next_back(), None);
+        let single = NativeSymbols::from(inner);
+        assert_eq!(single.iter().next().unwrap().inline_depth(), 0);
+        let mut iterator = single.into_iter();
+        assert_eq!(iterator.len(), 1);
+        assert_eq!(iterator.next().unwrap().name(), "inner");
+        assert_eq!(iterator.len(), 0);
+        assert_eq!(iterator.next(), None);
+        assert_eq!(iterator.next_back(), None);
+        let empty = NativeSymbols::from(Vec::new());
+        assert!(empty.is_empty());
+        let mut iterator = empty.into_iter();
+        assert_eq!(iterator.len(), 0);
+        assert_eq!(iterator.next(), None);
+        assert_eq!(iterator.next_back(), None);
+    }
+
+    #[test]
+    fn paired_entries_keep_bulk_preparation_and_results_aligned() {
+        let pid = crate::Pid::new(1).unwrap();
+        let identity = NativeFileIdentity::new(0, 0, 0, 0);
+        let requests = [
+            NativeLookup::new(pid, NativeMapping::new("/first", identity, 1), 10).unwrap(),
+            NativeLookup::new(pid, NativeMapping::new("/second", identity, 2), 20).unwrap(),
+        ];
+        let mut outputs = [NativeSymbols::default(), NativeSymbols::default()];
+        let mut batch = NativeBatch::new(&requests, &mut outputs);
+        assert_eq!(
+            batch
+                .lookups()
+                .iter()
+                .map(NativeLookup::absolute_address)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
+        for (request, output) in batch.entries() {
+            *output = symbol(request.mapping().name()).into();
+        }
+        assert_eq!(outputs[0].iter().next().unwrap().name(), "first");
+        assert_eq!(outputs[1].iter().next().unwrap().name(), "second");
+    }
+
+    #[test]
+    fn lookups_derive_coordinates_and_reject_outside_the_mapping() {
+        let mapping = NativeMapping::from_recording(
+            Path::new("/fixture").into(),
+            0x1000..0x2000,
+            ModuleImageBase::new(0x1000, 0x4000),
+            false,
+            NativeFileIdentity::new(0, 0, 0, 0),
+            0,
+            0,
+        );
+        let pid = crate::Pid::new(1).unwrap();
+        let lookup = NativeLookup::new(pid, mapping.clone(), 0x1234).unwrap();
+        assert_eq!(lookup.relative_address(), 0x234);
+        assert_eq!(lookup.image_address(), 0x4234);
+        assert!(NativeLookup::new(pid, mapping.clone(), 0xfff).is_none());
+        assert!(NativeLookup::new(pid, mapping, 0x2000).is_none());
+    }
+
+    #[test]
+    fn retained_image_keeps_file_and_proc_path_alive_after_unlink() {
+        use std::io::Read;
+        let directory = crate::test_support::TempDir::new("retained-native-image");
+        let path = directory.path().join("image");
+        std::fs::write(&path, b"retained contents").unwrap();
+        let image = NativeImage::new(Arc::new(std::fs::File::open(&path).unwrap()));
+        let retained = image.clone();
+        drop(image);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            std::fs::read(retained.proc_path()).unwrap(),
+            b"retained contents"
+        );
+        let mut descriptor = std::fs::File::from(retained.as_fd().try_clone_to_owned().unwrap());
+        let mut bytes = Vec::new();
+        descriptor.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"retained contents");
+    }
+
+    #[test]
+    fn normalized_native_paths_preserve_non_utf8_bytes() {
+        let path = Path::new(OsStr::from_bytes(b"/image/\xff.so (deleted)"));
+        assert_eq!(
+            normalized_module_path(path).as_os_str().as_bytes(),
+            b"/image/\xff.so"
+        );
     }
 }

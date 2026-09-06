@@ -197,6 +197,10 @@ pub(super) fn extend_sparse_kernel_symbols_for_spool(
     let KernelSymbolTable::Sparse(existing) = table else {
         return;
     };
+    let mut addresses = addresses.into_iter().peekable();
+    if addresses.peek().is_none() {
+        return;
+    }
     let KernelSymbolTable::Sparse(added) = load_sparse_kernel_symbols_for_spool(addresses, modules)
     else {
         return;
@@ -310,6 +314,29 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn extending_sparse_kernel_symbols_without_addresses_allocates_nothing() {
+        let existing: Arc<[(u64, KernelSymbol)]> = Arc::from([(
+            0xffff_ffff_8100_0108,
+            KernelSymbol {
+                address: 0xffff_ffff_8100_0100,
+                name: "do_syscall_64".into(),
+                module: None,
+            },
+        )]);
+        let mut table = KernelSymbolTable::Sparse(Arc::clone(&existing));
+
+        let allocations = allocation_counter::measure(|| {
+            extend_sparse_kernel_symbols_for_spool(&mut table, [], &[]);
+        });
+
+        assert_eq!(allocations.count_total, 0);
+        let KernelSymbolTable::Sparse(actual) = table else {
+            panic!("sparse table changed representation");
+        };
+        assert!(Arc::ptr_eq(&existing, &actual));
+    }
 
     #[test]
     fn sparse_kernel_symbol_cache_is_bounded_and_evicts_fifo() {

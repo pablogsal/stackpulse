@@ -42,32 +42,9 @@ pub(crate) struct ModuleTable {
     active: FxHashMap<u32, ModuleRecord>,
     next_id: usize,
     active_by_key: FxHashMap<ModuleIdentity, u32>,
-    active_by_process: FxHashMap<i32, ProcessModules>,
+    active_by_process: FxHashMap<i32, BTreeSet<(u64, u32)>>,
     index: ModuleIndex,
     index_dirty: bool,
-}
-
-#[derive(Default)]
-struct ProcessModules {
-    by_start: BTreeSet<(u64, u32)>,
-}
-
-impl ProcessModules {
-    fn insert(&mut self, module: &ModuleRecord) {
-        self.by_start.insert((module.start, module.id));
-    }
-
-    fn remove(&mut self, module: &ModuleRecord) {
-        self.by_start.remove(&(module.start, module.id));
-    }
-
-    fn len(&self) -> usize {
-        self.by_start.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.by_start.is_empty()
-    }
 }
 
 #[derive(Default)]
@@ -110,15 +87,15 @@ impl ModuleTable {
         let active_count = self
             .active_by_process
             .get(&process_id)
-            .map_or(0, ProcessModules::len);
+            .map_or(0, BTreeSet::len);
         if active_count != snapshot.len() {
             return false;
         }
-        let matched: FxHashSet<_> = snapshot
-            .iter()
-            .filter_map(|module| self.find_compatible_active(module))
-            .collect();
-        matched.len() == snapshot.len()
+        let mut matched = FxHashSet::default();
+        snapshot.iter().all(|module| {
+            self.find_compatible_active(module)
+                .is_some_and(|id| matched.insert(id))
+        })
     }
 
     pub(crate) fn apply_module<W: Write>(
@@ -148,26 +125,19 @@ impl ModuleTable {
         // existing VMA, so retire every overlap and preserve its unaffected
         // fragments before activating the replacement.
         if let Some(module_pid) = module.pid() {
-            let overlapping: Vec<_> = self
-                .overlapping_module_ids(module_pid.get(), &module)
-                .into_iter()
-                .filter_map(|id| {
-                    let known = &self.active[&id];
-                    module_ranges_overlap(known, &module).then(|| (id, known.clone()))
-                })
-                .collect();
+            let mut overlapping = self.overlapping_module_ids(module_pid.get(), &module);
+            overlapping.retain(|id| module_ranges_overlap(&self.active[id], &module));
             if !overlapping.is_empty() {
                 let survivors: Vec<_> = overlapping
                     .iter()
-                    .flat_map(|(id, known)| {
-                        split_module_around(known, &module)
-                            .into_iter()
-                            .map(|module| (*id, module))
+                    .flat_map(|id| {
+                        split_module_around(&self.active[id], &module).map(|module| (*id, module))
                     })
                     .collect();
-                for (id, known) in overlapping {
-                    let removed = self.active.remove(&id);
-                    debug_assert!(removed.is_some());
+                for id in overlapping {
+                    let Some(known) = self.active.remove(&id) else {
+                        continue;
+                    };
                     self.active_by_key.remove(&ModuleIdentity::from(&known));
                     self.remove_process_active(&known);
                     writer.write_module_deactivation_one(id)?;
@@ -202,7 +172,6 @@ impl ModuleTable {
                 return self
                     .active_by_process
                     .get(&pid.get())?
-                    .by_start
                     .range((module.start, 0)..=(module.start, u32::MAX))
                     .map(|(_, id)| *id)
                     .find(|id| {
@@ -240,7 +209,7 @@ impl ModuleTable {
             self.active_by_process
                 .entry(pid.get())
                 .or_default()
-                .insert(&module);
+                .insert((module.start, module.id));
         }
         self.active.insert(id, module);
         self.index_dirty = true;
@@ -256,7 +225,7 @@ impl ModuleTable {
         let Some(active_ids) = self.active_by_process.remove(&process_id) else {
             return Ok(());
         };
-        for &(_, id) in &active_ids.by_start {
+        for &(_, id) in &active_ids {
             let module = self.active.remove(&id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -267,7 +236,7 @@ impl ModuleTable {
         }
         self.index_dirty = true;
         writer.write_module_deactivation(process_id)?;
-        for (_, id) in active_ids.by_start {
+        for (_, id) in active_ids {
             retire(id);
         }
         Ok(())
@@ -276,7 +245,7 @@ impl ModuleTable {
     pub(crate) fn process_module_ids(&self, process_id: i32) -> Vec<u32> {
         self.active_by_process
             .get(&process_id)
-            .map(|modules| modules.by_start.iter().map(|(_, id)| *id).collect())
+            .map(|modules| modules.iter().map(|(_, id)| *id).collect())
             .unwrap_or_default()
     }
 
@@ -285,18 +254,13 @@ impl ModuleTable {
             return Vec::new();
         };
         let mut overlapping = Vec::new();
-        if let Some(&(_, id)) = modules
-            .by_start
-            .range(..=(module.start, u32::MAX))
-            .next_back()
-        {
+        if let Some(&(_, id)) = modules.range(..=(module.start, u32::MAX)).next_back() {
             if self.active[&id].end > module.start {
                 overlapping.push(id);
             }
         }
         overlapping.extend(
             modules
-                .by_start
                 .range((Excluded((module.start, u32::MAX)), Unbounded))
                 .take_while(|(start, _)| *start < module.end)
                 .map(|(_, id)| *id),
@@ -400,7 +364,7 @@ impl ModuleTable {
         };
         let pid = pid.get();
         if let Some(ids) = self.active_by_process.get_mut(&pid) {
-            ids.remove(module);
+            ids.remove(&(module.start, module.id));
             if ids.is_empty() {
                 self.active_by_process.remove(&pid);
             }
@@ -423,25 +387,25 @@ fn same_mapping_except_inode_generation(left: &ModuleRecord, right: &ModuleRecor
         && left.path == right.path
 }
 
-fn split_module_around(old: &ModuleRecord, replacement: &ModuleRecord) -> Vec<ModuleRecord> {
-    let mut fragments = Vec::with_capacity(2);
-    if old.start < replacement.start {
-        fragments.push(ModuleRecord {
-            id: 0,
-            end: replacement.start.min(old.end),
-            ..old.clone()
-        });
-    }
-    if replacement.end < old.end {
+fn split_module_around(
+    old: &ModuleRecord,
+    replacement: &ModuleRecord,
+) -> impl Iterator<Item = ModuleRecord> {
+    let left = (old.start < replacement.start).then(|| ModuleRecord {
+        id: 0,
+        end: replacement.start.min(old.end),
+        ..old.clone()
+    });
+    let right = (replacement.end < old.end).then(|| {
         let start = replacement.end.max(old.start);
-        fragments.push(ModuleRecord {
+        ModuleRecord {
             id: 0,
             start,
             file_offset: old.file_offset.saturating_add(start - old.start),
             ..old.clone()
-        });
-    }
-    fragments
+        }
+    });
+    [left, right].into_iter().flatten()
 }
 
 #[derive(Default)]

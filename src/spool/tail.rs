@@ -12,14 +12,14 @@ use crate::native_module::ExactImageStore;
 
 use super::{
     decode_spool_record, invalid_data, next_source_id, DecodedSpoolRecord, MmapSpoolCursor,
-    SampleRecord, SampleStack, SpoolDefinitions, ThreadRecord,
+    SampleRecord, SpoolDefinitions, ThreadRecord,
 };
 
 const MAX_BATCH_SAMPLES: usize = 16 * 1024;
 
-struct SpoolDiscarder {
+pub(super) struct SpoolDiscarder {
     file: File,
-    position: usize,
+    pub(super) position: usize,
 }
 
 /// Incremental reader for an append-only StackPulse spool.
@@ -30,15 +30,17 @@ struct SpoolDiscarder {
 /// is bounded and reused between polls.
 pub struct Tail {
     file: File,
-    discarder: Option<SpoolDiscarder>,
+    pub(super) visible_len: Option<usize>,
+    pub(super) discarder: Option<SpoolDiscarder>,
     mmap: Arc<Mmap>,
-    position: usize,
-    definitions: SpoolDefinitions,
+    pub(super) position: usize,
+    pub(super) definitions: SpoolDefinitions,
     threads: Vec<ThreadRecord>,
     last_timestamp_ns: u64,
+    #[cfg(test)]
     first_sample_timestamp_ns: Option<u64>,
     samples: Vec<SampleRecord>,
-    initial_samples_pending: bool,
+    pub(super) initial_samples_pending: bool,
     observed_processes: Vec<crate::Pid>,
     observed_process_set: FxHashSet<crate::Pid>,
     retired_processes: Vec<crate::Pid>,
@@ -93,55 +95,56 @@ impl Tail {
     /// Returns a corrupt-spool error for malformed input, or an I/O category
     /// when the file cannot be opened or mapped.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        Self::open_inner(path).map_err(crate::Error::spool)
-    }
-
-    fn open_inner(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::from_file_inner(File::open(path)?, None, None)
-    }
-
-    pub(crate) fn from_recorder(
-        file: File,
-        discarder: File,
-        exact_images: ExactImageStore,
-    ) -> crate::Result<Self> {
-        Self::from_file_inner(file, Some(discarder), Some(exact_images))
+        File::open(path)
+            .and_then(|file| Self::from_file_bounded(file, None, None, None))
             .map_err(crate::Error::spool)
     }
 
-    fn from_file_inner(
+    pub(super) fn from_file_bounded(
         file: File,
         discarder: Option<File>,
         exact_images: Option<ExactImageStore>,
+        visible_len: Option<usize>,
     ) -> io::Result<Self> {
+        let mut options = memmap2::MmapOptions::new();
+        if let Some(len) = visible_len {
+            options.len(len);
+        }
         // SAFETY: writers do not modify the unread prefix represented by a
         // mapping. Decoded module paths are copied, cursors do not outlive a
         // parse, and `discard_consumed` requires exclusive access to Tail
         // before it changes bytes that no later parse will read.
-        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+        let mmap = Arc::new(unsafe { options.map(&file)? });
         let mut cursor = MmapSpoolCursor::new(Arc::clone(&mmap));
         cursor.check_magic()?;
-        let start_timestamp_us = cursor.read_varint::<u64>()?;
-        let sample_interval_us = cursor.read_varint::<u64>()?;
+        let _start_timestamp_us = cursor.read_varint::<u64>()?;
+        let sample_interval_ns = cursor.read_varint::<u64>()?;
+        let clock_origin = super::read_clock_origin(&mut cursor)?;
         let position = cursor.position;
         let mut tail = Self {
             file,
+            visible_len,
             discarder: discarder.map(|file| SpoolDiscarder { file, position: 0 }),
             mmap,
             position,
             definitions: SpoolDefinitions {
+                clock_origin,
+                processes: Vec::new(),
                 source_id: next_source_id(),
-                start_timestamp_us,
-                sample_interval_us,
+                #[cfg(test)]
+                start_timestamp_us: _start_timestamp_us,
+                sample_interval_ns,
                 modules: Vec::new(),
                 frames: Vec::new(),
                 frame_contexts: super::SpoolFrameModuleContexts::default(),
                 stack_nodes: Vec::new(),
+                #[cfg(test)]
                 python_runtime_records: Vec::new(),
                 truncated_tail: false,
             },
             threads: Vec::new(),
             last_timestamp_ns: 0,
+            #[cfg(test)]
             first_sample_timestamp_ns: None,
             samples: Vec::new(),
             initial_samples_pending: true,
@@ -169,7 +172,8 @@ impl Tail {
     /// Call [`crate::Symbolizer::update`] with every batch before resolving
     /// that batch's stacks.
     #[must_use]
-    pub fn symbolizer(&self) -> crate::SymbolizerBuilder<'_> {
+    #[cfg(test)]
+    pub(crate) fn symbolizer(&self) -> crate::SymbolizerBuilder<'_> {
         crate::SymbolizerBuilder::for_tail(self)
     }
 
@@ -192,18 +196,7 @@ impl Tail {
         self.poll_inner().map_err(crate::Error::spool)
     }
 
-    /// Release filesystem blocks occupied by complete records already decoded.
-    ///
-    /// This makes the spool disposable: it remains usable by this tail and its
-    /// writer, but can no longer be reopened or replayed from the beginning.
-    /// This is supported by tails created with [`crate::Recorder::tail`]; a
-    /// tail opened with [`Tail::open`] holds a read-only file descriptor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when the filesystem does not support hole punching
-    /// or the tail does not hold a writable file descriptor.
-    pub fn discard_consumed(&mut self) -> crate::Result<()> {
+    pub(super) fn discard_consumed(&mut self) -> crate::Result<()> {
         self.discard_consumed_inner().map_err(crate::Error::spool)
     }
 
@@ -235,7 +228,7 @@ impl Tail {
     }
 
     fn poll_inner(&mut self) -> io::Result<TailBatch<'_>> {
-        let initial = std::mem::take(&mut self.initial_samples_pending);
+        let initial = self.initial_samples_pending;
         let module_start = self.definitions.modules.len();
         let frame_start = self.definitions.frames.len();
 
@@ -254,6 +247,7 @@ impl Tail {
             self.more_available = self.parse_available()?;
         }
 
+        self.initial_samples_pending = false;
         Ok(TailBatch {
             tail: self,
             modules: module_start..self.definitions.modules.len(),
@@ -263,14 +257,17 @@ impl Tail {
 
     /// Return the profile timeline anchor in microseconds.
     #[must_use]
-    pub fn start_timestamp_us(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn start_timestamp_us(&self) -> Option<u64> {
         (self.definitions.start_timestamp_us != 0).then_some(self.definitions.start_timestamp_us)
     }
 
     /// Return the optional sample interval metadata in microseconds.
     #[must_use]
-    pub fn sample_interval_us(&self) -> Option<u64> {
-        (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
+    #[cfg(test)]
+    pub(crate) fn sample_interval_us(&self) -> Option<u64> {
+        (self.definitions.sample_interval_ns / 1_000 != 0)
+            .then_some(self.definitions.sample_interval_ns / 1_000)
     }
 
     pub(crate) fn modules(&self) -> &[super::ModuleRecord] {
@@ -281,6 +278,7 @@ impl Tail {
         &self.definitions.frames
     }
 
+    #[cfg(test)]
     fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
         let anchor = self.start_timestamp_us()?;
         let first = self
@@ -310,15 +308,24 @@ impl Tail {
     }
 
     fn remap_if_grown(&mut self) -> io::Result<()> {
-        let file_len = usize::try_from(self.file.metadata()?.len())
+        let actual_len = usize::try_from(self.file.metadata()?.len())
             .map_err(|_| invalid_data("spool file is too large to map"))?;
+        let file_len = self.visible_len.unwrap_or(actual_len);
+        if file_len > actual_len {
+            return Err(invalid_data("published spool exceeds file length"));
+        }
         if file_len < self.mmap.len() {
             return Err(invalid_data("spool file shrank while being tailed"));
         }
         if file_len > self.mmap.len() {
-            // SAFETY: see `from_file_inner`; only the unread suffix of an old
+            // SAFETY: see `from_file_bounded`; only the unread suffix of an old
             // mapping is accessed, and that suffix is never modified.
-            self.mmap = Arc::new(unsafe { Mmap::map(&self.file)? });
+            let mmap = unsafe { memmap2::MmapOptions::new().len(file_len).map(&self.file)? };
+            if let Some(current) = Arc::get_mut(&mut self.mmap) {
+                *current = mmap;
+            } else {
+                self.mmap = Arc::new(mmap);
+            }
         }
         Ok(())
     }
@@ -368,6 +375,7 @@ impl Tail {
                 DecodedSpoolRecord::Stack(stack) => self.definitions.stack_nodes.push(stack),
                 DecodedSpoolRecord::Thread(thread) => self.threads.push(thread),
                 DecodedSpoolRecord::Sample(sample) => {
+                    #[cfg(test)]
                     self.first_sample_timestamp_ns
                         .get_or_insert(sample.timestamp_ns);
                     self.observe_process(sample.process_id);
@@ -421,17 +429,17 @@ impl Tail {
 
 impl<'a> TailBatch<'a> {
     #[cfg(test)]
-    pub(crate) fn samples(&self) -> &[SampleRecord] {
+    pub(crate) fn raw_samples(&self) -> &[SampleRecord] {
         &self.tail.samples
     }
 
-    /// Iterate over this poll's samples with borrowed raw frames.
-    pub fn stacks(&self) -> impl ExactSizeIterator<Item = SampleStack<'a>> + '_ {
-        self.tail
-            .samples
+    /// Sample occurrences decoded by this batch.
+    pub fn samples(&self) -> impl ExactSizeIterator<Item = super::Sample<'a>> + 'a {
+        let tail = self.tail;
+        tail.samples
             .iter()
             .copied()
-            .map(|sample| self.tail.definitions.sample_stack(sample))
+            .map(move |sample| tail.definitions.sample_stack(sample))
     }
 
     /// Return the process IDs observed in this batch.
@@ -462,7 +470,8 @@ impl<'a> TailBatch<'a> {
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
     #[must_use]
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
         self.tail.timestamp_us(sample)
     }
 
@@ -504,9 +513,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::spool::{
-        FrameMode, FrameRecord, ModulePath, ModuleRecord, PerfSpoolWriter, Snapshot,
-    };
+    use crate::spool::{FrameMode, FrameRecord, ModuleRecord, PerfSpoolWriter, Snapshot};
     use crate::test_support::TempDir;
 
     fn module() -> ModuleRecord {
@@ -515,7 +522,7 @@ mod tests {
             crate::Pid::new(7).unwrap(),
             0x1000..0x2000,
             0,
-            ModulePath::from("/tmp/test.so"),
+            "/tmp/test.so",
         )
         .unwrap()
         .file_identity(0, 0, 1, 0)
@@ -548,11 +555,11 @@ mod tests {
         let mut symbolizer = tail
             .symbolizer()
             .disable_perf_maps()
-            .stack_cache(crate::StackCache::External)
+            .stack_cache(crate::symbolize::StackCache::External)
             .build()
             .unwrap();
         let initial = tail.poll().unwrap();
-        assert!(initial.samples().is_empty());
+        assert!(initial.raw_samples().is_empty());
         assert!(!initial.has_more());
         assert!(initial.processes().is_empty());
         let other_tail = Tail::open(&path).unwrap();
@@ -570,28 +577,31 @@ mod tests {
         writer.flush().unwrap();
         let first = tail.poll().unwrap();
         assert!(format!("{first:?}").contains("samples: 1"));
-        assert_eq!(first.samples().len(), 1);
+        assert_eq!(first.raw_samples().len(), 1);
         assert_eq!(
             first.processes(),
             &[crate::Pid::new(7).unwrap(), crate::Pid::new(9).unwrap()]
         );
-        assert_eq!(first.timestamp_us(&first.samples()[0]), Some(123));
+        assert_eq!(first.timestamp_us(&first.raw_samples()[0]), Some(123));
         assert!(!symbolizer.update(&first).unwrap().all());
         let native_backend = symbolizer.has_native_backend();
-        let mut stack = symbolizer.resolve(first.stacks().next().unwrap()).unwrap();
+        let stack = symbolizer
+            .resolve(first.samples().next().unwrap().stack())
+            .unwrap();
         assert_eq!(stack.is_cacheable(), !native_backend);
-        assert!(stack.next_with_id().is_some());
-        assert!(stack.next().is_none());
+        let mut frames = stack.iter();
+        assert!(frames.next().is_some());
+        assert!(frames.next().is_none());
 
         writer.write_sample_frames(3_000, 7, 8, [frame()]).unwrap();
         writer.write_module_deactivation(7).unwrap();
         writer.flush().unwrap();
         let second = tail.poll().unwrap();
-        assert_eq!(second.timestamp_us(&second.samples()[0]), Some(125));
+        assert_eq!(second.timestamp_us(&second.raw_samples()[0]), Some(125));
         symbolizer.update(&second).unwrap();
         assert_eq!(
             symbolizer
-                .resolve(second.stacks().next().unwrap())
+                .resolve(second.samples().next().unwrap().stack())
                 .unwrap()
                 .len(),
             1
@@ -607,7 +617,7 @@ mod tests {
         let finished = Snapshot::open(&path).unwrap();
         assert_eq!(tail.modules(), finished.modules());
         assert_eq!(tail.frames(), finished.frames());
-        assert_eq!(finished.samples().len(), 2);
+        assert_eq!(finished.raw_samples().len(), 2);
         assert_eq!(finished.python_runtime_records().len(), 1);
 
         let mut append = std::fs::OpenOptions::new()
@@ -643,7 +653,7 @@ mod tests {
         std::fs::write(&path, &bytes[..split]).unwrap();
 
         let mut tail = Tail::open(&path).unwrap();
-        assert!(tail.poll().unwrap().samples().is_empty());
+        assert!(tail.poll().unwrap().raw_samples().is_empty());
         let mut append = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -652,7 +662,7 @@ mod tests {
         append.flush().unwrap();
         {
             let batch = tail.poll().unwrap();
-            let mut stacks = batch.stacks();
+            let mut stacks = batch.samples();
             let stack = stacks.next().expect("expected one sample");
             assert!(stacks.next().is_none());
             assert_eq!(stack.sample().timestamp_ns, 1_000);
@@ -683,10 +693,10 @@ mod tests {
         let file = writer.open_reader().unwrap();
         let discarder = writer.open_discarder().unwrap();
         file.sync_all().unwrap();
-        let mut tail = Tail::from_file_inner(file, Some(discarder), None).unwrap();
+        let mut tail = Tail::from_file_bounded(file, Some(discarder), None, None).unwrap();
         {
             let first = tail.poll().unwrap();
-            assert_eq!(first.samples().len(), MAX_BATCH_SAMPLES);
+            assert_eq!(first.raw_samples().len(), MAX_BATCH_SAMPLES);
         }
 
         if let Err(error) = tail.discard_consumed() {
@@ -697,17 +707,51 @@ mod tests {
 
         {
             let second = tail.poll().unwrap();
-            assert_eq!(second.samples().len(), 20_000 - MAX_BATCH_SAMPLES);
+            assert_eq!(second.raw_samples().len(), 20_000 - MAX_BATCH_SAMPLES);
         }
 
         writer.write_sample_frames(20_001, 7, 8, [frame]).unwrap();
         writer.flush().unwrap();
         {
             let appended = tail.poll().unwrap();
-            assert_eq!(appended.samples().len(), 1);
-            assert_eq!(appended.samples()[0].timestamp_ns, 20_001);
+            assert_eq!(appended.raw_samples().len(), 1);
+            assert_eq!(appended.raw_samples()[0].timestamp_ns, 20_001);
         }
 
         assert!(super::super::Replay::open(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::spool::{FrameMode, FrameRecord, PerfSpoolWriter};
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn initial_remap_failure_preserves_undelivered_samples() {
+        let dir = TempDir::new("tail-remap-retry");
+        let path = dir.path().join("capture");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
+        writer
+            .write_sample_frames(
+                1,
+                7,
+                8,
+                [FrameRecord {
+                    module_id: None,
+                    abs_ip: 4096,
+                    file_relative_ip: 4096,
+                    mode: FrameMode::User,
+                }],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        let mut tail = Tail::open(path).unwrap();
+        tail.visible_len = Some(tail.mmap.len() + 1);
+        assert!(tail.poll().is_err());
+        tail.visible_len = None;
+        assert_eq!(tail.poll().unwrap().samples().len(), 1);
+        assert_eq!(tail.poll().unwrap().samples().len(), 0);
     }
 }

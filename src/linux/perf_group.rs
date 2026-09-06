@@ -90,17 +90,7 @@ enum OpenedEvent {
     },
     Output {
         inherit: TaskInheritance,
-        capacity_bytes: u64,
     },
-}
-
-impl OpenedEvent {
-    fn allocated_capacity_bytes(&self) -> u64 {
-        match self {
-            Self::Member { .. } => 0,
-            Self::Output { capacity_bytes, .. } => *capacity_bytes,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -126,37 +116,12 @@ impl ThreadTrack {
     }
 }
 
-struct ThreadPerfEvents {
-    events: Vec<Member>,
-    inherits: bool,
-}
-
-impl ThreadPerfEvents {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            events: Vec::with_capacity(capacity),
-            inherits: false,
-        }
-    }
-
-    fn push(&mut self, opened: OpenedEvent) {
-        match opened {
-            OpenedEvent::Member { member, inherit } => {
-                self.inherits |= inherit.is_enabled();
-                self.events.push(member);
-            }
-            OpenedEvent::Output { inherit, .. } => {
-                self.inherits |= inherit.is_enabled();
-            }
-        }
-    }
-}
-
 pub(super) struct PerfGroup {
     members: BTreeMap<RawFd, Member>,
     outputs: BTreeMap<RawFd, OutputMember>,
     cpu_outputs: BTreeMap<u32, RawFd>,
     saw_readable: bool,
+    sampling_enabled: bool,
     // Closed poll fds cannot become anchors again before their members are removed.
     retired_poll_fds: BTreeSet<RawFd>,
     poll: Poll,
@@ -267,6 +232,7 @@ impl PerfGroup {
             outputs: Default::default(),
             cpu_outputs: Default::default(),
             saw_readable: false,
+            sampling_enabled: true,
             retired_poll_fds: BTreeSet::new(),
             poll: Poll::new()?,
             poll_events: Events::with_capacity(16),
@@ -331,7 +297,7 @@ impl PerfGroup {
             pending
                 .perfs
                 .reserve(cpu_count.saturating_mul(threads.len().saturating_add(1)));
-            let leader_perfs = self.open_task_perfs(
+            let leader_inherits = self.open_task_perfs(
                 TaskTarget {
                     tid: pid,
                     owner_pid: pid,
@@ -342,23 +308,20 @@ impl PerfGroup {
                 &mut pending,
             )?;
             let mut new_tracks = Vec::with_capacity(threads.len().saturating_add(1));
-            new_tracks.push((pid, ThreadTrack::new(pid, leader_perfs.inherits)));
-            pending.perfs.extend(leader_perfs.events);
+            new_tracks.push((pid, ThreadTrack::new(pid, leader_inherits)));
             for &tid in &threads {
-                let mut events_inherit = false;
-                if let Some(thread_perfs) = self.try_open_thread_perfs(
-                    TaskTarget {
-                        tid,
-                        owner_pid: pid,
-                    },
-                    &cpu_ids,
-                    attach_mode,
-                    frequency,
-                    &mut pending,
-                )? {
-                    events_inherit = thread_perfs.inherits;
-                    pending.perfs.extend(thread_perfs.events);
-                }
+                let events_inherit = self
+                    .try_open_thread_perfs(
+                        TaskTarget {
+                            tid,
+                            owner_pid: pid,
+                        },
+                        &cpu_ids,
+                        attach_mode,
+                        frequency,
+                        &mut pending,
+                    )?
+                    .unwrap_or(false);
                 new_tracks.push((tid, ThreadTrack::new(pid, events_inherit)));
             }
 
@@ -439,7 +402,7 @@ impl PerfGroup {
             .reserve(cpu_count.saturating_mul(new_threads.len()));
         let mut tracked_threads = Vec::with_capacity(new_threads.len());
         for tid in new_threads {
-            if let Some(thread_perfs) = self.try_open_thread_perfs(
+            if let Some(inherits) = self.try_open_thread_perfs(
                 TaskTarget {
                     tid,
                     owner_pid: pid,
@@ -449,9 +412,7 @@ impl PerfGroup {
                 frequency,
                 &mut pending,
             )? {
-                let events_inherit = thread_perfs.inherits;
-                pending.perfs.extend(thread_perfs.events);
-                tracked_threads.push((tid, ThreadTrack::new(pid, events_inherit)));
+                tracked_threads.push((tid, ThreadTrack::new(pid, inherits)));
             }
         }
         self.enable_and_register_pending(pending)?;
@@ -493,16 +454,14 @@ impl PerfGroup {
                 continue;
             }
 
-            if let Some(thread_perfs) = self.try_open_thread_perfs(
+            if let Some(inherits) = self.try_open_thread_perfs(
                 TaskTarget { tid, owner_pid },
                 &cpu_ids,
                 AttachMode::StopWhileAttaching,
                 frequency,
                 &mut pending,
             )? {
-                let events_inherit = thread_perfs.inherits;
-                pending.perfs.extend(thread_perfs.events);
-                tracked_threads.insert(tid, ThreadTrack::new(owner_pid, events_inherit));
+                tracked_threads.insert(tid, ThreadTrack::new(owner_pid, inherits));
             }
         }
 
@@ -540,7 +499,7 @@ impl PerfGroup {
                 FrequencyMode::ClampToKernelMax,
             ) {
                 Ok(opened) => {
-                    if let Err(err) = self.enable() {
+                    if let Err(err) = self.enable_if_running() {
                         self.rollback_open(opened);
                         return Err(err);
                     }
@@ -621,30 +580,40 @@ impl PerfGroup {
         attach_mode: AttachMode,
         frequency: u64,
         pending: &mut PendingEvents,
-    ) -> io::Result<ThreadPerfEvents> {
-        let mut perf_events = ThreadPerfEvents::with_capacity(cpu_ids.len());
-        let per_cpu_budget =
-            MAX_TOTAL_RING_BUFFER_BYTES / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
-        for &cpu in cpu_ids {
-            let remaining =
-                MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
-            let opened = self.open_perf(
-                target,
-                cpu,
-                OpenSettings {
-                    attach_mode,
-                    inherit: self.task_inheritance(),
-                    frequency,
-                    maximum_ring_bytes: per_cpu_budget.min(remaining),
-                },
-                pending,
-            )?;
-            pending.allocated_ring_bytes = pending
-                .allocated_ring_bytes
-                .saturating_add(opened.allocated_capacity_bytes());
-            perf_events.push(opened);
+    ) -> io::Result<bool> {
+        let checkpoint = pending.perfs.len();
+        let result = (|| {
+            let mut inherits = false;
+            let per_cpu_budget = MAX_TOTAL_RING_BUFFER_BYTES
+                / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
+            for &cpu in cpu_ids {
+                let remaining =
+                    MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
+                let opened = self.open_perf(
+                    target,
+                    cpu,
+                    OpenSettings {
+                        attach_mode,
+                        inherit: self.task_inheritance(),
+                        frequency,
+                        maximum_ring_bytes: per_cpu_budget.min(remaining),
+                    },
+                    pending,
+                )?;
+                match opened {
+                    OpenedEvent::Member { member, inherit } => {
+                        inherits |= inherit.is_enabled();
+                        pending.perfs.push(member);
+                    }
+                    OpenedEvent::Output { inherit } => inherits |= inherit.is_enabled(),
+                }
+            }
+            Ok(inherits)
+        })();
+        if result.is_err() {
+            pending.perfs.truncate(checkpoint);
         }
-        Ok(perf_events)
+        result
     }
 
     fn try_open_thread_perfs(
@@ -654,9 +623,9 @@ impl PerfGroup {
         attach_mode: AttachMode,
         frequency: u64,
         pending: &mut PendingEvents,
-    ) -> io::Result<Option<ThreadPerfEvents>> {
+    ) -> io::Result<Option<bool>> {
         match self.open_task_perfs(target, cpu_ids, attach_mode, frequency, pending) {
-            Ok(perfs) => Ok(Some(perfs)),
+            Ok(inherits) => Ok(Some(inherits)),
             Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(None),
             Err(err) => Err(err),
         }
@@ -710,11 +679,13 @@ impl PerfGroup {
     }
 
     fn enable_and_register_pending(&mut self, pending: PendingEvents) -> io::Result<()> {
-        for ring in &pending.outputs {
-            ring.enable()?;
-        }
-        for member in &pending.perfs {
-            member.perf.enable()?;
+        if self.sampling_enabled {
+            for ring in &pending.outputs {
+                ring.enable()?;
+            }
+            for member in &pending.perfs {
+                member.perf.enable()?;
+            }
         }
         self.register_pending(pending).map(drop)
     }
@@ -896,10 +867,9 @@ impl PerfGroup {
             let capacity_bytes = output.capacity_bytes();
             pending.cpu_outputs.insert(cpu, fd);
             pending.outputs.push(output);
-            Ok(OpenedEvent::Output {
-                inherit,
-                capacity_bytes,
-            })
+            pending.allocated_ring_bytes =
+                pending.allocated_ring_bytes.saturating_add(capacity_bytes);
+            Ok(OpenedEvent::Output { inherit })
         }
     }
 
@@ -932,16 +902,24 @@ impl PerfGroup {
         )
     }
 
+    fn perfs(&self) -> impl Iterator<Item = &Perf> {
+        self.outputs
+            .values()
+            .map(|output| output.ring.perf())
+            .chain(self.members.values().map(|member| &member.perf))
+    }
+
+    pub(super) fn enable_if_running(&mut self) -> io::Result<()> {
+        if self.sampling_enabled {
+            self.enable()
+        } else {
+            self.resume_stopped_processes()
+        }
+    }
+
     pub(super) fn enable(&mut self) -> io::Result<()> {
-        let enable_result = (|| {
-            for member in self.outputs.values() {
-                member.ring.enable()?;
-            }
-            for member in self.members.values_mut() {
-                member.perf.enable()?;
-            }
-            Ok(())
-        })();
+        self.sampling_enabled = true;
+        let enable_result = self.perfs().try_for_each(Perf::enable);
         let resume_result = self.resume_stopped_processes();
         crate::error::and_cleanup(enable_result, resume_result)
     }
@@ -964,14 +942,10 @@ impl PerfGroup {
     }
 
     pub(super) fn disable(&mut self) -> io::Result<()> {
+        self.sampling_enabled = false;
         let mut first_error = None;
-        for member in self.outputs.values() {
-            if let Err(err) = member.ring.disable() {
-                first_error.get_or_insert(err);
-            }
-        }
-        for member in self.members.values_mut() {
-            if let Err(err) = member.perf.disable() {
+        for perf in self.perfs() {
+            if let Err(err) = perf.disable() {
                 first_error.get_or_insert(err);
             }
         }
@@ -980,11 +954,8 @@ impl PerfGroup {
 
     pub(super) fn take_lost_records(&mut self) -> io::Result<u64> {
         let mut total = self.retired_lost_records;
-        for output in self.outputs.values() {
-            total = checked_loss_sum(total, output.ring.lost_records()?)?;
-        }
-        for member in self.members.values() {
-            total = checked_loss_sum(total, member.perf.lost_records()?)?;
+        for perf in self.perfs() {
+            total = checked_loss_sum(total, perf.lost_records()?)?;
         }
         let delta = total
             .checked_sub(self.reported_lost_records)
@@ -1111,7 +1082,7 @@ fn drain_output_ring<C: EventConsumer>(ring: &mut OutputRing, consumer: &mut C) 
 }
 
 fn frequency_for_mode(frequency: u32, mode: FrequencyMode) -> u64 {
-    frequency_for_kernel_max(frequency, mode, crate::record::max_sample_rate())
+    frequency_for_kernel_max(frequency, mode, crate::record::max_sample_rate().ok())
 }
 
 fn frequency_for_kernel_max(frequency: u32, mode: FrequencyMode, max_rate: Option<u64>) -> u64 {
@@ -1844,5 +1815,31 @@ mod tests {
             Some(vec![0, 1, 2, 8, 10, 11])
         );
         assert_eq!(parse_cpu_list("5-4"), None);
+    }
+}
+
+#[cfg(test)]
+mod sampling_state_tests {
+    use super::*;
+    #[test]
+    fn bookkeeping_keeps_paused_sampling_paused() {
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            frequency: 1,
+            stack_size: 0,
+            ring_stacks: 0,
+            event_source: EventSource::SwCpuClock,
+            regs_mask: 0,
+            include_kernel: false,
+            inherit_child_processes: false,
+        })
+        .unwrap();
+        group.disable().unwrap();
+        group
+            .enable_and_register_pending(group.pending_events())
+            .unwrap();
+        group.enable_if_running().unwrap();
+        assert!(!group.sampling_enabled);
+        group.enable().unwrap();
+        assert!(group.sampling_enabled);
     }
 }

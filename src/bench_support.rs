@@ -2,9 +2,13 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::linux;
+pub use crate::spool::model::{
+    FrameMode, FrameRecord, ModulePath, PythonRuntimeRecord, SampleRecord, ThreadRecord,
+};
+pub use crate::spool::Module as ModuleRecord;
 #[cfg(test)]
 use crate::spool::ModuleOwner;
-use crate::spool::{FrameRecord, ModuleRecord, PerfSpoolWriter, PythonRuntimeRecord};
+use crate::spool::PerfSpoolWriter;
 
 #[doc(hidden)]
 pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
@@ -247,7 +251,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/tmp/libstackpulse.so".into(),
+            path: Path::new("/tmp/libstackpulse.so").into(),
         };
         let runtime = PythonRuntimeRecord {
             timestamp_ns: 1_700_000_000_000_001,
@@ -306,7 +310,10 @@ mod tests {
             Some(FIXTURE_SAMPLE_INTERVAL_US)
         );
         assert_eq!(reader.modules().len(), 1);
-        assert_eq!(reader.modules()[0].path.as_str(), "/tmp/libstackpulse.so");
+        assert_eq!(
+            reader.modules()[0].path.to_str().unwrap(),
+            "/tmp/libstackpulse.so"
+        );
         assert_eq!(reader.modules()[0].file_offset, 0x100);
         assert_eq!(reader.python_runtime_records().len(), 1);
         assert_eq!(
@@ -316,14 +323,17 @@ mod tests {
         assert_eq!(reader.python_runtime_records()[0].process_id.get(), 42);
         assert!(reader.python_runtime_records()[0].is_python_runtime);
         assert_eq!(reader.samples().len(), 1);
-        assert_eq!(reader.samples()[0].timestamp_ns, samples[0].timestamp_ns);
-        assert_eq!(reader.samples()[0].process_id.get(), 42);
-        assert_eq!(reader.samples()[0].thread_id.get(), 43);
+        assert_eq!(
+            reader.raw_samples()[0].timestamp_ns,
+            samples[0].timestamp_ns
+        );
+        assert_eq!(reader.raw_samples()[0].process_id.get(), 42);
+        assert_eq!(reader.raw_samples()[0].thread_id.get(), 43);
 
         let mut frames = Vec::new();
         frames.extend(
             reader
-                .stack_frame_refs(reader.samples()[0].stack_id)
+                .stack_frame_refs(reader.raw_samples()[0].stack_id)
                 .expect("read sample stack")
                 .copied(),
         );
@@ -362,5 +372,167 @@ mod tests {
                     .wrapping_add(*address as usize)
                     .wrapping_add(name.len())
             })
+    }
+}
+
+#[doc(hidden)]
+pub fn symbolizer_for_modules(modules: &[ModuleRecord]) -> crate::SymbolizerBuilder<'_> {
+    crate::SymbolizerBuilder::for_modules(modules)
+}
+
+#[doc(hidden)]
+pub fn resolve_raw<'a>(
+    symbolizer: &'a mut crate::Symbolizer,
+    pid: crate::Pid,
+    frames: &[FrameRecord],
+) -> crate::Result<crate::profile::ResolvedStack<'a>> {
+    symbolizer.resolve_raw(pid, frames)
+}
+
+#[doc(hidden)]
+pub fn module(
+    id: u32,
+    pid: crate::Pid,
+    addresses: std::ops::Range<u64>,
+    file_offset: u64,
+    path: impl AsRef<Path>,
+) -> crate::Result<ModuleRecord> {
+    ModuleRecord::new(id, pid, addresses, file_offset, path)
+}
+
+#[doc(hidden)]
+pub fn kernel_module(
+    id: u32,
+    addresses: std::ops::Range<u64>,
+    path: impl AsRef<Path>,
+) -> crate::Result<ModuleRecord> {
+    ModuleRecord::kernel(id, addresses, path)
+}
+
+#[doc(hidden)]
+pub fn with_file_identity(
+    module: ModuleRecord,
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    generation: u64,
+) -> ModuleRecord {
+    module.file_identity(device_major, device_minor, inode, generation)
+}
+
+#[doc(hidden)]
+pub struct LiveSpoolFixture {
+    writer: PerfSpoolWriter<std::io::BufWriter<std::fs::File>>,
+    publisher: crate::spool::Publisher,
+}
+
+impl LiveSpoolFixture {
+    #[doc(hidden)]
+    pub fn new(
+        file: std::fs::File,
+        disposable: bool,
+    ) -> crate::Result<(Self, crate::spool::LiveReader)> {
+        let spool = if disposable {
+            crate::spool::Spool::disposable(file)?
+        } else {
+            crate::spool::Spool::retained(file)?
+        };
+        let writer = PerfSpoolWriter::from_writer(
+            std::io::BufWriter::new(spool.file),
+            FIXTURE_START_TIMESTAMP_US,
+            FIXTURE_SAMPLE_INTERVAL_US,
+        )?;
+        let mut fixture = Self {
+            writer,
+            publisher: crate::spool::Publisher::new(),
+        };
+        fixture.flush()?;
+        let discarder = disposable
+            .then(|| fixture.writer.open_discarder())
+            .transpose()?;
+        let reader = crate::spool::LiveReader::new(
+            fixture.writer.open_reader()?,
+            discarder,
+            crate::native_module::ExactImageStore::default(),
+            fixture.publisher.clone(),
+        )?;
+        Ok((fixture, reader))
+    }
+
+    #[doc(hidden)]
+    pub fn append(&mut self, sample: &BenchSpoolSample) -> crate::Result<()> {
+        self.writer.write_sample_frames(
+            sample.timestamp_ns,
+            sample.process_id,
+            sample.thread_id,
+            sample.frames.iter().copied(),
+        )?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn flush(&mut self) -> crate::Result<()> {
+        self.writer.flush()?;
+        self.publisher.publish(self.writer.position());
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn finish(mut self) -> crate::Result<()> {
+        self.flush()?;
+        self.publisher
+            .finish(self.writer.position(), crate::RecordingSummary::default());
+        Ok(())
+    }
+}
+
+impl Drop for LiveSpoolFixture {
+    fn drop(&mut self) {
+        self.publisher.abort(None);
+    }
+}
+
+#[cfg(test)]
+mod live_fixture_tests {
+    use super::*;
+    use crate::spool::ReadStatus;
+    use crate::test_support::TempDir;
+    use std::time::Duration;
+
+    #[test]
+    fn abandoned_fixture_exposes_only_the_flushed_prefix() {
+        let directory = TempDir::new("live-spool-fixture");
+        let file = std::fs::File::create(directory.path().join("live.spool")).unwrap();
+        let (mut fixture, mut reader) = LiveSpoolFixture::new(file, false).unwrap();
+        let mut sample = BenchSpoolSample {
+            timestamp_ns: 1,
+            process_id: 100,
+            thread_id: 100,
+            frames: vec![FrameRecord {
+                module_id: None,
+                file_relative_ip: 0x1000,
+                abs_ip: 0x1000,
+                mode: FrameMode::User,
+            }],
+        };
+        fixture.append(&sample).unwrap();
+        fixture.flush().unwrap();
+        sample.timestamp_ns = 2;
+        fixture.append(&sample).unwrap();
+        drop(fixture);
+        let mut timestamps = Vec::new();
+        loop {
+            match reader.poll(Duration::ZERO) {
+                Ok(ReadStatus::Batch(batch)) => {
+                    timestamps.extend(batch.samples().map(|sample| sample.monotonic_timestamp()))
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), crate::ErrorKind::Io);
+                    break;
+                }
+                Ok(other) => panic!("abandoned source must terminate with its error: {other:?}"),
+            }
+        }
+        assert_eq!(timestamps, vec![Duration::from_nanos(1)]);
     }
 }

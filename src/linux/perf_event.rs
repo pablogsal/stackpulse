@@ -264,7 +264,10 @@ impl PerfOptions {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if let Some(max_rate) = crate::record::max_sample_rate().filter(|&r| self.frequency > r) {
+        if let Some(max_rate) = crate::record::max_sample_rate()
+            .ok()
+            .filter(|&r| self.frequency > r)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 PerfFrequencyLimit {
@@ -366,12 +369,12 @@ pub(super) struct OutputRing {
 }
 
 impl OutputRing {
-    pub(super) fn enable(&self) -> io::Result<()> {
-        self.perf.enable()
+    pub(super) fn perf(&self) -> &Perf {
+        &self.perf
     }
 
-    pub(super) fn disable(&self) -> io::Result<()> {
-        self.perf.disable()
+    pub(super) fn enable(&self) -> io::Result<()> {
+        self.perf.enable()
     }
 
     #[inline]
@@ -405,10 +408,6 @@ impl OutputRing {
             parser: &self.parser,
             end,
         }
-    }
-
-    pub(super) fn lost_records(&self) -> io::Result<u64> {
-        self.perf.lost_records()
     }
 }
 

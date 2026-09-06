@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stackpulse::profile::ResolvedFrame;
-use stackpulse::spool::{FrameRecord, SampleStack};
-use stackpulse::{Replay, Snapshot, StackCache, Symbolizer};
+use stackpulse::profile::Frame;
+use stackpulse::spool::{RawFrame, Sample};
+use stackpulse::{Replay, Snapshot, Symbolizer};
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -24,7 +24,6 @@ struct Options {
     iterations: usize,
     mode: Mode,
     reader: ReaderMode,
-    without_stack_cache: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,56 +38,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reader = Replay::open(&options.spool)?;
             checksum = checksum
                 .wrapping_add(reader.modules().len())
-                .wrapping_add(reader.python_runtime_records().len());
+                .wrapping_add(reader.samples().len());
             samples += reader.sample_count();
             match options.mode {
                 Mode::Open => {}
                 Mode::Read => {
-                    for stack in reader.stacks() {
-                        let raw_frames = stack.frames();
+                    for stack in reader.samples() {
+                        let raw_stack = stack.stack();
+                        let raw_frames = raw_stack.frames();
                         frames += raw_frames.len();
                         checksum = checksum.wrapping_add(raw_frame_score(raw_frames));
                     }
                 }
                 Mode::Symbolize => {
-                    let mut symbolizer = reader
-                        .symbolizer()
-                        .disable_perf_maps()
-                        .stack_cache(if options.without_stack_cache {
-                            StackCache::External
-                        } else {
-                            StackCache::Internal
-                        })
-                        .build()?;
-                    symbolize_samples(reader.stacks(), &mut symbolizer, &mut frames, &mut checksum);
+                    let mut symbolizer = reader.symbolizer().disable_perf_maps().build()?;
+                    symbolize_samples(
+                        reader.samples(),
+                        &mut symbolizer,
+                        &mut frames,
+                        &mut checksum,
+                    );
                 }
             }
         } else {
             let reader = Snapshot::open(&options.spool)?;
             checksum = checksum
                 .wrapping_add(reader.modules().len())
-                .wrapping_add(reader.python_runtime_records().len());
+                .wrapping_add(reader.samples().len());
             samples += reader.samples().len();
             match options.mode {
                 Mode::Open => {}
                 Mode::Read => {
-                    for stack in reader.stacks() {
-                        let raw_frames = stack.frames();
+                    for stack in reader.samples() {
+                        let raw_stack = stack.stack();
+                        let raw_frames = raw_stack.frames();
                         frames += raw_frames.len();
                         checksum = checksum.wrapping_add(raw_frame_score(raw_frames));
                     }
                 }
                 Mode::Symbolize => {
-                    let mut symbolizer = reader
-                        .symbolizer()
-                        .disable_perf_maps()
-                        .stack_cache(if options.without_stack_cache {
-                            StackCache::External
-                        } else {
-                            StackCache::Internal
-                        })
-                        .build()?;
-                    symbolize_samples(reader.stacks(), &mut symbolizer, &mut frames, &mut checksum);
+                    let mut symbolizer = reader.symbolizer().disable_perf_maps().build()?;
+                    symbolize_samples(
+                        reader.samples(),
+                        &mut symbolizer,
+                        &mut frames,
+                        &mut checksum,
+                    );
                 }
             }
         }
@@ -96,13 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::hint::black_box(checksum);
     println!(
-        "reader={:?} stack_cache={} mode={:?} iterations={} samples={} frames={} checksum={} elapsed_ms={:.2}",
+        "reader={:?} mode={:?} iterations={} samples={} frames={} checksum={} elapsed_ms={:.2}",
         options.reader,
-        if options.without_stack_cache {
-            "disabled"
-        } else {
-            "enabled"
-        },
         options.mode,
         options.iterations,
         samples,
@@ -114,16 +104,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn symbolize_samples<'a>(
-    stacks: impl IntoIterator<Item = SampleStack<'a>>,
+    stacks: impl IntoIterator<Item = Sample<'a>>,
     symbolizer: &mut Symbolizer,
     frames: &mut usize,
     checksum: &mut usize,
 ) {
     for stack in stacks {
         let mut stack_checksum = 0_usize;
-        let resolved = symbolizer.resolve(stack).expect("symbolize stack");
+        let resolved = symbolizer.resolve(stack.stack()).expect("symbolize stack");
         let count = resolved.len();
-        for frame in resolved {
+        for frame in resolved.frames() {
             stack_checksum = stack_checksum.wrapping_add(resolved_frame_score(frame));
         }
         *frames += count;
@@ -136,7 +126,6 @@ fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
     let mut iterations = 1000;
     let mut mode = Mode::Symbolize;
     let mut reader = ReaderMode::Eager;
-    let mut without_stack_cache = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -154,7 +143,6 @@ fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
             "--open-only" => mode = Mode::Open,
             "--symbolize" => mode = Mode::Symbolize,
             "--replay" => reader = ReaderMode::Replay,
-            "--without-stack-cache" => without_stack_cache = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -162,42 +150,44 @@ fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
-    if without_stack_cache && !matches!(mode, Mode::Symbolize) {
-        return Err("--without-stack-cache requires --symbolize".into());
-    }
 
     Ok(Options {
         spool,
         iterations,
         mode,
         reader,
-        without_stack_cache,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run --release --example bench_spool_symbolize -- [--spool PATH] [--iterations N] [--open-only|--read-only|--symbolize] [--replay] [--without-stack-cache]"
+        "usage: cargo run --release --example bench_spool_symbolize -- [--spool PATH] [--iterations N] [--open-only|--read-only|--symbolize] [--replay]"
     );
 }
 
-fn raw_frame_score<'a>(frames: impl IntoIterator<Item = &'a FrameRecord>) -> usize {
-    frames.into_iter().fold(0, |score, frame| {
-        score
-            .wrapping_add(frame.abs_ip as usize)
-            .wrapping_add(frame.file_relative_ip as usize)
-            .wrapping_add(frame.module_id.unwrap_or(u32::MAX) as usize)
+fn raw_frame_score<'a>(frames: impl IntoIterator<Item = RawFrame<'a>>) -> usize {
+    frames.into_iter().fold(0usize, |score, frame| {
+        score.wrapping_add(match frame {
+            RawFrame::Native {
+                address, mapping, ..
+            } => {
+                address as usize
+                    ^ mapping.map_or(0, |mapping| mapping.file_relative_address() as usize)
+            }
+            RawFrame::TruncatedStack => 1,
+        })
     })
 }
 
-fn resolved_frame_score(frame: &ResolvedFrame) -> usize {
+fn resolved_frame_score(frame: &Frame) -> usize {
     match frame {
-        ResolvedFrame::Python(frame) => frame
+        Frame::Python(frame) => frame
             .file_name()
             .len()
             .wrapping_add(frame.func_name.len())
-            .wrapping_add(frame.location.lineno as usize),
-        ResolvedFrame::Native(frame) => {
+            .wrapping_add(frame.location.line.unwrap_or(0) as usize),
+        Frame::TruncatedStack => 0,
+        Frame::Native(frame) => {
             let symbol_score = frame.symbol.as_ref().map_or(0, |symbol| {
                 symbol
                     .name()

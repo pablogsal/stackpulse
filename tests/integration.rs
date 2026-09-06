@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use stackpulse::profile::{
-    is_python_runtime_basename as is_python_module, FrameKind, ResolvedFrame, SymbolOrigin,
+    is_python_runtime_basename as is_python_module, AddressSpace, Frame, SymbolOrigin,
 };
-use stackpulse::{AttachMode, Recorder, RecorderOptions, RecordingSummary, Snapshot};
+use stackpulse::record::ProcessScope;
+use stackpulse::{Recorder, RecordingSummary, Snapshot, Spool};
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -128,8 +129,7 @@ fn records_samples_from_real_python_process() -> TestResult {
         capture
             .reader
             .samples()
-            .iter()
-            .any(|sample| sample.process_id.get() == target_pid),
+            .any(|sample| sample.pid().get() == target_pid),
         "profile should contain samples for pid {target_pid}; {}",
         capture.diagnostics()
     );
@@ -175,8 +175,7 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
         capture
             .reader
             .samples()
-            .iter()
-            .any(|sample| sample.process_id.get() == spawned_child_pid),
+            .any(|sample| sample.pid().get() == spawned_child_pid),
         "expected inherited child pid {spawned_child_pid} in samples; seen pids: {:?}; {}",
         sample_pids(&capture.reader),
         capture.diagnostics()
@@ -369,7 +368,7 @@ struct CapturedProfile {
     path: ProfilePath,
     summary: RecordingSummary,
     reader: Snapshot,
-    stacks: Vec<ResolvedSampleStack>,
+    stacks: Vec<ResolvedSample>,
 }
 
 impl CapturedProfile {
@@ -381,7 +380,7 @@ impl CapturedProfile {
         );
     }
 
-    fn stacks_for_pid(&self, pid: i32) -> impl Iterator<Item = &ResolvedSampleStack> {
+    fn stacks_for_pid(&self, pid: i32) -> impl Iterator<Item = &ResolvedSample> {
         self.stacks
             .iter()
             .filter(move |stack| stack.process_id == pid)
@@ -412,9 +411,17 @@ impl CapturedProfile {
 }
 
 #[derive(Debug)]
-struct ResolvedSampleStack {
+struct ResolvedSample {
     process_id: i32,
     frames: Vec<ResolvedTestFrame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameKind {
+    Python,
+    Native,
+    Kernel,
+    Truncated,
 }
 
 #[derive(Debug)]
@@ -537,7 +544,7 @@ fn assert_python_stack_contains_ordered_names(
     }
 }
 
-impl ResolvedSampleStack {
+impl ResolvedSample {
     fn frame_names(&self) -> Vec<&str> {
         self.frames
             .iter()
@@ -599,10 +606,10 @@ fn finish_recording(
     target_samples: u64,
 ) -> io::Result<CapturedProfile> {
     let deadline = Instant::now() + RECORD_TIMEOUT;
-    while Instant::now() < deadline && recorder.summary().samples < target_samples {
+    while Instant::now() < deadline && recorder.stats().samples < target_samples {
         recorder.poll(Duration::from_millis(100))?;
     }
-    let summary = recorder.finish()?;
+    let summary = recorder.finish().map_err(io::Error::other)?;
     assert!(summary.minimum_ring_buffer_bytes > 0);
     assert!(summary.maximum_ring_buffer_bytes >= summary.minimum_ring_buffer_bytes);
     let reader = Snapshot::open(profile_path.as_ref())?;
@@ -615,29 +622,43 @@ fn finish_recording(
     })
 }
 
-fn resolve_stacks(reader: &Snapshot) -> io::Result<Vec<ResolvedSampleStack>> {
+fn resolve_stacks(reader: &Snapshot) -> io::Result<Vec<ResolvedSample>> {
     let mut symbolizer = reader.symbolizer().build().expect("build symbolizer");
     let mut stacks = Vec::new();
-    for stack in reader.stacks() {
-        let process_id = stack.sample().process_id.get();
-        let frames = symbolizer.resolve(stack)?.map(resolve_test_frame).collect();
-        stacks.push(ResolvedSampleStack { process_id, frames });
+    for stack in reader.samples() {
+        let process_id = stack.pid().get();
+        let frames = symbolizer
+            .resolve(stack.stack())?
+            .frames()
+            .map(resolve_test_frame)
+            .collect();
+        stacks.push(ResolvedSample { process_id, frames });
     }
     Ok(stacks)
 }
 
-fn resolve_test_frame(frame: &ResolvedFrame) -> ResolvedTestFrame {
+fn resolve_test_frame(frame: &Frame) -> ResolvedTestFrame {
     match frame {
-        ResolvedFrame::Python(frame) => ResolvedTestFrame {
+        Frame::TruncatedStack => ResolvedTestFrame {
+            name: "<stack truncated>".into(),
+            kind: FrameKind::Truncated,
+            origin: SymbolOrigin::AddressOnly,
+            module: None,
+            file: None,
+        },
+        Frame::Python(frame) => ResolvedTestFrame {
             name: frame.func_name.to_string(),
             kind: FrameKind::Python,
             origin: SymbolOrigin::PerfMap,
             module: None,
             file: Some(frame.file_name().to_string()),
         },
-        ResolvedFrame::Native(frame) => ResolvedTestFrame {
-            name: frame.display_name(),
-            kind: frame.kind,
+        Frame::Native(frame) => ResolvedTestFrame {
+            name: frame.to_string(),
+            kind: match frame.address_space {
+                AddressSpace::User => FrameKind::Native,
+                AddressSpace::Kernel => FrameKind::Kernel,
+            },
             origin: frame.origin,
             module: frame
                 .symbol
@@ -665,15 +686,18 @@ fn attach_recorder_with_options(
     inherit_child_processes: bool,
     include_kernel: bool,
 ) -> io::Result<Option<Recorder>> {
-    match Recorder::attach(
-        stackpulse::Pid::try_from(pid).map_err(io::Error::other)?,
-        profile_path,
-        AttachMode::StopWhileAttaching,
-        RecorderOptions::new(stackpulse::SampleRate::hz(499)?)
-            .stack_size(60 * 1024)
-            .include_kernel(include_kernel)
-            .inherit_children(inherit_child_processes),
-    ) {
+    match Recorder::builder(stackpulse::SampleRate::hz(499)?)
+        .stack_size(60 * 1024)
+        .include_kernel(include_kernel)
+        .scope(if inherit_child_processes {
+            ProcessScope::Descendants
+        } else {
+            ProcessScope::Process
+        })
+        .attach(
+            stackpulse::Pid::try_from(pid).map_err(io::Error::other)?,
+            Spool::retained(std::fs::File::create(profile_path)?)?,
+        ) {
         Ok(recorder) => Ok(Some(recorder)),
         Err(err) if attach_is_not_allowed(&err) => {
             if environment_skips_allowed() {
@@ -1136,11 +1160,7 @@ fn skip_or_fail(message: &str) -> TestResult {
 }
 
 fn sample_pids(reader: &Snapshot) -> Vec<i32> {
-    let mut pids: Vec<_> = reader
-        .samples()
-        .iter()
-        .map(|sample| sample.process_id.get())
-        .collect();
+    let mut pids: Vec<_> = reader.samples().map(|sample| sample.pid().get()).collect();
     pids.sort_unstable();
     pids.dedup();
     pids
@@ -1151,7 +1171,6 @@ fn assert_has_python_module(reader: &Snapshot) {
         reader.modules().iter().any(|module| {
             module
                 .path()
-                .as_path()
                 .file_name()
                 .and_then(OsStr::to_str)
                 .is_some_and(is_python_module)

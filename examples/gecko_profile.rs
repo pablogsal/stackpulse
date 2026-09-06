@@ -20,7 +20,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -30,9 +30,10 @@ use fxprof_processed_profile::{
     Timestamp,
 };
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
-use stackpulse::process::SuspendedLaunchedProcess;
-use stackpulse::profile::{FrameFlags, FrameKind, ResolvedFrame};
-use stackpulse::{AttachMode, Recorder, RecorderOptions, RecordingSummary, Snapshot};
+use stackpulse::process::Launch;
+use stackpulse::profile::{AddressSpace, Frame as ResolvedFrame};
+use stackpulse::record::{PreparedRecording, ProcessScope};
+use stackpulse::{Recorder, RecordingSummary, Snapshot, Spool};
 
 const DEFAULT_OUTPUT: &str = "stackpulse_gecko.json.gz";
 const STACK_SIZE: u32 = stackpulse::record::MAX_SAMPLE_USER_STACK;
@@ -91,24 +92,18 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let product = command_display_name(&options.command);
-    let started_at = SystemTime::now();
-    let started_at_us = started_at.duration_since(UNIX_EPOCH)?.as_micros() as u64;
-
-    let suspended = SuspendedLaunchedProcess::launch_in_suspended_state(
-        options.command.as_os_str(),
-        &options.command_args,
-        &[],
-    )?;
-    let pid = suspended.pid();
-    let pid_i32 = pid.get();
     let spool = options.spool.clone().unwrap_or_else(|| {
-        env::temp_dir().join(format!(
-            "stackpulse-gecko-{}-{pid}.spool",
-            std::process::id()
-        ))
+        env::temp_dir().join(format!("stackpulse-gecko-{}.spool", std::process::id()))
     });
-
-    let (summary, command_status) = record_until_exit(&options, &spool, suspended, started_at_us)?;
+    let launch = Launch::new(&options.command).args(&options.command_args);
+    let prepared = Recorder::builder(stackpulse::SampleRate::hz(options.frequency)?)
+        .stack_size(STACK_SIZE)
+        .include_kernel(options.include_kernel)
+        .scope(ProcessScope::Descendants)
+        .prepare(launch, Spool::retained(File::create(&spool)?)?)?;
+    let pid_i32 = prepared.pid().get();
+    let started_at = prepared.metadata().started_at();
+    let (summary, command_status) = record_until_exit(prepared)?;
     let reader = Snapshot::open(&spool)?;
     let profile = build_profile(&reader, &product, pid_i32, started_at, options.frequency)?;
     write_profile(&profile, &options.output)?;
@@ -132,25 +127,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 }
 
 fn record_until_exit(
-    options: &Options,
-    spool: &Path,
-    suspended: SuspendedLaunchedProcess,
-    started_at_us: u64,
+    prepared: PreparedRecording,
 ) -> Result<(RecordingSummary, ExitStatus), Box<dyn std::error::Error>> {
-    let pid = suspended.pid();
-    let mut recorder = Recorder::attach(
-        pid,
-        spool,
-        AttachMode::OnExec,
-        RecorderOptions::new(stackpulse::SampleRate::hz(options.frequency)?)
-            .stack_size(STACK_SIZE)
-            .include_kernel(options.include_kernel)
-            .inherit_children(true)
-            .start_timestamp_us(started_at_us)
-            .sample_interval_us((1_000_000 / u64::from(options.frequency)).max(1)),
-    )?;
-
-    let mut running = suspended.unsuspend_and_run()?;
+    let (mut recorder, mut running) = prepared.start()?;
     let command_status = loop {
         recorder.poll(Duration::from_millis(100))?;
         if let Some(status) = running.try_wait()? {
@@ -210,7 +189,10 @@ fn build_profile(
     profile.set_symbolicated(true);
 
     let categories = Categories::new(&mut profile);
-    let first_sample_ns = reader.samples().first().map_or(0, |s| s.timestamp_ns);
+    let first_sample_ns = reader
+        .samples()
+        .next()
+        .map_or(0, |s| s.monotonic_timestamp().as_nanos() as u64);
     let mut state = ExportState::new(main_pid, product.to_string());
     state.ensure_thread(
         &mut profile,
@@ -220,33 +202,31 @@ fn build_profile(
     );
 
     let mut symbolizer = reader.symbolizer().build()?;
-    for stack in reader.stacks() {
-        let sample = stack.sample();
-        let timestamp_ns = sample.timestamp_ns.saturating_sub(first_sample_ns);
+    for sample in reader.samples() {
+        let timestamp_ns =
+            (sample.monotonic_timestamp().as_nanos() as u64).saturating_sub(first_sample_ns);
         let timestamp = Timestamp::from_nanos_since_reference(timestamp_ns);
         let (thread, cpu_delta) = {
             let thread = state.ensure_thread(
                 &mut profile,
-                sample.process_id.get(),
-                u64::try_from(sample.thread_id.get()).unwrap_or_default(),
+                sample.pid().get(),
+                u64::try_from(sample.tid().get()).unwrap_or_default(),
                 timestamp_ns,
             );
             let cpu_delta = thread
                 .last_sample_timestamp_ns
                 .map_or(CpuDelta::ZERO, |previous| {
-                    CpuDelta::from_nanos(sample.timestamp_ns.saturating_sub(previous))
+                    CpuDelta::from_nanos(
+                        (sample.monotonic_timestamp().as_nanos() as u64).saturating_sub(previous),
+                    )
                 });
-            thread.last_sample_timestamp_ns = Some(sample.timestamp_ns);
+            thread.last_sample_timestamp_ns = Some(sample.monotonic_timestamp().as_nanos() as u64);
             (thread.handle, cpu_delta)
         };
 
         let mut frames = Vec::new();
-        for frame in symbolizer.resolve(stack)? {
-            if matches!(
-                frame,
-                ResolvedFrame::Native(native)
-                    if native.flags.contains(FrameFlags::TRUNCATED_STACK)
-            ) {
+        for frame in symbolizer.resolve(sample.stack())?.frames() {
+            if matches!(frame, ResolvedFrame::TruncatedStack) {
                 frames.push(GeckoFrame::TruncatedStack);
             } else {
                 frames.push(GeckoFrame::Resolved(frame.clone()));
@@ -389,13 +369,12 @@ fn category_for_frame(frame: &GeckoFrame, categories: Categories) -> CategoryPai
     }
     match frame {
         GeckoFrame::TruncatedStack => categories.other,
-        GeckoFrame::Resolved(ResolvedFrame::Native(frame)) => match frame.kind {
-            FrameKind::Python => categories.python,
-            FrameKind::Native => categories.native,
-            FrameKind::Kernel => categories.kernel,
-            FrameKind::Unknown => categories.other,
-            _ => categories.other,
+        GeckoFrame::Resolved(ResolvedFrame::Native(frame)) => match frame.address_space {
+            AddressSpace::User if frame.symbol.is_none() => categories.other,
+            AddressSpace::User => categories.native,
+            AddressSpace::Kernel => categories.kernel,
         },
+        GeckoFrame::Resolved(ResolvedFrame::TruncatedStack) => categories.other,
         GeckoFrame::Resolved(ResolvedFrame::Python(_)) => categories.python,
     }
 }
@@ -403,7 +382,8 @@ fn category_for_frame(frame: &GeckoFrame, categories: Categories) -> CategoryPai
 fn is_python_frame(frame: &GeckoFrame) -> bool {
     match frame {
         GeckoFrame::Resolved(ResolvedFrame::Python(_)) => true,
-        GeckoFrame::Resolved(ResolvedFrame::Native(frame)) => frame.kind == FrameKind::Python,
+        GeckoFrame::Resolved(ResolvedFrame::Native(_)) => false,
+        GeckoFrame::Resolved(ResolvedFrame::TruncatedStack) => false,
         GeckoFrame::TruncatedStack => false,
     }
 }
@@ -422,7 +402,7 @@ fn intern_label_for_frame(
             let module = symbol.module_basename();
             if is_addressish_symbol_name(name, module) {
                 Cow::Owned(format!("[unknown native frame in {module}]"))
-            } else if frame.kind == FrameKind::Kernel && module != "[kernel]" {
+            } else if frame.address_space == AddressSpace::Kernel && module != "[kernel]" {
                 let key = KernelModuleLabelKey {
                     name: Rc::clone(symbol.name_rc()),
                     module: Rc::clone(&symbol.module),
@@ -446,7 +426,9 @@ fn intern_label_for_frame(
 
 fn label_for_frame(frame: &GeckoFrame) -> Cow<'_, str> {
     match frame {
-        GeckoFrame::TruncatedStack => Cow::Borrowed(TRUNCATED_STACK_LABEL),
+        GeckoFrame::TruncatedStack | GeckoFrame::Resolved(ResolvedFrame::TruncatedStack) => {
+            Cow::Borrowed(TRUNCATED_STACK_LABEL)
+        }
         GeckoFrame::Resolved(ResolvedFrame::Python(frame)) => {
             if frame.file_name().is_empty() {
                 Cow::Borrowed(frame.func_name.as_ref())
@@ -463,7 +445,7 @@ fn label_for_frame(frame: &GeckoFrame) -> Cow<'_, str> {
             if is_addressish_symbol_name(name, module) {
                 return Cow::Owned(format!("[unknown native frame in {module}]"));
             }
-            if frame.kind == FrameKind::Kernel && module != "[kernel]" {
+            if frame.address_space == AddressSpace::Kernel && module != "[kernel]" {
                 return Cow::Owned(format!("{name} {module}"));
             }
             Cow::Borrowed(name)
@@ -550,6 +532,7 @@ fn parse_u32(value: OsString) -> Result<u32, String> {
 
 fn default_frequency() -> u32 {
     stackpulse::record::max_sample_rate()
+        .ok()
         .and_then(|limit| u32::try_from(limit.min(999)).ok())
         .filter(|&limit| limit > 0)
         .unwrap_or(999)
@@ -582,7 +565,33 @@ mod tests {
     use super::*;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::{fork, ForkResult};
-    use stackpulse::profile::{LocationInfo, PythonFrame};
+    use stackpulse::profile::{NativeFrame, NativeSymbol, PythonFrame};
+
+    #[test]
+    fn native_address_categories_preserve_unknown_frames() {
+        let mut profile = Profile::new(
+            "test",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_hz(1.0),
+        );
+        let categories = Categories::new(&mut profile);
+        for (address_space, symbol, expected) in [
+            (AddressSpace::User, None, categories.other),
+            (AddressSpace::Kernel, None, categories.kernel),
+            (
+                AddressSpace::User,
+                Some(NativeSymbol::new("module+0x34", "module")),
+                categories.native,
+            ),
+        ] {
+            let frame = GeckoFrame::Resolved(ResolvedFrame::Native(NativeFrame {
+                address_space,
+                symbol,
+                ..NativeFrame::from_address(0x1234)
+            }));
+            assert_eq!(category_for_frame(&frame, categories), expected);
+        }
+    }
 
     #[test]
     fn command_exit_code_is_preserved() {
@@ -623,10 +632,7 @@ mod tests {
         let categories = Categories::new(&mut profile);
         let frame = GeckoFrame::Resolved(ResolvedFrame::Python(PythonFrame::new(
             "example.py",
-            LocationInfo::default(),
             "work",
-            None,
-            true,
         )));
         let mut kernel_module_labels = HashMap::new();
         let frame_info = frame_info_for_resolved_frame(

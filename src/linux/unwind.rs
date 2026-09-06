@@ -181,7 +181,7 @@ fn module_to_framehop(
     };
 
     Some(framehop::Module::new(
-        crate::path_name(module.path.as_path()).to_owned(),
+        crate::path_name(module.path()).to_owned(),
         module.start..module.end,
         image_base.avma,
         explicit_info,
@@ -209,11 +209,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: std::env::current_exe()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-                .into(),
+            path: std::env::current_exe().unwrap().into(),
         };
         let mut child = parent.clone();
         child.id = 2;
@@ -259,11 +255,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: std::fs::canonicalize("/bin/true")
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-                .into(),
+            path: std::fs::canonicalize("/bin/true").unwrap().into(),
         };
         let update = ModuleUpdate {
             active: vec![ModuleActivation {
