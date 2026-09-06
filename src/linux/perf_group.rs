@@ -425,13 +425,9 @@ impl PerfGroup {
             return Ok(());
         }
 
-        let cpu_ids = online_cpu_ids()?;
-        let cpu_count = cpu_ids.len();
-        let frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
+        let mut cpu_ids = Vec::new();
+        let mut frequency = u64::from(self.frequency);
         let mut pending = self.pending_events();
-        pending
-            .perfs
-            .reserve(cpu_count.saturating_mul(thread_forks.len()));
         let mut tracked_threads =
             FxHashMap::with_capacity_and_hasher(thread_forks.len(), Default::default());
 
@@ -454,6 +450,13 @@ impl PerfGroup {
                 continue;
             }
 
+            if cpu_ids.is_empty() {
+                cpu_ids = online_cpu_ids()?;
+                frequency = frequency_for_mode(self.frequency, FrequencyMode::ClampToKernelMax);
+                pending
+                    .perfs
+                    .reserve(cpu_ids.len().saturating_mul(thread_forks.len()));
+            }
             if let Some(inherits) = self.try_open_thread_perfs(
                 TaskTarget { tid, owner_pid },
                 &cpu_ids,
@@ -1441,26 +1444,29 @@ mod tests {
             .tracked_threads
             .insert(100, ThreadTrack::new(100, true));
 
-        group
-            .open_forked_threads(&[
-                ThreadFork {
-                    tid: 101,
-                    owner_pid: 100,
-                    parent_tid: 100,
-                },
-                ThreadFork {
-                    tid: 102,
-                    owner_pid: 100,
-                    parent_tid: 101,
-                },
-                ThreadFork {
-                    tid: 101,
-                    owner_pid: 100,
-                    parent_tid: 100,
-                },
-            ])
-            .expect("track forked threads");
+        let allocations = allocation_counter::measure(|| {
+            group
+                .open_forked_threads(&[
+                    ThreadFork {
+                        tid: 101,
+                        owner_pid: 100,
+                        parent_tid: 100,
+                    },
+                    ThreadFork {
+                        tid: 102,
+                        owner_pid: 100,
+                        parent_tid: 101,
+                    },
+                    ThreadFork {
+                        tid: 101,
+                        owner_pid: 100,
+                        parent_tid: 100,
+                    },
+                ])
+                .expect("track forked threads");
+        });
 
+        assert!(allocations.count_total <= 2, "{allocations:?}");
         assert_eq!(
             group.tracked_threads.get(&101),
             Some(&ThreadTrack::new(100, true))
@@ -1470,6 +1476,39 @@ mod tests {
             Some(&ThreadTrack::new(100, true))
         );
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn failed_explicit_thread_open_preserves_inherited_batch_bookkeeping() {
+        let mut group = PerfGroup::new(PerfGroupOptions {
+            stack_size: MAX_SAMPLE_USER_STACK + 1,
+            ..TEST_OPTIONS
+        })
+        .unwrap();
+        group
+            .tracked_threads
+            .insert(100, ThreadTrack::new(100, true));
+        let error = group
+            .open_forked_threads(&[
+                ThreadFork {
+                    tid: 101,
+                    owner_pid: 100,
+                    parent_tid: 100,
+                },
+                ThreadFork {
+                    tid: 200,
+                    owner_pid: 200,
+                    parent_tid: 999,
+                },
+            ])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("sample_user_stack"));
+        assert_eq!(group.tracked_threads.len(), 1);
+        assert_eq!(group.tracked_threads[&100], ThreadTrack::new(100, true));
+        assert!(group.members.is_empty());
+        assert!(group.outputs.is_empty());
     }
 
     #[test]
