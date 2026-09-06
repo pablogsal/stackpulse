@@ -346,16 +346,6 @@ pub enum AttachOutcome {
     Exited,
 }
 
-/// Result of reconciling an attached process's thread list.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum RefreshOutcome {
-    /// The live process's thread list was reconciled.
-    Refreshed,
-    /// The process exited before its thread list could be read.
-    Exited,
-}
-
 /// Records stack samples for one or more Linux processes.
 ///
 /// Call [`finish`](Self::finish) to drain perf rings, flush sorted events, and
@@ -1255,11 +1245,13 @@ impl<W: std::io::Write> Recorder<W> {
         self.drain_events(DrainMode::Consume)?;
         if self.last_reconcile.elapsed() >= Duration::from_millis(100) {
             self.last_reconcile = Instant::now();
-            for pid in self.processes.tracked_pids() {
-                if let Some(pid) = crate::Pid::new(pid) {
-                    if self.processes.process_is_active(pid)? {
-                        self.refresh_threads(pid)?;
-                    }
+            for (&pid, state) in &mut self.processes.states {
+                let Some(pid) = crate::Pid::new(pid) else {
+                    continue;
+                };
+                if state.tracking.poll_alive_checked(pid)?.unwrap_or(false) {
+                    self.perf.refresh_threads(pid.get_u32())?;
+                    refresh_recording_summary(&mut self.summary, &self.perf);
                 }
             }
         }
@@ -1393,29 +1385,6 @@ impl<W: std::io::Write> Recorder<W> {
         refresh_recording_summary(&mut self.summary, &self.perf);
         self.disable_on_drop = true;
         Ok(AttachOutcome::Attached)
-    }
-
-    /// Discover newly-created threads for `pid` when needed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) when
-    /// `pid` is not attached, or an I/O error when thread discovery fails.
-    pub(crate) fn refresh_threads(&mut self, pid: crate::Pid) -> crate::Result<RefreshOutcome> {
-        if !self.processes.is_tracked(pid.get()) {
-            return Err(crate::Error::message(
-                crate::ErrorKind::InvalidInput,
-                format!("process {pid} is not attached"),
-            ));
-        }
-        let refreshed = self.perf.refresh_threads(pid.get_u32())?;
-        refresh_recording_summary(&mut self.summary, &self.perf);
-        Ok(if refreshed {
-            self.disable_on_drop = true;
-            RefreshOutcome::Refreshed
-        } else {
-            RefreshOutcome::Exited
-        })
     }
 
     /// Drain all collected events, force loss bookkeeping and recovery, then
