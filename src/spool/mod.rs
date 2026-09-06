@@ -3377,16 +3377,12 @@ impl<'a> Stack<'a> {
                 },
             })
     }
-    pub(crate) fn into_parts(self) -> (StackKey, crate::Pid, StackFrames<'a>) {
-        (self.key, self.pid(), self.raw_frames())
-    }
-
     #[expect(
         clippy::expect_used,
         reason = "sample stack ids are validated while decoding the spool"
     )]
     #[inline]
-    fn raw_frames(&self) -> StackFrames<'a> {
+    pub(crate) fn raw_frames(&self) -> StackFrames<'a> {
         self.definitions
             .stack_frame_refs(self.key.stack_id)
             .expect("sample stack ids were validated while decoding the spool")

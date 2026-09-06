@@ -1095,7 +1095,8 @@ impl Symbolizer {
     /// Native backend failures use
     /// [`ErrorKind::NativeSymbolizer`](crate::ErrorKind::NativeSymbolizer).
     pub fn resolve(&mut self, stack: spool::Stack<'_>) -> crate::Result<ResolvedStack<'_>> {
-        let (key, process, mut frames) = stack.into_parts();
+        let key = stack.key();
+        let process = stack.pid();
         match self.source_id {
             Some(source_id) if !key.belongs_to(source_id) => {
                 return Err(crate::Error::message(
@@ -1122,6 +1123,7 @@ impl Symbolizer {
             self.clear_resolution_cache();
         }
 
+        let mut frames = stack.raw_frames();
         self.begin_frame_batch(frames.len());
         let mut pending = frames.clone();
         while let Some(frame_ref) = pending.next_with_id() {

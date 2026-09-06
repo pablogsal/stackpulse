@@ -304,10 +304,10 @@ impl NativeFrame {
 /// A resolved frame from a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Frame {
-    /// Python frame.
-    Python(PythonFrame),
     /// Native, kernel, or address-only frame.
     Native(NativeFrame),
+    /// Python frame.
+    Python(PythonFrame),
     /// The captured stack bytes ended before the stack root.
     TruncatedStack,
 }
