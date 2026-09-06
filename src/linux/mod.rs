@@ -3934,6 +3934,30 @@ mod recording_lifecycle_tests {
     }
 
     #[test]
+    fn periodic_reconciliation_preserves_process_tracking() {
+        let child = crate::test_support::SleepChild::spawn();
+        let pid = crate::Pid::new(child.pid_i32()).unwrap();
+        let mut recorder = empty_recorder(Vec::new());
+        recorder.root_pid = pid;
+        recorder.processes = ProcessTable::default();
+        recorder.processes.ensure_tracked(pid.get());
+        recorder.processes.state_mut(std::process::id() as i32);
+        recorder.last_reconcile = Instant::now() - Duration::from_secs(1);
+        let previous_reconcile = recorder.last_reconcile;
+
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(recorder.last_reconcile > previous_reconcile);
+        assert!(summary.root_active());
+        assert_eq!(summary.active_processes(), 1);
+        assert!(!recorder.processes.is_tracked(std::process::id() as i32));
+
+        drop(child);
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(!summary.root_active());
+        assert_eq!(summary.active_processes(), 0);
+    }
+
+    #[test]
     fn reader_observes_finish_and_abandoned_recording() {
         for finish in [false, true] {
             let dir = TempDir::new("recorder-completion");
