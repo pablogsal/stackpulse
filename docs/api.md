@@ -1,83 +1,124 @@
-StackPulse is a Rust library for building Linux profilers with `perf_event`.
-[`Recorder`] captures CPU stack samples from running processes and writes
-them to a compact spool file. [`Snapshot`] loads that file back, and
-[`Symbolizer`] resolves the recorded addresses into frames with names and
-source locations, ready for whatever aggregation or output your profiler does
-with them.
+StackPulse records Linux CPU stack samples and resolves native, Python, JIT,
+and kernel frames. Capture writes a compact spool; consumers can replay a
+finished recording or process published batches while capture continues.
 
-# Quick example
+# Record and replay
 
 ```rust,no_run
+use std::fs::File;
 use std::time::{Duration, Instant};
-use stackpulse::{AttachMode, Pid, Recorder, RecorderOptions, SampleRate, Snapshot};
+use stackpulse::{Pid, Recorder, SampleRate, Snapshot, Spool};
 # fn run(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-let pid = Pid::try_from(pid)?;
-let mut recorder = Recorder::attach(
-    pid,
-    "profile.spool",
-    AttachMode::StopWhileAttaching,
-    RecorderOptions::new(SampleRate::hz(99)?).stack_size(60 * 1024),
-)?;
+let mut recorder = Recorder::builder(SampleRate::hz(99)?)
+    .stack_size(60 * 1024)
+    .attach(Pid::try_from(pid)?, Spool::retained(File::create("profile.spool")?)?)?;
 
 let deadline = Instant::now() + Duration::from_secs(10);
-while Instant::now() < deadline && recorder.process_is_active(pid)? {
-    recorder.poll(Duration::from_millis(100))?;
+while Instant::now() < deadline {
+    let activity = recorder.poll(Duration::from_millis(100))?;
+    if activity.active_processes() == 0 && !activity.pending_events() {
+        break;
+    }
 }
 recorder.finish()?;
 
-let reader = Snapshot::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build()?;
-
-for stack in reader.stacks() {
-    for frame in symbolizer.resolve(stack)? {
-        println!("{}", frame.display_name());
+let recording = Snapshot::open("profile.spool")?;
+let mut symbols = recording.symbolizer().build()?;
+for sample in recording.samples() {
+    let stack = symbols.resolve(sample.stack())?;
+    for frame in stack.frames() {
+        println!("{frame}");
     }
 }
 # Ok(())
 # }
 ```
 
-# Core types
+# Public modules
 
-| Type | Role |
+| Module | Responsibility |
 | --- | --- |
-| [`Recorder`] | Attaches to one or more processes, drains `perf_event_open` ring buffers, writes a spool file. |
-| [`Snapshot`] | Reads a completed spool into memory for random access. |
-| [`Replay`] | Validates a spool, retains its definitions, and decodes samples sequentially to reduce memory use for large profiles. |
-| [`Tail`] | Decodes bounded batches from a growing spool for live processing. |
-| [`Symbolizer`] | Resolves raw frame addresses using ELF symbols, kernel symbols, Python perf maps, and address fallbacks. The native ELF backend is pluggable via [`symbolize::NativeSymbolizer`]. |
-| [`symbolize::NativeSymbolizer`] | Trait for swapping in your own native symbolizer (custom debuginfod, debug-dir, or source-info policy). [`Symbolizer`] still handles kernel and perf-map frames. |
-| [`profile`] types | Resolved frame data types: what an aggregator, UI, or exporter consumes. |
+| [`record`] | Recorder configuration, preparation, progress, diagnostics, and completion errors. |
+| [`process`] | Validated IDs, child launching, identity-bound process handles, and discovery. |
+| [`spool`] | Storage policy, publication-aware live readers, replay, samples, and raw stacks. |
+| [`symbolize`] | Source-bound resolution, live sessions, transformed stack caches, and native backends. |
+| [`profile`] | Resolved frame collections, frame identities, and symbol/source metadata. |
 
-The recorder writes a self-contained spool file. Symbolization reads it later
-and can run on another host if the same binaries and perf maps are available.
+A [`spool::Sample`] is one observation with a PID, TID, monotonic timestamp,
+optional correlated wall time, and an interned [`spool::Stack`]. Its stack
+contains raw frames joined with the mappings recorded for that process.
+[`profile::ResolvedStack`] is a repeatable borrowed collection; `frames()`
+yields frames and `iter()` yields their owner-qualified cache keys as well.
 
-# Vocabulary
+# Live processing
 
-- A sample is one timestamped observation of one thread.
-- A module is an executable memory range: a binary, shared object,
-  anonymous JIT mapping, or kernel range.
-- A raw frame is an address recorded in the spool file.
-- A resolved frame is a displayable [`profile::ResolvedFrame`] produced by
-  [`Symbolizer`].
-- A spool file is the compact on-disk profile written by [`Recorder`].
-
-# Raw replay
-
-Recording never depends on symbolization: the spool stores raw instruction
-pointers together with the module mappings observed at capture time. An
-application that already has its own symbol pipeline can skip
-[`Symbolizer`] and consume those raw frames directly:
+A recorder creates one [`LiveReader`] through `take_reader()`. Move the reader
+into your replay worker, then build its symbolization session there. Capture
+continues on the recording thread. Polling the recorder services its configured
+publication interval; StackPulse does not create a background capture thread.
 
 ```rust,no_run
-# fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = stackpulse::Snapshot::open("profile.spool")?;
+use std::time::Duration;
+use stackpulse::{LiveReader, ReadStatus};
+# fn replay(reader: &mut LiveReader) -> Result<(), Box<dyn std::error::Error>> {
+let mut session = reader.symbolizer().build()?;
+loop {
+    match session.poll(Duration::from_millis(100))? {
+        ReadStatus::Batch(mut batch) => {
+            for sample in batch.samples() {
+                for frame in batch.resolve(sample.stack())?.frames() {
+                    println!("{frame}");
+                }
+            }
+        }
+        ReadStatus::Pending => {}
+        ReadStatus::Finished(_) => break,
+    }
+}
+# Ok(())
+# }
+```
 
-for stack in reader.stacks() {
-    for context in stack.contexts() {
-        let ip = context.frame.abs_ip;
-        if let Some(module) = context.module {
-            // Pass `ip`, `module.module`, and `module.file_relative_ip` to your symbolizer.
+A batch borrows its session exclusively. Finish using its samples and resolved
+frames before polling again. The session applies symbol updates before exposing
+samples, and checks fallible native refreshes before advancing the reader.
+
+`Spool::retained(file)` preserves replay from the beginning.
+`Spool::disposable(file)` authorizes the linked reader to reclaim complete
+pages from the preceding delivered batch when it advances. Unsupported hole
+punching is remembered; other reclamation errors are returned before advancing.
+Drive the reader through `Finished` to reclaim the final batch. Dropping a batch
+does not perform filesystem I/O.
+
+[`ReadStatus::Pending`] means temporary exhaustion. `Finished` means the
+producer finished successfully and all published data has been consumed.
+Abandoned or failed recording returns an error after its valid published
+prefix. An external [`Tail`] has no producer completion channel and must be
+driven according to the external writer's lifecycle.
+
+# Prepared stack values
+
+Use `session.cache_stacks::<T>(capacity)` when your collector can reuse a
+prepared representation. StackPulse owns the bounded cache, process
+invalidation, and the rule that provisional resolutions cannot be retained.
+A zero capacity disables storage.
+
+```rust,no_run
+use stackpulse::{LiveReader, ReadStatus};
+use stackpulse::symbolize::StackEntry;
+use std::time::Duration;
+# fn replay(reader: &mut LiveReader) -> Result<(), Box<dyn std::error::Error>> {
+let mut session = reader.symbolizer().build()?.cache_stacks::<Vec<String>>(4096);
+if let ReadStatus::Batch(mut batch) = session.poll(Duration::ZERO)? {
+    for sample in batch.samples() {
+        match batch.entry(sample.stack())? {
+            StackEntry::Occupied(value) => println!("{value:?}"),
+            StackEntry::Vacant(entry) => {
+                let resolved = entry.resolve()?;
+                let value = resolved.stack().frames().map(ToString::to_string).collect();
+                let prepared = resolved.insert(value);
+                println!("{:?}", &*prepared);
+            }
         }
     }
 }
@@ -85,176 +126,73 @@ for stack in reader.stacks() {
 # }
 ```
 
-`SampleStack::contexts` does not symbolize anything. It binds each borrowed raw
-frame to the module mapping StackPulse recorded at capture time, which is what
-an external symbolizer needs to translate the address, even across remaps.
+On a miss, callers may inspect resolved frames and reject a sample before
+allocating their prepared value. `insert` returns a guard borrowing a cached
+value or owning a transient value. Cache hits do not resolve symbols.
 
-# Sequential replay
+The cache bounds its stored values, not a collector's independent handle arena.
+Before resetting such an arena, flush pending samples, call `batch.clear_cache()`,
+and reset the collector. Consume an outstanding vacant entry with `into_stack()`
+to release its borrow before that sequence, then reacquire the entry.
 
-For large profiles, use [`Replay`] to avoid retaining every
-[`spool::SampleRecord`] in memory:
+# Native symbolization
 
-```rust,no_run
-use stackpulse::Replay;
-# fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = Replay::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer().build()?;
+Supply `native(factory)` or `try_native(factory)` to replace the optional
+built-in backend. [`symbolize::NativeSymbolizer`] receives a
+[`symbolize::NativeBatch`] with immutable lookup requests and paired mutable
+results. Return a persistent generation from `refresh()` when previously
+resolved symbols may have changed. The live session invalidates affected
+processes before callers can reuse their prepared stacks.
 
-for stack in reader.stacks() {
-    for frame in symbolizer.resolve(stack)? {
-        println!("{}", frame.display_name());
-    }
-}
-# Ok(())
-# }
+[`symbolize::NativeImage`] retains an open file and implements `AsFd`; use
+`proc_path()` for engines that require a path. Keep the image owner alive while
+using its descriptor or path. Mapping retirement does not invalidate another
+mapping's retained image owner. File identity does not promise immutable file
+contents.
+
+Native filesystem paths preserve operating-system bytes. Python source names
+remain strings because they may be pseudo-filenames rather than filesystem
+paths. Native runtime classification and default visibility are independent.
+Truncation is [`profile::Frame::TruncatedStack`], not an address-only frame.
+
+# Frame metadata
+
+Construct symbols from their name and module; attach source positions and offsets
+when available. Shared `Rc<str>` inputs retain their existing string allocations.
+
+```rust
+use stackpulse::profile::{NativeSymbol, PythonFrame, PythonSourceLocation, SourceLocation};
+
+let symbol = NativeSymbol::new("evaluate", "libpython.so")
+    .with_source(SourceLocation { line: Some(42), ..Default::default() })
+    .with_offset(16);
+
+let mut frame = PythonFrame::new("worker.py", "run");
+frame.location = PythonSourceLocation {
+    line: Some(42),
+    column: Some(0),
+    ..Default::default()
+};
+assert!(!symbol.is_hidden_by_default());
 ```
 
-Opening still validates the complete spool and retains modules, frames,
-interned stacks, threads, and runtime markers; only the samples themselves are
-decoded on the fly as the iterator advances. The file must remain unchanged
-while the reader is alive. Use [`Snapshot`] instead when you need
-random access to `samples()`.
+Python positions use `None` for unknown coordinates and zero-based byte columns.
+Native source columns retain their separate one-based convention. Borrowed frame
+accessors expose strings without copying; shared string accessors allow collectors
+to retain the same allocation after the resolved stack borrow ends.
 
-# Live tailing
+# Errors and resources
 
-Use [`Tail`] when recording and processing run concurrently. Apply each batch
-to its symbolizer before resolving the batch's stacks. With
-[`StackCache::External`], discard prepared stacks selected by the returned
-[`symbolize::Invalidation`] before resolving more samples.
+`recorder.last_poll()` returns the previous poll summary without performing I/O.
+`record::max_sample_rate()` returns `io::Result<u64>` so callers can propagate a
+failed kernel-limit read or explicitly choose a fallback.
 
-Prefer [`Recorder::tail`] when the recorder and tail live in one process. It
-shares handles still held by the recorder's bounded image cache, so deleted or
-replaced files can still be symbolized exactly while their images remain in
-that cache. `Tail::open` has only the paths stored in the spool.
+[`Error`] preserves a category, source, and available OS/frequency-limit details.
+[`record::FinishError`] retains final recording counters and the cleanup error
+chain. A terminal writer failure prevents new records; a custom writer can
+still perform its own work during `Drop`. Live readers only consume successfully
+published complete-record offsets.
 
-```rust,no_run
-use stackpulse::{StackCache, Tail};
-# fn run() -> Result<(), Box<dyn std::error::Error>> {
-let mut tail = Tail::open("profile.spool")?;
-let mut symbolizer = tail.symbolizer().stack_cache(StackCache::External).build()?;
-
-// Call this function after each writer flush and once after the writer finishes.
-fn process_visible(
-    tail: &mut Tail,
-    symbolizer: &mut stackpulse::Symbolizer,
-) -> stackpulse::Result<()> {
-  loop {
-    let batch = tail.poll()?;
-    let invalidation = symbolizer.update(&batch)?;
-    invalidate_prepared_stacks(|pid| invalidation.affects_process(pid));
-
-    for stack in batch.stacks() {
-        for frame in symbolizer.resolve(stack)? {
-            aggregate(frame);
-        }
-    }
-
-    if !batch.has_more() {
-        break;
-    }
-  }
-  Ok(())
-}
-# Ok(())
-# }
-# fn invalidate_prepared_stacks(_: impl Fn(stackpulse::Pid) -> bool) {}
-# fn aggregate(_: &stackpulse::profile::ResolvedFrame) {}
-```
-
-`TailBatch` borrows the tail's reusable sample storage. Finish processing and
-drop the batch before polling again. `has_more()` means another complete batch
-may already be visible, not that the writer is still running. Poll again
-promptly when it is true. When it is false, wait for the writer to flush or
-finish before polling again. A final incomplete record is retried after the
-writer appends the remainder.
-
-`Symbolizer::update` verifies that the batch and symbolizer came from the same
-tail. It installs new definitions, refreshes live perf maps and kernel symbols,
-and retires resources only after the last batch that can reference them has
-been processed. An invalidation can target individual processes or every
-prepared stack. Callers using `StackCache::Internal` do not maintain that
-external state, but must still call `update` before `resolve`.
-
-External caches can use [`symbolize::ResolvedFrameId`] to reuse converted
-frames across different stacks. IDs are unique for one symbolizer and are
-never reused. Cache a whole resolved stack only when
-[`symbolize::ResolvedStack::is_cacheable`] is true; otherwise a temporary
-native-image failure would preserve an address-only result permanently.
-
-# Plugging in an external native symbolizer
-
-The default constructors install the bundled `wholesym` backend for native
-ELF symbol lookup. To replace it, implement [`symbolize::NativeSymbolizer`] and pass a
-factory to [`SymbolizerBuilder::native`]. StackPulse groups native lookups by
-process and passes them to the backend in batches. Each [`symbolize::NativeLookup`]
-contains the selected module and the absolute, relative, and image addresses:
-
-```rust,no_run
-use stackpulse::symbolize::{NativeLookup, NativeSymbolizer, NativeSymbols};
-use stackpulse::Snapshot;
-
-struct MySymbolizer { /* your wholesym / debuginfod / dwarf state */ }
-
-impl NativeSymbolizer for MySymbolizer {
-    type Error = std::convert::Infallible;
-
-    fn symbolize(
-        &mut self,
-        requests: &[NativeLookup],
-        output: &mut Vec<NativeSymbols>,
-    ) -> Result<(), Self::Error> {
-        for request in requests {
-            let _ = (request.module().path(), request.image_address());
-            output.push(NativeSymbols::unresolved());
-        }
-        Ok(())
-    }
-}
-
-# fn run() -> Result<(), Box<dyn std::error::Error>> {
-let reader = Snapshot::open("profile.spool")?;
-let mut symbolizer = reader.symbolizer()
-    .native(|_pid| MySymbolizer { /* ... */ })
-    .build()?;
-# Ok(())
-# }
-```
-
-Kernel frames (`/proc/kallsyms`) and Python or JIT perf maps
-(`/tmp/perf-<pid>.map`) stay inside [`Symbolizer`]; the plug-in only sees
-native module addresses. Consumers that always supply a native symbolizer can
-disable StackPulse's default features to omit `wholesym` and Tokio. In that
-configuration [`Symbolizer::has_native_backend`] is `false` until `native(...)`
-installs one; native frames otherwise resolve to address-only values.
-
-Backend tests can construct requests directly with
-[`symbolize::NativeModule::new`] and [`symbolize::NativeLookup::new`]. Each
-synthetic module gets a distinct opaque image identity. Its `image_path()` is
-`None`; recorded modules expose that path only when StackPulse retained the
-exact validated file backing the Linux mapping.
-
-During live tailing, [`symbolize::NativeSymbolizer::retire_module`] reports
-when a mapping is no longer active. Backends should use it to discard
-mapping-specific indexes. State shared by `NativeModule::image_id()` can stay
-cached until the last mapping for that image is retired.
-
-Symbol results can be provisional when a retryable error prevents StackPulse
-from opening a validated native image. A later resolution attempt can replace
-that address-only fallback with more specific symbols. External stack caches
-should avoid permanently caching those temporary fallbacks.
-
-# Runtime requirements
-
-StackPulse runs on Linux and uses `perf_event_open`, `/proc`, ELF metadata,
-optional `/proc/kallsyms`, and optional Python perf maps under `/tmp`.
-
-User-space recording works as the same user that owns the target. Kernel
-frames, containers, hardened systems, and aggressive sample rates may need
-extra capabilities (typically `CAP_PERFMON`) or a relaxed
-`perf_event_paranoid` setting. See the Permissions section in the
-explanation chapter for the full breakdown.
-
-# Guide
-
-The [guide](crate::docs) walks through process attachment, startup capture,
-configuration, symbolization, diagnostics, and the SPULSE file format.
+Disk reclamation does not reclaim the decoded definition tables needed by later
+samples. Observe reader statistics when operating long-running recordings.
+Linux perf permissions and kernel symbol visibility remain host requirements.

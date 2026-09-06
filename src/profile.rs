@@ -8,18 +8,13 @@ pub fn is_python_runtime_basename(name: &str) -> bool {
     crate::is_python_module(name)
 }
 
-/// High-level frame category.
+/// Address space containing a native instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum FrameKind {
-    /// Python frame.
-    Python,
-    /// Native user-space frame.
-    Native,
-    /// Kernel frame.
+pub enum AddressSpace {
+    /// User-space instruction.
+    User,
+    /// Kernel-space instruction.
     Kernel,
-    /// Frame that could not be classified.
-    Unknown,
 }
 
 /// Where a symbol name came from.
@@ -37,7 +32,7 @@ pub enum SymbolOrigin {
 }
 
 bitflags! {
-    /// Per-frame classification flags attached to every [`ResolvedFrame`].
+    /// Per-frame classification flags attached to every [`Frame`].
     ///
     /// Flags are additive. Consumers commonly use these to hide
     /// implementation-detail frames in default views (see
@@ -50,39 +45,21 @@ bitflags! {
         const HIDDEN_DEFAULT = 1 << 2;
         /// Frame came from a JIT-emitted code region (perf-map entry).
         const JIT = 1 << 3;
-        /// Sentinel frame marking where native unwinding stopped because the
-        /// captured stack bytes were exhausted (`stack_size` too small for
-        /// the full stack), not a real (or failed) address resolution.
-        const TRUNCATED_STACK = 1 << 4;
+
     }
 }
 
-/// Optional source-position information attached to a [`PythonFrame`].
-///
-/// A value of `-1` for any field means "unknown"; this matches the CPython
-/// convention for missing position attributes on code objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LocationInfo {
-    /// 1-based starting line number (`-1` if unknown).
-    pub lineno: i32,
-    /// 1-based ending line number (`-1` if unknown).
-    pub end_lineno: i32,
-    /// 0-based starting column offset in bytes (`-1` if unknown).
-    pub column: i32,
-    /// 0-based ending column offset in bytes (`-1` if unknown).
-    pub end_column: i32,
-}
-
-impl Default for LocationInfo {
-    fn default() -> Self {
-        const UNKNOWN: i32 = -1;
-        Self {
-            lineno: UNKNOWN,
-            end_lineno: UNKNOWN,
-            column: UNKNOWN,
-            end_column: UNKNOWN,
-        }
-    }
+/// Optional source positions reported by CPython.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PythonSourceLocation {
+    /// Starting line number. CPython may use zero for artificial instructions.
+    pub line: Option<u32>,
+    /// Ending line number, when available.
+    pub end_line: Option<u32>,
+    /// Zero-based starting column offset in UTF-8 bytes.
+    pub column: Option<u32>,
+    /// Zero-based ending column offset in UTF-8 bytes.
+    pub end_column: Option<u32>,
 }
 
 /// A resolved Python frame.
@@ -97,14 +74,11 @@ pub struct PythonFrame {
     /// pseudo-path such as `<frozen importlib._bootstrap>`.
     file_name: Rc<str>,
     /// Source position information for the frame (line/column ranges).
-    pub location: LocationInfo,
+    pub location: PythonSourceLocation,
     /// Resolved function or method name.
     pub func_name: Rc<str>,
     /// Last executed bytecode opcode, if available.
     pub opcode: Option<u8>,
-    /// Whether this frame is the entry point of a Python call (top of an
-    /// eval-loop activation, not an inlined or continuation frame).
-    pub is_entry: bool,
     /// Classification flags for this frame.
     pub flags: FrameFlags,
     basename_start: usize,
@@ -113,21 +87,14 @@ pub struct PythonFrame {
 impl PythonFrame {
     /// Construct a resolved Python frame.
     #[must_use]
-    pub fn new(
-        file_name: impl Into<Rc<str>>,
-        location: LocationInfo,
-        func_name: impl Into<Rc<str>>,
-        opcode: Option<u8>,
-        is_entry: bool,
-    ) -> Self {
+    pub fn new(file_name: impl Into<Rc<str>>, func_name: impl Into<Rc<str>>) -> Self {
         let file_name = file_name.into();
         let basename_start = basename_start(&file_name);
         Self {
             file_name,
-            location,
+            location: PythonSourceLocation::default(),
             func_name: func_name.into(),
-            opcode,
-            is_entry,
+            opcode: None,
             flags: FrameFlags::empty(),
             basename_start,
         }
@@ -206,36 +173,43 @@ pub struct NativeSymbol {
     is_eval_frame: bool,
     /// Whether default views should hide this symbol (matches
     /// [`FrameFlags::HIDDEN_DEFAULT`] semantics).
-    should_ignore: bool,
+    is_hidden_by_default: bool,
 }
 
 impl NativeSymbol {
-    /// Build a [`NativeSymbol`] for the innermost (non-inline) frame,
-    /// with its source and module metadata.
+    /// Construct a symbol with unknown source positions and zero function offset.
     #[must_use]
-    pub fn new(
-        name: impl Into<Rc<str>>,
-        source: SourceLocation,
-        module: impl Into<Rc<str>>,
-        offset: u64,
-    ) -> Self {
+    pub fn new(name: impl Into<Rc<str>>, module: impl Into<Rc<str>>) -> Self {
         let name = name.into();
-        let module = module.into();
         Self {
             is_eval_frame: crate::symbols::is_eval_frame(&name),
             name,
-            source,
-            module,
-            offset,
+            source: SourceLocation::default(),
+            module: module.into(),
+            offset: 0,
             inline_depth: 0,
-            should_ignore: false,
+            is_hidden_by_default: false,
         }
+    }
+
+    /// Set the available source positions.
+    #[must_use]
+    pub fn with_source(mut self, source: SourceLocation) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Set the instruction's byte offset within its enclosing function.
+    #[must_use]
+    pub fn with_offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
     }
 
     /// Mark this symbol as hidden in default views.
     #[must_use]
     pub fn hidden_by_default(mut self) -> Self {
-        self.should_ignore = true;
+        self.is_hidden_by_default = true;
         self
     }
 
@@ -265,8 +239,8 @@ impl NativeSymbol {
 
     /// Whether default views should hide this symbol.
     #[must_use]
-    pub const fn should_ignore(&self) -> bool {
-        self.should_ignore
+    pub const fn is_hidden_by_default(&self) -> bool {
+        self.is_hidden_by_default
     }
 
     pub(crate) fn set_inline_depth(&mut self, depth: usize) {
@@ -292,7 +266,7 @@ pub struct NativeFrame {
     /// Resolved symbol, if symbolization succeeded.
     pub symbol: Option<NativeSymbol>,
     /// High-level category: native, kernel, or unknown.
-    pub kind: FrameKind,
+    pub address_space: AddressSpace,
     /// Where the symbol info came from (ELF, perf-map, kallsyms, address-only).
     pub origin: SymbolOrigin,
     /// Classification flags shared with [`PythonFrame`] consumers.
@@ -301,36 +275,16 @@ pub struct NativeFrame {
 
 impl NativeFrame {
     /// Build an address-only [`NativeFrame`] for an IP that could not be
-    /// symbolized. `kind` is set to [`FrameKind::Unknown`] and `origin` to
+    /// symbolized. `address_space` is set to [`AddressSpace::User`] and `origin` to
     /// [`SymbolOrigin::AddressOnly`].
     #[must_use]
     pub fn from_address(pc: u64) -> Self {
         Self {
             pc,
             symbol: None,
-            kind: FrameKind::Unknown,
+            address_space: AddressSpace::User,
             origin: SymbolOrigin::AddressOnly,
             flags: FrameFlags::empty(),
-        }
-    }
-
-    /// Sentinel resolved frame for a truncated-stack marker (see
-    /// [`crate::spool::FrameRecord::truncated_stack_marker`]): the unwinder ran out
-    /// of captured stack bytes before reaching the root. Distinguishable from
-    /// a failed resolve via [`FrameFlags::TRUNCATED_STACK`].
-    #[must_use]
-    pub fn truncated_stack_marker() -> Self {
-        Self {
-            pc: 0,
-            symbol: Some(NativeSymbol::new(
-                "<stack truncated>",
-                SourceLocation::default(),
-                "",
-                0,
-            )),
-            kind: FrameKind::Unknown,
-            origin: SymbolOrigin::AddressOnly,
-            flags: FrameFlags::TRUNCATED_STACK,
         }
     }
 
@@ -345,43 +299,156 @@ impl NativeFrame {
     pub fn is_python_runtime(&self) -> bool {
         self.flags.contains(FrameFlags::PYTHON_RUNTIME)
     }
-
-    /// Allocate a display name, formatting unresolved addresses when needed.
-    #[must_use]
-    pub fn display_name(&self) -> String {
-        self.symbol.as_ref().map_or_else(
-            || format!("<0x{:x}>", self.pc),
-            |symbol| symbol.name().to_owned(),
-        )
-    }
 }
 
 /// A resolved frame from a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ResolvedFrame {
-    /// Python frame.
-    Python(PythonFrame),
+pub enum Frame {
     /// Native, kernel, or address-only frame.
     Native(NativeFrame),
+    /// Python frame.
+    Python(PythonFrame),
+    /// The captured stack bytes ended before the stack root.
+    TruncatedStack,
 }
 
-impl ResolvedFrame {
+impl Frame {
     /// Borrow the resolved name without allocating.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         match self {
             Self::Python(frame) => Some(&frame.func_name),
             Self::Native(frame) => frame.name(),
+            Self::TruncatedStack => Some("<stack truncated>"),
+        }
+    }
+}
+
+impl std::fmt::Display for PythonFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.func_name)
+    }
+}
+
+impl std::fmt::Display for NativeFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.name() {
+            Some(name) => formatter.write_str(name),
+            None => write!(formatter, "<0x{:x}>", self.pc),
+        }
+    }
+}
+
+impl std::fmt::Display for Frame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Python(frame) => formatter.write_str(&frame.func_name),
+            Self::Native(frame) => frame.fmt(formatter),
+            Self::TruncatedStack => formatter.write_str("<stack truncated>"),
+        }
+    }
+}
+
+/// Owner-qualified identity of a resolved frame, never reused by its symbolizer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FrameKey {
+    pub(crate) owner: u64,
+    pub(crate) serial: u64,
+}
+
+/// Borrowed resolved frames for one sampled stack.
+#[derive(Clone, Debug)]
+pub struct ResolvedStack<'a> {
+    pub(crate) frames: &'a [Frame],
+    pub(crate) frame_ids: &'a [FrameKey],
+    pub(crate) indices: &'a [usize],
+    pub(crate) cacheable: bool,
+}
+
+impl<'a> ResolvedStack<'a> {
+    /// Number of resolved frames, including inline expansions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// Whether the stack contains no resolved frames.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// Whether symbol-derived values may be cached until the next invalidation.
+    #[must_use]
+    pub fn is_cacheable(&self) -> bool {
+        self.cacheable
+    }
+
+    /// Iterate over owner-qualified frame keys and their frames.
+    pub fn iter(&self) -> ResolvedStackIter<'a> {
+        ResolvedStackIter {
+            frames: self.frames,
+            frame_ids: self.frame_ids,
+            indices: self.indices.iter(),
         }
     }
 
-    /// Allocate a display name, formatting unresolved addresses when needed.
-    #[must_use]
-    pub fn display_name(&self) -> String {
-        match self {
-            Self::Python(frame) => frame.func_name.to_string(),
-            Self::Native(frame) => frame.display_name(),
-        }
+    /// Iterate over frames without their cache keys.
+    pub fn frames(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &'a Frame> + DoubleEndedIterator + std::iter::FusedIterator
+    {
+        let frames = self.frames;
+        self.indices.iter().map(move |&index| &frames[index])
+    }
+}
+
+/// Iterator over a resolved stack's frame keys and borrowed frames.
+#[derive(Clone, Debug)]
+pub struct ResolvedStackIter<'a> {
+    frames: &'a [Frame],
+    frame_ids: &'a [FrameKey],
+    indices: std::slice::Iter<'a, usize>,
+}
+
+impl<'a> Iterator for ResolvedStackIter<'a> {
+    type Item = (FrameKey, &'a Frame);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let &index = self.indices.next()?;
+        Some((self.frame_ids[index], &self.frames[index]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for ResolvedStackIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let &index = self.indices.next_back()?;
+        Some((self.frame_ids[index], &self.frames[index]))
+    }
+}
+
+impl ExactSizeIterator for ResolvedStackIter<'_> {}
+impl std::iter::FusedIterator for ResolvedStackIter<'_> {}
+
+impl<'a> IntoIterator for ResolvedStack<'a> {
+    type Item = (FrameKey, &'a Frame);
+    type IntoIter = ResolvedStackIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &ResolvedStack<'a> {
+    type Item = (FrameKey, &'a Frame);
+    type IntoIter = ResolvedStackIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -401,29 +468,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_python_location_uses_documented_sentinel() {
-        assert_eq!(
-            LocationInfo::default(),
-            LocationInfo {
-                lineno: -1,
-                end_lineno: -1,
-                column: -1,
-                end_column: -1,
-            }
-        );
+    fn resolved_collection_has_independent_double_ended_iterators() {
+        let frames = [
+            Frame::Native(NativeFrame::from_address(1)),
+            Frame::TruncatedStack,
+        ];
+        let ids = [
+            FrameKey {
+                owner: 1,
+                serial: 0,
+            },
+            FrameKey {
+                owner: 1,
+                serial: 1,
+            },
+        ];
+        let resolved = ResolvedStack {
+            frames: &frames,
+            frame_ids: &ids,
+            indices: &[1, 0, 1],
+            cacheable: true,
+        };
+        let mut iter = resolved.iter();
+        assert_eq!(iter.next().unwrap(), (ids[1], &frames[1]));
+        assert_eq!(iter.next_back().unwrap(), (ids[1], &frames[1]));
+        assert_eq!(iter.len(), 1);
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.frames().count(), 3);
+        assert_eq!(iter.next().unwrap(), (ids[0], &frames[0]));
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn native_symbol_construction_reuses_shared_strings() {
+        let name: Rc<str> = "_PyEval_EvalFrameDefault".into();
+        let module: Rc<str> = "/usr/bin/python3".into();
+        let file: Rc<str> = "Python/ceval.c".into();
+        let source = SourceLocation {
+            file: Some(Rc::clone(&file)),
+            line: Some(42),
+            ..SourceLocation::default()
+        };
+        let allocations = allocation_counter::measure(|| {
+            let symbol = NativeSymbol::new(Rc::clone(&name), Rc::clone(&module))
+                .with_source(source)
+                .with_offset(17)
+                .hidden_by_default();
+            assert!(Rc::ptr_eq(symbol.name_rc(), &name));
+            assert!(Rc::ptr_eq(&symbol.module, &module));
+            assert!(Rc::ptr_eq(symbol.source.file.as_ref().unwrap(), &file));
+            assert_eq!(symbol.source.line, Some(42));
+            assert_eq!(symbol.offset, 17);
+            assert!(symbol.is_eval_frame());
+            assert!(symbol.is_hidden_by_default());
+        });
+        assert_eq!(allocations.count_total, 0);
     }
 
     #[test]
     fn python_frame_basename_handles_long_utf8_path() {
         let path = format!("{}é/leaf.py", "a".repeat(65_534));
-        let frame = PythonFrame::new(path.as_str(), LocationInfo::default(), "f", None, false);
+        let frame = PythonFrame::new(path.as_str(), "f");
 
         assert_eq!(frame.basename(), "leaf.py");
     }
 
     #[test]
     fn native_symbol_basename_follows_mutated_module_path() {
-        let mut symbol = NativeSymbol::new("f", SourceLocation::default(), "/old/f.so", 0);
+        let mut symbol = NativeSymbol::new("f", "/old/f.so");
         symbol.module = "new.so".into();
 
         assert_eq!(symbol.module_basename(), "new.so");

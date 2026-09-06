@@ -1,10 +1,56 @@
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use crate::Pid;
 
-/// Result of polling a [`ProcessExitWatcher`].
+/// A process identity retained by a Linux pidfd.
+#[derive(Debug)]
+pub struct Process {
+    pid: Pid,
+    watcher: ProcessExitWatcher,
+}
+
+impl Process {
+    /// Open a process handle. Signals through this handle cannot target a reused PID.
+    pub fn open(pid: Pid) -> crate::Result<Self> {
+        Ok(Self {
+            pid,
+            watcher: ProcessExitWatcher::try_new(pid)?,
+        })
+    }
+
+    /// Return the PID originally used to open this handle.
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Observe whether this process has exited.
+    pub fn poll(&mut self) -> crate::Result<ProcessExitState> {
+        self.watcher.poll()
+    }
+
+    /// Send SIGINT to this process.
+    pub fn interrupt(&self) -> crate::Result<()> {
+        self.signal(libc::SIGINT)
+    }
+
+    /// Send SIGTERM to this process.
+    pub fn terminate(&self) -> crate::Result<()> {
+        self.signal(libc::SIGTERM)
+    }
+
+    /// Send SIGKILL to this process.
+    pub fn kill(&self) -> crate::Result<()> {
+        self.signal(libc::SIGKILL)
+    }
+
+    fn signal(&self, signal: libc::c_int) -> crate::Result<()> {
+        send_pidfd_signal(self.watcher.pidfd.as_fd(), signal).map_err(crate::Error::target)
+    }
+}
+
+/// Exit state observed through a [`Process`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessExitState {
     /// The pidfd has not reported process exit.
@@ -36,15 +82,8 @@ impl ProcessExitWatcher {
     /// Returns [`crate::ErrorKind::TargetGone`] when the target has exited,
     /// or the corresponding permission, unsupported, or I/O category.
     pub fn try_new(pid: Pid) -> crate::Result<Self> {
-        // SAFETY: a validated Pid identifies one process and pidfd_open takes
-        // no pointer arguments.
-        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid.get(), 0) };
-        if raw_fd < 0 {
-            return Err(crate::Error::target(io::Error::last_os_error()));
-        }
         Ok(Self {
-            // SAFETY: a nonnegative pidfd_open result is a newly owned file descriptor.
-            pidfd: unsafe { OwnedFd::from_raw_fd(raw_fd as i32) },
+            pidfd: open_pidfd(pid.get_u32()).map_err(crate::Error::target)?,
             exited: false,
         })
     }
@@ -90,6 +129,34 @@ impl ProcessExitWatcher {
 
     pub(crate) fn is_exited(&self) -> bool {
         self.exited
+    }
+}
+
+pub(crate) fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open takes scalar arguments and rejects invalid process IDs.
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open as libc::c_long, pid, 0) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a nonnegative pidfd_open result is a newly owned file descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd as i32) })
+}
+
+pub(crate) fn send_pidfd_signal(pidfd: BorrowedFd<'_>, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: the borrowed pidfd is live; a null siginfo pointer requests the default signal.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal as libc::c_long,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -173,38 +240,6 @@ pub(crate) fn poll_retry(fds: &mut [libc::pollfd], timeout: libc::c_int) -> io::
     }
 }
 
-/// Send `SIGINT` to `pid` (graceful interrupt). Fails with the underlying
-/// `kill(2)` error, typically `EPERM` or `ESRCH`.
-///
-/// # Errors
-///
-/// Returns [`crate::ErrorKind::TargetGone`] for `ESRCH` and preserves the
-/// underlying OS error code.
-pub fn interrupt_process(pid: Pid) -> crate::Result<()> {
-    send_signal(pid, libc::SIGINT).map_err(crate::Error::target)
-}
-
-/// Send `SIGKILL` to `pid` (uncatchable termination).
-///
-/// # Errors
-///
-/// Returns [`crate::ErrorKind::TargetGone`] for `ESRCH` and preserves the
-/// underlying OS error code.
-pub fn kill_process(pid: Pid) -> crate::Result<()> {
-    send_signal(pid, libc::SIGKILL).map_err(crate::Error::target)
-}
-
-fn send_signal(pid: Pid, signal: libc::c_int) -> io::Result<()> {
-    // SAFETY: kill takes scalar arguments and a validated Pid cannot invoke
-    // process-group or broadcast semantics.
-    let rc = unsafe { libc::kill(pid.get(), signal) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +249,23 @@ mod tests {
 
     fn pid(raw: i32) -> Pid {
         Pid::new(raw).expect("positive test pid")
+    }
+
+    #[test]
+    fn process_handle_retains_identity_after_child_exit() {
+        let mut child = SleepChild::spawn();
+        let original_pid = pid(child.pid_i32());
+        let mut process = Process::open(original_pid).expect("open child pidfd");
+        assert_eq!(process.poll().unwrap(), ProcessExitState::Running);
+        process.kill().unwrap();
+        let status = child.wait_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(process.pid(), original_pid);
+        assert_eq!(process.poll().unwrap(), ProcessExitState::Exited);
+        assert_eq!(
+            process.kill().unwrap_err().kind(),
+            crate::ErrorKind::TargetGone
+        );
     }
 
     #[test]
@@ -243,26 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn process_is_alive_propagates_pidfd_poll_failure() {
-        let pid = pid(std::process::id() as i32);
-        let Ok(watcher) = ProcessExitWatcher::try_new(pid) else {
-            return;
-        };
-        let fd = watcher.pidfd.as_raw_fd();
-        // SAFETY: this test deliberately invalidates its owned pidfd to verify
-        // that the public liveness API reports POLLNVAL instead of guessing.
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-        let mut watcher = Some(watcher);
-
-        let error = process_is_alive(&mut watcher, pid).expect_err("closed pidfd must fail");
-        let watcher = watcher.take().expect("poll failure retains the watcher");
-        std::mem::forget(watcher);
-
-        assert_eq!(error.kind(), crate::ErrorKind::Io);
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-    }
-
-    #[test]
     fn pidfd_watcher_observes_child_exit_when_available() {
         let mut child = SleepChild::spawn();
         let pid = pid(child.pid_i32());
@@ -274,7 +306,7 @@ mod tests {
             watcher.poll().expect("poll live child"),
             ProcessExitState::Running
         );
-        kill_process(pid).expect("kill child");
+        Process::open(pid).unwrap().kill().expect("kill child");
         let _ = child
             .wait_timeout(Duration::from_secs(2))
             .expect("wait child")
@@ -303,7 +335,24 @@ mod tests {
             watcher.observe_revents(0).unwrap(),
             ProcessExitState::Running
         );
-        assert!(watcher.observe_revents(libc::POLLERR).is_err());
+        assert_eq!(
+            watcher
+                .observe_revents(libc::POLLERR)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let mut fds = [libc::pollfd {
+            fd: i32::MAX,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        assert_eq!(poll_retry(&mut fds, 0).unwrap(), 1);
+        assert_eq!(fds[0].revents, libc::POLLNVAL);
+        let error = crate::Error::from(watcher.observe_revents(fds[0].revents).unwrap_err());
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(watcher.poll().unwrap(), ProcessExitState::Running);
         assert_eq!(
             watcher.observe_revents(libc::POLLHUP).unwrap(),
             ProcessExitState::Exited
@@ -315,7 +364,10 @@ mod tests {
     fn interrupt_process_sends_sigint() {
         let mut child = SleepChild::spawn();
 
-        interrupt_process(pid(child.pid_i32())).expect("interrupt child");
+        Process::open(pid(child.pid_i32()))
+            .unwrap()
+            .interrupt()
+            .expect("interrupt child");
         let status = child
             .wait_timeout(Duration::from_secs(2))
             .expect("wait child")
@@ -328,21 +380,16 @@ mod tests {
     fn kill_process_sends_sigkill() {
         let mut child = SleepChild::spawn();
 
-        kill_process(pid(child.pid_i32())).expect("kill child");
+        Process::open(pid(child.pid_i32()))
+            .unwrap()
+            .kill()
+            .expect("kill child");
         let status = child
             .wait_timeout(Duration::from_secs(2))
             .expect("wait child")
             .expect("child exited after kill");
 
         assert_eq!(status.signal(), Some(libc::SIGKILL));
-    }
-
-    #[test]
-    fn missing_signal_target_has_target_gone_error_kind() {
-        let error = kill_process(pid(i32::MAX)).expect_err("test PID should not exist");
-
-        assert_eq!(error.kind(), crate::ErrorKind::TargetGone);
-        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]

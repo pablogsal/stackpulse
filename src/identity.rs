@@ -119,3 +119,51 @@ pub struct InvalidPid(i64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 #[error("invalid thread id {0}")]
 pub struct InvalidTid(i64);
+
+impl From<Pid> for i32 {
+    fn from(value: Pid) -> Self {
+        value.get()
+    }
+}
+
+impl From<Pid> for u32 {
+    fn from(value: Pid) -> Self {
+        value.get() as u32
+    }
+}
+
+impl From<Pid> for i64 {
+    fn from(value: Pid) -> Self {
+        value.get() as i64
+    }
+}
+
+impl From<Pid> for u64 {
+    fn from(value: Pid) -> Self {
+        value.get() as u64
+    }
+}
+
+impl From<Tid> for i32 {
+    fn from(value: Tid) -> Self {
+        value.get()
+    }
+}
+
+impl From<Tid> for u32 {
+    fn from(value: Tid) -> Self {
+        value.get() as u32
+    }
+}
+
+impl From<Tid> for i64 {
+    fn from(value: Tid) -> Self {
+        value.get() as i64
+    }
+}
+
+impl From<Tid> for u64 {
+    fn from(value: Tid) -> Self {
+        value.get() as u64
+    }
+}

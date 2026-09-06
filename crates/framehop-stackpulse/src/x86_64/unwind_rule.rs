@@ -1,6 +1,5 @@
 use super::register_ordering;
 use super::unwindregs::{Reg, UnwindRegsX86_64};
-use crate::add_signed::checked_add_signed;
 use crate::error::Error;
 use crate::unwind_rule::UnwindRule;
 use arrayvec::ArrayVec;
@@ -143,7 +142,8 @@ impl UnwindRule for UnwindRuleX86_64 {
                 let sp_offset = u64::from(sp_offset_by_8) * 8;
                 let new_sp = sp.checked_add(sp_offset).ok_or(Error::IntegerOverflow)?;
                 let bp_storage_offset_from_sp = i64::from(bp_storage_offset_from_sp_by_8) * 8;
-                let bp_location = checked_add_signed(sp, bp_storage_offset_from_sp)
+                let bp_location = sp
+                    .checked_add_signed(bp_storage_offset_from_sp)
                     .ok_or(Error::IntegerOverflow)?;
                 let new_bp = match read_stack(bp_location) {
                     Ok(new_bp) => new_bp,

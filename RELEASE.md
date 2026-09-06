@@ -5,14 +5,16 @@ to crates.io and creates a GitHub release from the matching changelog entry.
 
 ## Prepare
 
-1. Update `version` in `Cargo.toml` and refresh `Cargo.lock`.
+1. Update `version` in `Cargo.toml` and refresh `Cargo.lock`. When
+   `framehop-stackpulse` changes, also increment its package version and the
+   root dependency requirement.
 2. Move the relevant entries under `## Unreleased` in `CHANGELOG.md` to
    `## X.Y.Z - YYYY-MM-DD`. Leave a fresh `## Unreleased` section above it.
 3. Run the local checks and package dry run:
 
    ```bash
    make ci
-   cargo publish --dry-run --locked
+   cargo publish --workspace --dry-run --locked
    ```
 
 4. Open and merge a pull request. Wait for `Required checks`, `Coverage`, and
@@ -20,11 +22,24 @@ to crates.io and creates a GitHub release from the matching changelog entry.
 
 ## Publish
 
-Create and push one annotated tag from the merged commit:
+Check out the validated merged commit:
 
 ```bash
 git switch main
 git pull --ff-only
+```
+
+If `framehop-stackpulse` has a new version, publish it from the merged commit
+before tagging StackPulse:
+
+```bash
+cargo publish --package framehop-stackpulse --locked
+cargo publish --dry-run --locked
+```
+
+Create and push one annotated tag from the merged commit:
+
+```bash
 git tag -a vX.Y.Z -m "stackpulse X.Y.Z"
 git push origin vX.Y.Z
 ```

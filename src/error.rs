@@ -18,6 +18,8 @@ pub enum ErrorKind {
     Permission,
     /// The target process exited before the operation completed.
     TargetGone,
+    /// A child process could not be created for a prepared recording.
+    ProcessLaunch,
     /// The requested sampling rate exceeds the kernel limit.
     FrequencyLimit,
     /// The spool is malformed.
@@ -179,7 +181,7 @@ impl From<Error> for io::Error {
             ErrorKind::TargetGone => io::ErrorKind::NotFound,
             ErrorKind::CorruptSpool | ErrorKind::NativeSymbolizer => io::ErrorKind::InvalidData,
             ErrorKind::Unsupported => io::ErrorKind::Unsupported,
-            ErrorKind::Io => error
+            ErrorKind::Io | ErrorKind::ProcessLaunch => error
                 .io_error()
                 .map_or(io::ErrorKind::Other, io::Error::kind),
         };
@@ -345,5 +347,26 @@ mod tests {
                 .and_then(Error::raw_os_error),
             Some(libc::ENOENT)
         );
+    }
+
+    #[test]
+    fn process_launch_errors_preserve_io_kind_and_errno() {
+        for errno in [libc::EINVAL, libc::EMFILE, libc::EAGAIN, libc::EPERM] {
+            let source = io::Error::from_raw_os_error(errno);
+            let expected_kind = source.kind();
+            let error = Error::new(ErrorKind::ProcessLaunch, Error::from(source));
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(error.io_error().unwrap().kind(), expected_kind);
+
+            let converted = io::Error::from(error);
+            assert_eq!(converted.kind(), expected_kind);
+            let source = converted
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Error>()
+                .unwrap();
+            assert_eq!(source.kind(), ErrorKind::ProcessLaunch);
+            assert_eq!(source.raw_os_error(), Some(errno));
+        }
     }
 }

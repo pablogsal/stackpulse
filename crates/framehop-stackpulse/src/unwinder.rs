@@ -25,7 +25,7 @@ use crate::{FrameAddress, FramePointerFallbackReason, UnwindFrame, UnwindFrameOu
 
 use core::marker::PhantomData;
 use core::ops::{Deref, Range};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Unwinder is the trait that each CPU architecture's concrete unwinder type implements.
 /// This trait's methods are what let you do the actual unwinding.
@@ -243,15 +243,9 @@ impl<U: Unwinder, F: FnMut(u64) -> Result<u64, ()>> FallibleIterator
     }
 }
 
-/// This global generation counter makes it so that the cache can be shared
-/// between multiple unwinders.
-/// This is a u16, so if you make it wrap around by adding / removing modules
-/// more than 65535 times, then you risk collisions in the cache; meaning:
-/// unwinding might not work properly if an old unwind rule was found in the
-/// cache for the same address and the same (pre-wraparound) modules_generation.
-static GLOBAL_MODULES_GENERATION: AtomicU16 = AtomicU16::new(0);
+static GLOBAL_MODULES_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn next_global_modules_generation() -> u16 {
+fn next_global_modules_generation() -> u64 {
     GLOBAL_MODULES_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -279,7 +273,7 @@ pub struct UnwinderInternal<D, A, P> {
     /// sorted by avma_range.start
     modules: Vec<Module<D>>,
     /// Incremented every time modules is changed.
-    modules_generation: u16,
+    modules_generation: u64,
     _arch: PhantomData<A>,
     _allocation_policy: PhantomData<P>,
 }
@@ -742,13 +736,14 @@ enum ModuleUnwindDataInternal<D> {
 
 impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
     fn new(section_info: &mut impl ModuleSectionInfo<D>) -> Self {
-        use crate::dwarf::base_addresses_for_sections;
+        use crate::dwarf::base_addresses_and_text_range;
 
         #[cfg(feature = "macho")]
         if let Some(unwind_info) = section_info.section_data(b"__unwind_info") {
             let eh_frame = section_info.section_data(b"__eh_frame");
             let stubs = section_info.section_svma_range(b"__stubs");
             let stub_helper = section_info.section_svma_range(b"__stub_helper");
+            let (base_addresses, text_range) = base_addresses_and_text_range(section_info);
             // Get the bytes of the executable code (instructions).
             //
             // In mach-O objects, executable code is stored in the `__TEXT` segment, which contains
@@ -760,10 +755,9 @@ impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
                 section_info.segment_svma_range(b"__TEXT"),
             ) {
                 Some(TextByteData { bytes, svma_range })
-            } else if let (Some(bytes), Some(svma_range)) = (
-                section_info.section_data(b"__text"),
-                section_info.section_svma_range(b"__text"),
-            ) {
+            } else if let (Some(bytes), Some(svma_range)) =
+                (section_info.section_data(b"__text"), text_range)
+            {
                 Some(TextByteData { bytes, svma_range })
             } else {
                 None
@@ -773,7 +767,7 @@ impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
                 eh_frame,
                 stubs_svma: stubs,
                 stub_helper_svma: stub_helper,
-                base_addresses: base_addresses_for_sections(section_info),
+                base_addresses,
                 text_data,
             };
         }
@@ -802,6 +796,7 @@ impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
             .section_data(b".eh_frame")
             .or_else(|| section_info.section_data(b"__eh_frame"))
         {
+            let (base_addresses, _) = base_addresses_and_text_range(section_info);
             if let Some(eh_frame_hdr) = section_info
                 .section_data(b".eh_frame_hdr")
                 .or_else(|| section_info.section_data(b"__eh_frame_hdr"))
@@ -809,24 +804,33 @@ impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
                 ModuleUnwindDataInternal::EhFrameHdrAndEhFrame {
                     eh_frame_hdr,
                     eh_frame,
-                    base_addresses: base_addresses_for_sections(section_info),
+                    base_addresses,
                 }
             } else {
-                match DwarfCfiIndex::try_new_eh_frame(&eh_frame, section_info) {
+                match DwarfCfiIndex::try_new_eh_frame(
+                    &eh_frame,
+                    &base_addresses,
+                    section_info.base_svma(),
+                ) {
                     Ok(index) => ModuleUnwindDataInternal::DwarfCfiIndexAndEhFrame {
                         index,
                         eh_frame,
-                        base_addresses: base_addresses_for_sections(section_info),
+                        base_addresses,
                     },
                     Err(_) => ModuleUnwindDataInternal::None,
                 }
             }
         } else if let Some(debug_frame) = section_info.section_data(b".debug_frame") {
-            match DwarfCfiIndex::try_new_debug_frame(&debug_frame, section_info) {
+            let (base_addresses, _) = base_addresses_and_text_range(section_info);
+            match DwarfCfiIndex::try_new_debug_frame(
+                &debug_frame,
+                &base_addresses,
+                section_info.base_svma(),
+            ) {
                 Ok(index) => ModuleUnwindDataInternal::DwarfCfiIndexAndDebugFrame {
                     index,
                     debug_frame,
-                    base_addresses: base_addresses_for_sections(section_info),
+                    base_addresses,
                 },
                 Err(_) => ModuleUnwindDataInternal::None,
             }
@@ -1089,6 +1093,104 @@ mod tests {
     type TestUnwinder = UnwinderInternal<Vec<u8>, ArchX86_64, MayAllocateDuringUnwind>;
     type TestCache = Cache<UnwindRuleX86_64, MayAllocateDuringUnwind>;
 
+    #[derive(Default)]
+    struct ConsumingSections {
+        ranges: alloc::collections::BTreeMap<Vec<u8>, Range<u64>>,
+        data: alloc::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        reads: alloc::collections::BTreeSet<(&'static str, Vec<u8>)>,
+    }
+
+    impl ConsumingSections {
+        fn record_read(&mut self, method: &'static str, name: &[u8]) {
+            assert!(
+                self.reads.insert((method, name.to_vec())),
+                "repeated {method}({name:?})"
+            );
+        }
+    }
+
+    impl ModuleSectionInfo<Vec<u8>> for ConsumingSections {
+        fn base_svma(&self) -> u64 {
+            0x1000
+        }
+
+        fn section_svma_range(&mut self, name: &[u8]) -> Option<Range<u64>> {
+            self.record_read("section_svma_range", name);
+            self.ranges.remove(name)
+        }
+
+        fn section_data(&mut self, name: &[u8]) -> Option<Vec<u8>> {
+            self.record_read("section_data", name);
+            self.data.remove(name)
+        }
+
+        fn segment_svma_range(&mut self, name: &[u8]) -> Option<Range<u64>> {
+            self.record_read("segment_svma_range", name);
+            None
+        }
+
+        fn segment_data(&mut self, name: &[u8]) -> Option<Vec<u8>> {
+            self.record_read("segment_data", name);
+            None
+        }
+    }
+
+    #[test]
+    fn dwarf_index_retains_bases_from_a_consuming_section_provider() {
+        for section_name in [b".eh_frame".as_slice(), b".debug_frame"] {
+            let mut sections = ConsumingSections::default();
+            for (name, start) in [
+                (b".eh_frame".as_slice(), 0x2000),
+                (b".eh_frame_hdr", 0x3000),
+                (b".text", 0x4000),
+                (b".got", 0x5000),
+            ] {
+                sections.ranges.insert(name.to_vec(), start..start + 0x100);
+            }
+            sections.data.insert(section_name.to_vec(), Vec::new());
+            let unwind_data = ModuleUnwindDataInternal::new(&mut sections);
+            let bases = match (section_name, unwind_data) {
+                (
+                    b".eh_frame",
+                    ModuleUnwindDataInternal::DwarfCfiIndexAndEhFrame { base_addresses, .. },
+                )
+                | (
+                    b".debug_frame",
+                    ModuleUnwindDataInternal::DwarfCfiIndexAndDebugFrame { base_addresses, .. },
+                ) => base_addresses,
+                _ => panic!("expected a DWARF index for {section_name:?}"),
+            };
+            assert_eq!(
+                bases,
+                gimli::BaseAddresses::default()
+                    .set_eh_frame(0x2000)
+                    .set_eh_frame_hdr(0x3000)
+                    .set_text(0x4000)
+                    .set_got(0x5000)
+            );
+        }
+    }
+
+    #[cfg(feature = "macho")]
+    #[test]
+    fn compact_unwind_reuses_the_consumed_text_range() {
+        let mut sections = ConsumingSections::default();
+        sections.data.insert(b"__unwind_info".to_vec(), Vec::new());
+        sections.data.insert(b"__text".to_vec(), alloc::vec![0x90]);
+        sections.ranges.insert(b"__text".to_vec(), 0x4000..0x4001);
+        let ModuleUnwindDataInternal::CompactUnwindInfoAndEhFrame {
+            base_addresses,
+            text_data: Some(text_data),
+            ..
+        } = ModuleUnwindDataInternal::new(&mut sections)
+        else {
+            panic!("expected compact unwind information with instruction bytes");
+        };
+        assert_eq!(base_addresses.eh_frame.text, Some(0x4000));
+        assert_eq!(text_data.svma_range, 0x4000..0x4001);
+        assert_eq!(text_data.bytes, [0x90]);
+    }
+
     fn module_without_unwind_data() -> Module<Vec<u8>> {
         Module {
             name: "test".into(),
@@ -1184,6 +1286,7 @@ mod tests {
 
         let mut regs = UnwindRegsX86_64::new(0x1100, 0x2000, 0x3000);
         let outcome = unwinder
+            .clone()
             .with_cache(
                 address,
                 &mut regs,

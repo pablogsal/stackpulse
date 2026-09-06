@@ -7,14 +7,14 @@
 #[doc(hidden)]
 pub mod bench_support;
 /// Child-process discovery for recorded targets.
-pub mod children;
+mod children;
 /// Recording and integration guide.
 pub mod docs;
 mod elf;
 /// Typed errors returned by recording, spool, and symbolization workflows.
-pub mod error;
+mod error;
 /// Validated Linux process and thread identifiers.
-pub mod identity;
+mod identity;
 mod linux;
 mod module_base;
 mod native_module;
@@ -24,7 +24,7 @@ pub mod profile;
 /// Spool readers and raw recorded profile types.
 pub mod spool;
 /// Process liveness checks, exit watching, and signal helpers.
-pub mod state;
+mod state;
 mod stats;
 pub mod symbolize;
 mod symbols;
@@ -34,9 +34,9 @@ mod unwind_stats;
 
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{Pid, Tid};
-pub use linux::{process, AttachMode, Recorder, RecorderOptions, RecordingSummary, SampleRate};
-pub use spool::{Replay, Snapshot, Tail};
-pub use symbolize::{StackCache, Symbolizer, SymbolizerBuilder};
+pub use linux::{Recorder, RecordingSummary, SampleRate};
+pub use spool::{LiveReader, ReadStatus, Replay, Snapshot, Spool, Tail};
+pub use symbolize::{Symbolizer, SymbolizerBuilder};
 
 const _: fn() = || {
     fn assert_send<T: Send>() {}
@@ -46,9 +46,16 @@ const _: fn() = || {
     assert_send_sync::<Replay>();
     assert_send_sync::<Snapshot>();
     assert_send_sync::<Tail>();
-    assert_send_sync::<process::RunningProcess>();
-    assert_send_sync::<process::SuspendedLaunchedProcess>();
+    assert_send_sync::<process::Child>();
 };
+
+/// Process identity, launching, discovery, and exit observation.
+pub mod process {
+    pub use crate::children::{discover_all_descendants, discover_descendant_edges};
+    pub use crate::identity::{InvalidPid, InvalidTid, Pid, Tid};
+    pub use crate::linux::process::{Child, Launch};
+    pub use crate::state::{Process, ProcessExitState};
+}
 
 /// Perf recording types and statistics.
 pub mod record {
@@ -56,19 +63,16 @@ pub mod record {
 
     pub use crate::linux::perf_event::{PerfFrequencyLimit, MAX_SAMPLE_USER_STACK};
     pub use crate::linux::{
-        AttachMode, AttachOutcome, PollSummary, Recorder, RecorderOptions, RecordingSummary,
-        RefreshOutcome, SampleRate,
+        AttachOutcome, AttachPolicy, FinishError, PollSummary, PreparedRecording, ProcessScope,
+        Recorder, RecorderBuilder, RecordingMetadata, RecordingSummary, SampleRate,
     };
     pub use crate::stats::{SampleErrorKind, SampleErrorStats};
     pub use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};
 
     /// Read the kernel's current maximum perf sample rate.
-    #[must_use]
-    pub fn max_sample_rate() -> Option<u64> {
-        read_max_sample_rate().ok()
-    }
-
-    pub(crate) fn read_max_sample_rate() -> io::Result<u64> {
+    ///
+    /// Returns an error if the kernel limit cannot be read or parsed.
+    pub fn max_sample_rate() -> io::Result<u64> {
         const PATH: &str = "/proc/sys/kernel/perf_event_max_sample_rate";
         let data = std::fs::read_to_string(PATH).map_err(|source| {
             let kind = source.kind();

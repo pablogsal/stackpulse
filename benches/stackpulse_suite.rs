@@ -9,13 +9,14 @@ use criterion::{
 use stackpulse::bench_support::{
     self, BenchSpoolSample, LivePerfSampleFixture, SparseKernelSymbolsFixture, CURRENT_SPOOL_MAGIC,
 };
+use stackpulse::bench_support::{FrameMode, FrameRecord, ModuleRecord, PythonRuntimeRecord};
 use stackpulse::profile::{
-    is_python_runtime_basename as is_python_module, LocationInfo, NativeFrame, PythonFrame,
-    ResolvedFrame,
+    is_python_runtime_basename as is_python_module, Frame, NativeFrame, PythonFrame,
+    PythonSourceLocation,
 };
 use stackpulse::record::{SampleErrorKind, SampleErrorStats};
-use stackpulse::spool::{FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord};
-use stackpulse::{Snapshot, Symbolizer, SymbolizerBuilder};
+use stackpulse::spool::RawFrame;
+use stackpulse::{Snapshot, Symbolizer};
 
 const FIXTURE_VERSION: u32 = 10;
 
@@ -134,7 +135,7 @@ fn bench_spool_open(c: &mut Criterion) {
                     checksum = checksum
                         .wrapping_add(reader.modules().len())
                         .wrapping_add(reader.samples().len())
-                        .wrapping_add(reader.python_runtime_records().len());
+                        .wrapping_add(reader.processes().count());
                 }
                 black_box(checksum)
             });
@@ -169,10 +170,10 @@ fn bench_spool_iteration(c: &mut Criterion) {
             let mut frames = 0usize;
             for _ in 0..BORROWED_ITERATE_BATCH {
                 for (_, reader) in &readers {
-                    for stack in reader.stacks() {
-                        for frame in stack.frames() {
+                    for stack in reader.samples() {
+                        for frame in stack.stack().frames() {
                             frames += 1;
-                            checksum = checksum.wrapping_add(raw_frame_score(frame));
+                            checksum = checksum.wrapping_add(raw_view_score(&frame));
                         }
                     }
                 }
@@ -192,14 +193,10 @@ fn bench_spool_iteration(c: &mut Criterion) {
             let mut frames = 0usize;
             for _ in 0..BORROWED_ITERATE_BATCH {
                 for (_, reader) in &readers {
-                    for stack in reader.stacks() {
-                        for context in stack.contexts() {
+                    for stack in reader.samples() {
+                        for frame in stack.stack().frames() {
                             frames += 1;
-                            checksum = checksum
-                                .wrapping_add(raw_frame_score(context.frame))
-                                .wrapping_add(context.module.map_or(0, |module| {
-                                    module.module.id() as usize ^ module.file_relative_ip as usize
-                                }));
+                            checksum = checksum.wrapping_add(raw_view_score(&frame));
                         }
                     }
                 }
@@ -223,11 +220,16 @@ fn bench_spool_iteration(c: &mut Criterion) {
                 let mut checksum = 0usize;
                 let mut frames = 0usize;
                 for _ in 0..EXPANDED_ITERATE_BATCH {
-                    for stack in reader.stacks() {
+                    for stack in reader.samples() {
                         expanded.clear();
-                        expanded.extend(stack.frames().copied());
+                        expanded.extend(stack.stack().frames());
                         frames += expanded.len();
-                        checksum = checksum.wrapping_add(raw_frames_score(&expanded));
+                        checksum = checksum.wrapping_add(
+                            expanded
+                                .iter()
+                                .map(raw_view_score)
+                                .fold(0usize, usize::wrapping_add),
+                        );
                     }
                 }
                 black_box(checksum ^ frames)
@@ -252,15 +254,15 @@ fn bench_spool_iteration(c: &mut Criterion) {
                 for (_, reader) in &readers {
                     for sample in reader.samples() {
                         checksum = checksum
-                            .wrapping_add(reader.timestamp_us(sample).unwrap_or(0) as usize)
-                            .wrapping_add(sample.process_id.get() as usize)
-                            .wrapping_add(sample.thread_id.get() as usize);
+                            .wrapping_add(sample.monotonic_timestamp().as_micros() as u64 as usize)
+                            .wrapping_add(sample.pid().get() as usize)
+                            .wrapping_add(sample.tid().get() as usize);
                     }
                     for module in reader.modules() {
-                        let path = module.path().as_str();
+                        let path = module.path().to_string_lossy();
                         checksum = checksum
                             .wrapping_add(path.len())
-                            .wrapping_add(usize::from(is_python_module(basename(path))));
+                            .wrapping_add(usize::from(is_python_module(basename(&path))));
                     }
                 }
             }
@@ -374,7 +376,7 @@ fn bench_symbolization(c: &mut Criterion) {
     address_group.throughput(Throughput::Elements(total_frames(&address_stacks) as u64));
     address_group.bench_function("unique_stacks", |b| {
         b.iter(|| {
-            let mut symbolizer = SymbolizerBuilder::for_modules(&[])
+            let mut symbolizer = bench_support::symbolizer_for_modules(&[])
                 .disable_perf_maps()
                 .build()
                 .expect("build symbolizer");
@@ -387,7 +389,7 @@ fn bench_symbolization(c: &mut Criterion) {
         });
     });
 
-    let mut warm_symbolizer = SymbolizerBuilder::for_modules(&[])
+    let mut warm_symbolizer = bench_support::symbolizer_for_modules(&[])
         .disable_perf_maps()
         .build()
         .expect("build symbolizer");
@@ -460,7 +462,7 @@ fn bench_symbolization(c: &mut Criterion) {
     ));
     perf_map_group.bench_function("python_perf_map", |b| {
         b.iter(|| {
-            let mut symbolizer = SymbolizerBuilder::for_modules(&[])
+            let mut symbolizer = bench_support::symbolizer_for_modules(&[])
                 .build()
                 .expect("build symbolizer");
             let mut checksum = 0usize;
@@ -484,7 +486,7 @@ fn bench_symbolization(c: &mut Criterion) {
         native_group.throughput(Throughput::Elements(frames.len() as u64));
         native_group.bench_function("cold_current_exe_batch", |b| {
             b.iter(|| {
-                let mut symbolizer = SymbolizerBuilder::for_modules(&modules)
+                let mut symbolizer = bench_support::symbolizer_for_modules(&modules)
                     .disable_perf_maps()
                     .build()
                     .expect("build symbolizer");
@@ -565,7 +567,7 @@ fn bench_helpers(c: &mut Criterion) {
                     checksum = checksum.wrapping_add(bench_support::basename_start(input));
                 }
                 for frame in &frames {
-                    checksum = checksum.wrapping_add(frame.display_name().len());
+                    checksum = checksum.wrapping_add(frame.to_string().len());
                 }
                 for &(base_avma, base_svma, avma) in &bases {
                     let (relative, svma) =
@@ -721,27 +723,30 @@ fn synthetic_modules(spec: ScenarioSpec) -> Vec<ModuleRecord> {
         for index in 0..spec.modules_per_process {
             let id = modules.len() as u32;
             let start = process_base + index as u64 * 0x0010_0000;
-            modules.push(
-                ModuleRecord::new(
+            modules.push(bench_support::with_file_identity(
+                bench_support::module(
                     id,
                     stackpulse::Pid::try_from(process_id).expect("valid benchmark pid"),
                     start..start + 0x000c_0000,
                     (index as u64 % 4) * 0x1000,
                     module_path(spec, process, index),
                 )
-                .expect("valid benchmark module")
-                .file_identity(0, 0, 100_000 + id as u64, 0),
-            );
+                .expect("valid benchmark module"),
+                0,
+                0,
+                100_000 + id as u64,
+                0,
+            ));
         }
     }
 
     if spec.include_kernel {
         let id = modules.len() as u32;
         modules.push(
-            ModuleRecord::kernel(
+            bench_support::kernel_module(
                 id,
                 0xffff_ffff_8000_0000..0xffff_ffff_9000_0000,
-                ModulePath::from("[kernel.kallsyms]"),
+                "[kernel.kallsyms]",
             )
             .expect("valid benchmark kernel module"),
         );
@@ -750,16 +755,16 @@ fn synthetic_modules(spec: ScenarioSpec) -> Vec<ModuleRecord> {
     modules
 }
 
-fn module_path(spec: ScenarioSpec, process: usize, index: usize) -> ModulePath {
+fn module_path(spec: ScenarioSpec, process: usize, index: usize) -> PathBuf {
     if spec.include_python {
         match index {
-            0 => return ModulePath::from(format!("/opt/python/process-{process}/python3.12")),
-            1 => return ModulePath::from("[anon:python-code]"),
-            2 => return ModulePath::from(format!("/tmp/stackpulse-app-{process}.py")),
+            0 => return PathBuf::from(format!("/opt/python/process-{process}/python3.12")),
+            1 => return PathBuf::from("[anon:python-code]"),
+            2 => return PathBuf::from(format!("/tmp/stackpulse-app-{process}.py")),
             _ => {}
         }
     }
-    ModulePath::from(format!("/opt/stackpulse/lib/libbench-{process}-{index}.so"))
+    PathBuf::from(format!("/opt/stackpulse/lib/libbench-{process}-{index}.so"))
 }
 
 fn frame_in_module(
@@ -826,11 +831,11 @@ fn total_frames(stacks: &[Vec<FrameRecord>]) -> usize {
 
 fn symbolize_reader(reader: &Snapshot, symbolizer: &mut Symbolizer) -> usize {
     let mut checksum = 0usize;
-    for stack in reader.stacks() {
+    for stack in reader.samples() {
         let mut sample_score = 0usize;
-        let resolved = symbolizer.resolve(stack).expect("symbolize stack");
+        let resolved = symbolizer.resolve(stack.stack()).expect("symbolize stack");
         let frames = resolved.len();
-        for frame in resolved {
+        for frame in resolved.frames() {
             sample_score = sample_score.wrapping_add(resolved_frame_score(frame));
         }
         checksum = checksum.wrapping_add(sample_score).wrapping_add(frames);
@@ -844,40 +849,42 @@ fn score_resolved_frame_slice(
     frames: &[FrameRecord],
 ) -> usize {
     let mut score = 0usize;
-    let resolved = symbolizer
-        .resolve_raw(
-            stackpulse::Pid::try_from(process_id).expect("valid benchmark pid"),
-            frames,
-        )
-        .expect("symbolize frames");
+    let resolved = bench_support::resolve_raw(
+        symbolizer,
+        stackpulse::Pid::try_from(process_id).expect("valid benchmark pid"),
+        frames,
+    )
+    .expect("symbolize frames");
     let count = resolved.len();
-    for frame in resolved {
+    for frame in resolved.frames() {
         score = score.wrapping_add(resolved_frame_score(frame));
     }
     score.wrapping_add(count)
 }
 
-fn raw_frames_score(frames: &[FrameRecord]) -> usize {
-    frames.iter().fold(0usize, |score, frame| {
-        score.wrapping_add(raw_frame_score(frame))
-    })
-}
-
-fn raw_frame_score(frame: &FrameRecord) -> usize {
-    frame
-        .abs_ip
-        .wrapping_add(frame.file_relative_ip)
-        .wrapping_add(u64::from(frame.module_id.unwrap_or(u32::MAX))) as usize
-}
-
-fn resolved_frame_score(frame: &ResolvedFrame) -> usize {
+fn raw_view_score(frame: &RawFrame<'_>) -> usize {
     match frame {
-        ResolvedFrame::Python(frame) => frame
+        RawFrame::Native {
+            address, mapping, ..
+        } => {
+            *address as usize
+                ^ mapping
+                    .as_ref()
+                    .map_or(0, |mapping| mapping.file_relative_address() as usize)
+        }
+        RawFrame::TruncatedStack => 1,
+    }
+}
+
+fn resolved_frame_score(frame: &Frame) -> usize {
+    match frame {
+        Frame::Python(frame) => frame
             .file_name()
             .len()
             .wrapping_add(frame.func_name.len())
-            .wrapping_add(frame.location.lineno as usize),
-        ResolvedFrame::Native(frame) => {
+            .wrapping_add(frame.location.line.unwrap_or(0) as usize),
+        Frame::TruncatedStack => 0,
+        Frame::Native(frame) => {
             let symbol_score = frame.symbol.as_ref().map_or(0usize, |symbol| {
                 symbol
                     .name()
@@ -890,29 +897,25 @@ fn resolved_frame_score(frame: &ResolvedFrame) -> usize {
     }
 }
 
-fn resolved_frame_matrix() -> Vec<ResolvedFrame> {
+fn resolved_frame_matrix() -> Vec<Frame> {
     vec![
-        ResolvedFrame::Native(NativeFrame::from_address(0x1000)),
-        ResolvedFrame::Native(NativeFrame::from_address(0x1010)),
-        ResolvedFrame::Python(PythonFrame::new(
-            "/tmp/stackpulse/app.py",
-            LocationInfo {
-                lineno: 42,
-                end_lineno: 43,
-                column: 1,
-                end_column: 8,
-            },
-            "stackpulse_busy_leaf",
-            None,
-            false,
-        )),
-        ResolvedFrame::Python(PythonFrame::new(
-            "/tmp/stackpulse/app.py",
-            LocationInfo::default(),
-            "stackpulse_busy_middle",
-            Some(2),
-            false,
-        )),
+        Frame::Native(NativeFrame::from_address(0x1000)),
+        Frame::Native(NativeFrame::from_address(0x1010)),
+        Frame::Python({
+            let mut frame = PythonFrame::new("/tmp/stackpulse/app.py", "stackpulse_busy_leaf");
+            frame.location = PythonSourceLocation {
+                line: Some(42),
+                end_line: Some(43),
+                column: Some(1),
+                end_column: Some(8),
+            };
+            frame
+        }),
+        Frame::Python({
+            let mut frame = PythonFrame::new("/tmp/stackpulse/app.py", "stackpulse_busy_middle");
+            frame.opcode = Some(2);
+            frame
+        }),
     ]
 }
 
@@ -943,15 +946,20 @@ fn current_exe_symbolization_fixture() -> Option<(Vec<ModuleRecord>, Vec<FrameRe
     let maps = fs::read_to_string("/proc/self/maps").ok()?;
     let (start, end, file_offset, inode) = find_current_exe_mapping(&maps, &exe, abs_ip)?;
     let file_relative_ip = file_offset + abs_ip.saturating_sub(start);
-    let module = ModuleRecord::new(
+    let module = bench_support::with_file_identity(
+        bench_support::module(
+            0,
+            stackpulse::Pid::try_from(std::process::id()).ok()?,
+            start..end,
+            file_offset,
+            exe.to_string_lossy().into_owned(),
+        )
+        .ok()?,
         0,
-        stackpulse::Pid::try_from(std::process::id()).ok()?,
-        start..end,
-        file_offset,
-        exe.to_string_lossy().into_owned(),
-    )
-    .ok()?
-    .file_identity(0, 0, inode, 0);
+        0,
+        inode,
+        0,
+    );
     let frames = current_exe_frame_batch(start, end, file_offset, abs_ip);
     let frames = if frames.is_empty() {
         vec![FrameRecord {

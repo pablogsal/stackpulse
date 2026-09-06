@@ -1,141 +1,15 @@
-use std::hash::{Hash, Hasher};
-use std::io;
-use std::ops::{Deref, Range};
-use std::path::Path;
-use std::sync::Arc;
-
 use crate::{Pid, Tid};
-use memmap2::Mmap;
+use std::io;
 
 pub(crate) const VDSO_PATH: &str = "[vdso]";
 
-/// File path or display name for a recorded module.
-#[derive(Clone)]
-pub struct ModulePath(Arc<str>);
-
-impl ModulePath {
-    /// Borrow the path as a `&str`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Borrow the underlying UTF-8 bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.as_str().as_bytes()
-    }
-
-    /// Borrow the path as a [`Path`].
-    #[must_use]
-    pub fn as_path(&self) -> &Path {
-        Path::new(self.as_str())
-    }
-
-    /// Whether the path string is empty (typical for kernel-marker records).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.as_str().is_empty()
-    }
-
-    pub(crate) fn is_bracketed_mapping(&self) -> bool {
-        self.as_str().starts_with('[')
-    }
-
-    pub(crate) fn is_vdso(&self) -> bool {
-        self.as_str() == VDSO_PATH
-    }
-
-    pub(super) fn from_mmap(mmap: Arc<Mmap>, range: Range<usize>) -> io::Result<Self> {
-        let bytes = mmap
-            .get(range)
-            .ok_or_else(|| super::invalid_data("module path range is outside the spool"))?;
-        let path =
-            std::str::from_utf8(bytes).map_err(|err| super::invalid_data(err.to_string()))?;
-        Ok(Self(Arc::from(path)))
-    }
-}
-
-impl Deref for ModulePath {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for ModulePath {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for ModulePath {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        std::ffi::OsStr::new(self.as_str())
-    }
-}
-
-impl AsRef<Path> for ModulePath {
-    fn as_ref(&self) -> &Path {
-        Path::new(self.as_str())
-    }
-}
-
-impl std::borrow::Borrow<str> for ModulePath {
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl From<String> for ModulePath {
-    fn from(path: String) -> Self {
-        Self(Arc::from(path.into_boxed_str()))
-    }
-}
-
-impl From<&str> for ModulePath {
-    fn from(path: &str) -> Self {
-        Self(Arc::from(path))
-    }
-}
-
-impl From<ModulePath> for std::rc::Rc<str> {
-    fn from(path: ModulePath) -> Self {
-        path.as_str().into()
-    }
-}
-
-impl std::fmt::Debug for ModulePath {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(fmt)
-    }
-}
-
-impl std::fmt::Display for ModulePath {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt.write_str(self.as_str())
-    }
-}
-
-impl PartialEq for ModulePath {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl Eq for ModulePath {}
-
-impl Hash for ModulePath {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
-    }
-}
+/// A recorded filesystem path, preserving native operating-system bytes.
+pub type ModulePath = std::sync::Arc<std::path::Path>;
 
 /// One executable memory mapping recorded in a spool file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub struct ModuleRecord {
+pub struct Module {
     /// Stable module id within the spool.
     pub(crate) id: u32,
     /// Process that owned this code area, or the kernel.
@@ -194,7 +68,7 @@ impl ModuleOwner {
     }
 }
 
-impl ModuleRecord {
+impl Module {
     /// Return the spool-local mapping id.
     #[must_use]
     pub const fn id(&self) -> u32 {
@@ -245,7 +119,7 @@ impl ModuleRecord {
 
     /// Borrow the recorded path or mapping name.
     #[must_use]
-    pub const fn path(&self) -> &ModulePath {
+    pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
@@ -269,12 +143,13 @@ impl ModuleRecord {
     /// # Errors
     ///
     /// Returns an invalid-input error when `addresses` is empty or reversed.
-    pub fn new(
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn new(
         id: u32,
         process_id: Pid,
         addresses: std::ops::Range<u64>,
         file_offset: u64,
-        path: impl Into<ModulePath>,
+        path: impl AsRef<std::path::Path>,
     ) -> crate::Result<Self> {
         if addresses.start >= addresses.end {
             return Err(crate::Error::message(
@@ -292,13 +167,14 @@ impl ModuleRecord {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.into(),
+            path: path.as_ref().into(),
         })
     }
 
     /// Attach verified filesystem identity to this mapping.
     #[must_use]
-    pub fn file_identity(
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn file_identity(
         mut self,
         device_major: u32,
         device_minor: u32,
@@ -317,10 +193,11 @@ impl ModuleRecord {
     /// # Errors
     ///
     /// Returns an invalid-input error when `addresses` is empty or reversed.
-    pub fn kernel(
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn kernel(
         id: u32,
         addresses: std::ops::Range<u64>,
-        path: impl Into<ModulePath>,
+        path: impl AsRef<std::path::Path>,
     ) -> crate::Result<Self> {
         if addresses.start >= addresses.end {
             return Err(crate::Error::message(
@@ -338,7 +215,7 @@ impl ModuleRecord {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.into(),
+            path: path.as_ref().into(),
         })
     }
 }
@@ -394,11 +271,11 @@ impl FrameRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SampleRecord {
     /// Monotonic timestamp in nanoseconds.
-    pub timestamp_ns: u64,
+    pub(crate) timestamp_ns: u64,
     /// Process id for the sample.
-    pub process_id: Pid,
+    pub(crate) process_id: Pid,
     /// Thread id for the sample.
-    pub thread_id: Tid,
+    pub(crate) thread_id: Tid,
     /// Stack id used with spool-reader stack accessors.
     pub(crate) stack_id: u32,
 }
@@ -423,24 +300,4 @@ pub struct PythonRuntimeRecord {
     pub is_python_runtime: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::mmap_from_bytes;
-
-    #[test]
-    fn mmap_module_path_validates_utf8_and_range() {
-        let mmap = mmap_from_bytes(b"prefix:/lib/libc.so\xff[vdso]");
-
-        let path = ModulePath::from_mmap(mmap.clone(), 7..19).expect("valid path");
-        let vdso = ModulePath::from_mmap(mmap.clone(), 20..26).expect("valid vdso path");
-
-        assert_eq!(path.as_str(), "/lib/libc.so");
-        assert_eq!(path.as_path(), Path::new("/lib/libc.so"));
-        assert_eq!(path, ModulePath::from("/lib/libc.so"));
-        assert!(!path.is_bracketed_mapping());
-        assert!(vdso.is_bracketed_mapping());
-        assert!(ModulePath::from_mmap(mmap.clone(), 19..20).is_err());
-        assert!(ModulePath::from_mmap(mmap, 100..101).is_err());
-    }
-}
+pub(crate) type ModuleRecord = Module;

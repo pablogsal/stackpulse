@@ -9,8 +9,7 @@ use std::rc::Rc;
 use rustc_hash::FxHashSet;
 
 use crate::profile::{
-    FrameFlags, FrameKind, LocationInfo, NativeFrame, NativeSymbol, PythonFrame, ResolvedFrame,
-    SourceLocation, SymbolOrigin,
+    AddressSpace, Frame, FrameFlags, NativeFrame, NativeSymbol, PythonFrame, SymbolOrigin,
 };
 use crate::spool::ModuleRecord;
 
@@ -68,7 +67,7 @@ pub(super) fn perf_map_file_identity(
 }
 
 pub(super) fn perf_map_module_allowed(module: &ModuleRecord) -> bool {
-    is_perf_map_mapping(&module.path)
+    module.path.to_str().is_some_and(is_perf_map_mapping)
 }
 
 pub(super) fn find_perf_map_symbol(
@@ -87,27 +86,19 @@ pub(super) fn perf_map_symbol_to_frame(
     abs_ip: u64,
     symbol: PerfMapSymbol,
     module: Rc<str>,
-) -> ResolvedFrame {
+) -> Frame {
     let PerfMapSymbol { start, payload, .. } = symbol;
     let name = match payload {
         PerfMapPayload::Python { function, file } => {
-            return ResolvedFrame::Python(
-                PythonFrame::new(file, LocationInfo::default(), function, None, false)
-                    .with_flags(FrameFlags::JIT),
-            );
+            return Frame::Python(PythonFrame::new(file, function).with_flags(FrameFlags::JIT));
         }
         PerfMapPayload::Native(name) => name,
     };
-    let native_symbol = NativeSymbol::new(
-        name,
-        SourceLocation::default(),
-        module,
-        abs_ip.saturating_sub(start),
-    );
-    ResolvedFrame::Native(NativeFrame {
+    let native_symbol = NativeSymbol::new(name, module).with_offset(abs_ip.saturating_sub(start));
+    Frame::Native(NativeFrame {
         pc: abs_ip,
         symbol: Some(native_symbol),
-        kind: FrameKind::Native,
+        address_space: AddressSpace::User,
         origin: SymbolOrigin::PerfMap,
         flags: FrameFlags::JIT,
     })
@@ -139,7 +130,10 @@ pub(super) fn parse_python_perf_map_symbol(name: &str) -> Option<(&str, &str)> {
 
 fn strip_python_perf_map_line_suffix(file: &str) -> &str {
     if let Some((path, line)) = file.rsplit_once(':') {
-        if !path.is_empty() && line.chars().all(|character| character.is_ascii_digit()) {
+        if !path.is_empty()
+            && !line.is_empty()
+            && line.chars().all(|character| character.is_ascii_digit())
+        {
             return path;
         }
     }
@@ -220,6 +214,21 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_source_suffix_requires_a_line_number() {
+        for (name, expected_file) in [
+            ("py::work:/tmp/file:", "/tmp/file:"),
+            ("py::work:/tmp/file:123", "/tmp/file"),
+            ("py::work:/tmp/file:version", "/tmp/file:version"),
+            ("py::work:/tmp/file:version:123", "/tmp/file:version"),
+        ] {
+            assert_eq!(
+                parse_python_perf_map_symbol(name),
+                Some(("work", expected_file))
+            );
+        }
+    }
 
     #[test]
     fn overflowing_perf_map_range_does_not_match() {

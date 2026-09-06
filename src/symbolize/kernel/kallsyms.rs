@@ -41,14 +41,14 @@ pub(super) fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
         }
     }
     symbols.sort_by_key(|s| s.address);
-    let mut deduplicated: Vec<KernelSymbol> = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        match deduplicated.last_mut() {
-            Some(previous) if previous.address == symbol.address => *previous = symbol,
-            _ => deduplicated.push(symbol),
+    symbols.dedup_by(|later, earlier| {
+        if later.address != earlier.address {
+            return false;
         }
-    }
-    deduplicated
+        std::mem::swap(later, earlier);
+        true
+    });
+    symbols
 }
 
 pub(super) fn load_sparse_kernel_symbols_from_file(
@@ -522,6 +522,10 @@ mod tests {
             (
                 "ffffffff89800100 t much_longer_function\nffffffff89800100 t short\n",
                 "short",
+            ),
+            (
+                "ffffffff89800100 t first\nffffffff89800100 t second\nffffffff89800100 t last [module]\n",
+                "last",
             ),
         ] {
             let kallsyms = format!("ffffffff89800000 T _text\n{aliases}");

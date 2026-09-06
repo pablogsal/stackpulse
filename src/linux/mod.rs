@@ -2,6 +2,7 @@ mod aligned_bytes;
 mod attach;
 #[cfg(any(test, feature = "bench-support"))]
 mod bench;
+mod builder;
 mod convert_regs;
 mod cpu;
 mod module_tracking;
@@ -9,6 +10,9 @@ pub(crate) mod perf_event;
 mod perf_group;
 /// Launch a process suspended and attach recording before `execve`.
 pub mod process;
+pub use builder::{
+    AttachPolicy, FinishError, PreparedRecording, ProcessScope, RecorderBuilder, RecordingMetadata,
+};
 mod ring_buffer;
 mod sorter;
 mod types;
@@ -25,7 +29,6 @@ use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::state::ProcessExitWatcher;
@@ -207,7 +210,7 @@ impl SampleRate {
         match self {
             Self::Hertz(rate) => Ok(rate.get()),
             Self::Maximum => {
-                let rate = crate::record::read_max_sample_rate()?;
+                let rate = crate::record::max_sample_rate()?;
                 u32::try_from(rate)
                     .ok()
                     .filter(|&rate| rate != 0)
@@ -228,14 +231,12 @@ impl SampleRate {
 /// Options used when attaching a [`Recorder`] to a process.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct RecorderOptions {
+pub(crate) struct RecorderOptions {
     sample_rate: SampleRate,
     stack_size: u32,
     ring_stacks: u32,
     include_kernel: bool,
     inherit_child_processes: bool,
-    start_timestamp_us: u64,
-    sample_interval_us: u64,
 }
 
 impl RecorderOptions {
@@ -248,64 +249,7 @@ impl RecorderOptions {
             ring_stacks: DEFAULT_RING_BUFFER_STACKS,
             include_kernel: false,
             inherit_child_processes: false,
-            start_timestamp_us: 0,
-            sample_interval_us: 0,
         }
-    }
-
-    /// Set the user-stack snapshot size in bytes.
-    #[must_use]
-    pub fn stack_size(mut self, stack_size: u32) -> Self {
-        self.stack_size = stack_size;
-        self
-    }
-
-    /// Set the target per-CPU perf data-ring capacity in stack-sized records.
-    ///
-    /// Capacity is the larger of the configured stack snapshot and system page
-    /// size, times this count, with a floor large enough for any perf record and
-    /// power-of-two page rounding. On 4 KiB-page hosts, the default count of 32
-    /// gives a 1 MiB ring for the default 32 KiB stack and a 2 MiB ring for a
-    /// 64 KiB stack. Memory is pinned per CPU. Values
-    /// requiring more than 256 MiB per CPU are rejected. Larger valid values
-    /// can absorb occasional long stalls, but should be benchmarked under
-    /// sustained load before deployment. Zero selects the default. If mmap
-    /// fails with `EPERM` or `ENOMEM`, attach progressively halves the ring down
-    /// to the minimum valid capacity. All per-CPU rings in one recorder also
-    /// share a 1 GiB aggregate data budget; effective capacities are available
-    /// in [`RecordingSummary`].
-    #[must_use]
-    pub fn ring_buffer_stacks(mut self, stacks: u32) -> Self {
-        self.ring_stacks = normalized_ring_stacks(stacks);
-        self
-    }
-
-    /// Include kernel frames when permitted.
-    #[must_use]
-    pub fn include_kernel(mut self, include: bool) -> Self {
-        self.include_kernel = include;
-        self
-    }
-
-    /// Follow child processes created after recording starts.
-    #[must_use]
-    pub fn inherit_children(mut self, inherit: bool) -> Self {
-        self.inherit_child_processes = inherit;
-        self
-    }
-
-    /// Set the Unix-timeline anchor stored in the spool header.
-    #[must_use]
-    pub fn start_timestamp_us(mut self, timestamp: u64) -> Self {
-        self.start_timestamp_us = timestamp;
-        self
-    }
-
-    /// Set optional sampling-interval metadata stored in the spool header.
-    #[must_use]
-    pub fn sample_interval_us(mut self, interval: u64) -> Self {
-        self.sample_interval_us = interval;
-        self
     }
 }
 
@@ -359,9 +303,24 @@ pub struct RecordingSummary {
 pub struct PollSummary {
     samples: u64,
     lost_events: u64,
+    root_active: bool,
+    active_processes: usize,
+    pending_events: bool,
 }
 
 impl PollSummary {
+    /// Whether the most recent observation found the recording root alive.
+    pub fn root_active(self) -> bool {
+        self.root_active
+    }
+    /// Number of observed active processes after this poll.
+    pub fn active_processes(self) -> usize {
+        self.active_processes
+    }
+    /// Whether capture still has queued or readable events.
+    pub fn pending_events(self) -> bool {
+        self.pending_events
+    }
     /// Return the number of samples written during this poll.
     #[must_use]
     pub const fn samples(self) -> u64 {
@@ -403,7 +362,7 @@ pub enum RefreshOutcome {
 /// report write errors. Dropping a recorder only disables sampling on a
 /// best-effort basis; queued samples may be lost and flush errors cannot be
 /// reported from `Drop`.
-pub struct Recorder<W: std::io::Write = std::io::BufWriter<std::fs::File>> {
+pub struct Recorder<W: std::io::Write = crate::spool::SpoolFile> {
     perf: perf_group::PerfGroup,
     event_sorter: EventSorter<RawFd, u64, PreparedEvent>,
     writer: PerfSpoolWriter<W>,
@@ -415,10 +374,20 @@ pub struct Recorder<W: std::io::Write = std::io::BufWriter<std::fs::File>> {
     capture_pacing: CapturePacing,
     summary: RecordingSummary,
     disable_on_drop: bool,
+    metadata: RecordingMetadata,
+    publisher: crate::spool::Publisher,
+    publish_interval: Duration,
+    last_publish: Instant,
+    last_reconcile: Instant,
+    disposable: bool,
+    root_pid: crate::Pid,
+    last_poll: PollSummary,
+    failure: Option<std::sync::Arc<crate::Error>>,
 }
 
 impl<W: std::io::Write> Drop for Recorder<W> {
     fn drop(&mut self) {
+        self.publisher.abort(self.failure.clone());
         if self.disable_on_drop {
             let _ = self.perf.disable();
         }
@@ -736,6 +705,7 @@ impl ProcessTable {
         Ok(state.tracking.poll_alive_checked(pid)?.unwrap_or(false))
     }
 
+    #[cfg(test)]
     fn has_active_processes_except(&mut self, excluded_pid: i32) -> crate::Result<bool> {
         for (&pid, state) in &mut self.states {
             let Some(pid) = crate::Pid::new(pid).filter(|pid| pid.get() != excluded_pid) else {
@@ -930,59 +900,29 @@ impl<W: std::io::Write> DrainSink<'_, W> {
 }
 
 impl Recorder {
-    /// Attach to `pid` and start writing samples to `output`.
-    ///
-    /// Use [`AttachMode::StopWhileAttaching`] for a process that is already
-    /// running. Use [`AttachMode::OnExec`] with
-    /// [`process::SuspendedLaunchedProcess`] when launching a new process.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the options are invalid, perf cannot attach, the
-    /// process cannot be inspected, or the spool file cannot be created.
-    pub fn attach<P: AsRef<Path>>(
-        pid: crate::Pid,
-        output: P,
-        attach_mode: AttachMode,
-        options: RecorderOptions,
-    ) -> crate::Result<Self> {
-        let raw_pid = pid.get_u32();
-        let mut perf =
-            open_perf_group(raw_pid, attach_mode, &options).map_err(crate::Error::target)?;
-        let writer = PerfSpoolWriter::create(
-            output,
-            options.start_timestamp_us,
-            options.sample_interval_us,
-        )
-        .map_err(|err| perf.resume_error_or(err))?;
-        Self::finish_attach(pid, attach_mode, perf, writer)
+    /// Configure a recording with a validated positive sampling rate.
+    pub fn builder(rate: SampleRate) -> RecorderBuilder {
+        RecorderBuilder::new(rate)
     }
 
-    /// Flush the spool and create an incremental reader that shares exact
-    /// module images still held by this recorder's bounded image cache.
-    ///
-    /// A recorder can create one live tail. Continue polling and flushing the
-    /// recorder, then call [`crate::Tail::poll`] to consume newly visible
-    /// batches. Build the symbolizer through [`crate::Tail::symbolizer`] and
-    /// update it before resolving each batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-input error after a tail has already been created.
-    /// Returns an I/O error when the spool cannot be flushed, cloned, or read.
-    pub fn tail(&mut self) -> crate::Result<crate::Tail> {
-        let exact_images = self.exact_images.clone().ok_or_else(|| {
+    /// Take the sole recorder-linked reader.
+    pub fn take_reader(&mut self) -> crate::Result<crate::spool::LiveReader> {
+        let images = self.exact_images.clone().ok_or_else(|| {
             crate::Error::message(
                 crate::ErrorKind::InvalidInput,
-                "this recorder already has a live tail",
+                "recording reader was already taken",
             )
         })?;
-        self.writer.flush()?;
+        self.flush()?;
         let file = self.writer.open_reader()?;
-        let discarder = self.writer.open_discarder()?;
-        let tail = crate::spool::Tail::from_recorder(file, discarder, exact_images)?;
+        let discarder = self
+            .disposable
+            .then(|| self.writer.open_discarder())
+            .transpose()?;
+        let reader =
+            crate::spool::LiveReader::new(file, discarder, images, self.publisher.clone())?;
         self.exact_images = None;
-        Ok(tail)
+        Ok(reader)
     }
 }
 
@@ -997,22 +937,27 @@ impl<W: std::io::Write> Recorder<W> {
     ///
     /// Returns an error when the options are invalid, perf cannot attach, the
     /// process cannot be inspected, or the writer rejects the spool header.
-    pub fn attach_with_writer(
+    pub(crate) fn attach_with_writer(
         pid: crate::Pid,
         output: W,
         attach_mode: AttachMode,
         options: RecorderOptions,
     ) -> crate::Result<Self> {
+        let origin = crate::spool::ClockOrigin::capture()?;
+        let metadata = RecordingMetadata::new(&options, origin)?;
+        let mut options = options;
+        options.sample_rate = SampleRate::Hertz(metadata.nominal_rate);
         let raw_pid = pid.get_u32();
         let mut perf =
             open_perf_group(raw_pid, attach_mode, &options).map_err(crate::Error::target)?;
-        let writer = PerfSpoolWriter::from_writer(
+        let writer = PerfSpoolWriter::from_writer_with_origin(
             output,
-            options.start_timestamp_us,
-            options.sample_interval_us,
+            0,
+            metadata.nominal_interval.as_nanos() as u64,
+            Some(origin),
         )
         .map_err(|err| perf.resume_error_or(err))?;
-        Self::finish_attach(pid, attach_mode, perf, writer)
+        Self::finish_attach(pid, attach_mode, perf, writer, metadata)
     }
 
     fn finish_attach(
@@ -1020,6 +965,7 @@ impl<W: std::io::Write> Recorder<W> {
         attach_mode: AttachMode,
         mut perf: perf_group::PerfGroup,
         mut writer: PerfSpoolWriter<W>,
+        metadata: RecordingMetadata,
     ) -> crate::Result<Self> {
         let raw_pid = pid.get_u32();
         let kernel_enabled = perf.kernel_enabled();
@@ -1080,6 +1026,19 @@ impl<W: std::io::Write> Recorder<W> {
                 ..RecordingSummary::default()
             },
             disable_on_drop: true,
+            metadata,
+            publisher: crate::spool::Publisher::new(),
+            publish_interval: Duration::from_millis(500),
+            last_publish: Instant::now(),
+            last_reconcile: Instant::now(),
+            disposable: false,
+            root_pid: pid,
+            last_poll: PollSummary {
+                root_active: true,
+                active_processes: 1,
+                ..PollSummary::default()
+            },
+            failure: None,
         };
         if matches!(
             attach_mode,
@@ -1090,8 +1049,13 @@ impl<W: std::io::Write> Recorder<W> {
         Ok(recorder)
     }
 
-    #[allow(clippy::cognitive_complexity)]
     fn drain_events(&mut self, mode: DrainMode) -> io::Result<()> {
+        let result = self.drain_events_inner(mode);
+        refresh_recording_summary(&mut self.summary, &self.perf);
+        result
+    }
+
+    fn drain_events_inner(&mut self, mode: DrainMode) -> io::Result<()> {
         let open_new_perf_events = mode.opens_new_perf_events();
         let Self {
             perf,
@@ -1103,13 +1067,12 @@ impl<W: std::io::Write> Recorder<W> {
             capture_pacing,
             writer,
             summary,
-            exact_images: _,
-            disable_on_drop: _,
+            ..
         } = self;
         let mut lifecycle_actions = Vec::new();
         let mut recovered_process_forks = Vec::new();
         let inherit_child_processes = perf.inherit_child_processes;
-        let (mut result, recovery_timestamp_ns, mut recovered_lifecycle_gap) = {
+        let (result, recovery_timestamp_ns, mut recovered_lifecycle_gap) = {
             let ctx = EventContext {
                 modules,
                 processes,
@@ -1161,178 +1124,92 @@ impl<W: std::io::Write> Recorder<W> {
                 run_recovery_sweep,
             )
         };
-        // Replay lifecycle mutations in event order. Only adjacent thread
-        // forks can share one open transaction without crossing a reuse or
-        // retirement boundary.
-        if result.is_ok() {
-            let mut action_index = 0;
-            let mut thread_fork_batch = Vec::new();
-            while action_index < lifecycle_actions.len() {
-                if open_new_perf_events {
-                    thread_fork_batch.clear();
-                    while let Some(LifecycleAction::ThreadFork {
-                        tid,
-                        pid,
-                        parent_tid,
-                    }) = lifecycle_actions.get(action_index)
-                    {
-                        thread_fork_batch.push(ThreadFork {
-                            tid: *tid,
-                            owner_pid: *pid,
-                            parent_tid: *parent_tid,
-                        });
-                        action_index += 1;
-                    }
-                    if !thread_fork_batch.is_empty() {
-                        if let Err(error) = perf.open_forked_threads(&thread_fork_batch) {
-                            result = Err(error);
-                            break;
-                        }
-                        continue;
-                    }
-                }
-                let action_result = match lifecycle_actions[action_index] {
-                    LifecycleAction::ProcessRetire { pid } => perf.remove_process(pid),
-                    LifecycleAction::ProcessFork { pid, parent_tid } if open_new_perf_events => {
-                        perf.open_forked_processes(&[ProcessFork { pid, parent_tid }])
-                    }
-                    LifecycleAction::ThreadExit { tid, .. } => perf.remove_thread(tid),
-                    LifecycleAction::ProcessFork { .. } | LifecycleAction::ThreadFork { .. } => {
-                        Ok(())
-                    }
+        result?;
+        replay_lifecycle_actions(perf, &lifecycle_actions, open_new_perf_events)?;
+        let dead_processes = processes.dead_or_reused_pids()?;
+        let mut last_exit_by_pid = FxHashMap::<i32, u64>::default();
+        if !dead_processes.is_empty() {
+            for action in &lifecycle_actions {
+                let LifecycleAction::ThreadExit {
+                    pid, timestamp_ns, ..
+                } = *action
+                else {
+                    continue;
                 };
-                action_index += 1;
-                if let Err(err) = action_result {
-                    result = Err(err);
-                    break;
-                }
+                let Some(pid) = i32_from_u32(pid) else {
+                    continue;
+                };
+                last_exit_by_pid
+                    .entry(pid)
+                    .and_modify(|latest| *latest = (*latest).max(timestamp_ns))
+                    .or_insert(timestamp_ns);
             }
         }
-        if result.is_ok() {
-            let dead_processes = match processes.dead_or_reused_pids() {
-                Ok(dead_processes) => dead_processes,
-                Err(error) => {
-                    result = Err(error.into());
-                    Vec::new()
-                }
-            };
-            let mut last_exit_by_pid = FxHashMap::<i32, u64>::default();
-            if !dead_processes.is_empty() {
-                for action in &lifecycle_actions {
-                    let LifecycleAction::ThreadExit {
-                        pid, timestamp_ns, ..
-                    } = *action
-                    else {
-                        continue;
-                    };
-                    let Some(pid) = i32_from_u32(pid) else {
-                        continue;
-                    };
-                    last_exit_by_pid
-                        .entry(pid)
-                        .and_modify(|latest| *latest = (*latest).max(timestamp_ns))
-                        .or_insert(timestamp_ns);
-                }
-            }
+        let retire_result = (|| {
             for &pid in &dead_processes {
                 if let Ok(pid_u32) = u32::try_from(pid) {
-                    if let Err(err) = perf.remove_process(pid_u32) {
-                        result = Err(err);
-                        break;
-                    }
+                    perf.remove_process(pid_u32)?;
                 }
                 let timestamp_ns = last_exit_by_pid
                     .get(&pid)
                     .copied()
                     .unwrap_or(recovery_timestamp_ns);
-                if let Err(err) = end_python_runtime_process(processes, writer, timestamp_ns, pid) {
-                    result = Err(err);
-                    break;
-                }
-                if let Err(err) = cleanup_process(pid, modules, processes, writer) {
-                    result = Err(err);
-                    break;
-                }
+                end_python_runtime_process(processes, writer, timestamp_ns, pid)?;
+                cleanup_process(pid, modules, processes, writer)?;
             }
-            processes.recycle_dead_pid_scratch(dead_processes);
-        }
+            Ok::<(), io::Error>(())
+        })();
+        processes.recycle_dead_pid_scratch(dead_processes);
+        retire_result?;
         // Retiring a member snapshots its final PERF_FORMAT_LOST value into
         // PerfGroup. Forced drains read here, after replay, so one counter
         // sweep includes both live and newly retired members.
-        if result.is_ok() && mode.forces_bookkeeping() {
-            match perf.take_lost_records() {
-                Ok(lost) => {
-                    result = record_observed_lost_events(summary, capture_pacing, lost);
-                    if result.is_ok() {
-                        recovered_lifecycle_gap |= capture_pacing.should_run_recovery_sweep(mode);
-                    }
-                }
-                Err(err) => result = Err(err),
-            }
+        if mode.forces_bookkeeping() {
+            let lost = perf.take_lost_records()?;
+            record_observed_lost_events(summary, capture_pacing, lost)?;
+            recovered_lifecycle_gap |= capture_pacing.should_run_recovery_sweep(mode);
         }
-        if result.is_ok() && recovered_lifecycle_gap {
+        if recovered_lifecycle_gap {
             let tracked_pids = processes.tracked_pids();
             for pid in tracked_pids {
                 let Ok(pid_u32) = u32::try_from(pid) else {
                     continue;
                 };
-                match reconcile_process_image(
+                if !reconcile_process_image(
                     pid_u32,
                     recovery_timestamp_ns,
                     modules,
                     processes,
                     writer,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(err) = perf.remove_process(pid_u32) {
-                            result = Err(err);
-                            break;
-                        }
-                        if let Err(err) = cleanup_process(pid, modules, processes, writer) {
-                            result = Err(err);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        result = Err(err);
-                        break;
-                    }
+                )? {
+                    perf.remove_process(pid_u32)?;
+                    cleanup_process(pid, modules, processes, writer)?;
                 }
             }
         }
-        if result.is_ok()
-            && open_new_perf_events
-            && recovered_lifecycle_gap
-            && inherit_child_processes
-        {
+        if open_new_perf_events && recovered_lifecycle_gap && inherit_child_processes {
             let roots = processes.tracked_pids();
             for (child, parent) in crate::children::discover_descendant_edges_raw_for_roots(&roots)
             {
                 if processes.is_tracked(child) {
                     continue;
                 }
-                match register_recovered_descendant(
+                if let Some(process_fork) = register_recovered_descendant(
                     child,
                     parent,
                     recovery_timestamp_ns,
                     modules,
                     processes,
                     writer,
-                ) {
-                    Ok(Some(process_fork)) => recovered_process_forks.push(process_fork),
-                    Ok(None) => {}
-                    Err(err) => {
-                        result = Err(err);
-                        break;
-                    }
+                )? {
+                    recovered_process_forks.push(process_fork);
                 }
             }
         }
-        if result.is_ok() && open_new_perf_events {
-            result = perf.recover_forked_processes(&recovered_process_forks);
+        if open_new_perf_events {
+            perf.recover_forked_processes(&recovered_process_forks)?;
         }
-        if result.is_ok() && open_new_perf_events && recovered_lifecycle_gap {
+        if open_new_perf_events && recovered_lifecycle_gap {
             for pid in processes
                 .tracked_pids()
                 .into_iter()
@@ -1340,17 +1217,15 @@ impl<W: std::io::Write> Recorder<W> {
             {
                 if let Err(err) = perf.refresh_threads(pid) {
                     if !crate::error::is_target_gone_io(&err) {
-                        result = Err(err);
-                        break;
+                        return Err(err);
                     }
                 }
             }
         }
-        if result.is_ok() && recovered_lifecycle_gap {
+        if recovered_lifecycle_gap {
             capture_pacing.complete_recovery_sweep();
         }
-        refresh_recording_summary(summary, perf);
-        result
+        Ok(())
     }
 
     /// Wait for data for at most `timeout`, then drain every ready event.
@@ -1360,6 +1235,17 @@ impl<W: std::io::Write> Recorder<W> {
     /// Returns an error when polling perf, decoding events, unwinding a stack,
     /// or writing a spool record fails.
     pub fn poll(&mut self, timeout: std::time::Duration) -> crate::Result<PollSummary> {
+        match self.poll_recording(timeout) {
+            Ok(summary) => {
+                self.last_poll = summary;
+                Ok(summary)
+            }
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
+    fn poll_recording(&mut self, timeout: Duration) -> crate::Result<PollSummary> {
+        self.check_failure()?;
         self.disable_on_drop = true;
         let samples = self.summary.samples;
         let lost_events = self.summary.lost_events;
@@ -1367,10 +1253,43 @@ impl<W: std::io::Write> Recorder<W> {
             self.perf.wait(timeout)?;
         }
         self.drain_events(DrainMode::Consume)?;
+        if self.last_reconcile.elapsed() >= Duration::from_millis(100) {
+            self.last_reconcile = Instant::now();
+            for pid in self.processes.tracked_pids() {
+                if let Some(pid) = crate::Pid::new(pid) {
+                    if self.processes.process_is_active(pid)? {
+                        self.refresh_threads(pid)?;
+                    }
+                }
+            }
+        }
+        if self.last_publish.elapsed() >= self.publish_interval {
+            self.flush()?;
+        }
+        let root_active = self.processes.process_is_active(self.root_pid)?;
+        let active_processes = self.processes.active_process_count()?;
+        let pending_events = self.has_pending_events();
         Ok(PollSummary {
+            root_active,
+            active_processes,
+            pending_events,
             samples: self.summary.samples.saturating_sub(samples),
             lost_events: self.summary.lost_events.saturating_sub(lost_events),
         })
+    }
+
+    /// Attach another process using the selected initial mapping policy.
+    pub fn attach_additional(
+        &mut self,
+        pid: crate::Pid,
+        policy: AttachPolicy,
+    ) -> crate::Result<AttachOutcome> {
+        self.check_failure()?;
+        let mode = match policy {
+            AttachPolicy::Running => AttachMode::Running,
+            AttachPolicy::StopWhileAttaching => AttachMode::StopWhileAttaching,
+        };
+        self.attach_process(pid, mode)
     }
 
     /// Add another process to this recording.
@@ -1379,7 +1298,7 @@ impl<W: std::io::Write> Recorder<W> {
     ///
     /// Returns an error when perf cannot attach, process metadata cannot be
     /// read, or the spool cannot record the new mappings.
-    pub fn attach_process(
+    pub(crate) fn attach_process(
         &mut self,
         pid: crate::Pid,
         attach_mode: AttachMode,
@@ -1418,7 +1337,7 @@ impl<W: std::io::Write> Recorder<W> {
         let opened = match self.perf.open_process(pid, attach_mode) {
             Ok(opened) => opened,
             Err(error) if crate::error::is_target_gone_io(&error) => {
-                return Ok(AttachOutcome::Exited)
+                return Ok(AttachOutcome::Exited);
             }
             Err(error) => return Err(error.into()),
         };
@@ -1467,7 +1386,7 @@ impl<W: std::io::Write> Recorder<W> {
             attach_mode,
             AttachMode::Running | AttachMode::StopWhileAttaching
         ) {
-            if let Err(err) = self.perf.enable() {
+            if let Err(err) = self.perf.enable_if_running() {
                 return Err(self.rollback_open_process_error(pid, opened, err).into());
             }
         }
@@ -1482,7 +1401,7 @@ impl<W: std::io::Write> Recorder<W> {
     ///
     /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) when
     /// `pid` is not attached, or an I/O error when thread discovery fails.
-    pub fn refresh_threads(&mut self, pid: crate::Pid) -> crate::Result<RefreshOutcome> {
+    pub(crate) fn refresh_threads(&mut self, pid: crate::Pid) -> crate::Result<RefreshOutcome> {
         if !self.processes.is_tracked(pid.get()) {
             return Err(crate::Error::message(
                 crate::ErrorKind::InvalidInput,
@@ -1499,29 +1418,6 @@ impl<W: std::io::Write> Recorder<W> {
         })
     }
 
-    /// Disable sampling for all attached processes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first perf-event disable failure.
-    pub fn disable(&mut self) -> crate::Result<()> {
-        self.perf.disable()?;
-        self.disable_on_drop = false;
-        Ok(())
-    }
-
-    /// Enable sampling for all attached processes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first perf-event enable or process-resume failure. When both
-    /// fail, the enable failure remains primary and the resume failure is
-    /// included as cleanup context.
-    pub fn enable(&mut self) -> crate::Result<()> {
-        self.disable_on_drop = true;
-        Ok(self.perf.enable()?)
-    }
-
     /// Drain all collected events, force loss bookkeeping and recovery, then
     /// flush the spool writer. Sampling and lifecycle discovery remain active.
     ///
@@ -1534,8 +1430,69 @@ impl<W: std::io::Write> Recorder<W> {
     ///
     /// Returns an event-processing or writer error.
     pub fn flush(&mut self) -> crate::Result<()> {
-        self.drain_events(DrainMode::Flush)?;
-        Ok(self.writer.flush()?)
+        self.check_failure()?;
+        if let Err(error) = self
+            .drain_events(DrainMode::Flush)
+            .and_then(|()| self.writer.flush())
+        {
+            return Err(self.fail(error.into()));
+        }
+        self.publisher.publish(self.writer.position());
+        self.last_publish = Instant::now();
+        Ok(())
+    }
+
+    /// Pause sampling without changing the recording's process scope.
+    pub fn pause(&mut self) -> crate::Result<()> {
+        self.perf.disable()?;
+        self.disable_on_drop = false;
+        Ok(())
+    }
+    /// Resume sampling, including counters added while paused.
+    pub fn resume(&mut self) -> crate::Result<()> {
+        self.check_failure()?;
+        self.disable_on_drop = true;
+        Ok(self.perf.enable()?)
+    }
+    /// The most recent poll summary, without performing new I/O.
+    pub fn last_poll(&self) -> PollSummary {
+        self.last_poll
+    }
+
+    /// Derived capture metadata.
+    pub fn metadata(&self) -> &RecordingMetadata {
+        &self.metadata
+    }
+    /// Current capture counters.
+    pub fn stats(&self) -> RecordingSummary {
+        self.summary.clone()
+    }
+
+    fn fail(&mut self, error: crate::Error) -> crate::Error {
+        let failure = match &self.failure {
+            Some(failure) => std::sync::Arc::clone(failure),
+            None => {
+                let failure = std::sync::Arc::new(error);
+                self.failure = Some(std::sync::Arc::clone(&failure));
+                self.publisher.abort(Some(std::sync::Arc::clone(&failure)));
+                let _ = self.perf.disable();
+                failure
+            }
+        };
+        crate::Error::new(failure.kind(), builder::SharedFailure(failure))
+    }
+
+    fn check_failure(&mut self) -> crate::Result<()> {
+        if let Some(failure) = self.failure.clone() {
+            return Err(crate::Error::new(
+                failure.kind(),
+                builder::SharedFailure(failure),
+            ));
+        }
+        if let Some(error) = self.writer.failure() {
+            return Err(self.fail(error.into()));
+        }
+        Ok(())
     }
 
     /// Return whether userspace has queued events or [`Self::poll`] observed a
@@ -1544,53 +1501,38 @@ impl<W: std::io::Write> Recorder<W> {
         self.event_sorter.has_more() || self.perf.has_pending_events()
     }
 
-    /// Return a snapshot of the current counters.
-    pub fn summary(&self) -> RecordingSummary {
-        self.summary.clone()
-    }
-
-    /// Return whether `pid` is still believed to be alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when process state cannot be checked.
-    pub fn process_is_active(&mut self, pid: crate::Pid) -> crate::Result<bool> {
-        self.processes.process_is_active(pid)
-    }
-
-    /// Return whether any active process other than `pid` remains.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when process state cannot be inspected. Inspection
-    /// failures are never treated as an alive or dead result.
-    pub fn has_active_processes_except(&mut self, pid: crate::Pid) -> crate::Result<bool> {
-        self.processes.has_active_processes_except(pid.get())
-    }
-
-    /// Return the number of processes still believed to be alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when any tracked process cannot be inspected.
-    pub fn active_process_count(&mut self) -> crate::Result<usize> {
-        self.processes.active_process_count()
-    }
-
     /// Flush the spool file and return the final counters.
     ///
     /// # Errors
     ///
     /// Returns the first disable, drain, or flush error. Later failures are
     /// retained as cleanup context, and flushing is attempted in every case.
-    pub fn finish(mut self) -> crate::Result<RecordingSummary> {
-        let result = self.perf.disable();
-        if result.is_ok() {
+    pub fn finish(mut self) -> Result<RecordingSummary, FinishError> {
+        let initial = self.check_failure().map_err(io::Error::from);
+        let disabled = self.perf.disable();
+        if disabled.is_ok() {
             self.disable_on_drop = false;
         }
-        let result = crate::error::and_cleanup(result, self.drain_events(DrainMode::Final));
-        crate::error::and_cleanup(result, self.writer.flush())?;
-        Ok(std::mem::take(&mut self.summary))
+        let mut result = crate::error::and_cleanup(initial, disabled);
+        if self.failure.is_none() && !self.writer.failed() {
+            result = crate::error::and_cleanup(result, self.drain_events(DrainMode::Final));
+        }
+        result = crate::error::and_cleanup(result, self.writer.flush());
+        match result {
+            Ok(()) => {
+                self.publisher
+                    .finish(self.writer.position(), self.summary.clone());
+                Ok(std::mem::take(&mut self.summary))
+            }
+            Err(error) => {
+                let source = std::sync::Arc::new(crate::Error::from(error));
+                self.publisher.abort(Some(source.clone()));
+                Err(FinishError {
+                    summary: Box::new(std::mem::take(&mut self.summary)),
+                    source,
+                })
+            }
+        }
     }
 
     fn rollback_open_process(
@@ -1772,6 +1714,50 @@ fn record_lost_events(summary: &mut RecordingSummary, lost: u64) -> io::Result<(
     Ok(())
 }
 
+fn replay_lifecycle_actions(
+    perf: &mut perf_group::PerfGroup,
+    lifecycle_actions: &[LifecycleAction],
+    open_new_perf_events: bool,
+) -> io::Result<()> {
+    // Replay lifecycle mutations in event order. Only adjacent thread
+    // forks can share one open transaction without crossing a reuse or
+    // retirement boundary.
+    let mut action_index = 0;
+    let mut thread_fork_batch = Vec::new();
+    while action_index < lifecycle_actions.len() {
+        if open_new_perf_events {
+            thread_fork_batch.clear();
+            while let Some(LifecycleAction::ThreadFork {
+                tid,
+                pid,
+                parent_tid,
+            }) = lifecycle_actions.get(action_index)
+            {
+                thread_fork_batch.push(ThreadFork {
+                    tid: *tid,
+                    owner_pid: *pid,
+                    parent_tid: *parent_tid,
+                });
+                action_index += 1;
+            }
+            if !thread_fork_batch.is_empty() {
+                perf.open_forked_threads(&thread_fork_batch)?;
+                continue;
+            }
+        }
+        match lifecycle_actions[action_index] {
+            LifecycleAction::ProcessRetire { pid } => perf.remove_process(pid)?,
+            LifecycleAction::ProcessFork { pid, parent_tid } if open_new_perf_events => {
+                perf.open_forked_processes(&[ProcessFork { pid, parent_tid }])?;
+            }
+            LifecycleAction::ThreadExit { tid, .. } => perf.remove_thread(tid)?,
+            LifecycleAction::ProcessFork { .. } | LifecycleAction::ThreadFork { .. } => {}
+        }
+        action_index += 1;
+    }
+    Ok(())
+}
+
 fn record_observed_lost_events(
     summary: &mut RecordingSummary,
     capture_pacing: &mut CapturePacing,
@@ -1845,7 +1831,7 @@ fn reconcile_process_image<W: std::io::Write>(
     // not the exe symlink alone, determine whether this generation survives.
     let current_identity = read_process_image_identity(pid).ok();
 
-    let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+    let maps = match std::fs::read(format!("/proc/{pid}/maps")) {
         Ok(maps) => maps,
         Err(err) if crate::error::is_target_gone_io(&err) => {
             processes.forget_generation(pid_i32);
@@ -2371,17 +2357,11 @@ fn record_prepared_sample_input<W: std::io::Write>(
                 .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
         )
     };
-    match stack_id {
-        Ok(None) => {
-            bump(&mut ctx.summary.empty_stack_samples);
-            Ok(())
-        }
-        Ok(Some(_)) => {
-            bump(&mut ctx.summary.samples);
-            Ok(())
-        }
-        Err(err) => Err(err),
+    match stack_id? {
+        None => bump(&mut ctx.summary.empty_stack_samples),
+        Some(_) => bump(&mut ctx.summary.samples),
     }
+    Ok(())
 }
 
 fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
@@ -2698,10 +2678,6 @@ fn frame_mode(mode: StackMode) -> FrameMode {
     }
 }
 
-fn c_string_to_string(data: &std::ffi::CString) -> String {
-    String::from_utf8_lossy(data.as_bytes()).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -2864,7 +2840,10 @@ mod tests {
         processes.track_or_refresh(exited_pid).unwrap();
         processes.track_or_refresh(live_pid).unwrap();
 
-        crate::state::kill_process(crate::Pid::new(exited_pid).unwrap()).unwrap();
+        crate::process::Process::open(crate::Pid::new(exited_pid).unwrap())
+            .unwrap()
+            .kill()
+            .unwrap();
         exited
             .wait_timeout(Duration::from_secs(2))
             .unwrap()
@@ -2880,11 +2859,13 @@ mod tests {
     fn reopening_the_same_process_is_idempotent() {
         let child = SleepChild::spawn();
         let temp = TempDir::new("duplicate-open");
-        let mut recorder = match Recorder::attach(
+        let spool = crate::spool::Spool::retained(
+            std::fs::File::create(temp.path().join("profile.stackpulse")).unwrap(),
+        )
+        .unwrap();
+        let mut recorder = match Recorder::builder(SampleRate::hz(1).unwrap()).attach(
             crate::Pid::try_from(child.pid_u32()).expect("child pid is valid"),
-            temp.path().join("profile.stackpulse"),
-            AttachMode::StopWhileAttaching,
-            RecorderOptions::new(SampleRate::hz(1).expect("one hertz is valid")),
+            spool,
         ) {
             Ok(recorder) => recorder,
             Err(err)
@@ -2908,16 +2889,15 @@ mod tests {
 
         assert_eq!(recorder.perf.resource_counts(), before);
 
-        let mut tail = recorder.tail().expect("create live tail");
-        assert!(tail
-            .poll()
-            .expect("poll initial tail batch")
-            .stacks()
-            .next()
-            .is_none());
+        let mut reader = recorder.take_reader().expect("create live reader");
+        let crate::spool::ReadStatus::Batch(_) =
+            reader.poll(Duration::ZERO).expect("poll initial batch")
+        else {
+            panic!("initial batch is available");
+        };
         let error = recorder
-            .tail()
-            .expect_err("a recorder creates one live tail");
+            .take_reader()
+            .expect_err("a recorder creates one live reader");
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
@@ -3124,7 +3104,7 @@ mod tests {
     fn unchanged_process_reconciliation_preserves_module_generation() {
         let pid = std::process::id();
         let pid_i32 = i32::try_from(pid).unwrap();
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        let maps = std::fs::read(format!("/proc/{pid}/maps")).unwrap();
         let snapshot: Vec<_> = executable_modules_from_maps(pid, &maps).collect();
         let probe_address = snapshot.first().expect("executable mapping").start;
         let mut modules = ModuleTable::default();
@@ -3400,7 +3380,7 @@ mod tests {
                     crate::ErrorKind::Permission | crate::ErrorKind::Unsupported
                 ) || matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) =>
             {
-                return
+                return;
             }
             Err(error) => error,
             Ok(_) => panic!("writer should reject the first module record"),
@@ -3523,7 +3503,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/tmp/libtest.so".into(),
+            path: std::path::Path::new("/tmp/libtest.so").into(),
         }
     }
 
@@ -3946,5 +3926,90 @@ mod tests {
         assert_eq!(runtime.timestamp_ns, 456);
         assert_eq!(runtime.process_id.get(), 8);
         assert!(runtime.is_python_runtime);
+    }
+}
+
+#[cfg(test)]
+mod recording_lifecycle_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn empty_recorder<W: io::Write>(output: W) -> Recorder<W> {
+        let origin = crate::spool::ClockOrigin::capture().unwrap();
+        let metadata = RecordingMetadata::new(&RecorderOptions::default(), origin).unwrap();
+        let writer = PerfSpoolWriter::from_writer_with_origin(
+            output,
+            0,
+            metadata.nominal_interval.as_nanos() as u64,
+            Some(origin),
+        )
+        .unwrap();
+        let perf = perf_group::PerfGroup::new(PerfGroupOptions {
+            frequency: 1,
+            stack_size: 0,
+            ring_stacks: 0,
+            event_source: EventSource::SwCpuClock,
+            regs_mask: 0,
+            include_kernel: false,
+            inherit_child_processes: false,
+        })
+        .unwrap();
+        Recorder::finish_attach(
+            crate::Pid::try_from(std::process::id()).unwrap(),
+            AttachMode::OnExec,
+            perf,
+            writer,
+            metadata,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reader_observes_finish_and_abandoned_recording() {
+        for finish in [false, true] {
+            let dir = TempDir::new("recorder-completion");
+            let file = std::fs::File::create(dir.path().join("capture")).unwrap();
+            let mut recorder =
+                empty_recorder(crate::spool::Spool::retained(file).unwrap().into_writer());
+            let mut reader = recorder.take_reader().unwrap();
+            assert!(recorder.take_reader().is_err());
+            assert!(reader.started_at().is_some());
+            assert_eq!(reader.nominal_interval(), Some(Duration::from_millis(1)));
+            if finish {
+                recorder.finish().unwrap();
+            } else {
+                drop(recorder);
+            }
+            assert!(matches!(
+                reader.poll(Duration::ZERO).unwrap(),
+                crate::spool::ReadStatus::Batch(_)
+            ));
+            if finish {
+                assert!(matches!(
+                    reader.poll(Duration::ZERO).unwrap(),
+                    crate::spool::ReadStatus::Finished(_)
+                ));
+            } else {
+                assert!(reader.poll(Duration::ZERO).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn finish_error_preserves_final_counters_and_primary_failure() {
+        struct FailingFlush;
+        impl io::Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush refused"))
+            }
+        }
+        let mut recorder = empty_recorder(FailingFlush);
+        recorder.summary.samples = 17;
+        let error = recorder.finish().unwrap_err();
+        assert_eq!(error.summary().samples, 17);
+        assert_eq!(error.to_string(), "flush refused");
     }
 }

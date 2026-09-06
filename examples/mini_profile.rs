@@ -12,8 +12,8 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
-use stackpulse::profile::{FrameFlags, FrameKind, ResolvedFrame, SymbolOrigin};
-use stackpulse::{AttachMode, Recorder, RecorderOptions, Snapshot};
+use stackpulse::profile::{AddressSpace, Frame, FrameFlags, SymbolOrigin};
+use stackpulse::{Recorder, Snapshot, Spool};
 
 const TOP_FUNCS: usize = 10;
 const TOP_STACKS: usize = 6;
@@ -76,16 +76,15 @@ enum Kind {
     Unknown,
 }
 
-fn classify(frame: &ResolvedFrame) -> Kind {
+fn classify(frame: &Frame) -> Kind {
     match frame {
-        ResolvedFrame::Python(_) => Kind::Python,
-        ResolvedFrame::Native(n) => match n.kind {
-            FrameKind::Python => Kind::Python,
-            FrameKind::Native => Kind::Native,
-            FrameKind::Kernel => Kind::Kernel,
-            FrameKind::Unknown => Kind::Unknown,
-            _ => Kind::Unknown,
+        Frame::Python(_) => Kind::Python,
+        Frame::Native(n) => match n.address_space {
+            AddressSpace::User if n.symbol.is_none() => Kind::Unknown,
+            AddressSpace::User => Kind::Native,
+            AddressSpace::Kernel => Kind::Kernel,
         },
+        Frame::TruncatedStack => Kind::Unknown,
     }
 }
 
@@ -107,9 +106,9 @@ fn kind_tag(c: C, kind: Kind) -> String {
     }
 }
 
-fn is_hidden(frame: &ResolvedFrame) -> bool {
+fn is_hidden(frame: &Frame) -> bool {
     match frame {
-        ResolvedFrame::Native(n) => n.flags.contains(FrameFlags::HIDDEN_DEFAULT),
+        Frame::Native(n) => n.flags.contains(FrameFlags::HIDDEN_DEFAULT),
         _ => false,
     }
 }
@@ -202,15 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut recorder = Recorder::attach(
-        stackpulse::Pid::try_from(pid)?,
-        spool,
-        AttachMode::StopWhileAttaching,
-        RecorderOptions::new(stackpulse::SampleRate::hz(frequency)?)
-            .stack_size(32 * 1024)
-            .include_kernel(true),
-    )?;
-    let kernel_on = recorder.summary().kernel_enabled;
+    let mut recorder = Recorder::builder(stackpulse::SampleRate::hz(frequency)?)
+        .stack_size(32 * 1024)
+        .include_kernel(true)
+        .attach(
+            stackpulse::Pid::try_from(pid)?,
+            Spool::retained(std::fs::File::create(spool)?)?,
+        )?;
+    let kernel_on = recorder.stats().kernel_enabled;
     let kallsyms_visible = kallsyms_addresses_visible();
 
     let paranoid = read_sysctl_i64("/proc/sys/kernel/perf_event_paranoid");
@@ -241,15 +239,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a final drain and exit promptly.
     let wait_slack = Duration::from_millis(100);
 
-    let pid = stackpulse::Pid::try_from(pid)?;
-    while Instant::now() + wait_slack < deadline && recorder.process_is_active(pid)? {
-        recorder.poll(wait_slack)?;
+    while Instant::now() + wait_slack < deadline {
+        let activity = recorder.poll(wait_slack)?;
+        if !activity.root_active() && !activity.pending_events() {
+            break;
+        }
 
         if live && last_redraw.elapsed() >= Duration::from_millis(120) {
             let now = Instant::now();
             let elapsed_ms = (now - started).as_millis() as f64;
             let pct = (elapsed_ms / total_ms).min(1.0);
-            let s = recorder.summary();
+            let s = recorder.stats();
 
             let width = 24;
             let filled = (pct * width as f64).round() as usize;
@@ -303,13 +303,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut origin_counts: HashMap<&'static str, u64> = HashMap::new();
     let mut total_frames: u64 = 0;
 
-    for stack in reader.stacks() {
+    for stack in reader.samples() {
         let mut visible = Vec::new();
-        for f in symbolizer.resolve(stack)? {
+        for f in symbolizer.resolve(stack.stack())?.frames() {
             total_frames += 1;
             let origin = match f {
-                ResolvedFrame::Python(_) => "perfmap",
-                ResolvedFrame::Native(n) => match n.origin {
+                Frame::Python(_) => "perfmap",
+                Frame::TruncatedStack => "truncated",
+                Frame::Native(n) => match n.origin {
                     SymbolOrigin::Elf => "elf",
                     SymbolOrigin::PerfMap => "perfmap",
                     SymbolOrigin::KernelSymbols => "kallsyms",
@@ -320,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *origin_counts.entry(origin).or_default() += 1;
 
             if !is_hidden(f) {
-                visible.push((f.display_name(), classify(f)));
+                visible.push((f.to_string(), classify(f)));
             }
         }
 
@@ -535,10 +536,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "  {} modules={}  Python runtime records={}",
+        "  {} modules={}  processes={}",
         c.dim_pad("recording state", 22),
         c.bold(&reader.modules().len().to_string()),
-        c.bold(&reader.python_runtime_records().len().to_string()),
+        c.bold(&reader.processes().count().to_string()),
     );
 
     if summary.error_stats.has_errors() {
@@ -599,4 +600,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stackpulse::profile::{NativeFrame, NativeSymbol};
+
+    #[test]
+    fn native_address_categories_preserve_unknown_frames() {
+        for (address_space, symbol, expected) in [
+            (AddressSpace::User, None, Kind::Unknown),
+            (AddressSpace::Kernel, None, Kind::Kernel),
+            (
+                AddressSpace::User,
+                Some(NativeSymbol::new("module+0x34", "module")),
+                Kind::Native,
+            ),
+        ] {
+            let frame = Frame::Native(NativeFrame {
+                address_space,
+                symbol,
+                ..NativeFrame::from_address(0x1234)
+            });
+            assert!(classify(&frame) == expected, "{frame:?}");
+        }
+    }
 }

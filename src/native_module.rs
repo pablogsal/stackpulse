@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::elf::{
@@ -232,8 +233,9 @@ impl ElfSectionCache {
         module: &ModuleRecord,
     ) -> Result<LoadedElfMapping, ElfLoadError> {
         if module.is_kernel()
-            || module.path.is_empty()
-            || (module.path.is_bracketed_mapping() && !module.path.is_vdso())
+            || module.path.as_os_str().is_empty()
+            || (module.path.as_os_str().as_bytes().starts_with(b"[")
+                && module.path() != Path::new(VDSO_PATH))
         {
             return Err(ElfLoadError::Unsupported);
         }
@@ -247,12 +249,12 @@ impl ElfSectionCache {
             });
         }
 
-        let (image, exact) = if module.path.is_vdso() {
+        let (image, exact) = if module.path() == Path::new(VDSO_PATH) {
             let bytes = local_vdso_bytes().ok_or(ElfLoadError::Unsupported)?;
             (
                 CachedElfImage {
                     sections: Arc::new(
-                        load_elf_sections_from_bytes(bytes, module.path.as_path())
+                        load_elf_sections_from_bytes(bytes, module.path())
                             .map_err(|_| ElfLoadError::Unsupported)?,
                     ),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
@@ -281,8 +283,10 @@ impl ElfSectionCache {
             self.ensure_open_attempt_allowed(module.id)?;
             let file =
                 Arc::new(open_module_file(module).ok_or_else(|| self.failed_open(module.id))?);
-            let identity =
-                elf_image_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
+            let file_identity =
+                elf_file_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
+            let identity = elf_image_identity(module, file_identity)
+                .ok_or_else(|| self.failed_open(module.id))?;
             let cached = self.by_image.get(&identity).map(|shared| {
                 let retained_image = Arc::clone(&shared.image);
                 (
@@ -304,7 +308,7 @@ impl ElfSectionCache {
             } else {
                 let exact = Arc::new(NativeImage::new(Arc::clone(&file)));
                 let image = CachedElfImage {
-                    sections: Arc::new(self.parse_file(&file, module.path.as_path())?),
+                    sections: Arc::new(self.parse_file(&file, module.path())?),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
                     image: Arc::downgrade(&exact),
                     identity: Some(identity.file().clone()),
@@ -421,7 +425,7 @@ impl ElfSectionCache {
         &mut self,
         module: &ModuleRecord,
     ) -> Result<Arc<NativeImage>, ElfLoadError> {
-        if module.path.is_vdso() {
+        if module.path() == Path::new(VDSO_PATH) {
             return Err(ElfLoadError::Unsupported);
         }
         if let Some((image, trusted, identity)) =
@@ -441,8 +445,8 @@ impl ElfSectionCache {
         let file = Arc::new(open_module_file(module).ok_or_else(|| self.failed_open(module.id))?);
         let identity =
             elf_file_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
-        let shared_identity = elf_image_identity(module, &file);
-        let current_sections = self.parse_file(&file, module.path.as_path())?;
+        let shared_identity = elf_image_identity(module, identity.clone());
+        let current_sections = self.parse_file(&file, module.path())?;
         let shared = {
             let image = self
                 .by_module
@@ -525,9 +529,8 @@ fn elf_image_owned_bytes(sections: &ElfSectionInfo) -> usize {
     owned
 }
 
-fn elf_image_identity(module: &ModuleRecord, file: &File) -> Option<ElfImageIdentity> {
+fn elf_image_identity(module: &ModuleRecord, file: ElfFileIdentity) -> Option<ElfImageIdentity> {
     let pid = module.pid()?;
-    let file = elf_file_identity(module, file)?;
     let mount_namespace = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
         .ok()
         .map(|metadata| metadata.ino());
@@ -567,8 +570,9 @@ fn local_vdso_bytes() -> Option<Arc<[u8]>> {
     if let Some(bytes) = VDSO.get() {
         return Some(Arc::clone(bytes));
     }
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    let region = crate::proc_maps::parse_iter(&maps).find(|region| region.path == VDSO_PATH)?;
+    let maps = std::fs::read("/proc/self/maps").ok()?;
+    let region =
+        crate::proc_maps::parse_iter(&maps).find(|region| region.path == Path::new(VDSO_PATH))?;
     let length = region.address.end.checked_sub(region.address.start)?;
     if length == 0 || length > MAX_MAPPED_ELF_SIZE {
         return None;
@@ -607,7 +611,7 @@ fn open_module_file_with_mapping_path(
     // resolve in a different mount namespace. The pathname remains a useful
     // fallback after the process exits and map_files disappears.
     validated_module_file(map_file, module, true)
-        .or_else(|| validated_module_file(module.path.as_path(), module, false))
+        .or_else(|| validated_module_file(module.path(), module, false))
 }
 
 fn validated_module_file(
@@ -729,7 +733,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/tmp/libexample.so".into(),
+            path: Path::new("/tmp/libexample.so").into(),
         };
 
         assert_eq!(resolve_image_base(&module, &section_info), None);
@@ -747,11 +751,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: std::env::current_exe()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-                .into(),
+            path: std::env::current_exe().unwrap().into(),
         };
 
         let loaded = ElfSectionCache::default()
@@ -779,7 +779,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
 
         assert!(!module_path_matches_inode(&module));
@@ -818,7 +818,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.into(),
         };
 
         assert!(validated_module_file(&fifo, &module(&fifo), false).is_none());
@@ -842,7 +842,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
 
@@ -873,9 +873,10 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
-        let first_identity = elf_image_identity(&module, &first_file).unwrap();
+        let first_identity =
+            elf_image_identity(&module, elf_file_identity(&module, &first_file).unwrap()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::write(&path, b"other").unwrap();
@@ -883,7 +884,8 @@ mod tests {
         second_file
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        let second_identity = elf_image_identity(&module, &second_file).unwrap();
+        let second_identity =
+            elf_image_identity(&module, elf_file_identity(&module, &second_file).unwrap()).unwrap();
 
         assert_ne!(first_identity, second_identity);
     }
@@ -903,7 +905,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
         let loaded = cache.load_mapping(&module).unwrap();
@@ -944,7 +946,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
         let loaded = cache.load_mapping(&module).unwrap();
@@ -988,7 +990,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
         let loaded = cache.load_mapping(&module).unwrap();
@@ -1012,7 +1014,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
         assert!(cache.load_mapping(&module).is_ok());
@@ -1038,7 +1040,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.to_string_lossy().into_owned().into(),
+            path: path.as_path().into(),
         };
         let mut cache = ElfSectionCache::default();
         let LoadedElfMapping {
@@ -1114,7 +1116,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/definitely/missing/image".into(),
+            path: Path::new("/definitely/missing/image").into(),
         };
         let mut first = ElfSectionCache::using_exact_images(store.clone());
         let mut second = ElfSectionCache::using_exact_images(store);
@@ -1290,7 +1292,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: textual_path.to_string_lossy().into_owned().into(),
+            path: textual_path.as_path().into(),
         };
 
         let opened = open_module_file_with_mapping_path(&module, &map_path).unwrap();
@@ -1302,9 +1304,9 @@ mod tests {
 
     #[test]
     fn loads_vdso_elf_from_the_target_mapping() {
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let maps = std::fs::read("/proc/self/maps").unwrap();
         let region = crate::proc_maps::parse_iter(&maps)
-            .find(|region| region.path == "[vdso]")
+            .find(|region| region.path == Path::new("[vdso]"))
             .expect("current process has a vDSO mapping");
         let module = ModuleRecord {
             id: 1,
@@ -1316,7 +1318,7 @@ mod tests {
             device_major: region.device_major,
             device_minor: region.device_minor,
             inode_generation: 0,
-            path: "[vdso]".into(),
+            path: Path::new("[vdso]").into(),
         };
 
         let loaded = ElfSectionCache::default()

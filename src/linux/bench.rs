@@ -207,7 +207,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/opt/stackpulse/live-bench/libworkload.so".into(),
+            path: std::path::Path::new("/opt/stackpulse/live-bench/libworkload.so").into(),
         },
         ModuleRecord {
             id: 0,
@@ -219,7 +219,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "/opt/stackpulse/live-bench/python3.12".into(),
+            path: std::path::Path::new("/opt/stackpulse/live-bench/python3.12").into(),
         },
         ModuleRecord {
             id: 0,
@@ -231,7 +231,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: "[kernel.kallsyms]".into(),
+            path: std::path::Path::new("[kernel.kallsyms]").into(),
         },
     ]
 }

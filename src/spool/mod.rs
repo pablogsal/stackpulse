@@ -1,7 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+#[cfg(any(test, feature = "bench-support"))]
+use std::io::BufWriter;
+use std::io::{self, Read, Write};
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,12 +14,18 @@ use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
-mod model;
+mod live;
+pub(crate) use live::Publisher;
+#[doc(hidden)]
+pub use live::SpoolFile;
+pub use live::{LiveReader, ReadStatus, ReaderStats, Reclamation, Spool};
+pub(crate) mod model;
 mod modules;
 mod tail;
+pub use model::Module;
 pub(crate) use model::ModuleOwner;
 pub(crate) use model::VDSO_PATH;
-pub use model::{
+pub(crate) use model::{
     FrameMode, FrameRecord, ModulePath, ModuleRecord, PythonRuntimeRecord, SampleRecord,
     ThreadRecord,
 };
@@ -26,7 +36,7 @@ pub(crate) use modules::ModuleTable;
 pub(crate) use modules::ModuleUpdate;
 pub use tail::{Tail, TailBatch};
 
-pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE3\0";
+pub(crate) const CURRENT_MAGIC: &[u8; 8] = b"SPULSE4\0";
 const REC_MODULE: u8 = 1;
 const REC_FRAME: u8 = 2;
 const REC_STACK: u8 = 3;
@@ -48,13 +58,13 @@ const NONE_U32: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct StackNodeRecord {
-    prefix: Option<u32>,
+    prefix: Option<NonZeroU32>,
     frame_id: u32,
     depth: usize,
 }
 
 pub(crate) struct PerfSpoolWriter<W: Write> {
-    writer: W,
+    writer: SpoolOutput<W>,
     last_timestamp_ns: u64,
     // Frames pinned to a module id resolve through that id on the read side
     // regardless of surrounding module records, so they are interned once for
@@ -68,6 +78,7 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     thread_cache: FxHashMap<(i32, u64), u32>,
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 impl PerfSpoolWriter<BufWriter<File>> {
     pub(crate) fn create<P: AsRef<Path>>(
         path: P,
@@ -81,23 +92,52 @@ impl PerfSpoolWriter<BufWriter<File>> {
     pub(crate) fn open_reader(&self) -> io::Result<File> {
         OpenOptions::new().read(true).open(format!(
             "/proc/self/fd/{}",
-            self.writer.get_ref().as_raw_fd()
+            self.writer.inner.get_ref().as_raw_fd()
         ))
     }
 
     pub(crate) fn open_discarder(&self) -> io::Result<File> {
-        self.writer.get_ref().try_clone()
+        self.writer.inner.get_ref().try_clone()
+    }
+}
+
+impl PerfSpoolWriter<SpoolFile> {
+    pub(crate) fn open_reader(&self) -> io::Result<File> {
+        OpenOptions::new().read(true).open(format!(
+            "/proc/self/fd/{}",
+            self.writer.inner.0.get_ref().as_raw_fd()
+        ))
+    }
+    pub(crate) fn open_discarder(&self) -> io::Result<File> {
+        self.writer.inner.0.get_ref().try_clone()
     }
 }
 
 impl<W: Write> PerfSpoolWriter<W> {
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn from_writer(
         writer: W,
         start_timestamp_us: u64,
         sample_interval_us: u64,
     ) -> io::Result<Self> {
-        let mut writer = Self {
+        Self::from_writer_with_origin(
             writer,
+            start_timestamp_us,
+            sample_interval_us
+                .checked_mul(1_000)
+                .ok_or_else(|| invalid_input("sample interval out of range"))?,
+            None,
+        )
+    }
+
+    pub(crate) fn from_writer_with_origin(
+        writer: W,
+        start_timestamp_us: u64,
+        sample_interval_ns: u64,
+        origin: Option<ClockOrigin>,
+    ) -> io::Result<Self> {
+        let mut writer = Self {
+            writer: SpoolOutput::new(writer),
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
             next_frame_id: 0,
@@ -107,13 +147,14 @@ impl<W: Write> PerfSpoolWriter<W> {
         };
         writer.writer.write_all(CURRENT_MAGIC)?;
         writer.writer.write_varint(start_timestamp_us)?;
-        writer.writer.write_varint(sample_interval_us)?;
+        writer.writer.write_varint(sample_interval_ns)?;
+        write_clock_origin(&mut writer.writer, origin)?;
         Ok(writer)
     }
 
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn into_inner(self) -> W {
-        self.writer
+        self.writer.inner
     }
 
     pub(crate) fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
@@ -129,7 +170,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(u64::from(module.device_minor))?;
         self.writer.write_varint(module.inode_generation)?;
         self.writer.write_all(&[u8::from(module.is_kernel())])?;
-        write_bytes(&mut self.writer, module.path.as_bytes())?;
+        write_bytes(&mut self.writer, module.path.as_os_str().as_bytes())?;
         self.unpinned_frame_cache.clear();
         Ok(())
     }
@@ -155,10 +196,10 @@ impl<W: Write> PerfSpoolWriter<W> {
         };
         let thread_id = self.intern_thread(process_id, thread_id)?;
 
-        self.writer.write_all(&[REC_SAMPLE])?;
-        self.writer.write_varint(delta)?;
-        self.writer.write_varint(u64::from(thread_id))?;
-        self.writer.write_varint(u64::from(stack_id))?;
+        self.writer.write_record(
+            REC_SAMPLE,
+            (delta, u64::from(thread_id), u64::from(stack_id)),
+        )?;
         // Advance the delta baseline only after the record is written; a failed
         // write would otherwise skew every later sample's timestamp.
         self.last_timestamp_ns = timestamp_ns;
@@ -191,6 +232,18 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(())
     }
 
+    pub(crate) fn position(&self) -> u64 {
+        self.writer.bytes
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.writer.failure.is_some()
+    }
+
+    pub(crate) fn failure(&self) -> Option<io::Error> {
+        self.writer.failed()
+    }
+
     pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
@@ -201,10 +254,10 @@ impl<W: Write> PerfSpoolWriter<W> {
             return Ok(id);
         }
         let id = next_spool_id(self.thread_cache.len(), "thread")?;
-        self.writer.write_all(&[REC_THREAD])?;
-        self.writer.write_varint(u64::from(id))?;
-        self.writer.write_varint(i64::from(process_id))?;
-        self.writer.write_varint(thread_id)?;
+        self.writer.write_record(
+            REC_THREAD,
+            (u64::from(id), i64::from(process_id), thread_id),
+        )?;
         self.thread_cache.insert(key, id);
         Ok(id)
     }
@@ -231,9 +284,8 @@ impl<W: Write> PerfSpoolWriter<W> {
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
-        writer.write_all(&[REC_FRAME])?;
-        writer.write_varint(u64::from(id))?;
-        write_compact_frame(writer, frame)?;
+        let (tag, address) = compact_frame(frame)?;
+        writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
         cache.insert(*frame, id);
         *next_frame_id = next_frame_id
             .checked_add(1)
@@ -247,9 +299,7 @@ impl<W: Write> PerfSpoolWriter<W> {
         I::IntoIter: DoubleEndedIterator,
     {
         let mut prefix = NONE_U32;
-        let mut saw_frame = false;
         for frame in frames.into_iter().rev() {
-            saw_frame = true;
             let frame_id = self.intern_frame(&frame)?;
             let key = (prefix, frame_id);
             if let Some(&stack_id) = self.stack_cache.get(&key) {
@@ -257,14 +307,14 @@ impl<W: Write> PerfSpoolWriter<W> {
                 continue;
             }
             let stack_id = next_spool_id(self.stack_cache.len(), "stack")?;
-            self.writer.write_all(&[REC_STACK])?;
-            self.writer.write_varint(u64::from(stack_id))?;
-            self.writer.write_varint(u64::from(prefix))?;
-            self.writer.write_varint(u64::from(frame_id))?;
+            self.writer.write_record(
+                REC_STACK,
+                (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
+            )?;
             self.stack_cache.insert(key, stack_id);
             prefix = stack_id;
         }
-        Ok(saw_frame.then_some(prefix))
+        Ok((prefix != NONE_U32).then_some(prefix))
     }
 }
 
@@ -286,6 +336,7 @@ pub struct Replay {
     sample_ranges: Box<[Range<usize>]>,
     scan_start: Option<ReplayScanStart>,
     sample_count: usize,
+    #[cfg(test)]
     first_sample_timestamp_ns: Option<u64>,
 }
 
@@ -314,18 +365,23 @@ impl std::fmt::Debug for Replay {
 }
 
 struct SpoolDefinitions {
+    clock_origin: Option<ClockOrigin>,
+    processes: Vec<crate::Pid>,
     source_id: u64,
+    #[cfg(test)]
     start_timestamp_us: u64,
-    sample_interval_us: u64,
+    sample_interval_ns: u64,
     modules: Vec<ModuleRecord>,
     frames: Vec<FrameRecord>,
     frame_contexts: SpoolFrameModuleContexts,
     stack_nodes: Vec<StackNodeRecord>,
+    #[cfg(test)]
     python_runtime_records: Vec<PythonRuntimeRecord>,
     truncated_tail: bool,
 }
 
 impl SpoolDefinitions {
+    #[inline]
     fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrames<'_>> {
         let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
             invalid_data(format!("sample references missing stack node {stack_id}"))
@@ -333,47 +389,35 @@ impl SpoolDefinitions {
         Ok(StackFrames {
             frames: &self.frames,
             stack_nodes: &self.stack_nodes,
-            current: Some(stack_id),
+            current: stack_id,
             remaining: node.depth,
         })
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "replay sample stack ids are validated during reader construction"
-    )]
     fn sample_stack(&self, sample: SampleRecord) -> SampleStack<'_> {
-        let frames = self
-            .stack_frame_refs(sample.stack_id)
-            .expect("sample stack ids were validated while opening the spool");
         SampleStack {
             definitions: self,
-            key: StackKey {
-                source_id: self.source_id,
-                process_id: sample.process_id,
-                stack_id: sample.stack_id,
-            },
             sample,
-            frames,
         }
     }
 
+    #[inline]
     fn module_for_frame(
         &self,
         process_id: i32,
         frame_id: u32,
         frame: &FrameRecord,
     ) -> Option<FrameModuleRef<'_>> {
-        let context = self.frame_contexts.for_frame_id(frame_id)?;
         module_for_frame_with_context(
             &self.modules,
             &self.frame_contexts,
-            context,
+            frame_id,
             process_id,
             frame,
         )
     }
 
+    #[inline]
     fn frame_context<'a>(
         &'a self,
         process_id: i32,
@@ -389,11 +433,11 @@ impl SpoolDefinitions {
 
 /// Recorded module context for a raw frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameModuleRef<'a> {
+pub struct Mapping<'a> {
     /// Recorded module that contains the frame.
-    pub module: &'a ModuleRecord,
+    pub(crate) module: &'a ModuleRecord,
     /// Address relative to the module's file-offset coordinate space.
-    pub file_relative_ip: u64,
+    pub(crate) file_relative_ip: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -520,28 +564,11 @@ impl SpoolFrameModuleContexts {
 
 /// Raw frame plus its recorded module context, when StackPulse had one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameContext<'a> {
+pub(crate) struct FrameContext<'a> {
     /// Raw frame from the interned stack.
     pub frame: &'a FrameRecord,
     /// Recorded module context for `frame`.
     pub module: Option<FrameModuleRef<'a>>,
-}
-
-/// Borrowed raw frames with recorded module context for one interned stack.
-#[derive(Clone)]
-pub struct StackFrameContexts<'a> {
-    definitions: &'a SpoolDefinitions,
-    process_id: i32,
-    frames: StackFrames<'a>,
-}
-
-impl std::fmt::Debug for StackFrameContexts<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StackFrameContexts")
-            .field("process_id", &self.process_id)
-            .field("remaining", &self.frames.len())
-            .finish()
-    }
 }
 
 /// Opaque identity for one interned stack in one spool source.
@@ -570,34 +597,48 @@ impl StackKey {
 
 /// Sample metadata and its no-copy raw stack iterator.
 #[derive(Clone)]
-pub struct SampleStack<'a> {
+pub struct Sample<'a> {
     definitions: &'a SpoolDefinitions,
-    key: StackKey,
     sample: SampleRecord,
-    frames: StackFrames<'a>,
 }
 
-impl std::fmt::Debug for SampleStack<'_> {
+impl std::fmt::Debug for Sample<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SampleStack")
-            .field("key", &self.key)
+        f.debug_struct("Sample")
+            .field("key", &self.key())
             .field("sample", &self.sample)
-            .field("frames", &self.frames.len())
+            .field("frames", &self.stack().raw_frames().len())
             .finish()
     }
 }
 
-impl<'a> SampleStack<'a> {
+impl<'a> Sample<'a> {
+    /// Borrow the interned stack associated with this occurrence.
+    pub fn stack(&self) -> Stack<'a> {
+        Stack {
+            definitions: self.definitions,
+            key: self.key(),
+        }
+    }
+
+    /// Return the timestamp in the recording's monotonic clock domain.
+    pub fn monotonic_timestamp(&self) -> std::time::Duration {
+        self.timestamp()
+    }
+
     /// Return this sample's metadata.
     #[must_use]
-    pub fn sample(&self) -> SampleRecord {
+    #[cfg(test)]
+    pub(crate) fn sample(&self) -> SampleRecord {
         self.sample
     }
 
-    /// Return the stable stack identity for caching within this spool.
-    #[must_use]
-    pub fn key(&self) -> StackKey {
-        self.key
+    pub(crate) fn key(&self) -> StackKey {
+        StackKey {
+            source_id: self.definitions.source_id,
+            process_id: self.sample.process_id,
+            stack_id: self.sample.stack_id,
+        }
     }
 
     /// Return the sampled process.
@@ -614,28 +655,18 @@ impl<'a> SampleStack<'a> {
 
     /// Return the monotonic timestamp recorded for this sample.
     #[must_use]
-    pub fn timestamp(&self) -> std::time::Duration {
+    pub(crate) fn timestamp(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(self.sample.timestamp_ns)
     }
 
-    /// Borrow the raw stack frames.
-    #[must_use]
-    pub fn frames(&self) -> StackFrames<'_> {
-        self.frames.clone()
-    }
-
-    /// Borrow raw frames together with their recorded module mappings.
-    #[must_use]
-    pub fn contexts(&self) -> StackFrameContexts<'_> {
-        StackFrameContexts {
-            definitions: self.definitions,
-            process_id: self.sample.process_id.get(),
-            frames: self.frames.clone(),
-        }
-    }
-
-    pub(crate) fn into_parts(self) -> (StackKey, SampleRecord, StackFrames<'a>) {
-        (self.key, self.sample, self.frames)
+    /// Return correlated wall time, or None when the source has no clock origin.
+    ///
+    /// Returns an error when the correlated time is outside SystemTime bounds.
+    pub fn recorded_at(&self) -> Result<Option<std::time::SystemTime>, TimestampOutOfRange> {
+        let Some(origin) = self.definitions.clock_origin else {
+            return Ok(None);
+        };
+        origin.recorded_at(self.sample.timestamp_ns).map(Some)
     }
 }
 
@@ -668,10 +699,10 @@ struct ReplayRecordState {
 
 /// Borrowed raw frames for one interned stack.
 #[derive(Clone, Debug)]
-pub struct StackFrames<'a> {
+pub(crate) struct StackFrames<'a> {
     frames: &'a [FrameRecord],
     stack_nodes: &'a [StackNodeRecord],
-    current: Option<u32>,
+    current: u32,
     remaining: usize,
 }
 
@@ -681,17 +712,30 @@ pub(crate) struct StackFrameRef<'a> {
 }
 
 impl<'a> StackFrames<'a> {
+    fn contexts(
+        mut self,
+        definitions: &'a SpoolDefinitions,
+        process_id: i32,
+    ) -> impl ExactSizeIterator<Item = FrameContext<'a>> + 'a {
+        (0..self.len()).map(move |_| {
+            let frame = self.advance();
+            definitions.frame_context(process_id, frame.id, frame.frame)
+        })
+    }
+
+    #[inline]
+    fn advance(&mut self) -> StackFrameRef<'a> {
+        let node = &self.stack_nodes[self.current as usize];
+        self.current = node.prefix.map_or(0, |prefix| prefix.get() - 1);
+        self.remaining -= 1;
+        StackFrameRef {
+            id: node.frame_id,
+            frame: &self.frames[node.frame_id as usize],
+        }
+    }
+
     pub(crate) fn next_with_id(&mut self) -> Option<StackFrameRef<'a>> {
-        let id = self.current?;
-        let node = self.stack_nodes.get(id as usize)?;
-        self.current = node.prefix;
-        self.remaining = self.remaining.saturating_sub(1);
-        self.frames
-            .get(node.frame_id as usize)
-            .map(|frame| StackFrameRef {
-                id: node.frame_id,
-                frame,
-            })
+        (self.remaining != 0).then(|| self.advance())
     }
 }
 
@@ -710,28 +754,6 @@ impl<'a> Iterator for StackFrames<'a> {
 impl ExactSizeIterator for StackFrames<'_> {
     fn len(&self) -> usize {
         self.remaining
-    }
-}
-
-impl<'a> Iterator for StackFrameContexts<'a> {
-    type Item = FrameContext<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let frame_ref = self.frames.next_with_id()?;
-        Some(
-            self.definitions
-                .frame_context(self.process_id, frame_ref.id, frame_ref.frame),
-        )
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.frames.size_hint()
-    }
-}
-
-impl ExactSizeIterator for StackFrameContexts<'_> {
-    fn len(&self) -> usize {
-        self.frames.len()
     }
 }
 
@@ -813,6 +835,20 @@ impl ExactSizeIterator for ReplaySamples<'_> {
 }
 
 impl Snapshot {
+    /// Process identities observed in the recording, including metadata-only processes.
+    pub fn processes(&self) -> impl ExactSizeIterator<Item = crate::Pid> + '_ {
+        self.definitions.processes.iter().copied()
+    }
+    /// Wall time paired with this source's monotonic origin.
+    pub fn started_at(&self) -> Option<std::time::SystemTime> {
+        self.definitions.clock_origin.map(|origin| origin.wall_time)
+    }
+    /// Nominal interval recorded with nanosecond precision.
+    pub fn nominal_interval(&self) -> Option<std::time::Duration> {
+        let nanos = self.definitions.sample_interval_ns;
+        (nanos != 0).then(|| std::time::Duration::from_nanos(nanos))
+    }
+
     pub(crate) fn source_id(&self) -> u64 {
         self.definitions.source_id
     }
@@ -840,43 +876,42 @@ impl Snapshot {
 
     /// Return the profile timeline anchor in microseconds.
     #[must_use]
-    pub fn start_timestamp_us(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn start_timestamp_us(&self) -> Option<u64> {
         (self.definitions.start_timestamp_us != 0).then_some(self.definitions.start_timestamp_us)
     }
 
     /// Return the optional sample interval metadata in microseconds.
     #[must_use]
-    pub fn sample_interval_us(&self) -> Option<u64> {
-        (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
+    #[cfg(test)]
+    pub(crate) fn sample_interval_us(&self) -> Option<u64> {
+        (self.definitions.sample_interval_ns / 1_000 != 0)
+            .then_some(self.definitions.sample_interval_ns / 1_000)
     }
 
     /// Return code areas recorded in the profile.
     #[must_use]
-    pub fn modules(&self) -> &[ModuleRecord] {
+    pub fn modules(&self) -> &[Module] {
         &self.definitions.modules
     }
 
     /// Return all interned raw frame records.
     #[must_use]
-    pub fn frames(&self) -> &[FrameRecord] {
+    pub(crate) fn frames(&self) -> &[FrameRecord] {
         &self.definitions.frames
     }
 
     /// Return samples recorded in the profile.
     #[must_use]
-    pub fn samples(&self) -> &[SampleRecord] {
+    #[cfg(test)]
+    pub(crate) fn raw_samples(&self) -> &[SampleRecord] {
         &self.samples
-    }
-
-    /// Return the process and thread identities interned in this spool.
-    #[must_use]
-    pub fn threads(&self) -> &[ThreadRecord] {
-        &self.threads
     }
 
     /// Return recorded Python-runtime status changes.
     #[must_use]
-    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
+    #[cfg(test)]
+    pub(crate) fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
         &self.definitions.python_runtime_records
     }
 
@@ -885,14 +920,6 @@ impl Snapshot {
     #[must_use]
     pub fn recovered_from_truncated_tail(&self) -> bool {
         self.definitions.truncated_tail
-    }
-
-    /// Return absolute kernel instruction pointers present in interned frame records.
-    pub fn kernel_frame_addresses(&self) -> impl Iterator<Item = u64> + '_ {
-        self.definitions
-            .frames
-            .iter()
-            .filter_map(|frame| (frame.mode == FrameMode::Kernel).then_some(frame.abs_ip))
     }
 
     pub(crate) fn frame_module_contexts(&self) -> SpoolFrameModuleContexts {
@@ -909,25 +936,23 @@ impl Snapshot {
         &self,
         process_id: crate::Pid,
         stack_id: u32,
-    ) -> crate::Result<StackFrameContexts<'_>> {
-        Ok(StackFrameContexts {
-            definitions: &self.definitions,
-            process_id: process_id.get(),
-            frames: self.definitions.stack_frame_refs(stack_id)?,
-        })
+    ) -> crate::Result<impl ExactSizeIterator<Item = FrameContext<'_>>> {
+        Ok(self
+            .definitions
+            .stack_frame_refs(stack_id)?
+            .contexts(&self.definitions, process_id.get()))
     }
 
-    /// Iterate over all samples with borrowed raw frames.
-    pub fn stacks(&self) -> impl ExactSizeIterator<Item = SampleStack<'_>> + '_ {
+    /// Iterate over sample occurrences with their source-bound stacks.
+    pub fn samples(&self) -> impl ExactSizeIterator<Item = Sample<'_>> + '_ {
         self.samples
             .iter()
             .copied()
             .map(|sample| self.definitions.sample_stack(sample))
     }
 
-    /// Borrow one sample and its raw frames by sample index.
-    #[must_use]
-    pub fn stack(&self, index: usize) -> Option<SampleStack<'_>> {
+    /// Borrow a sample occurrence by index.
+    pub fn sample(&self, index: usize) -> Option<Sample<'_>> {
         self.samples
             .get(index)
             .copied()
@@ -936,7 +961,8 @@ impl Snapshot {
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
     #[must_use]
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
         let anchor = self.start_timestamp_us()?;
         let first = self
             .samples
@@ -947,6 +973,20 @@ impl Snapshot {
 }
 
 impl Replay {
+    /// Process identities observed in the recording, including metadata-only processes.
+    pub fn processes(&self) -> impl ExactSizeIterator<Item = crate::Pid> + '_ {
+        self.definitions.processes.iter().copied()
+    }
+    /// Wall time paired with this source's monotonic origin.
+    pub fn started_at(&self) -> Option<std::time::SystemTime> {
+        self.definitions.clock_origin.map(|origin| origin.wall_time)
+    }
+    /// Nominal interval recorded with nanosecond precision.
+    pub fn nominal_interval(&self) -> Option<std::time::Duration> {
+        let nanos = self.definitions.sample_interval_ns;
+        (nanos != 0).then(|| std::time::Duration::from_nanos(nanos))
+    }
+
     pub(crate) fn source_id(&self) -> u64 {
         self.definitions.source_id
     }
@@ -982,31 +1022,35 @@ impl Replay {
             sample_ranges: opened.sample_ranges,
             scan_start: opened.scan_start,
             sample_count: opened.sample_count,
+            #[cfg(test)]
             first_sample_timestamp_ns: opened.first_sample_timestamp_ns,
         }
     }
 
     /// Return the profile timeline anchor in microseconds.
     #[must_use]
-    pub fn start_timestamp_us(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn start_timestamp_us(&self) -> Option<u64> {
         (self.definitions.start_timestamp_us != 0).then_some(self.definitions.start_timestamp_us)
     }
 
     /// Return the optional sample interval metadata in microseconds.
     #[must_use]
-    pub fn sample_interval_us(&self) -> Option<u64> {
-        (self.definitions.sample_interval_us != 0).then_some(self.definitions.sample_interval_us)
+    #[cfg(test)]
+    pub(crate) fn sample_interval_us(&self) -> Option<u64> {
+        (self.definitions.sample_interval_ns / 1_000 != 0)
+            .then_some(self.definitions.sample_interval_ns / 1_000)
     }
 
     /// Return code areas recorded in the profile.
     #[must_use]
-    pub fn modules(&self) -> &[ModuleRecord] {
+    pub fn modules(&self) -> &[Module] {
         &self.definitions.modules
     }
 
     /// Return all interned raw frame records.
     #[must_use]
-    pub fn frames(&self) -> &[FrameRecord] {
+    pub(crate) fn frames(&self) -> &[FrameRecord] {
         &self.definitions.frames
     }
 
@@ -1016,15 +1060,10 @@ impl Replay {
         self.sample_count
     }
 
-    /// Return the process and thread identities interned in this spool.
-    #[must_use]
-    pub fn threads(&self) -> &[ThreadRecord] {
-        &self.threads
-    }
-
     /// Return recorded Python-runtime status changes.
     #[must_use]
-    pub fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
+    #[cfg(test)]
+    pub(crate) fn python_runtime_records(&self) -> &[PythonRuntimeRecord] {
         &self.definitions.python_runtime_records
     }
 
@@ -1043,16 +1082,16 @@ impl Replay {
         &self,
         process_id: crate::Pid,
         stack_id: u32,
-    ) -> crate::Result<StackFrameContexts<'_>> {
-        Ok(StackFrameContexts {
-            definitions: &self.definitions,
-            process_id: process_id.get(),
-            frames: self.definitions.stack_frame_refs(stack_id)?,
-        })
+    ) -> crate::Result<impl ExactSizeIterator<Item = FrameContext<'_>>> {
+        Ok(self
+            .definitions
+            .stack_frame_refs(stack_id)?
+            .contexts(&self.definitions, process_id.get()))
     }
 
     /// Decode samples sequentially without retaining them.
-    pub fn samples(&self) -> impl ExactSizeIterator<Item = SampleRecord> + '_ {
+    #[cfg(test)]
+    pub(crate) fn raw_samples(&self) -> impl ExactSizeIterator<Item = SampleRecord> + '_ {
         self.replay_samples()
     }
 
@@ -1073,15 +1112,16 @@ impl Replay {
         }
     }
 
-    /// Decode samples and borrow their raw frames sequentially.
-    pub fn stacks(&self) -> impl ExactSizeIterator<Item = SampleStack<'_>> + '_ {
+    /// Decode source-bound sample occurrences sequentially.
+    pub fn samples(&self) -> impl ExactSizeIterator<Item = Sample<'_>> + '_ {
         self.replay_samples()
             .map(|sample| self.definitions.sample_stack(sample))
     }
 
     /// Convert a sample timestamp to the profile timeline in microseconds.
     #[must_use]
-    pub fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn timestamp_us(&self, sample: &SampleRecord) -> Option<u64> {
         let anchor = self.start_timestamp_us()?;
         let first = self
             .first_sample_timestamp_ns
@@ -1098,6 +1138,7 @@ struct OpenedSpool {
     sample_ranges: Box<[Range<usize>]>,
     scan_start: Option<ReplayScanStart>,
     sample_count: usize,
+    #[cfg(test)]
     first_sample_timestamp_ns: Option<u64>,
 }
 
@@ -1166,28 +1207,23 @@ fn open_spool_with_range_limit(
     let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let mut reader = MmapSpoolCursor::new(Arc::clone(&mmap));
     reader.check_magic()?;
-    let start_timestamp_us = reader.read_varint::<u64>()?;
-    let sample_interval_us = reader.read_varint::<u64>()?;
-    let (
-        mut modules,
-        mut frames,
-        mut stack_nodes,
-        mut threads,
-        mut samples,
-        mut python_runtime_records,
-    ) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
+    let _start_timestamp_us = reader.read_varint::<u64>()?;
+    let sample_interval_ns = reader.read_varint::<u64>()?;
+    let clock_origin = read_clock_origin(&mut reader)?;
+    let mut modules = Vec::new();
+    let mut frames = Vec::new();
+    let mut stack_nodes = Vec::new();
+    let mut threads = Vec::new();
+    let mut samples = Vec::new();
+    let mut processes = Vec::new();
+    #[cfg(test)]
+    let mut python_runtime_records = Vec::new();
     let mut frame_contexts = SpoolFrameModuleContexts::default();
     let mut sample_count = 0_usize;
     let mut sample_ranges =
         (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
     let mut scan_start = None;
+    #[cfg(test)]
     let mut first_sample_timestamp_ns = None;
     let mut last_timestamp_ns = 0_u64;
     let mut truncated_tail = false;
@@ -1224,6 +1260,7 @@ fn open_spool_with_range_limit(
                         stack_nodes.len(),
                         &mut last_timestamp_ns,
                     )?;
+                    #[cfg(test)]
                     first_sample_timestamp_ns.get_or_insert(sample.timestamp_ns);
                     sample_count = sample_count
                         .checked_add(1)
@@ -1233,11 +1270,15 @@ fn open_spool_with_range_limit(
                     }
                 }
                 REC_PYTHON_RUNTIME => {
-                    python_runtime_records.push(read_python_runtime(&mut reader)?)
+                    let record = read_python_runtime(&mut reader)?;
+                    processes.push(record.process_id);
+                    #[cfg(test)]
+                    python_runtime_records.push(record);
                 }
                 REC_MODULE_DEACTIVATE => {
                     let process_id = read_pid(&mut reader)?;
                     frame_contexts.deactivate_process(&modules, process_id.get(), frames.len());
+                    processes.push(process_id);
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
                     let module_id =
@@ -1276,15 +1317,28 @@ fn open_spool_with_range_limit(
             }
         }
     }
+    processes.extend(
+        modules.iter().filter_map(ModuleRecord::pid).chain(
+            threads
+                .iter()
+                .map(|thread: &ThreadRecord| thread.process_id),
+        ),
+    );
+    processes.sort_unstable();
+    processes.dedup();
     Ok(OpenedSpool {
         definitions: SpoolDefinitions {
+            clock_origin,
+            processes,
             source_id: next_source_id(),
-            start_timestamp_us,
-            sample_interval_us,
+            #[cfg(test)]
+            start_timestamp_us: _start_timestamp_us,
+            sample_interval_ns,
             modules,
             frames,
             frame_contexts,
             stack_nodes,
+            #[cfg(test)]
             python_runtime_records,
             truncated_tail,
         },
@@ -1294,6 +1348,7 @@ fn open_spool_with_range_limit(
         sample_ranges: sample_ranges.unwrap_or_default().into_boxed_slice(),
         scan_start,
         sample_count,
+        #[cfg(test)]
         first_sample_timestamp_ns,
     })
 }
@@ -1327,6 +1382,7 @@ impl MmapSpoolCursor {
         }
     }
 
+    #[inline]
     fn read_tag(&mut self) -> io::Result<Option<u8>> {
         if self.position == self.mmap.len() {
             return Ok(None);
@@ -1363,6 +1419,7 @@ impl MmapSpoolCursor {
         self.position == self.mmap.len()
     }
 
+    #[inline]
     fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
         let bytes = &self.mmap[self.position..];
         match VI::decode_var(bytes) {
@@ -1474,7 +1531,7 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
     let len = usize::try_from(reader.read_varint::<u64>()?)
         .map_err(|_| invalid_data("module path length too large"))?;
     let range = reader.read_bytes_range(len)?;
-    let path = ModulePath::from_mmap(Arc::clone(&reader.mmap), range)?;
+    let path = Path::new(std::ffi::OsStr::from_bytes(&reader.mmap[range])).into();
     Ok(ModuleRecord {
         id,
         owner,
@@ -1501,24 +1558,21 @@ fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeR
     })
 }
 
-fn write_compact_frame(writer: &mut impl Write, frame: &FrameRecord) -> io::Result<()> {
+fn compact_frame(frame: &FrameRecord) -> io::Result<(u64, u64)> {
     if frame.mode == FrameMode::TruncatedStackMarker {
         if *frame != FrameRecord::truncated_stack_marker() {
             return Err(invalid_input("invalid truncated stack marker frame"));
         }
-        writer.write_varint(TRUNCATED_STACK_MARKER_TAG)?;
-        return writer.write_varint(0).map(drop);
+        return Ok((TRUNCATED_STACK_MARKER_TAG, 0));
     }
 
-    let (tag, address) = match frame.module_id {
+    Ok(match frame.module_id {
         Some(module_id) => (u64::from(module_id) << 1, frame.file_relative_ip),
         None => (
             1 | (u64::from(frame.mode == FrameMode::Kernel) << 1),
             frame.abs_ip,
         ),
-    };
-    writer.write_varint(tag)?;
-    writer.write_varint(address).map(drop)
+    })
 }
 
 pub(crate) fn module_for_frame_unbounded<'a>(
@@ -1543,10 +1597,11 @@ pub(crate) fn module_for_frame_unbounded<'a>(
     frame_module_ref(module, frame)
 }
 
+#[inline]
 pub(crate) fn module_for_frame_with_context<'a>(
     modules: &'a [ModuleRecord],
     contexts: &SpoolFrameModuleContexts,
-    context: FrameLookupContext,
+    frame_id: u32,
     process_id: i32,
     frame: &FrameRecord,
 ) -> Option<FrameModuleRef<'a>> {
@@ -1559,6 +1614,17 @@ pub(crate) fn module_for_frame_with_context<'a>(
             file_relative_ip: frame.file_relative_ip,
         });
     }
+    find_unpinned_frame_module(modules, contexts, frame_id, process_id, frame)
+}
+
+fn find_unpinned_frame_module<'a>(
+    modules: &'a [ModuleRecord],
+    contexts: &SpoolFrameModuleContexts,
+    frame_id: u32,
+    process_id: i32,
+    frame: &FrameRecord,
+) -> Option<FrameModuleRef<'a>> {
+    let context = contexts.for_frame_id(frame_id)?;
     let module_limit = context.module_limit.min(modules.len());
     let module = modules
         .get(..module_limit)?
@@ -1748,7 +1814,7 @@ fn read_stack_node(
         stack_nodes[prefix.index].depth.saturating_add(1)
     });
     Ok(StackNodeRecord {
-        prefix: prefix.map(|prefix| prefix.id),
+        prefix: prefix.and_then(|prefix| NonZeroU32::new(prefix.id + 1)),
         frame_id,
         depth,
     })
@@ -1821,7 +1887,7 @@ mod tests {
 
     fn writer() -> PerfSpoolWriter<Vec<u8>> {
         PerfSpoolWriter {
-            writer: Vec::new(),
+            writer: SpoolOutput::new(Vec::new()),
             last_timestamp_ns: 0,
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
@@ -1851,7 +1917,7 @@ mod tests {
             device_major: 0,
             device_minor: 0,
             inode_generation: 0,
-            path: path.into(),
+            path: Path::new(path).into(),
         }
     }
 
@@ -1886,11 +1952,14 @@ mod tests {
         let reader = Snapshot::open(&path).expect("truncated spool still opens");
         let replay = Replay::open(&path).expect("truncated replay spool still opens");
         let _ = std::fs::remove_file(&path);
-        assert!(!reader.samples().is_empty());
+        assert!(!reader.raw_samples().is_empty());
         assert!(reader.recovered_from_truncated_tail());
-        assert_eq!(replay.sample_count(), reader.samples().len());
+        assert_eq!(replay.sample_count(), reader.raw_samples().len());
         assert!(replay.recovered_from_truncated_tail());
-        assert_eq!(replay.samples().collect::<Vec<_>>(), reader.samples());
+        assert_eq!(
+            replay.raw_samples().collect::<Vec<_>>(),
+            reader.raw_samples()
+        );
     }
 
     #[test]
@@ -1920,7 +1989,7 @@ mod tests {
         let reader = Snapshot::open(&path).expect("truncated spool still opens");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(reader.samples().len(), 1);
+        assert_eq!(reader.raw_samples().len(), 1);
         assert!(reader.modules().is_empty());
         assert!(reader.recovered_from_truncated_tail());
     }
@@ -2018,10 +2087,16 @@ mod tests {
         assert_eq!(replay.sample_ranges.len(), 4);
         assert_eq!(scanned.sample_ranges.len(), 1);
         assert!(scanned.scan_start.is_some());
-        assert_eq!(replay.sample_count(), eager.samples().len());
-        assert_eq!(replay.samples().collect::<Vec<_>>(), eager.samples());
-        assert_eq!(scanned.samples().collect::<Vec<_>>(), eager.samples());
-        for sample in replay.samples() {
+        assert_eq!(replay.sample_count(), eager.raw_samples().len());
+        assert_eq!(
+            replay.raw_samples().collect::<Vec<_>>(),
+            eager.raw_samples()
+        );
+        assert_eq!(
+            scanned.raw_samples().collect::<Vec<_>>(),
+            eager.raw_samples()
+        );
+        for sample in replay.raw_samples() {
             let replay_contexts: Vec<_> = replay
                 .stack_frame_contexts(sample.process_id, sample.stack_id)
                 .unwrap()
@@ -2034,15 +2109,15 @@ mod tests {
         }
 
         let eager_stacks: Vec<_> = eager
-            .stacks()
-            .map(|stack| stack.frames.copied().collect::<Vec<_>>())
+            .samples()
+            .map(|sample| sample.stack().frames().collect::<Vec<_>>())
             .collect();
         let replay_stacks: Vec<_> = replay
-            .stacks()
-            .map(|stack| stack.frames.copied().collect::<Vec<_>>())
+            .samples()
+            .map(|sample| sample.stack().frames().collect::<Vec<_>>())
             .collect();
         assert_eq!(replay_stacks, eager_stacks);
-        for (replay_sample, eager_sample) in replay.samples().zip(eager.samples()) {
+        for (replay_sample, eager_sample) in replay.raw_samples().zip(eager.raw_samples()) {
             assert_eq!(
                 replay.timestamp_us(&replay_sample),
                 eager.timestamp_us(eager_sample)
@@ -2158,7 +2233,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "/first".into(),
+                path: Path::new("/first").into(),
             })
             .unwrap();
         writer
@@ -2172,7 +2247,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "/second".into(),
+                path: Path::new("/second").into(),
             })
             .unwrap();
         writer
@@ -2186,7 +2261,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "[kernel]".into(),
+                path: Path::new("[kernel]").into(),
             })
             .unwrap();
         let stack_id = writer
@@ -2226,11 +2301,11 @@ mod tests {
         assert_eq!(reader.start_timestamp_us(), Some(123));
         assert_eq!(reader.sample_interval_us(), Some(10));
         assert_eq!(reader.frames().len(), 3);
-        assert_eq!(reader.stacks().len(), 1);
+        assert_eq!(reader.samples().len(), 1);
 
-        let sample_stack = reader.stacks().next().unwrap();
+        let sample_stack = reader.samples().next().unwrap();
         assert_eq!(sample_stack.sample.stack_id, stack_id);
-        assert_eq!(sample_stack.frames.len(), 3);
+        assert_eq!(sample_stack.stack().frames().len(), 3);
 
         let contexts: Vec<_> = reader
             .stack_frame_contexts(crate::Pid::try_from(7).unwrap(), stack_id)
@@ -2241,7 +2316,7 @@ mod tests {
                     context.module.map(|module| {
                         (
                             module.module.id,
-                            module.module.path.as_str().to_owned(),
+                            module.module.path.to_str().unwrap().to_owned(),
                             module.file_relative_ip,
                         )
                     }),
@@ -2280,7 +2355,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "/future".into(),
+                path: Path::new("/future").into(),
             })
             .unwrap();
         writer.flush().unwrap();
@@ -2365,7 +2440,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            context.module.map(|module| module.module.path.as_str()),
+            context
+                .module
+                .map(|module| module.module.path.to_str().unwrap()),
             Some("/old")
         );
     }
@@ -2403,7 +2480,9 @@ mod tests {
 
         assert!(first.module.is_none());
         assert_eq!(
-            second.module.map(|module| module.module.path.as_str()),
+            second
+                .module
+                .map(|module| module.module.path.to_str().unwrap()),
             Some("/new")
         );
     }
@@ -2510,7 +2589,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "/bad".into(),
+                path: Path::new("/bad").into(),
             })
             .unwrap();
         writer.flush().unwrap();
@@ -2542,7 +2621,7 @@ mod tests {
                 device_major: 0,
                 device_minor: 0,
                 inode_generation: 0,
-                path: "/module".into(),
+                path: Path::new("/module").into(),
             }],
             0,
         )
@@ -2930,7 +3009,7 @@ mod tests {
         let reader = Snapshot::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let paths: Vec<_> = reader
-            .samples()
+            .raw_samples()
             .iter()
             .map(|sample| {
                 reader
@@ -2942,6 +3021,7 @@ mod tests {
                     .unwrap()
                     .module
                     .path
+                    .display()
                     .to_string()
             })
             .collect();
@@ -3076,5 +3156,697 @@ mod tests {
         assert_eq!(kernel_frame_in_user_module.file_relative_ip, 0x1008);
         assert_eq!(user_frame_in_kernel_module.module_id, None);
         assert_eq!(user_frame_in_kernel_module.file_relative_ip, 0x3008);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ClockOrigin {
+    pub(crate) monotonic_ns: u64,
+    pub(crate) wall_time: std::time::SystemTime,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("sample time cannot be represented as SystemTime")]
+/// A correlated sample time outside the platform SystemTime range.
+pub struct TimestampOutOfRange;
+
+impl ClockOrigin {
+    pub(crate) fn capture() -> io::Result<Self> {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: value points to an initialized writable timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let seconds =
+            u64::try_from(value.tv_sec).map_err(|_| invalid_input("negative monotonic clock"))?;
+        let monotonic_ns = seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64))
+            .ok_or_else(|| invalid_input("monotonic clock out of range"))?;
+        Ok(Self {
+            monotonic_ns,
+            wall_time: std::time::SystemTime::now(),
+        })
+    }
+    fn recorded_at(self, sample_ns: u64) -> Result<std::time::SystemTime, TimestampOutOfRange> {
+        use std::time::Duration;
+        let value = if sample_ns >= self.monotonic_ns {
+            self.wall_time
+                .checked_add(Duration::from_nanos(sample_ns - self.monotonic_ns))
+        } else {
+            self.wall_time
+                .checked_sub(Duration::from_nanos(self.monotonic_ns - sample_ns))
+        };
+        value.ok_or(TimestampOutOfRange)
+    }
+}
+
+fn write_clock_origin(writer: &mut impl Write, origin: Option<ClockOrigin>) -> io::Result<()> {
+    use std::time::UNIX_EPOCH;
+    let Some(origin) = origin else {
+        writer.write_varint(0_u64)?;
+        return Ok(());
+    };
+    writer.write_varint(1_u64)?;
+    writer.write_varint(origin.monotonic_ns)?;
+    let (sign, duration) = match origin.wall_time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (1_i64, duration),
+        Err(error) => (-1_i64, error.duration()),
+    };
+    writer.write_varint(sign)?;
+    writer.write_varint(duration.as_secs())?;
+    writer.write_varint(duration.subsec_nanos())?;
+    Ok(())
+}
+
+fn read_clock_origin(reader: &mut impl SpoolRead) -> io::Result<Option<ClockOrigin>> {
+    use std::time::{Duration, UNIX_EPOCH};
+    match reader.read_varint::<u64>()? {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(invalid_data("invalid clock-origin tag")),
+    }
+    let monotonic_ns = reader.read_varint::<u64>()?;
+    let sign = reader.read_varint::<i64>()?;
+    let seconds = reader.read_varint::<u64>()?;
+    let nanos = reader.read_varint::<u32>()?;
+    if nanos >= 1_000_000_000 {
+        return Err(invalid_data("invalid origin nanoseconds"));
+    }
+    let duration = Duration::new(seconds, nanos);
+    let wall_time = match sign {
+        1 => UNIX_EPOCH.checked_add(duration),
+        -1 => UNIX_EPOCH.checked_sub(duration),
+        _ => return Err(invalid_data("invalid origin direction")),
+    }
+    .ok_or_else(|| invalid_data("unrepresentable clock origin"))?;
+    Ok(Some(ClockOrigin {
+        monotonic_ns,
+        wall_time,
+    }))
+}
+
+struct SpoolOutput<W> {
+    inner: W,
+    bytes: u64,
+    failure: Option<Arc<io::Error>>,
+}
+
+#[derive(Debug)]
+struct OutputFailure(Arc<io::Error>);
+
+impl std::fmt::Display for OutputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), f)
+    }
+}
+
+impl std::error::Error for OutputFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+impl<W> SpoolOutput<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            failure: None,
+        }
+    }
+    fn failed(&self) -> Option<io::Error> {
+        self.failure
+            .as_ref()
+            .map(|error| io::Error::new(error.kind(), OutputFailure(Arc::clone(error))))
+    }
+    #[cold]
+    fn remember(&mut self, error: io::Error) -> io::Error {
+        let failure = self.failure.get_or_insert_with(|| Arc::new(error));
+        io::Error::new(failure.kind(), OutputFailure(Arc::clone(failure)))
+    }
+}
+
+impl<W: Write> SpoolOutput<W> {
+    fn write_record(
+        &mut self,
+        tag: u8,
+        fields: (impl VarInt, impl VarInt, impl VarInt),
+    ) -> io::Result<()> {
+        let mut bytes = [0_u8; 31];
+        bytes[0] = tag;
+        let mut len = 1;
+        len += fields.0.encode_var(&mut bytes[len..]);
+        len += fields.1.encode_var(&mut bytes[len..]);
+        len += fields.2.encode_var(&mut bytes[len..]);
+        self.write_all(&bytes[..len])
+    }
+}
+
+impl<W: Write> Write for SpoolOutput<W> {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(error) = self.failed() {
+            return Err(error);
+        }
+        match self.inner.write(bytes) {
+            Ok(0) if !bytes.is_empty() => Err(self.remember(io::ErrorKind::WriteZero.into())),
+            Ok(written) => {
+                self.bytes += written as u64;
+                Ok(written)
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(error),
+            Err(error) => Err(self.remember(error)),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.flush() {
+            Err(error) if self.failure.is_some() => Err(error),
+            Err(error) => Err(self.remember(error)),
+            Ok(()) => self.failed().map_or(Ok(()), Err),
+        }
+    }
+}
+
+/// A sample occurrence borrowed from a recording.
+pub(crate) type SampleStack<'a> = Sample<'a>;
+
+/// An interned stack and its recorded mapping context.
+#[derive(Clone)]
+pub struct Stack<'a> {
+    definitions: &'a SpoolDefinitions,
+    key: StackKey,
+}
+
+impl std::fmt::Debug for Stack<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stack")
+            .field("key", &self.key)
+            .field("frames", &self.raw_frames().len())
+            .finish()
+    }
+}
+
+impl<'a> Stack<'a> {
+    /// Source-qualified identity of this interned stack.
+    pub fn key(&self) -> StackKey {
+        self.key
+    }
+    /// Process that owns this stack.
+    pub fn pid(&self) -> crate::Pid {
+        self.key.process_id
+    }
+    /// Raw frames joined with their recorded mappings.
+    #[inline]
+    pub fn frames(&self) -> impl ExactSizeIterator<Item = RawFrame<'a>> + 'a {
+        self.raw_frames()
+            .contexts(self.definitions, self.pid().get())
+            .map(|context| match context.frame.mode {
+                FrameMode::TruncatedStackMarker => RawFrame::TruncatedStack,
+                FrameMode::User | FrameMode::Kernel => RawFrame::Native {
+                    address: context.frame.abs_ip,
+                    address_space: if context.frame.mode == FrameMode::Kernel {
+                        crate::profile::AddressSpace::Kernel
+                    } else {
+                        crate::profile::AddressSpace::User
+                    },
+                    mapping: context.module,
+                },
+            })
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "sample stack ids are validated while decoding the spool"
+    )]
+    #[inline]
+    pub(crate) fn raw_frames(&self) -> StackFrames<'a> {
+        self.definitions
+            .stack_frame_refs(self.key.stack_id)
+            .expect("sample stack ids were validated while decoding the spool")
+    }
+}
+
+impl<'a> From<Sample<'a>> for Stack<'a> {
+    fn from(sample: Sample<'a>) -> Self {
+        sample.stack()
+    }
+}
+
+pub(crate) type FrameModuleRef<'a> = Mapping<'a>;
+
+impl Mapping<'_> {
+    /// Recorded filesystem path, preserving operating-system bytes.
+    pub fn path(&self) -> &Path {
+        self.module.path()
+    }
+    /// Address range covered by this mapping.
+    pub fn address_range(&self) -> Range<u64> {
+        self.module.start..self.module.end
+    }
+    /// File offset backing the beginning of this mapping.
+    pub fn file_offset(&self) -> u64 {
+        self.module.file_offset
+    }
+    /// Address of the associated frame in file-offset coordinates.
+    pub fn file_relative_address(&self) -> u64 {
+        self.file_relative_ip
+    }
+    /// Owning process, or None for a kernel mapping.
+    pub fn pid(&self) -> Option<crate::Pid> {
+        self.module.pid()
+    }
+}
+
+/// A captured native address or an explicit truncation marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawFrame<'a> {
+    /// A native frame and the mapping recorded for it, if available.
+    Native {
+        /// Absolute instruction address.
+        address: u64,
+        /// User or kernel address space.
+        address_space: crate::profile::AddressSpace,
+        /// Recorded mapping associated with this frame.
+        mapping: Option<Mapping<'a>>,
+    },
+    /// Unwinding ended before reaching the stack root.
+    TruncatedStack,
+}
+
+#[cfg(test)]
+mod clock_roundtrip_validation {
+    use super::*;
+    use crate::test_support::TempDir;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn write_profile(
+        path: &Path,
+        origin: Option<ClockOrigin>,
+        samples: &[u64],
+    ) -> PerfSpoolWriter<BufWriter<File>> {
+        let mut writer = PerfSpoolWriter::from_writer_with_origin(
+            BufWriter::new(File::create(path).unwrap()),
+            9_999_999,
+            333_333,
+            origin,
+        )
+        .unwrap();
+        for &timestamp in samples {
+            writer
+                .write_sample_frames(
+                    timestamp,
+                    7,
+                    8,
+                    [FrameRecord {
+                        module_id: None,
+                        file_relative_ip: 4096,
+                        abs_ip: 4096,
+                        mode: FrameMode::User,
+                    }],
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        writer
+    }
+
+    fn assert_all_readers(path: &Path, expected: &[Option<SystemTime>]) {
+        let snapshot = Snapshot::open(path).unwrap();
+        let replay = Replay::open(path).unwrap();
+        let mut tail = Tail::open(path).unwrap();
+        assert_eq!(
+            snapshot
+                .samples()
+                .map(|stack| stack.recorded_at().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            replay
+                .samples()
+                .map(|stack| stack.recorded_at().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            tail.poll()
+                .unwrap()
+                .samples()
+                .map(|stack| stack.recorded_at().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn origin_roundtrip_preserves_delay_and_live_append() {
+        let dir = TempDir::new("paired-origin-roundtrip");
+        let path = dir.path().join("capture.spool");
+        let origin = ClockOrigin {
+            monotonic_ns: 10_000_000_000,
+            wall_time: UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let mut writer = write_profile(&path, Some(origin), &[12_000_000_000, 13_000_000_000]);
+        assert_all_readers(
+            &path,
+            &[
+                Some(UNIX_EPOCH + Duration::from_secs(3)),
+                Some(UNIX_EPOCH + Duration::from_secs(4)),
+            ],
+        );
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.poll().unwrap().samples().len(), 2);
+        writer
+            .write_sample_frames(
+                15_000_000_000,
+                7,
+                8,
+                [FrameRecord {
+                    module_id: None,
+                    file_relative_ip: 4096,
+                    abs_ip: 4096,
+                    mode: FrameMode::User,
+                }],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        let batch = tail.poll().unwrap();
+        assert_eq!(batch.samples().len(), 1);
+        assert_eq!(
+            batch.samples().next().unwrap().recorded_at().unwrap(),
+            Some(UNIX_EPOCH + Duration::from_secs(6))
+        );
+    }
+
+    #[test]
+    fn source_bound_accessor_uses_own_header_with_identical_raw_sample() {
+        let dir = TempDir::new("paired-origin-binding");
+        let first_path = dir.path().join("first.spool");
+        let second_path = dir.path().join("second.spool");
+        drop(write_profile(
+            &first_path,
+            Some(ClockOrigin {
+                monotonic_ns: 10_000_000_000,
+                wall_time: UNIX_EPOCH + Duration::from_secs(1),
+            }),
+            &[12_000_000_000],
+        ));
+        drop(write_profile(
+            &second_path,
+            Some(ClockOrigin {
+                monotonic_ns: 10_000_000_000,
+                wall_time: UNIX_EPOCH + Duration::from_secs(101),
+            }),
+            &[12_000_000_000],
+        ));
+        let first = Snapshot::open(&first_path).unwrap();
+        let second = Snapshot::open(&second_path).unwrap();
+        let a = first.samples().next().unwrap();
+        let b = second.samples().next().unwrap();
+        assert_eq!(a.sample().timestamp_ns, b.sample().timestamp_ns);
+        assert_eq!(
+            a.recorded_at().unwrap(),
+            Some(UNIX_EPOCH + Duration::from_secs(3))
+        );
+        assert_eq!(
+            b.recorded_at().unwrap(),
+            Some(UNIX_EPOCH + Duration::from_secs(103))
+        );
+        assert_all_readers(&second_path, &[Some(UNIX_EPOCH + Duration::from_secs(103))]);
+    }
+
+    #[test]
+    fn absent_origin_is_none_in_every_reader_despite_legacy_wall_field() {
+        let dir = TempDir::new("paired-origin-absent");
+        let path = dir.path().join("capture.spool");
+        drop(write_profile(&path, None, &[12_000_000_000]));
+        assert_all_readers(&path, &[None]);
+    }
+
+    #[test]
+    fn negative_delta_and_pre_epoch_origin_roundtrip() {
+        let dir = TempDir::new("paired-origin-negative");
+        let path = dir.path().join("capture.spool");
+        let origin = ClockOrigin {
+            monotonic_ns: 2_000_000_000,
+            wall_time: UNIX_EPOCH - Duration::new(1, 123),
+        };
+        drop(write_profile(
+            &path,
+            Some(origin),
+            &[1_000_000_000, 3_000_000_000],
+        ));
+        assert_all_readers(
+            &path,
+            &[
+                Some(UNIX_EPOCH - Duration::new(2, 123)),
+                Some(UNIX_EPOCH - Duration::from_nanos(123)),
+            ],
+        );
+    }
+
+    #[test]
+    fn representability_overflow_is_error_not_missing_origin() {
+        let dir = TempDir::new("paired-origin-overflow");
+        let high = UNIX_EPOCH
+            .checked_add(Duration::new(i64::MAX as u64, 999_999_999))
+            .unwrap();
+        let low = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(i64::MAX as u64 + 1))
+            .unwrap();
+        for (name, origin) in [
+            (
+                "high",
+                ClockOrigin {
+                    monotonic_ns: 0,
+                    wall_time: high,
+                },
+            ),
+            (
+                "low",
+                ClockOrigin {
+                    monotonic_ns: 2,
+                    wall_time: low,
+                },
+            ),
+        ] {
+            let path = dir.path().join(name);
+            drop(write_profile(&path, Some(origin), &[1]));
+            let snapshot = Snapshot::open(&path).unwrap();
+            let replay = Replay::open(&path).unwrap();
+            let mut tail = Tail::open(&path).unwrap();
+            assert!(snapshot.samples().next().unwrap().recorded_at().is_err());
+            assert!(replay.samples().next().unwrap().recorded_at().is_err());
+            assert!(tail
+                .poll()
+                .unwrap()
+                .samples()
+                .next()
+                .unwrap()
+                .recorded_at()
+                .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct State {
+        bytes: Vec<u8>,
+        budget: Option<usize>,
+        write_error: Option<i32>,
+    }
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<State>>);
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            if let Some(errno) = state.write_error {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            if state.budget == Some(0) {
+                state.budget = None;
+                return Err(io::Error::other("sink failed"));
+            }
+            let count = state.budget.unwrap_or(bytes.len()).min(bytes.len());
+            if let Some(budget) = state.budget.as_mut() {
+                *budget -= count;
+            }
+            state.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn readers_agree_on_processes_from_complete_metadata_records() {
+        let dir = crate::test_support::TempDir::new("metadata-processes");
+        let expected = [7, 9, 11].map(|pid| crate::Pid::new(pid).unwrap());
+        for truncated in [false, true] {
+            let path = dir
+                .path()
+                .join(if truncated { "truncated" } else { "complete" });
+            let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
+            writer.write_module_deactivation(9).unwrap();
+            writer.write_module_deactivation(7).unwrap();
+            writer.write_module_deactivation(9).unwrap();
+            writer.write_python_runtime(1, 11, true).unwrap();
+            writer.write_python_runtime(2, 11, false).unwrap();
+            if truncated {
+                writer.write_module_deactivation(16_384).unwrap();
+            }
+            writer.flush().unwrap();
+            drop(writer);
+            if truncated {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            }
+
+            let snapshot = Snapshot::open(&path).unwrap();
+            let replay = Replay::open(&path).unwrap();
+            let mut tail = Tail::open(&path).unwrap();
+            let mut observed = Vec::new();
+            loop {
+                let batch = tail.poll().unwrap();
+                observed.extend_from_slice(batch.processes());
+                assert_eq!(batch.samples().len(), 0);
+                if !batch.has_more() {
+                    break;
+                }
+            }
+            observed.sort_unstable();
+            observed.dedup();
+            assert_eq!(observed, expected);
+            assert_eq!(snapshot.processes().collect::<Vec<_>>(), expected);
+            assert_eq!(replay.processes().collect::<Vec<_>>(), expected);
+            assert_eq!(snapshot.recovered_from_truncated_tail(), truncated);
+            assert_eq!(replay.recovered_from_truncated_tail(), truncated);
+        }
+    }
+
+    #[test]
+    fn partial_failure_prevents_all_later_records() {
+        let sink = Sink::default();
+        let mut writer = PerfSpoolWriter::from_writer(sink.clone(), 0, 0).unwrap();
+        sink.0.lock().unwrap().budget = Some(1);
+        assert!(writer.write_python_runtime(1, 7, true).is_err());
+        let bytes = sink.0.lock().unwrap().bytes.len();
+        assert!(writer.write_python_runtime(2, 7, false).is_err());
+        assert_eq!(sink.0.lock().unwrap().bytes.len(), bytes);
+        assert_eq!(writer.flush().unwrap_err().to_string(), "sink failed");
+    }
+
+    #[test]
+    fn partial_sample_records_preserve_the_written_prefix() {
+        let frame = FrameRecord {
+            module_id: None,
+            file_relative_ip: u64::MAX,
+            abs_ip: u64::MAX,
+            mode: FrameMode::User,
+        };
+        let timestamp = i64::MAX as u64;
+        let mut complete = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        let header_len = complete.position() as usize;
+        complete
+            .write_sample_frames(timestamp, 7, 11, [frame])
+            .unwrap();
+        let expected = complete.into_inner();
+
+        for budget in 0..expected.len() - header_len {
+            let sink = Sink::default();
+            let mut writer = PerfSpoolWriter::from_writer(sink.clone(), 0, 0).unwrap();
+            sink.0.lock().unwrap().budget = Some(budget);
+            let error = writer
+                .write_sample_frames(timestamp, 7, 11, [frame])
+                .unwrap_err();
+            assert_eq!(error.to_string(), "sink failed");
+            assert_eq!(writer.last_timestamp_ns, 0);
+            assert!(writer.write_sample_frames(1, 7, 11, [frame]).is_err());
+            assert_eq!(writer.position() as usize, header_len + budget);
+            assert_eq!(
+                sink.0.lock().unwrap().bytes,
+                expected[..header_len + budget]
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_output_errors_preserve_errno_after_successful_retry() {
+        let sink = Sink::default();
+        let mut writer =
+            PerfSpoolWriter::from_writer(io::BufWriter::new(sink.clone()), 0, 0).unwrap();
+        sink.0.lock().unwrap().write_error = Some(libc::ENOSPC);
+
+        let first = crate::Error::from(writer.flush().unwrap_err());
+        assert_eq!(first.raw_os_error(), Some(libc::ENOSPC));
+        let source_errno = std::iter::successors(
+            Some(&first as &(dyn std::error::Error + 'static)),
+            |error| error.source(),
+        )
+        .find_map(|error| {
+            error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+        });
+        assert_eq!(source_errno, Some(libc::ENOSPC));
+
+        let repeated = crate::Error::from(writer.write_python_runtime(1, 7, true).unwrap_err());
+        assert_eq!(repeated.raw_os_error(), Some(libc::ENOSPC));
+        sink.0.lock().unwrap().write_error = None;
+        let flushed = crate::Error::from(writer.flush().unwrap_err());
+        assert_eq!(flushed.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!sink.0.lock().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn buffered_output_cleanup_preserves_distinct_flush_error() {
+        let sink = Sink::default();
+        let mut writer =
+            PerfSpoolWriter::from_writer(io::BufWriter::new(sink.clone()), 0, 0).unwrap();
+        sink.0.lock().unwrap().write_error = Some(libc::ENOSPC);
+        let operation = writer.flush();
+        sink.0.lock().unwrap().write_error = Some(libc::EIO);
+        let cleanup = writer.flush();
+
+        let error = crate::error::and_cleanup(operation, cleanup).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{}; cleanup also failed: {}",
+                io::Error::from_raw_os_error(libc::ENOSPC),
+                io::Error::from_raw_os_error(libc::EIO),
+            )
+        );
+        let remembered = crate::Error::from(writer.failure().unwrap());
+        assert_eq!(remembered.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[test]
+    fn module_paths_roundtrip_non_utf8_bytes() {
+        let dir = crate::test_support::TempDir::new("spool-path-bytes");
+        let path = dir.path().join("capture");
+        let module_path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/image-\xff.so"));
+        let module =
+            ModuleRecord::new(0, crate::Pid::new(7).unwrap(), 4096..8192, 0, module_path).unwrap();
+        let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
+        writer.write_module(&module).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            Snapshot::open(&path).unwrap().modules()[0].path(),
+            module_path
+        );
+        assert_eq!(
+            Replay::open(&path).unwrap().processes().collect::<Vec<_>>(),
+            [crate::Pid::new(7).unwrap()]
+        );
     }
 }

@@ -8,8 +8,8 @@ use super::{arch::ArchAarch64, unwind_rule::UnwindRuleAarch64, unwindregs::Unwin
 use crate::unwind_result::UnwindResult;
 
 use crate::dwarf::{
-    eval_cfa_rule, eval_register_rule, ConversionError, DwarfUnwindRegs, DwarfUnwinderError,
-    DwarfUnwinding,
+    eval_cfa_rule, eval_register_rule, register_rule_to_cfa_offset, DwarfUnwindRegs,
+    DwarfUnwinderError, DwarfUnwinding,
 };
 
 impl DwarfUnwindRegs for UnwindRegsAarch64 {
@@ -42,12 +42,10 @@ impl DwarfUnwinding for ArchAarch64 {
         let fp_rule = unwind_info.register(AArch64::X29);
         let lr_rule = unwind_info.register(AArch64::X30);
 
-        match translate_into_unwind_rule(cfa_rule, fp_rule.as_ref(), lr_rule.as_ref()) {
-            Ok(unwind_rule) => return Ok(UnwindResult::ExecRule(unwind_rule)),
-            Err(_err) => {
-                // Could not translate into a cacheable unwind rule. Fall back to the generic path.
-                // eprintln!("Unwind rule translation failed: {:?}", err);
-            }
+        if let Some(unwind_rule) =
+            translate_into_unwind_rule(cfa_rule, fp_rule.as_ref(), lr_rule.as_ref())
+        {
+            return Ok(UnwindResult::ExecRule(unwind_rule));
         }
 
         let cfa = eval_cfa_rule::<R, F, _, ES>(section, cfa_rule, encoding, regs, read_stack)
@@ -97,31 +95,19 @@ impl DwarfUnwinding for ArchAarch64 {
     }
 }
 
-fn register_rule_to_cfa_offset<RO: ReaderOffset>(
-    rule: Option<&RegisterRule<RO>>,
-) -> Result<Option<i64>, ConversionError> {
-    let Some(rule) = rule else { return Ok(None) };
-    match *rule {
-        RegisterRule::Undefined | RegisterRule::SameValue => Ok(None),
-        RegisterRule::Offset(offset) => Ok(Some(offset)),
-        _ => Err(ConversionError::RegisterNotStoredRelativeToCfa),
-    }
-}
-
 fn translate_into_unwind_rule<RO: ReaderOffset>(
     cfa_rule: &CfaRule<RO>,
     fp_rule: Option<&RegisterRule<RO>>,
     lr_rule: Option<&RegisterRule<RO>>,
-) -> Result<UnwindRuleAarch64, ConversionError> {
+) -> Option<UnwindRuleAarch64> {
     match cfa_rule {
         CfaRule::RegisterAndOffset { register, offset } => match *register {
             AArch64::SP => {
-                let sp_offset_by_16 =
-                    u16::try_from(offset / 16).map_err(|_| ConversionError::SpOffsetDoesNotFit)?;
+                let sp_offset_by_16 = u16::try_from(offset / 16).ok()?;
                 let lr_cfa_offset = register_rule_to_cfa_offset(lr_rule)?;
                 let fp_cfa_offset = register_rule_to_cfa_offset(fp_rule)?;
                 match (lr_cfa_offset, fp_cfa_offset) {
-                    (None, Some(_)) => Err(ConversionError::RestoringFpButNotLr),
+                    (None, Some(_)) => None,
                     (None, None) => {
                         match lr_rule {
                             None => {
@@ -129,38 +115,35 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
                                 // Per spec (at least as of DWARF >= 3), this means that it should be treated
                                 // as undefined. However, in practice, it seems that compilers often omit the rule
                                 // to say "same value", see https://github.com/gimli-rs/gimli/issues/857 .
-                                Ok(UnwindRuleAarch64::OffsetSp { sp_offset_by_16 })
+                                Some(UnwindRuleAarch64::OffsetSp { sp_offset_by_16 })
                             }
                             Some(RegisterRule::Undefined) => {
                                 // The column for the return address was manually set to "undefined"
                                 // using DW_CFA_undefined. This usually means that the function never returns
                                 // and can be treated as the root of the stack.
-                                Ok(
+                                Some(
                                     UnwindRuleAarch64::OffsetSpIfFirstFrameOtherwiseStackEndsHere {
                                         sp_offset_by_16,
                                     },
                                 )
                             }
-                            _ => Ok(UnwindRuleAarch64::OffsetSp { sp_offset_by_16 }),
+                            _ => Some(UnwindRuleAarch64::OffsetSp { sp_offset_by_16 }),
                         }
                     }
                     (Some(lr_cfa_offset), None) => {
                         let lr_storage_offset_from_sp_by_8 =
-                            i16::try_from((offset + lr_cfa_offset) / 8)
-                                .map_err(|_| ConversionError::LrStorageOffsetDoesNotFit)?;
-                        Ok(UnwindRuleAarch64::OffsetSpAndRestoreLr {
+                            i16::try_from((offset + lr_cfa_offset) / 8).ok()?;
+                        Some(UnwindRuleAarch64::OffsetSpAndRestoreLr {
                             sp_offset_by_16,
                             lr_storage_offset_from_sp_by_8,
                         })
                     }
                     (Some(lr_cfa_offset), Some(fp_cfa_offset)) => {
                         let lr_storage_offset_from_sp_by_8 =
-                            i16::try_from((offset + lr_cfa_offset) / 8)
-                                .map_err(|_| ConversionError::LrStorageOffsetDoesNotFit)?;
+                            i16::try_from((offset + lr_cfa_offset) / 8).ok()?;
                         let fp_storage_offset_from_sp_by_8 =
-                            i16::try_from((offset + fp_cfa_offset) / 8)
-                                .map_err(|_| ConversionError::FpStorageOffsetDoesNotFit)?;
-                        Ok(UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+                            i16::try_from((offset + fp_cfa_offset) / 8).ok()?;
+                        Some(UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
                             sp_offset_by_16,
                             fp_storage_offset_from_sp_by_8,
                             lr_storage_offset_from_sp_by_8,
@@ -169,30 +152,25 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
                 }
             }
             AArch64::X29 => {
-                let lr_cfa_offset = register_rule_to_cfa_offset(lr_rule)?
-                    .ok_or(ConversionError::FramePointerRuleDoesNotRestoreLr)?;
-                let fp_cfa_offset = register_rule_to_cfa_offset(fp_rule)?
-                    .ok_or(ConversionError::FramePointerRuleDoesNotRestoreFp)?;
+                let lr_cfa_offset = register_rule_to_cfa_offset(lr_rule).flatten()?;
+                let fp_cfa_offset = register_rule_to_cfa_offset(fp_rule).flatten()?;
                 if *offset == 16 && fp_cfa_offset == -16 && lr_cfa_offset == -8 {
-                    Ok(UnwindRuleAarch64::UseFramePointer)
+                    Some(UnwindRuleAarch64::UseFramePointer)
                 } else {
-                    let sp_offset_from_fp_by_8 = u16::try_from(offset / 8)
-                        .map_err(|_| ConversionError::SpOffsetFromFpDoesNotFit)?;
+                    let sp_offset_from_fp_by_8 = u16::try_from(offset / 8).ok()?;
                     let lr_storage_offset_from_fp_by_8 =
-                        i16::try_from((offset + lr_cfa_offset) / 8)
-                            .map_err(|_| ConversionError::LrStorageOffsetDoesNotFit)?;
+                        i16::try_from((offset + lr_cfa_offset) / 8).ok()?;
                     let fp_storage_offset_from_fp_by_8 =
-                        i16::try_from((offset + fp_cfa_offset) / 8)
-                            .map_err(|_| ConversionError::FpStorageOffsetDoesNotFit)?;
-                    Ok(UnwindRuleAarch64::UseFramepointerWithOffsets {
+                        i16::try_from((offset + fp_cfa_offset) / 8).ok()?;
+                    Some(UnwindRuleAarch64::UseFramepointerWithOffsets {
                         sp_offset_from_fp_by_8,
                         fp_storage_offset_from_fp_by_8,
                         lr_storage_offset_from_fp_by_8,
                     })
                 }
             }
-            _ => Err(ConversionError::CfaIsOffsetFromUnknownRegister),
+            _ => None,
         },
-        CfaRule::Expression(_) => Err(ConversionError::CfaIsExpression),
+        CfaRule::Expression(_) => None,
     }
 }
