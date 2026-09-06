@@ -48,12 +48,8 @@ pub(super) struct PerfMapFileIdentity {
     changed: (i64, i64),
 }
 
-pub(super) fn perf_map_file_identity(
-    directory: &Path,
-    process_id: i32,
-) -> Option<PerfMapFileIdentity> {
-    let metadata =
-        std::fs::symlink_metadata(directory.join(format!("perf-{process_id}.map"))).ok()?;
+pub(super) fn perf_map_file_identity(path: &Path) -> Option<PerfMapFileIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
     metadata
         .file_type()
         .is_file()
@@ -151,13 +147,12 @@ fn is_perf_map_mapping(path: &str) -> bool {
         || path.starts_with("/SYSV")
 }
 
-pub(super) fn load_perf_map(directory: &Path, process_id: i32) -> Option<PerfMap> {
+pub(super) fn load_perf_map(path: &Path) -> Option<PerfMap> {
     const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
-    let path = directory.join(format!("perf-{process_id}.map"));
     let mut file = File::options()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&path)
+        .open(path)
         .ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.len() > MAX_PERF_MAP_SIZE {
