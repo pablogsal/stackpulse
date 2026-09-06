@@ -708,15 +708,16 @@ impl ProcessTable {
         Ok(false)
     }
 
-    fn active_process_count(&mut self) -> crate::Result<usize> {
-        let mut active = 0;
+    fn activity(&mut self, root: crate::Pid) -> crate::Result<(bool, usize)> {
+        let root_active = self.process_is_active(root)?;
+        let mut active = usize::from(root_active);
         for (&pid, state) in &mut self.states {
-            let Some(pid) = crate::Pid::new(pid) else {
+            let Some(pid) = crate::Pid::new(pid).filter(|&pid| pid != root) else {
                 continue;
             };
             active += usize::from(state.tracking.poll_alive_checked(pid)?.unwrap_or(false));
         }
-        Ok(active)
+        Ok((root_active, active))
     }
 
     fn capture_available_generation(&mut self, pid: i32) {
@@ -1201,8 +1202,9 @@ impl<W: std::io::Write> Recorder<W> {
         }
         if open_new_perf_events && recovered_lifecycle_gap {
             for pid in processes
-                .tracked_pids()
-                .into_iter()
+                .states
+                .iter()
+                .filter_map(|(&pid, state)| state.tracking.is_tracked().then_some(pid))
                 .filter_map(|pid| u32::try_from(pid).ok())
             {
                 if let Err(err) = perf.refresh_threads(pid) {
@@ -1258,8 +1260,7 @@ impl<W: std::io::Write> Recorder<W> {
         if self.last_publish.elapsed() >= self.publish_interval {
             self.flush()?;
         }
-        let root_active = self.processes.process_is_active(self.root_pid)?;
-        let active_processes = self.processes.active_process_count()?;
+        let (root_active, active_processes) = self.processes.activity(self.root_pid)?;
         let pending_events = self.has_pending_events();
         Ok(PollSummary {
             root_active,
@@ -2758,7 +2759,10 @@ mod tests {
             .process_is_active(crate::Pid::new(pid).unwrap())
             .unwrap());
         assert!(!processes.has_active_processes_except(0).unwrap());
-        assert_eq!(processes.active_process_count().unwrap(), 0);
+        assert_eq!(
+            processes.activity(crate::Pid::new(pid).unwrap()).unwrap(),
+            (false, 0)
+        );
     }
 
     #[test]
@@ -2795,8 +2799,26 @@ mod tests {
             .unwrap());
         assert!(processes.has_active_processes_except(missing_pid).unwrap());
         assert!(!processes.has_active_processes_except(live_pid).unwrap());
-        assert_eq!(processes.active_process_count().unwrap(), 1);
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(live_pid).unwrap())
+                .unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(missing_pid).unwrap())
+                .unwrap(),
+            (false, 1)
+        );
         assert_eq!(processes.dead_or_reused_pids().unwrap(), [missing_pid]);
+        processes.states.remove(&missing_pid);
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(missing_pid).unwrap())
+                .unwrap(),
+            (false, 1)
+        );
     }
 
     #[test]
@@ -3951,7 +3973,14 @@ mod recording_lifecycle_tests {
         assert_eq!(summary.active_processes(), 1);
         assert!(!recorder.processes.is_tracked(std::process::id() as i32));
 
+        let other = crate::test_support::SleepChild::spawn();
+        recorder.processes.ensure_tracked(other.pid_i32());
         drop(child);
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(!summary.root_active());
+        assert_eq!(summary.active_processes(), 1);
+
+        drop(other);
         let summary = recorder.poll(Duration::ZERO).unwrap();
         assert!(!summary.root_active());
         assert_eq!(summary.active_processes(), 0);
