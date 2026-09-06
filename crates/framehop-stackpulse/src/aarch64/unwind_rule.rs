@@ -1,5 +1,4 @@
 use super::unwindregs::UnwindRegsAarch64;
-use crate::add_signed::checked_add_signed;
 use crate::error::Error;
 
 use crate::unwind_rule::UnwindRule;
@@ -117,8 +116,9 @@ impl UnwindRule for UnwindRuleAarch64 {
                 let sp_offset = u64::from(sp_offset_by_16) * 16;
                 let new_sp = sp.checked_add(sp_offset).ok_or(Error::IntegerOverflow)?;
                 let lr_storage_offset = i64::from(lr_storage_offset_from_sp_by_8) * 8;
-                let lr_location =
-                    checked_add_signed(sp, lr_storage_offset).ok_or(Error::IntegerOverflow)?;
+                let lr_location = sp
+                    .checked_add_signed(lr_storage_offset)
+                    .ok_or(Error::IntegerOverflow)?;
                 let new_lr =
                     read_stack(lr_location).map_err(|_| Error::CouldNotReadStack(lr_location))?;
                 (new_lr, new_sp, fp)
@@ -133,9 +133,9 @@ impl UnwindRule for UnwindRuleAarch64 {
                 // Use DWARF's saved-x29 offset to correct that estimate.
                 let sp = if regs.sp_is_fp_derived()
                     && fp != 0
-                    && checked_add_signed(sp, fp_storage_offset) != Some(fp)
+                    && sp.checked_add_signed(fp_storage_offset) != Some(fp)
                 {
-                    checked_add_signed(fp, -fp_storage_offset).unwrap_or(sp)
+                    fp.checked_add_signed(-fp_storage_offset).unwrap_or(sp)
                 } else {
                     sp
                 };
@@ -143,12 +143,14 @@ impl UnwindRule for UnwindRuleAarch64 {
                 let sp_offset = u64::from(sp_offset_by_16) * 16;
                 let new_sp = sp.checked_add(sp_offset).ok_or(Error::IntegerOverflow)?;
                 let lr_storage_offset = i64::from(lr_storage_offset_from_sp_by_8) * 8;
-                let lr_location =
-                    checked_add_signed(sp, lr_storage_offset).ok_or(Error::IntegerOverflow)?;
+                let lr_location = sp
+                    .checked_add_signed(lr_storage_offset)
+                    .ok_or(Error::IntegerOverflow)?;
                 let new_lr =
                     read_stack(lr_location).map_err(|_| Error::CouldNotReadStack(lr_location))?;
-                let fp_location =
-                    checked_add_signed(sp, fp_storage_offset).ok_or(Error::IntegerOverflow)?;
+                let fp_location = sp
+                    .checked_add_signed(fp_storage_offset)
+                    .ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
                 regs.set_sp_is_fp_derived(false);
@@ -216,13 +218,15 @@ impl UnwindRule for UnwindRuleAarch64 {
                     .checked_add(sp_offset_from_fp)
                     .ok_or(Error::IntegerOverflow)?;
                 let lr_storage_offset = i64::from(lr_storage_offset_from_fp_by_8) * 8;
-                let lr_location =
-                    checked_add_signed(fp, lr_storage_offset).ok_or(Error::IntegerOverflow)?;
+                let lr_location = fp
+                    .checked_add_signed(lr_storage_offset)
+                    .ok_or(Error::IntegerOverflow)?;
                 let new_lr =
                     read_stack(lr_location).map_err(|_| Error::CouldNotReadStack(lr_location))?;
                 let fp_storage_offset = i64::from(fp_storage_offset_from_fp_by_8) * 8;
-                let fp_location =
-                    checked_add_signed(fp, fp_storage_offset).ok_or(Error::IntegerOverflow)?;
+                let fp_location = fp
+                    .checked_add_signed(fp_storage_offset)
+                    .ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
 

@@ -1,4 +1,4 @@
-use core::marker::PhantomData;
+use core::{marker::PhantomData, ops::Range};
 
 use alloc::vec::Vec;
 use gimli::{
@@ -53,22 +53,14 @@ impl std::error::Error for DwarfUnwinderError {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum ConversionError {
-    CfaIsExpression,
-    CfaIsOffsetFromUnknownRegister,
-    ReturnAddressRuleWithUnexpectedOffset,
-    ReturnAddressRuleWasWeird,
-    SpOffsetDoesNotFit,
-    RegisterNotStoredRelativeToCfa,
-    RestoringFpButNotLr,
-    LrStorageOffsetDoesNotFit,
-    FpStorageOffsetDoesNotFit,
-    SpOffsetFromFpDoesNotFit,
-    FramePointerRuleDoesNotRestoreLr,
-    FramePointerRuleDoesNotRestoreFp,
-    FramePointerRuleDoesNotRestoreBp,
-    FramePointerRuleHasStrangeBpOffset,
+pub(crate) fn register_rule_to_cfa_offset<RO: ReaderOffset>(
+    rule: Option<&RegisterRule<RO>>,
+) -> Option<Option<i64>> {
+    match rule {
+        None | Some(RegisterRule::Undefined) | Some(RegisterRule::SameValue) => Some(None),
+        Some(RegisterRule::Offset(offset)) => Some(Some(*offset)),
+        _ => None,
+    }
 }
 
 pub trait DwarfUnwinding: Arch {
@@ -168,19 +160,10 @@ where
             UnwindSectionType::EhFrame => {
                 let mut eh_frame = EhFrame::from(unwind_section_data);
                 eh_frame.set_address_size(8);
-                let unwind_info = self.unwind_info_for_fde(&eh_frame, lookup_svma, fde_offset);
-                if let Err(error @ DwarfUnwinderError::UnwindInfoForAddressFailed(_)) = unwind_info
-                {
-                    return Ok(UnwindResult::ExecRuleWithFallback(
-                        A::rule_if_uncovered_by_fde(),
-                        error.into(),
-                    ));
-                }
-                let (unwind_info, encoding) = unwind_info?;
-                A::unwind_frame::<F, R, UCS, ES>(
+                self.unwind_frame_in_section::<_, F, ES>(
                     &eh_frame,
-                    unwind_info,
-                    encoding,
+                    lookup_svma,
+                    fde_offset,
                     regs,
                     is_first_frame,
                     read_stack,
@@ -189,19 +172,10 @@ where
             UnwindSectionType::DebugFrame => {
                 let mut debug_frame = DebugFrame::from(unwind_section_data);
                 debug_frame.set_address_size(8);
-                let unwind_info = self.unwind_info_for_fde(&debug_frame, lookup_svma, fde_offset);
-                if let Err(error @ DwarfUnwinderError::UnwindInfoForAddressFailed(_)) = unwind_info
-                {
-                    return Ok(UnwindResult::ExecRuleWithFallback(
-                        A::rule_if_uncovered_by_fde(),
-                        error.into(),
-                    ));
-                }
-                let (unwind_info, encoding) = unwind_info?;
-                A::unwind_frame::<F, R, UCS, ES>(
+                self.unwind_frame_in_section::<_, F, ES>(
                     &debug_frame,
-                    unwind_info,
-                    encoding,
+                    lookup_svma,
+                    fde_offset,
                     regs,
                     is_first_frame,
                     read_stack,
@@ -210,12 +184,20 @@ where
         }
     }
 
-    fn unwind_info_for_fde<US: UnwindSection<R>>(
+    fn unwind_frame_in_section<US, F, ES>(
         &mut self,
         unwind_section: &US,
         lookup_svma: u64,
         fde_offset: u32,
-    ) -> Result<(&UnwindTableRow<R::Offset, UCS>, Encoding), DwarfUnwinderError> {
+        regs: &mut A::UnwindRegs,
+        is_first_frame: bool,
+        read_stack: &mut F,
+    ) -> Result<UnwindResult<A::UnwindRule>, DwarfUnwinderError>
+    where
+        US: UnwindSection<R>,
+        F: FnMut(u64) -> Result<u64, ()>,
+        ES: EvaluationStorage<R>,
+    {
         let fde = unwind_section.fde_from_offset(
             &self.bases,
             US::Offset::from(R::Offset::from_u32(fde_offset)),
@@ -223,21 +205,40 @@ where
         );
         let fde = fde.map_err(DwarfUnwinderError::FdeFromOffsetFailed)?;
         let encoding = fde.cie().encoding();
-        let unwind_info: &UnwindTableRow<_, _> = fde
-            .unwind_info_for_address(
-                unwind_section,
-                &self.bases,
-                self.unwind_context,
-                lookup_svma,
-            )
-            .map_err(DwarfUnwinderError::UnwindInfoForAddressFailed)?;
-        Ok((unwind_info, encoding))
+        let unwind_info = match fde.unwind_info_for_address(
+            unwind_section,
+            &self.bases,
+            self.unwind_context,
+            lookup_svma,
+        ) {
+            Ok(unwind_info) => unwind_info,
+            Err(error) => {
+                return Ok(UnwindResult::ExecRuleWithFallback(
+                    A::rule_if_uncovered_by_fde(),
+                    DwarfUnwinderError::UnwindInfoForAddressFailed(error).into(),
+                ));
+            }
+        };
+        A::unwind_frame::<F, R, UCS, ES>(
+            unwind_section,
+            unwind_info,
+            encoding,
+            regs,
+            is_first_frame,
+            read_stack,
+        )
     }
 }
 
-pub(crate) fn base_addresses_for_sections<D>(
+pub(crate) fn base_addresses_and_text_range<D>(
     section_info: &mut impl ModuleSectionInfo<D>,
-) -> BaseAddresses {
+) -> (BaseAddresses, Option<Range<u64>>) {
+    let text_range = section_info.section_svma_range(b"__text");
+    let text_start = text_range
+        .clone()
+        .or_else(|| section_info.section_svma_range(b".text"))
+        .map(|range| range.start)
+        .unwrap_or_default();
     let mut start_addr = |names: &[&[u8]]| -> u64 {
         names
             .iter()
@@ -245,11 +246,12 @@ pub(crate) fn base_addresses_for_sections<D>(
             .map(|r| r.start)
             .unwrap_or_default()
     };
-    BaseAddresses::default()
+    let bases = BaseAddresses::default()
         .set_eh_frame(start_addr(&[b"__eh_frame", b".eh_frame"]))
         .set_eh_frame_hdr(start_addr(&[b"__eh_frame_hdr", b".eh_frame_hdr"]))
-        .set_text(start_addr(&[b"__text", b".text"]))
-        .set_got(start_addr(&[b"__got", b".got"]))
+        .set_text(text_start)
+        .set_got(start_addr(&[b"__got", b".got"]));
+    (bases, text_range)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +306,7 @@ pub struct DwarfCfiIndex {
 impl DwarfCfiIndex {
     pub fn try_new<R, US>(
         unwind_section: US,
-        bases: BaseAddresses,
+        bases: &BaseAddresses,
         base_svma: u64,
     ) -> Result<Self, DwarfCfiIndexError>
     where
@@ -315,7 +317,7 @@ impl DwarfCfiIndex {
         let mut fde_pc_and_offset = Vec::new();
 
         let mut cur_cie = None;
-        let mut entries_iter = unwind_section.entries(&bases);
+        let mut entries_iter = unwind_section.entries(bases);
         while let Some(entry) = entries_iter.next()? {
             let fde = match entry {
                 CieOrFde::Cie(cie) => {
@@ -358,26 +360,26 @@ impl DwarfCfiIndex {
         })
     }
 
-    pub fn try_new_eh_frame<D>(
+    pub fn try_new_eh_frame(
         eh_frame_data: &[u8],
-        section_info: &mut impl ModuleSectionInfo<D>,
+        bases: &BaseAddresses,
+        base_svma: u64,
     ) -> Result<Self, DwarfCfiIndexError> {
-        let bases = base_addresses_for_sections(section_info);
         let mut eh_frame = EhFrame::from(EndianSlice::new(eh_frame_data, LittleEndian));
         eh_frame.set_address_size(8);
 
-        Self::try_new(eh_frame, bases, section_info.base_svma())
+        Self::try_new(eh_frame, bases, base_svma)
     }
 
-    pub fn try_new_debug_frame<D>(
+    pub fn try_new_debug_frame(
         debug_frame_data: &[u8],
-        section_info: &mut impl ModuleSectionInfo<D>,
+        bases: &BaseAddresses,
+        base_svma: u64,
     ) -> Result<Self, DwarfCfiIndexError> {
-        let bases = base_addresses_for_sections(section_info);
         let mut debug_frame = DebugFrame::from(EndianSlice::new(debug_frame_data, LittleEndian));
         debug_frame.set_address_size(8);
 
-        Self::try_new(debug_frame, bases, section_info.base_svma())
+        Self::try_new(debug_frame, bases, base_svma)
     }
 
     pub fn fde_offset_for_relative_address(&self, rel_lookup_address: u32) -> Option<u32> {
@@ -519,6 +521,84 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn eh_frame_and_debug_frame_preserve_unwind_and_error_outcomes() {
+        use crate::error::UnwinderError;
+        use crate::x86_64::{ArchX86_64, UnwindRuleX86_64};
+
+        for section_type in [UnwindSectionType::EhFrame, UnwindSectionType::DebugFrame] {
+            let cie_id = match section_type {
+                UnwindSectionType::EhFrame => 0u32,
+                UnwindSectionType::DebugFrame => u32::MAX,
+            };
+            let mut data = 14u32.to_le_bytes().to_vec();
+            data.extend(cie_id.to_le_bytes());
+            data.extend([1, 0, 1, 0x78, X86_64::RA.0 as u8]);
+            data.extend([
+                gimli::DW_CFA_def_cfa.0,
+                X86_64::RSP.0 as u8,
+                8,
+                gimli::DW_CFA_offset.0 | X86_64::RA.0 as u8,
+                1,
+            ]);
+            let fde_offset = data.len() as u32;
+            let cie_pointer = match section_type {
+                UnwindSectionType::EhFrame => fde_offset + 4,
+                UnwindSectionType::DebugFrame => 0,
+            };
+            data.extend(20u32.to_le_bytes());
+            data.extend(cie_pointer.to_le_bytes());
+            data.extend(0x1000u64.to_le_bytes());
+            data.extend(0x10u64.to_le_bytes());
+            let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+            let mut unwinder = DwarfUnwinder::<_, ArchX86_64, _>::new(
+                EndianSlice::new(&data, LittleEndian),
+                section_type,
+                None,
+                &mut context,
+                BaseAddresses::default(),
+                0,
+            );
+            let mut regs = UnwindRegsX86_64::new(0x1000, 0x2000, 0x3000);
+            let mut read_stack = |_| panic!("a cacheable rule does not read the stack");
+            assert!(matches!(
+                unwinder.unwind_frame_with_fde::<_, StoreOnHeap>(
+                    &mut regs,
+                    true,
+                    0x1000,
+                    fde_offset,
+                    &mut read_stack,
+                ),
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                    UnwindRuleX86_64::OffsetSp { sp_offset_by_8: 1 },
+                ))
+            ));
+            assert!(matches!(
+                unwinder.unwind_frame_with_fde::<_, StoreOnHeap>(
+                    &mut regs,
+                    true,
+                    0x2000,
+                    fde_offset,
+                    &mut read_stack,
+                ),
+                Ok(UnwindResult::ExecRuleWithFallback(
+                    UnwindRuleX86_64::JustReturnIfFirstFrameOtherwiseFp,
+                    UnwinderError::Dwarf(DwarfUnwinderError::UnwindInfoForAddressFailed(_)),
+                ))
+            ));
+            assert!(matches!(
+                unwinder.unwind_frame_with_fde::<_, StoreOnHeap>(
+                    &mut regs,
+                    true,
+                    0x1000,
+                    u32::MAX,
+                    &mut read_stack,
+                ),
+                Err(DwarfUnwinderError::FdeFromOffsetFailed(_))
+            ));
+        }
+    }
 
     fn encoding() -> Encoding {
         Encoding {

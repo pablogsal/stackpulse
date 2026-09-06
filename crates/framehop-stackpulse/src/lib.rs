@@ -115,7 +115,6 @@
 
 extern crate alloc;
 
-mod add_signed;
 mod arch;
 mod cache;
 mod code_address;

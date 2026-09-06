@@ -10,8 +10,8 @@ use super::{
     unwindregs::{Reg, UnwindRegsX86_64},
 };
 use crate::dwarf::{
-    eval_cfa_rule, eval_register_rule, ConversionError, DwarfUnwindRegs, DwarfUnwinderError,
-    DwarfUnwinding,
+    eval_cfa_rule, eval_register_rule, register_rule_to_cfa_offset, DwarfUnwindRegs,
+    DwarfUnwinderError, DwarfUnwinding,
 };
 use crate::unwind_result::UnwindResult;
 
@@ -61,14 +61,10 @@ impl DwarfUnwinding for ArchX86_64 {
         let ra_rule = unwind_info.register(X86_64::RA);
 
         if !has_explicit_general_register_rules(unwind_info) {
-            match translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref()) {
-                Ok(unwind_rule) => {
-                    return Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(unwind_rule));
-                }
-                Err(_err) => {
-                    // Could not translate into a cacheable unwind rule. Fall back to the generic path.
-                    // eprintln!("Unwind rule translation failed: {:?}", err);
-                }
+            if let Some(unwind_rule) =
+                translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref())
+            {
+                return Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(unwind_rule));
             }
         }
 
@@ -187,52 +183,30 @@ where
         .collect()
 }
 
-fn register_rule_to_cfa_offset<RO: ReaderOffset>(
-    rule: Option<&RegisterRule<RO>>,
-) -> Result<Option<i64>, ConversionError> {
-    match rule {
-        None | Some(RegisterRule::Undefined) | Some(RegisterRule::SameValue) => Ok(None),
-        Some(RegisterRule::Offset(offset)) => Ok(Some(*offset)),
-        _ => Err(ConversionError::RegisterNotStoredRelativeToCfa),
-    }
-}
-
 fn translate_into_unwind_rule<RO: ReaderOffset>(
     cfa_rule: &CfaRule<RO>,
     bp_rule: Option<&RegisterRule<RO>>,
     ra_rule: Option<&RegisterRule<RO>>,
-) -> Result<UnwindRuleX86_64, ConversionError> {
+) -> Option<UnwindRuleX86_64> {
     match ra_rule {
         None | Some(RegisterRule::Undefined) => {
-            // No return address. This means that we've reached the end of the stack.
-            return Ok(UnwindRuleX86_64::EndOfStack);
+            return Some(UnwindRuleX86_64::EndOfStack);
         }
-        Some(RegisterRule::Offset(offset)) if *offset == -8 => {
-            // This is normal case. Return address is [CFA-8].
-        }
-        Some(RegisterRule::Offset(_)) => {
-            // Unsupported, will have to use the slow path.
-            return Err(ConversionError::ReturnAddressRuleWithUnexpectedOffset);
-        }
-        _ => {
-            // Unsupported, will have to use the slow path.
-            return Err(ConversionError::ReturnAddressRuleWasWeird);
-        }
+        Some(RegisterRule::Offset(-8)) => {}
+        _ => return None,
     }
 
     match cfa_rule {
         CfaRule::RegisterAndOffset { register, offset } => match *register {
             X86_64::RSP => {
-                let sp_offset_by_8 =
-                    u16::try_from(offset / 8).map_err(|_| ConversionError::SpOffsetDoesNotFit)?;
+                let sp_offset_by_8 = u16::try_from(offset / 8).ok()?;
                 let fp_cfa_offset = register_rule_to_cfa_offset(bp_rule)?;
                 match fp_cfa_offset {
-                    None => Ok(UnwindRuleX86_64::OffsetSp { sp_offset_by_8 }),
+                    None => Some(UnwindRuleX86_64::OffsetSp { sp_offset_by_8 }),
                     Some(bp_cfa_offset) => {
                         let bp_storage_offset_from_sp_by_8 =
-                            i16::try_from((offset + bp_cfa_offset) / 8)
-                                .map_err(|_| ConversionError::FpStorageOffsetDoesNotFit)?;
-                        Ok(UnwindRuleX86_64::OffsetSpAndRestoreBp {
+                            i16::try_from((offset + bp_cfa_offset) / 8).ok()?;
+                        Some(UnwindRuleX86_64::OffsetSpAndRestoreBp {
                             sp_offset_by_8,
                             bp_storage_offset_from_sp_by_8,
                         })
@@ -240,10 +214,9 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
                 }
             }
             X86_64::RBP => {
-                let bp_cfa_offset = register_rule_to_cfa_offset(bp_rule)?
-                    .ok_or(ConversionError::FramePointerRuleDoesNotRestoreBp)?;
+                let bp_cfa_offset = register_rule_to_cfa_offset(bp_rule).flatten()?;
                 if *offset == 16 && bp_cfa_offset == -16 {
-                    Ok(UnwindRuleX86_64::UseFramePointer)
+                    Some(UnwindRuleX86_64::UseFramePointer)
                 } else {
                     // TODO: Maybe handle this case. This case has been observed in _ffi_call_unix64,
                     // which has the following unwind table:
@@ -253,11 +226,11 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
                     //   0xde562: CFA=reg6+32: reg6=[CFA-16], reg16=[CFA-8]
                     //   0xde5ad: CFA=reg7+8: reg16=[CFA-8]
                     //   0xde668: CFA=reg7+8: reg6=[CFA-16], reg16=[CFA-8]
-                    Err(ConversionError::FramePointerRuleHasStrangeBpOffset)
+                    None
                 }
             }
-            _ => Err(ConversionError::CfaIsOffsetFromUnknownRegister),
+            _ => None,
         },
-        CfaRule::Expression(_) => Err(ConversionError::CfaIsExpression),
+        CfaRule::Expression(_) => None,
     }
 }
