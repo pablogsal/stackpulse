@@ -26,6 +26,11 @@ results. Empty `NativeSymbols` is unresolved. `From<NativeSymbol>`,
 `FromIterator<NativeSymbol>`, `AsRef`, and `IntoIterator` support ordinary Rust
 collection code without allocating for zero or one symbol.
 
+Factories run lazily when resolution first needs a backend for a process. The
+backend is retained after its initial `refresh` succeeds. A construction or
+initial refresh error reaches the caller; a later resolve may call the factory
+again.
+
 A backend's `refresh` generation must remain changed until the session observes
 it successfully. An edge-triggered boolean loses notifications when another
 backend fails during the same update. Return backend errors directly so their

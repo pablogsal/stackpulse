@@ -25,6 +25,8 @@
 
 - Prepared-stack cache hits avoid symbol resolution; warmed repeated live batches and module clones avoid allocations.
 - Recorded modules, module identities, and native mappings share immutable path storage.
+- Live sessions reuse mapping-context storage and perf-map paths between batches, including batches introducing new frames.
+- Module indexes sort existing entries, stack compaction uses smaller temporary buffers, and inherited threads skip unnecessary counter setup.
 
 ## 0.10.2 - 2026-09-05
 
