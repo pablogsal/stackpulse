@@ -2,10 +2,29 @@
 
 ## Unreleased
 
+## 0.11.0 - 2026-09-06
+
+### Changed
+
+- Breaking API redesign: recorder builders and prepared launches, source-bound samples and stacks, repeatable resolved frames, and identity-bound process handles replace the previous public interfaces without compatibility wrappers.
+- Recorder-owned live readers expose published batches, completion and failures. Disposable spools reclaim consumed pages as the linked reader advances.
+- Live symbolization sessions manage bounded caller-produced stack values and invalidate them when native or perf-map symbols change.
+- Native backends receive paired lookup/result batches, report persistent refresh generations, and borrow retained image handles.
+- SPULSE4 records nanosecond sampling intervals, optional monotonic/wall-clock correlation, and native paths preserving operating-system bytes. Earlier spool versions are rejected.
+- Python source positions use optional coordinates, and truncated stacks have an explicit frame variant.
+- StackPulse now requires `framehop-stackpulse` 0.16.4.
+
 ### Fixed
 
 - AArch64 unwinding can recover the stack pointer when a frame-pointer fallback is followed by an SP-relative DWARF rule.
 - Frame-pointer fallback diagnostics are tested through the rule cache, including retry after sample-dependent DWARF failures.
+- Unwind-cache generation rollover cannot reuse stale rules.
+- Adding counters to a paused recording keeps them paused. Terminal writer failures prevent subsequent records, and finish errors retain final recording counters and cleanup sources.
+
+### Performance
+
+- Prepared-stack cache hits avoid symbol resolution; warmed repeated live batches and module clones avoid allocations.
+- Recorded modules, module identities, and native mappings share immutable path storage.
 
 ## 0.10.2 - 2026-09-05
 

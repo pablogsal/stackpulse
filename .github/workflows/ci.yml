@@ -188,10 +188,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: List packaged files
-        run: cargo package --list --locked
+        run: cargo package --workspace --list --locked
 
       - name: Build the crate exactly as published
-        run: cargo publish --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked
 
   audit:
     name: Security / dependency audit
