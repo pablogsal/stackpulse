@@ -346,16 +346,6 @@ pub enum AttachOutcome {
     Exited,
 }
 
-/// Result of reconciling an attached process's thread list.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum RefreshOutcome {
-    /// The live process's thread list was reconciled.
-    Refreshed,
-    /// The process exited before its thread list could be read.
-    Exited,
-}
-
 /// Records stack samples for one or more Linux processes.
 ///
 /// Call [`finish`](Self::finish) to drain perf rings, flush sorted events, and
@@ -718,15 +708,16 @@ impl ProcessTable {
         Ok(false)
     }
 
-    fn active_process_count(&mut self) -> crate::Result<usize> {
-        let mut active = 0;
+    fn activity(&mut self, root: crate::Pid) -> crate::Result<(bool, usize)> {
+        let root_active = self.process_is_active(root)?;
+        let mut active = usize::from(root_active);
         for (&pid, state) in &mut self.states {
-            let Some(pid) = crate::Pid::new(pid) else {
+            let Some(pid) = crate::Pid::new(pid).filter(|&pid| pid != root) else {
                 continue;
             };
             active += usize::from(state.tracking.poll_alive_checked(pid)?.unwrap_or(false));
         }
-        Ok(active)
+        Ok((root_active, active))
     }
 
     fn capture_available_generation(&mut self, pid: i32) {
@@ -1211,8 +1202,9 @@ impl<W: std::io::Write> Recorder<W> {
         }
         if open_new_perf_events && recovered_lifecycle_gap {
             for pid in processes
-                .tracked_pids()
-                .into_iter()
+                .states
+                .iter()
+                .filter_map(|(&pid, state)| state.tracking.is_tracked().then_some(pid))
                 .filter_map(|pid| u32::try_from(pid).ok())
             {
                 if let Err(err) = perf.refresh_threads(pid) {
@@ -1255,19 +1247,20 @@ impl<W: std::io::Write> Recorder<W> {
         self.drain_events(DrainMode::Consume)?;
         if self.last_reconcile.elapsed() >= Duration::from_millis(100) {
             self.last_reconcile = Instant::now();
-            for pid in self.processes.tracked_pids() {
-                if let Some(pid) = crate::Pid::new(pid) {
-                    if self.processes.process_is_active(pid)? {
-                        self.refresh_threads(pid)?;
-                    }
+            for (&pid, state) in &mut self.processes.states {
+                let Some(pid) = crate::Pid::new(pid) else {
+                    continue;
+                };
+                if state.tracking.poll_alive_checked(pid)?.unwrap_or(false) {
+                    self.perf.refresh_threads(pid.get_u32())?;
+                    refresh_recording_summary(&mut self.summary, &self.perf);
                 }
             }
         }
         if self.last_publish.elapsed() >= self.publish_interval {
             self.flush()?;
         }
-        let root_active = self.processes.process_is_active(self.root_pid)?;
-        let active_processes = self.processes.active_process_count()?;
+        let (root_active, active_processes) = self.processes.activity(self.root_pid)?;
         let pending_events = self.has_pending_events();
         Ok(PollSummary {
             root_active,
@@ -1393,29 +1386,6 @@ impl<W: std::io::Write> Recorder<W> {
         refresh_recording_summary(&mut self.summary, &self.perf);
         self.disable_on_drop = true;
         Ok(AttachOutcome::Attached)
-    }
-
-    /// Discover newly-created threads for `pid` when needed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`](crate::ErrorKind::InvalidInput) when
-    /// `pid` is not attached, or an I/O error when thread discovery fails.
-    pub(crate) fn refresh_threads(&mut self, pid: crate::Pid) -> crate::Result<RefreshOutcome> {
-        if !self.processes.is_tracked(pid.get()) {
-            return Err(crate::Error::message(
-                crate::ErrorKind::InvalidInput,
-                format!("process {pid} is not attached"),
-            ));
-        }
-        let refreshed = self.perf.refresh_threads(pid.get_u32())?;
-        refresh_recording_summary(&mut self.summary, &self.perf);
-        Ok(if refreshed {
-            self.disable_on_drop = true;
-            RefreshOutcome::Refreshed
-        } else {
-            RefreshOutcome::Exited
-        })
     }
 
     /// Drain all collected events, force loss bookkeeping and recovery, then
@@ -2789,7 +2759,10 @@ mod tests {
             .process_is_active(crate::Pid::new(pid).unwrap())
             .unwrap());
         assert!(!processes.has_active_processes_except(0).unwrap());
-        assert_eq!(processes.active_process_count().unwrap(), 0);
+        assert_eq!(
+            processes.activity(crate::Pid::new(pid).unwrap()).unwrap(),
+            (false, 0)
+        );
     }
 
     #[test]
@@ -2826,8 +2799,26 @@ mod tests {
             .unwrap());
         assert!(processes.has_active_processes_except(missing_pid).unwrap());
         assert!(!processes.has_active_processes_except(live_pid).unwrap());
-        assert_eq!(processes.active_process_count().unwrap(), 1);
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(live_pid).unwrap())
+                .unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(missing_pid).unwrap())
+                .unwrap(),
+            (false, 1)
+        );
         assert_eq!(processes.dead_or_reused_pids().unwrap(), [missing_pid]);
+        processes.states.remove(&missing_pid);
+        assert_eq!(
+            processes
+                .activity(crate::Pid::new(missing_pid).unwrap())
+                .unwrap(),
+            (false, 1)
+        );
     }
 
     #[test]
@@ -3962,6 +3953,37 @@ mod recording_lifecycle_tests {
             metadata,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn periodic_reconciliation_preserves_process_tracking() {
+        let child = crate::test_support::SleepChild::spawn();
+        let pid = crate::Pid::new(child.pid_i32()).unwrap();
+        let mut recorder = empty_recorder(Vec::new());
+        recorder.root_pid = pid;
+        recorder.processes = ProcessTable::default();
+        recorder.processes.ensure_tracked(pid.get());
+        recorder.processes.state_mut(std::process::id() as i32);
+        recorder.last_reconcile = Instant::now() - Duration::from_secs(1);
+        let previous_reconcile = recorder.last_reconcile;
+
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(recorder.last_reconcile > previous_reconcile);
+        assert!(summary.root_active());
+        assert_eq!(summary.active_processes(), 1);
+        assert!(!recorder.processes.is_tracked(std::process::id() as i32));
+
+        let other = crate::test_support::SleepChild::spawn();
+        recorder.processes.ensure_tracked(other.pid_i32());
+        drop(child);
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(!summary.root_active());
+        assert_eq!(summary.active_processes(), 1);
+
+        drop(other);
+        let summary = recorder.poll(Duration::ZERO).unwrap();
+        assert!(!summary.root_active());
+        assert_eq!(summary.active_processes(), 0);
     }
 
     #[test]

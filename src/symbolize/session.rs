@@ -141,6 +141,7 @@ impl<'reader> Session<'reader> {
     /// ```
     pub fn poll(&mut self, timeout: Duration) -> Result<ReadStatus<LiveBatch<'_>>> {
         self.symbolizer.refresh_native_sources()?;
+        self.symbolizer.spool_frame_contexts = None;
         match self.reader.poll(timeout)? {
             ReadStatus::Batch(batch) => {
                 let invalidation = self.symbolizer.update(&batch)?;

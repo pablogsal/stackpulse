@@ -462,13 +462,14 @@ impl ModuleIndexGroup {
     }
 
     fn finish(&mut self) {
-        let mut sorted = self.entries.clone();
-        sorted.sort_by_key(|entry| (entry.start, entry.id));
-        self.has_overlaps = sorted
+        self.entries
+            .sort_unstable_by_key(|entry| (entry.start, entry.id));
+        self.has_overlaps = self
+            .entries
             .windows(2)
             .any(|window| window[0].end > window[1].start);
-        if !self.has_overlaps {
-            self.entries = sorted;
+        if self.has_overlaps {
+            self.entries.sort_unstable_by_key(|entry| entry.id);
         }
     }
 
@@ -491,4 +492,46 @@ struct ModuleIndexEntry {
     start: u64,
     end: u64,
     id: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_index_finalization_reuses_storage_and_preserves_mapping_precedence() {
+        let addresses = [
+            0, 31, 32, 47, 48, 63, 64, 95, 96, 127, 1024, 130_000, 131_071, 131_072, 131_087,
+            131_088, 131_135, 131_136,
+        ];
+        let allocations = [false, true].map(|overlap| {
+            let mut group = ModuleIndexGroup::default();
+            for id in 0..4096 {
+                let start = u64::from(4096 - id) * 32;
+                group.push(ModuleIndexEntry {
+                    start,
+                    end: start + if overlap { 64 } else { 16 },
+                    id,
+                });
+            }
+            let expected = addresses.map(|address| {
+                group
+                    .entries
+                    .iter()
+                    .rfind(|entry| entry.start <= address && address < entry.end)
+                    .map(|entry| entry.id)
+            });
+            let allocations = allocation_counter::measure(|| group.finish());
+            assert_eq!(group.has_overlaps, overlap);
+            for (address, expected) in addresses.into_iter().zip(expected) {
+                assert_eq!(
+                    group.find(address),
+                    expected,
+                    "address {address}, overlap {overlap}"
+                );
+            }
+            allocations.count_total
+        });
+        assert_eq!(allocations, [0, 0]);
+    }
 }

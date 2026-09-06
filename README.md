@@ -31,36 +31,40 @@ runs, call `poll` to drain samples into a spool file. Open that file with
 `Snapshot`, then resolve each sample’s stack. The resulting frames are
 ready for your aggregator, UI, or exporter.
 
-For example, to record for ten seconds and read back one stack:
+For example, to record for ten seconds and print each sampled stack:
 
 ```rust,no_run
 use std::fs::File;
 use std::time::{Duration, Instant};
 use stackpulse::{Pid, Recorder, SampleRate, Snapshot, Spool};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-let pid: u32 = std::env::args().nth(1).expect("pid").parse()?;
-let mut recorder = Recorder::builder(SampleRate::hz(99)?)
-    .stack_size(60 * 1024)
-    .attach(Pid::try_from(pid)?, Spool::retained(File::create("profile.spool")?)?)?;
+    let pid: u32 = std::env::args().nth(1).expect("pid").parse()?;
+    let mut recorder = Recorder::builder(SampleRate::hz(99)?)
+        .stack_size(60 * 1024)
+        .attach(
+            Pid::try_from(pid)?,
+            Spool::retained(File::create("profile.spool")?)?,
+        )?;
 
-let deadline = Instant::now() + Duration::from_secs(10);
-while Instant::now() < deadline {
-    let activity = recorder.poll(Duration::from_millis(100))?;
-    if activity.active_processes() == 0 && !activity.pending_events() {
-        break;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let activity = recorder.poll(Duration::from_millis(100))?;
+        if activity.active_processes() == 0 && !activity.pending_events() {
+            break;
+        }
     }
-}
-recorder.finish()?;
+    recorder.finish()?;
 
-let recording = Snapshot::open("profile.spool")?;
-let mut symbols = recording.symbolizer().build()?;
-for sample in recording.samples() {
-    let stack = symbols.resolve(sample.stack())?;
-    for frame in stack.frames() {
-        println!("{frame}");
+    let recording = Snapshot::open("profile.spool")?;
+    let mut symbols = recording.symbolizer().build()?;
+    for sample in recording.samples() {
+        let stack = symbols.resolve(sample.stack())?;
+        for frame in stack.frames() {
+            println!("{frame}");
+        }
     }
-}
-Ok(())
+    Ok(())
 }
 ```
 

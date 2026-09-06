@@ -129,6 +129,7 @@ pub struct Symbolizer {
 }
 
 struct PerfMapState {
+    path: PathBuf,
     identity: Option<PerfMapFileIdentity>,
     map: Option<PerfMap>,
 }
@@ -463,8 +464,9 @@ impl<'a> SymbolizerBuilder<'a> {
 
     /// Use a caller-supplied native symbolizer factory.
     ///
-    /// The factory runs lazily, at most once per process id, when a resolve
-    /// call first needs native symbols for that process.
+    /// The factory runs lazily when a resolve call needs native symbols for a
+    /// process. Its result is retained after its initial refresh succeeds;
+    /// a refresh error is returned and a later resolve may retry construction.
     #[must_use]
     pub fn native<S>(mut self, mut factory: impl FnMut(crate::Pid) -> S + 'static) -> Self
     where
@@ -478,9 +480,9 @@ impl<'a> SymbolizerBuilder<'a> {
 
     /// Use a caller-supplied native symbolizer factory that may fail.
     ///
-    /// The factory runs lazily and its first successful result is retained per
-    /// process id. A factory error is returned by that resolve call; a later
-    /// resolve may retry construction.
+    /// The factory runs lazily and its result is retained per process after
+    /// its initial refresh succeeds. A construction or initial refresh error
+    /// is returned by that resolve call; a later resolve may retry construction.
     #[must_use]
     pub fn try_native<S, E>(
         mut self,
@@ -876,7 +878,7 @@ impl Symbolizer {
                     || !self.mapping_changed_process_ids.contains(process_id)
             });
         }
-        if batch.frame_contexts_changed() {
+        if self.spool_frame_contexts.is_none() || batch.frame_contexts_changed() {
             self.spool_frame_contexts = Some(batch.frame_module_contexts());
         }
 
@@ -884,25 +886,22 @@ impl Symbolizer {
             if !self.perf_maps_allowed_for(process.get()) {
                 continue;
             }
-            let identity = perf_map_file_identity(&self.perf_map_dir, process.get());
-            if batch.retired_processes().contains(process) && identity.is_none() {
-                self.perf_maps.entry(process.get()).or_insert(PerfMapState {
-                    identity: None,
-                    map: None,
-                });
-                continue;
-            }
             let state = self.perf_maps.entry(process.get());
             let had_map = matches!(state, std::collections::hash_map::Entry::Occupied(_));
             let state = state.or_insert_with(|| PerfMapState {
-                identity,
-                map: load_perf_map(&self.perf_map_dir, process.get()),
+                path: self.perf_map_dir.join(format!("perf-{process}.map")),
+                identity: None,
+                map: None,
             });
+            let identity = perf_map_file_identity(&state.path);
+            if batch.retired_processes().contains(process) && identity.is_none() {
+                continue;
+            }
             let retry_failed_load = identity.is_some() && state.map.is_none();
             let changed = state.identity != identity;
-            let recovered = if had_map && (changed || retry_failed_load) {
-                let map = load_perf_map(&self.perf_map_dir, process.get());
-                let recovered = retry_failed_load && map.is_some();
+            let recovered = if !had_map || changed || retry_failed_load {
+                let map = load_perf_map(&state.path);
+                let recovered = had_map && retry_failed_load && map.is_some();
                 state.identity = identity;
                 state.map = map;
                 recovered
@@ -1012,18 +1011,15 @@ impl Symbolizer {
         if retained == self.resolved_stack_frame_ids.len() {
             return;
         }
-        let mut ranges = self
-            .stack_cache
-            .iter()
-            .map(|(&key, range)| (key, range.clone()))
-            .collect::<Vec<_>>();
-        ranges.sort_unstable_by_key(|(_, range)| range.start);
+        let mut ranges = self.stack_cache.values_mut().collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|range| range.start);
 
         let mut next = 0;
-        for (key, range) in ranges {
+        for range in ranges {
             let len = range.len();
-            self.resolved_stack_frame_ids.copy_within(range, next);
-            self.stack_cache.insert(key, next..next + len);
+            self.resolved_stack_frame_ids
+                .copy_within(range.clone(), next);
+            *range = next..next + len;
             next += len;
         }
         self.resolved_stack_frame_ids.truncate(next);
@@ -1761,12 +1757,18 @@ impl Symbolizer {
     ) -> Option<(PerfMapSymbol, std::rc::Rc<str>)> {
         self.perf_maps
             .entry(process_id)
-            .or_insert_with(|| PerfMapState {
-                identity: self
+            .or_insert_with(|| {
+                let path = self.perf_map_dir.join(format!("perf-{process_id}.map"));
+                let identity = self
                     .tracks_perf_map_updates
-                    .then(|| perf_map_file_identity(&self.perf_map_dir, process_id))
-                    .flatten(),
-                map: load_perf_map(&self.perf_map_dir, process_id),
+                    .then(|| perf_map_file_identity(&path))
+                    .flatten();
+                let map = load_perf_map(&path);
+                PerfMapState {
+                    path,
+                    identity,
+                    map,
+                }
             })
             .map
             .as_ref()
@@ -1807,6 +1809,53 @@ mod tests {
             abs_ip,
             mode: FrameMode::User,
         }
+    }
+
+    #[test]
+    fn stack_compaction_preserves_keys_and_ranges_across_stale_gaps() {
+        let temp = crate::test_support::TempDir::new("stack-compaction");
+        let path = temp.path().join("recording.spool");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        for address in 0..6 {
+            writer
+                .write_sample_frames(address, 7, 7, [frame(address)])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        let reader = Snapshot::open(&path).unwrap();
+        let keys: Vec<_> = reader.samples().map(|sample| sample.key()).collect();
+        let mut symbolizer = reader
+            .symbolizer()
+            .disable_perf_maps()
+            .kernel_symbols(KernelSymbolSource::Disabled)
+            .build()
+            .unwrap();
+        symbolizer.resolved_stack_frame_ids.extend(0..12);
+        symbolizer.stack_cache.extend(keys.iter().copied().zip([
+            0..0,
+            1..3,
+            5..5,
+            5..8,
+            10..11,
+            12..12,
+        ]));
+
+        symbolizer.compact_resolved_stack_frame_ids();
+
+        assert_eq!(symbolizer.resolved_stack_frame_ids, [1, 2, 5, 6, 7, 10]);
+        assert_eq!(symbolizer.stack_cache.len(), keys.len());
+        let expected: [&[usize]; 6] = [&[], &[1, 2], &[], &[5, 6, 7], &[10], &[]];
+        for (key, expected) in keys.iter().zip(expected) {
+            let range = symbolizer.stack_cache[key].clone();
+            assert_eq!(&symbolizer.resolved_stack_frame_ids[range], expected);
+        }
+        let allocations = allocation_counter::measure(|| {
+            symbolizer.compact_resolved_stack_frame_ids();
+        });
+        assert_eq!(allocations.count_total, 0);
+        symbolizer.stack_cache.clear();
+        symbolizer.compact_resolved_stack_frame_ids();
+        assert!(symbolizer.resolved_stack_frame_ids.is_empty());
     }
 
     #[test]
@@ -3328,6 +3377,110 @@ mod tests {
                 .collect();
             assert_eq!(frames, [(address, AddressSpace::Kernel)]);
         }
+    }
+
+    #[test]
+    fn live_perf_map_paths_are_reused_across_refresh_and_retirement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = crate::test_support::TempDir::new("perf-map-path-reuse");
+        let directory = temp.path().join(std::ffi::OsStr::from_bytes(b"maps-\xff"));
+        fs::create_dir(&directory).unwrap();
+        let perf_map = directory.join("perf-7.map");
+        fs::write(&perf_map, "1000 10 old_name\n").unwrap();
+        let path = temp.path().join("recording.spool");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        writer.flush().unwrap();
+        let mut tail = Tail::open(&path).unwrap();
+        let mut symbolizer = tail
+            .symbolizer()
+            .perf_map_dir(&directory)
+            .kernel_symbols(KernelSymbolSource::Disabled)
+            .build()
+            .unwrap();
+        let pid = crate::Pid::new(7).unwrap();
+        symbolizer.update(&tail.poll().unwrap()).unwrap();
+
+        for timestamp in 0..4 {
+            for process in [7, 8] {
+                writer
+                    .write_sample_frames(timestamp, process, 1, [frame(0x1000)])
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+            let batch = tail.poll().unwrap();
+            let allocations = allocation_counter::measure(|| {
+                assert!(!symbolizer.update(&batch).unwrap().affects_process(pid));
+            });
+            if timestamp != 0 {
+                assert_eq!(allocations.count_total, 0);
+            }
+        }
+        assert_eq!(symbolizer.perf_maps[&7].path, perf_map);
+        assert!(symbolizer.perf_maps[&8].map.is_none());
+
+        symbolizer.perf_maps.get_mut(&7).unwrap().map = None;
+        writer
+            .write_sample_frames(4, 7, 7, [frame(0x1000)])
+            .unwrap();
+        writer.flush().unwrap();
+        let batch = tail.poll().unwrap();
+        assert!(symbolizer.update(&batch).unwrap().affects_process(pid));
+        let stack = batch.samples().next().unwrap().stack();
+        assert_eq!(
+            symbolizer
+                .resolve(stack)
+                .unwrap()
+                .frames()
+                .next()
+                .unwrap()
+                .name(),
+            Some("old_name")
+        );
+
+        let replacement = directory.join("replacement");
+        fs::write(&replacement, "1000 10 new_name\n").unwrap();
+        fs::rename(replacement, &perf_map).unwrap();
+        writer
+            .write_sample_frames(5, 7, 7, [frame(0x1000)])
+            .unwrap();
+        writer.flush().unwrap();
+        let batch = tail.poll().unwrap();
+        assert!(symbolizer.update(&batch).unwrap().affects_process(pid));
+        let stack = batch.samples().next().unwrap().stack();
+        assert_eq!(
+            symbolizer
+                .resolve(stack)
+                .unwrap()
+                .frames()
+                .next()
+                .unwrap()
+                .name(),
+            Some("new_name")
+        );
+
+        fs::remove_file(&perf_map).unwrap();
+        writer
+            .write_sample_frames(6, 7, 7, [frame(0x1000)])
+            .unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        writer.flush().unwrap();
+        let batch = tail.poll().unwrap();
+        assert!(!symbolizer.update(&batch).unwrap().affects_process(pid));
+        let stack = batch.samples().next().unwrap().stack();
+        assert_eq!(
+            symbolizer
+                .resolve(stack)
+                .unwrap()
+                .frames()
+                .next()
+                .unwrap()
+                .name(),
+            Some("new_name")
+        );
+        let batch = tail.poll().unwrap();
+        assert!(symbolizer.update(&batch).unwrap().affects_process(pid));
+        assert!(!symbolizer.perf_maps.contains_key(&7));
     }
 
     #[test]
