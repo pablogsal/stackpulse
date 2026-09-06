@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 #[cfg(any(test, feature = "bench-support"))]
 use std::io::BufWriter;
 use std::io::{self, Read, Write};
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -57,7 +58,7 @@ const NONE_U32: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct StackNodeRecord {
-    prefix: Option<u32>,
+    prefix: Option<NonZeroU32>,
     frame_id: u32,
     depth: usize,
 }
@@ -380,6 +381,7 @@ struct SpoolDefinitions {
 }
 
 impl SpoolDefinitions {
+    #[inline]
     fn stack_frame_refs(&self, stack_id: u32) -> io::Result<StackFrames<'_>> {
         let node = self.stack_nodes.get(stack_id as usize).ok_or_else(|| {
             invalid_data(format!("sample references missing stack node {stack_id}"))
@@ -387,7 +389,7 @@ impl SpoolDefinitions {
         Ok(StackFrames {
             frames: &self.frames,
             stack_nodes: &self.stack_nodes,
-            current: Some(stack_id),
+            current: stack_id,
             remaining: node.depth,
         })
     }
@@ -399,22 +401,23 @@ impl SpoolDefinitions {
         }
     }
 
+    #[inline]
     fn module_for_frame(
         &self,
         process_id: i32,
         frame_id: u32,
         frame: &FrameRecord,
     ) -> Option<FrameModuleRef<'_>> {
-        let context = self.frame_contexts.for_frame_id(frame_id)?;
         module_for_frame_with_context(
             &self.modules,
             &self.frame_contexts,
-            context,
+            frame_id,
             process_id,
             frame,
         )
     }
 
+    #[inline]
     fn frame_context<'a>(
         &'a self,
         process_id: i32,
@@ -568,23 +571,6 @@ pub(crate) struct FrameContext<'a> {
     pub module: Option<FrameModuleRef<'a>>,
 }
 
-/// Borrowed raw frames with recorded module context for one interned stack.
-#[derive(Clone)]
-pub(crate) struct StackFrameContexts<'a> {
-    definitions: &'a SpoolDefinitions,
-    process_id: i32,
-    frames: StackFrames<'a>,
-}
-
-impl std::fmt::Debug for StackFrameContexts<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StackFrameContexts")
-            .field("process_id", &self.process_id)
-            .field("remaining", &self.frames.len())
-            .finish()
-    }
-}
-
 /// Opaque identity for one interned stack in one spool source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StackKey {
@@ -716,7 +702,7 @@ struct ReplayRecordState {
 pub(crate) struct StackFrames<'a> {
     frames: &'a [FrameRecord],
     stack_nodes: &'a [StackNodeRecord],
-    current: Option<u32>,
+    current: u32,
     remaining: usize,
 }
 
@@ -726,17 +712,30 @@ pub(crate) struct StackFrameRef<'a> {
 }
 
 impl<'a> StackFrames<'a> {
+    fn contexts(
+        mut self,
+        definitions: &'a SpoolDefinitions,
+        process_id: i32,
+    ) -> impl ExactSizeIterator<Item = FrameContext<'a>> + 'a {
+        (0..self.len()).map(move |_| {
+            let frame = self.advance();
+            definitions.frame_context(process_id, frame.id, frame.frame)
+        })
+    }
+
+    #[inline]
+    fn advance(&mut self) -> StackFrameRef<'a> {
+        let node = &self.stack_nodes[self.current as usize];
+        self.current = node.prefix.map_or(0, |prefix| prefix.get() - 1);
+        self.remaining -= 1;
+        StackFrameRef {
+            id: node.frame_id,
+            frame: &self.frames[node.frame_id as usize],
+        }
+    }
+
     pub(crate) fn next_with_id(&mut self) -> Option<StackFrameRef<'a>> {
-        let id = self.current?;
-        let node = self.stack_nodes.get(id as usize)?;
-        self.current = node.prefix;
-        self.remaining = self.remaining.saturating_sub(1);
-        self.frames
-            .get(node.frame_id as usize)
-            .map(|frame| StackFrameRef {
-                id: node.frame_id,
-                frame,
-            })
+        (self.remaining != 0).then(|| self.advance())
     }
 }
 
@@ -755,29 +754,6 @@ impl<'a> Iterator for StackFrames<'a> {
 impl ExactSizeIterator for StackFrames<'_> {
     fn len(&self) -> usize {
         self.remaining
-    }
-}
-
-impl<'a> Iterator for StackFrameContexts<'a> {
-    type Item = FrameContext<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let frame_ref = self.frames.next_with_id()?;
-        Some(
-            self.definitions
-                .frame_context(self.process_id, frame_ref.id, frame_ref.frame),
-        )
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.frames.size_hint()
-    }
-}
-
-impl ExactSizeIterator for StackFrameContexts<'_> {
-    fn len(&self) -> usize {
-        self.frames.len()
     }
 }
 
@@ -960,12 +936,11 @@ impl Snapshot {
         &self,
         process_id: crate::Pid,
         stack_id: u32,
-    ) -> crate::Result<StackFrameContexts<'_>> {
-        Ok(StackFrameContexts {
-            definitions: &self.definitions,
-            process_id: process_id.get(),
-            frames: self.definitions.stack_frame_refs(stack_id)?,
-        })
+    ) -> crate::Result<impl ExactSizeIterator<Item = FrameContext<'_>>> {
+        Ok(self
+            .definitions
+            .stack_frame_refs(stack_id)?
+            .contexts(&self.definitions, process_id.get()))
     }
 
     /// Iterate over sample occurrences with their source-bound stacks.
@@ -1107,12 +1082,11 @@ impl Replay {
         &self,
         process_id: crate::Pid,
         stack_id: u32,
-    ) -> crate::Result<StackFrameContexts<'_>> {
-        Ok(StackFrameContexts {
-            definitions: &self.definitions,
-            process_id: process_id.get(),
-            frames: self.definitions.stack_frame_refs(stack_id)?,
-        })
+    ) -> crate::Result<impl ExactSizeIterator<Item = FrameContext<'_>>> {
+        Ok(self
+            .definitions
+            .stack_frame_refs(stack_id)?
+            .contexts(&self.definitions, process_id.get()))
     }
 
     /// Decode samples sequentially without retaining them.
@@ -1623,10 +1597,11 @@ pub(crate) fn module_for_frame_unbounded<'a>(
     frame_module_ref(module, frame)
 }
 
+#[inline]
 pub(crate) fn module_for_frame_with_context<'a>(
     modules: &'a [ModuleRecord],
     contexts: &SpoolFrameModuleContexts,
-    context: FrameLookupContext,
+    frame_id: u32,
     process_id: i32,
     frame: &FrameRecord,
 ) -> Option<FrameModuleRef<'a>> {
@@ -1639,6 +1614,17 @@ pub(crate) fn module_for_frame_with_context<'a>(
             file_relative_ip: frame.file_relative_ip,
         });
     }
+    find_unpinned_frame_module(modules, contexts, frame_id, process_id, frame)
+}
+
+fn find_unpinned_frame_module<'a>(
+    modules: &'a [ModuleRecord],
+    contexts: &SpoolFrameModuleContexts,
+    frame_id: u32,
+    process_id: i32,
+    frame: &FrameRecord,
+) -> Option<FrameModuleRef<'a>> {
+    let context = contexts.for_frame_id(frame_id)?;
     let module_limit = context.module_limit.min(modules.len());
     let module = modules
         .get(..module_limit)?
@@ -1828,7 +1814,7 @@ fn read_stack_node(
         stack_nodes[prefix.index].depth.saturating_add(1)
     });
     Ok(StackNodeRecord {
-        prefix: prefix.map(|prefix| prefix.id),
+        prefix: prefix.and_then(|prefix| NonZeroU32::new(prefix.id + 1)),
         frame_id,
         depth,
     })
@@ -3374,24 +3360,22 @@ impl<'a> Stack<'a> {
         self.key.process_id
     }
     /// Raw frames joined with their recorded mappings.
+    #[inline]
     pub fn frames(&self) -> impl ExactSizeIterator<Item = RawFrame<'a>> + 'a {
-        StackFrameContexts {
-            definitions: self.definitions,
-            process_id: self.pid().get(),
-            frames: self.raw_frames(),
-        }
-        .map(|context| match context.frame.mode {
-            FrameMode::TruncatedStackMarker => RawFrame::TruncatedStack,
-            FrameMode::User | FrameMode::Kernel => RawFrame::Native {
-                address: context.frame.abs_ip,
-                address_space: if context.frame.mode == FrameMode::Kernel {
-                    crate::profile::AddressSpace::Kernel
-                } else {
-                    crate::profile::AddressSpace::User
+        self.raw_frames()
+            .contexts(self.definitions, self.pid().get())
+            .map(|context| match context.frame.mode {
+                FrameMode::TruncatedStackMarker => RawFrame::TruncatedStack,
+                FrameMode::User | FrameMode::Kernel => RawFrame::Native {
+                    address: context.frame.abs_ip,
+                    address_space: if context.frame.mode == FrameMode::Kernel {
+                        crate::profile::AddressSpace::Kernel
+                    } else {
+                        crate::profile::AddressSpace::User
+                    },
+                    mapping: context.module,
                 },
-                mapping: context.module,
-            },
-        })
+            })
     }
     pub(crate) fn into_parts(self) -> (StackKey, crate::Pid, StackFrames<'a>) {
         (self.key, self.pid(), self.raw_frames())
@@ -3401,6 +3385,7 @@ impl<'a> Stack<'a> {
         clippy::expect_used,
         reason = "sample stack ids are validated while decoding the spool"
     )]
+    #[inline]
     fn raw_frames(&self) -> StackFrames<'a> {
         self.definitions
             .stack_frame_refs(self.key.stack_id)

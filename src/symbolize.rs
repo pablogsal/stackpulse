@@ -1594,16 +1594,13 @@ impl Symbolizer {
             });
         }
         match (self.spool_frame_contexts.as_ref(), spool_frame_id) {
-            (Some(contexts), Some(frame_id)) => {
-                let context = contexts.for_frame_id(frame_id)?;
-                spool::module_for_frame_with_context(
-                    self.modules.records(),
-                    contexts,
-                    context,
-                    process_id,
-                    frame,
-                )
-            }
+            (Some(contexts), Some(frame_id)) => spool::module_for_frame_with_context(
+                self.modules.records(),
+                contexts,
+                frame_id,
+                process_id,
+                frame,
+            ),
             _ => spool::module_for_frame_unbounded(
                 self.modules.records(),
                 process_id,

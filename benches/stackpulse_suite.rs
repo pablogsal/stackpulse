@@ -173,7 +173,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
                     for stack in reader.samples() {
                         for frame in stack.stack().frames() {
                             frames += 1;
-                            checksum = checksum.wrapping_add(raw_view_score(frame));
+                            checksum = checksum.wrapping_add(raw_view_score(&frame));
                         }
                     }
                 }
@@ -196,7 +196,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
                     for stack in reader.samples() {
                         for frame in stack.stack().frames() {
                             frames += 1;
-                            checksum = checksum.wrapping_add(raw_view_score(frame));
+                            checksum = checksum.wrapping_add(raw_view_score(&frame));
                         }
                     }
                 }
@@ -227,7 +227,6 @@ fn bench_spool_iteration(c: &mut Criterion) {
                         checksum = checksum.wrapping_add(
                             expanded
                                 .iter()
-                                .copied()
                                 .map(raw_view_score)
                                 .fold(0usize, usize::wrapping_add),
                         );
@@ -863,12 +862,15 @@ fn score_resolved_frame_slice(
     score.wrapping_add(count)
 }
 
-fn raw_view_score(frame: RawFrame<'_>) -> usize {
+fn raw_view_score(frame: &RawFrame<'_>) -> usize {
     match frame {
         RawFrame::Native {
             address, mapping, ..
         } => {
-            address as usize ^ mapping.map_or(0, |mapping| mapping.file_relative_address() as usize)
+            *address as usize
+                ^ mapping
+                    .as_ref()
+                    .map_or(0, |mapping| mapping.file_relative_address() as usize)
         }
         RawFrame::TruncatedStack => 1,
     }
