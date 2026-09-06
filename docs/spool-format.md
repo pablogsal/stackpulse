@@ -24,13 +24,16 @@ must not modify or truncate bytes that were already visible to the reader.
 
 Every file begins with:
 
-1. The eight-byte magic value `SPULSE3\0`.
+1. The eight-byte magic value `SPULSE4\0`.
 2. The profile start timestamp in microseconds, encoded as an unsigned varint.
-3. The requested sample interval in microseconds, encoded as an unsigned
-   varint.
+3. The initial nominal sample interval in nanoseconds, encoded as an unsigned varint.
+4. An optional paired monotonic/realtime clock origin used by `Sample::recorded_at`.
 
 Integers after the magic use the `integer-encoding` varint representation.
 Signed values use that crate's signed encoding.
+
+Version 4 is a breaking format change. Earlier spool versions are rejected.
+Native mapping paths are length-prefixed operating-system bytes, not UTF-8 strings.
 
 ## Record types
 

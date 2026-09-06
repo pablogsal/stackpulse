@@ -21,50 +21,46 @@ newer.
 
 ```toml
 [dependencies]
-stackpulse = "0.9"
+stackpulse = "0.11"
 ```
 
 ## Record a profile
 
 Attach to a running process or launch one under the recorder. While the target
 runs, call `poll` to drain samples into a spool file. Open that file with
-`Snapshot`, then pass its stacks to `Symbolizer`. The resulting frames are
+`Snapshot`, then resolve each sample’s stack. The resulting frames are
 ready for your aggregator, UI, or exporter.
 
 For example, to record for ten seconds and read back one stack:
 
 ```rust,no_run
+use std::fs::File;
 use std::time::{Duration, Instant};
-
-use stackpulse::{AttachMode, Pid, Recorder, RecorderOptions, SampleRate, Snapshot};
-
+use stackpulse::{Pid, Recorder, SampleRate, Snapshot, Spool};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw_pid: u32 = std::env::args().nth(1).expect("pid").parse()?;
-    let pid = Pid::try_from(raw_pid)?;
+let pid: u32 = std::env::args().nth(1).expect("pid").parse()?;
+let mut recorder = Recorder::builder(SampleRate::hz(99)?)
+    .stack_size(60 * 1024)
+    .attach(Pid::try_from(pid)?, Spool::retained(File::create("profile.spool")?)?)?;
 
-    let mut recorder = Recorder::attach(
-        pid,
-        "profile.spool",
-        AttachMode::StopWhileAttaching,
-        RecorderOptions::new(SampleRate::hz(99)?).stack_size(60 * 1024),
-    )?;
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && recorder.process_is_active(pid)? {
-        recorder.poll(Duration::from_millis(100))?;
+let deadline = Instant::now() + Duration::from_secs(10);
+while Instant::now() < deadline {
+    let activity = recorder.poll(Duration::from_millis(100))?;
+    if activity.active_processes() == 0 && !activity.pending_events() {
+        break;
     }
-    recorder.finish()?;
+}
+recorder.finish()?;
 
-    let reader = Snapshot::open("profile.spool")?;
-    let mut symbolizer = reader.symbolizer().build()?;
-
-    if let Some(stack) = reader.stacks().next() {
-        for frame in symbolizer.resolve(stack)? {
-            println!("{}", frame.display_name());
-        }
+let recording = Snapshot::open("profile.spool")?;
+let mut symbols = recording.symbolizer().build()?;
+for sample in recording.samples() {
+    let stack = symbols.resolve(sample.stack())?;
+    for frame in stack.frames() {
+        println!("{frame}");
     }
-
-    Ok(())
+}
+Ok(())
 }
 ```
 
@@ -81,7 +77,7 @@ locally with `make doc`.
 | Native symbols | Bundled `wholesym` backend or a caller-supplied symbolizer |
 | Dynamic runtimes | Python perf maps and Python runtime frames |
 | Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
-| Profile files | Reads and writes SPULSE3 |
+| Profile files | Reads and writes SPULSE4 |
 | Rust version | 1.88 or newer |
 
 ## Development
