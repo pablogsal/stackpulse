@@ -83,7 +83,7 @@ fn frame(address: u64) -> FrameRecord {
 }
 
 #[test]
-fn warmed_live_batches_allocate_nothing() {
+fn live_batches_reuse_storage_for_repeated_and_new_frames() {
     use std::fs::File;
     use std::time::Duration;
 
@@ -134,8 +134,34 @@ fn warmed_live_batches_allocate_nothing() {
         if batch_index != 0 {
             assert_eq!(allocations.count_total, 0);
         }
+        assert!(matches!(
+            session.poll(Duration::ZERO).unwrap(),
+            ReadStatus::Pending
+        ));
         sample.timestamp_ns += 1_000;
     }
+    let allocations = allocation_counter::measure(|| {
+        for _ in 0..256 {
+            sample.timestamp_ns += 1_000;
+            for frame in &mut sample.frames {
+                frame.abs_ip += 0x1000;
+                frame.file_relative_ip = frame.abs_ip;
+            }
+            writer.append(&sample).unwrap();
+            writer.flush().unwrap();
+            let ReadStatus::Batch(mut batch) = session.poll(Duration::ZERO).unwrap() else {
+                panic!("published sample must be readable");
+            };
+            let stack = batch.samples().next().unwrap().stack();
+            let StackEntry::Vacant(entry) = batch.entry(stack).unwrap() else {
+                panic!("new frames must produce a new stack");
+            };
+            let entry = entry.resolve().unwrap();
+            assert_eq!(entry.stack().len(), 2);
+            entry.insert(2);
+        }
+    });
+    assert!(allocations.count_total < 128, "{allocations:?}");
     writer.finish().unwrap();
     assert!(matches!(
         session.poll(Duration::ZERO).unwrap(),

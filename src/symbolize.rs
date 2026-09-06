@@ -876,7 +876,7 @@ impl Symbolizer {
                     || !self.mapping_changed_process_ids.contains(process_id)
             });
         }
-        if batch.frame_contexts_changed() {
+        if self.spool_frame_contexts.is_none() || batch.frame_contexts_changed() {
             self.spool_frame_contexts = Some(batch.frame_module_contexts());
         }
 
