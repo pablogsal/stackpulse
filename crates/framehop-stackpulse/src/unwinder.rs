@@ -25,7 +25,7 @@ use crate::{FrameAddress, FramePointerFallbackReason, UnwindFrame, UnwindFrameOu
 
 use core::marker::PhantomData;
 use core::ops::{Deref, Range};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Unwinder is the trait that each CPU architecture's concrete unwinder type implements.
 /// This trait's methods are what let you do the actual unwinding.
@@ -243,15 +243,9 @@ impl<U: Unwinder, F: FnMut(u64) -> Result<u64, ()>> FallibleIterator
     }
 }
 
-/// This global generation counter makes it so that the cache can be shared
-/// between multiple unwinders.
-/// This is a u16, so if you make it wrap around by adding / removing modules
-/// more than 65535 times, then you risk collisions in the cache; meaning:
-/// unwinding might not work properly if an old unwind rule was found in the
-/// cache for the same address and the same (pre-wraparound) modules_generation.
-static GLOBAL_MODULES_GENERATION: AtomicU16 = AtomicU16::new(0);
+static GLOBAL_MODULES_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn next_global_modules_generation() -> u16 {
+fn next_global_modules_generation() -> u64 {
     GLOBAL_MODULES_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -279,7 +273,7 @@ pub struct UnwinderInternal<D, A, P> {
     /// sorted by avma_range.start
     modules: Vec<Module<D>>,
     /// Incremented every time modules is changed.
-    modules_generation: u16,
+    modules_generation: u64,
     _arch: PhantomData<A>,
     _allocation_policy: PhantomData<P>,
 }
