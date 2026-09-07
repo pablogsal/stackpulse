@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.11.1 - 2026-09-07
+
+### Fixed
+
+- `framehop-stackpulse` 0.16.5 treats a zero frame pointer as the end of a fallback walk, so loader entry frames no longer produce a false truncated-stack marker.
+
 ## 0.11.0 - 2026-09-06
 
 ### Changed
