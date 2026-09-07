@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
@@ -31,7 +31,7 @@ workspace = true
 
 [dependencies]
 bitflags = "2.4"
-framehop = { package = "framehop-stackpulse", path = "crates/framehop-stackpulse", version = "0.16.4", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "crates/framehop-stackpulse", version = "0.16.5", default-features = false, features = ["std"] }
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 goblin = "0.10"
 integer-encoding = { version = "4.1.0", default-features = false }
