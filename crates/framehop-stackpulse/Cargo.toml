@@ -31,6 +31,6 @@ pe = ["pe-unwind-info"]
 std = ["arrayvec/std", "gimli/std"]
 
 [dev-dependencies]
-object = "0.39"
+object = "0.40"
 flate2 = "1.0.28"
 itertools = "0.14"
