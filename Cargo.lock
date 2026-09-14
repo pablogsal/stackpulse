@@ -140,9 +140,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.13.1"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "brotli"
@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "pe-unwind-info"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97f6fccfd2d9d2df765ca23ff85fe5cc437fb0e6d3e164e4d3cbe09d14780c93"
+checksum = "e33c6dbf1a8fb7f71742cd70f5e9f0986e60b2d19dc0b28d9ca0d1323259274a"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1489,7 +1489,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
