@@ -776,6 +776,7 @@ mod tests {
             ReadStatus::Batch(_)
         ));
         let module = crate::spool::ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: crate::spool::ModuleOwner::Process(Pid::new(100).unwrap()),
             start: 0x1000,

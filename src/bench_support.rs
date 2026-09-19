@@ -242,6 +242,7 @@ mod tests {
         let temp = TempDir::new("bench-spool");
         let path = temp.path().join("samples.spool");
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: ModuleOwner::Process(crate::Pid::new(42).unwrap()),
             start: 0x1000,

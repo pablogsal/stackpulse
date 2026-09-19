@@ -14,6 +14,7 @@ use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
+mod jit;
 mod live;
 pub(crate) use live::Publisher;
 #[doc(hidden)]
@@ -45,6 +46,7 @@ const REC_SAMPLE: u8 = 5;
 const REC_PYTHON_RUNTIME: u8 = 6;
 const REC_MODULE_DEACTIVATE: u8 = 7;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
+const REC_JIT_MODULE: u8 = 9;
 const MAX_REPLAY_SAMPLE_RANGES: usize = 512 * 1024;
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -158,7 +160,11 @@ impl<W: Write> PerfSpoolWriter<W> {
     }
 
     pub(crate) fn write_module(&mut self, module: &ModuleRecord) -> io::Result<()> {
-        self.writer.write_all(&[REC_MODULE])?;
+        self.writer.write_all(&[if module.jit_symbols.is_some() {
+            REC_JIT_MODULE
+        } else {
+            REC_MODULE
+        }])?;
         self.writer.write_varint(module.id as u64)?;
         self.writer
             .write_varint(i64::from(module.wire_process_id()))?;
@@ -171,6 +177,9 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_varint(module.inode_generation)?;
         self.writer.write_all(&[u8::from(module.is_kernel())])?;
         write_bytes(&mut self.writer, module.path.as_os_str().as_bytes())?;
+        if let Some(symbols) = &module.jit_symbols {
+            jit::write_symbols(&mut self.writer, symbols)?;
+        }
         self.unpinned_frame_cache.clear();
         Ok(())
     }
@@ -1171,7 +1180,9 @@ fn decode_spool_record(
         return Ok(None);
     };
     Ok(Some(match tag {
-        REC_MODULE => DecodedSpoolRecord::Module(read_module_mmap(reader, modules.len())?),
+        REC_MODULE | REC_JIT_MODULE => {
+            DecodedSpoolRecord::Module(read_module_record(reader, modules.len(), tag)?)
+        }
         REC_FRAME => DecodedSpoolRecord::Frame(read_frame(reader, modules, frames_len)?),
         REC_STACK => DecodedSpoolRecord::Stack(read_stack_node(reader, stack_nodes, frames_len)?),
         REC_THREAD => DecodedSpoolRecord::Thread(read_thread(reader, threads.len())?),
@@ -1240,8 +1251,8 @@ fn open_spool_with_range_limit(
         // and keep the prefix; still surface real corruption.
         let parsed = (|| -> io::Result<()> {
             match tag {
-                REC_MODULE => {
-                    modules.push(read_module_mmap(&mut reader, modules.len())?);
+                REC_MODULE | REC_JIT_MODULE => {
+                    modules.push(read_module_record(&mut reader, modules.len(), tag)?);
                     frame_contexts.push_module();
                 }
                 REC_FRAME => {
@@ -1470,8 +1481,8 @@ fn consume_validated_record(
     state: &mut ReplayRecordState,
 ) -> io::Result<()> {
     match tag {
-        REC_MODULE => {
-            read_module_mmap(reader, state.module_count)?;
+        REC_MODULE | REC_JIT_MODULE => {
+            read_module_record(reader, state.module_count, tag)?;
             state.module_count += 1;
         }
         REC_FRAME => {
@@ -1512,7 +1523,12 @@ fn consume_validated_record(
     Ok(())
 }
 
-fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Result<ModuleRecord> {
+/// Decode common module fields and the optional recorded-symbol payload.
+fn read_module_record(
+    reader: &mut MmapSpoolCursor,
+    expected_id: usize,
+    tag: u8,
+) -> io::Result<ModuleRecord> {
     check_id(reader, expected_id, "module")?;
     let id = u32::try_from(expected_id).map_err(|_| invalid_data("module id too large"))?;
     let process_id = read_process_id(reader)?;
@@ -1532,7 +1548,7 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
         .map_err(|_| invalid_data("module path length too large"))?;
     let range = reader.read_bytes_range(len)?;
     let path = Path::new(std::ffi::OsStr::from_bytes(&reader.mmap[range])).into();
-    Ok(ModuleRecord {
+    let mut module = ModuleRecord {
         id,
         owner,
         start,
@@ -1543,7 +1559,12 @@ fn read_module_mmap(reader: &mut MmapSpoolCursor, expected_id: usize) -> io::Res
         device_major,
         device_minor,
         inode_generation,
-    })
+        jit_symbols: None,
+    };
+    if tag == REC_JIT_MODULE {
+        module.jit_symbols = Some(jit::read_symbols(reader, &module)?);
+    }
+    Ok(module)
 }
 
 fn read_python_runtime(reader: &mut impl SpoolRead) -> io::Result<PythonRuntimeRecord> {
@@ -1908,6 +1929,7 @@ mod tests {
 
     fn module(process_id: i32, start: u64, end: u64, path: &str, is_kernel: bool) -> ModuleRecord {
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: module_owner(process_id, is_kernel),
             start,
@@ -1926,6 +1948,65 @@ mod tests {
         path.push(format!("stackpulse-{name}-{}.spool", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn jit_modules_roundtrip_through_snapshot_tail_and_scanned_replay() {
+        let path = temp_spool_path("jit-readers");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        writer
+            .write_sample_frames(1, 7, 7, [frame(0x8000)])
+            .unwrap();
+        let mut jit = module(7, 0x1000, 0x2000, "[jit]", false);
+        jit.jit_symbols = Some(
+            [model::JitSymbol {
+                start: 0x1100,
+                end: 0x1200,
+                name: "generated".into(),
+            }]
+            .into(),
+        );
+        writer.write_module(&jit).unwrap();
+        writer.write_module_deactivation_one(jit.id).unwrap();
+        writer
+            .write_sample_frames(
+                2,
+                7,
+                7,
+                [FrameRecord {
+                    module_id: Some(jit.id),
+                    file_relative_ip: 0x108,
+                    abs_ip: 0x1108,
+                    mode: FrameMode::User,
+                }],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let snapshot = Snapshot::open(&path).unwrap();
+        let replay = Replay::from_opened(
+            open_spool_with_range_limit(&path, SampleStorage::Replay, 0).unwrap(),
+        );
+        assert!(replay.scan_start.is_some());
+        assert_eq!(
+            replay.raw_samples().collect::<Vec<_>>(),
+            snapshot.raw_samples()
+        );
+        assert_eq!(replay.modules(), snapshot.modules());
+        assert_eq!(snapshot.modules()[0].jit_symbols, jit.jit_symbols);
+        let mut tail = Tail::open(&path).unwrap();
+        let mut symbolizer = tail.symbolizer().build().unwrap();
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let batch = tail.poll().unwrap();
+            symbolizer.update(&batch).unwrap();
+            for sample in batch.samples() {
+                let resolved = symbolizer.resolve(sample.stack()).unwrap();
+                names.push(resolved.frames().next().unwrap().name().map(str::to_owned));
+            }
+        }
+        assert_eq!(names, [None, Some("generated".to_owned())]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2224,6 +2305,7 @@ mod tests {
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 0,
                 owner: module_owner(7, false),
                 start: 0x1000,
@@ -2238,6 +2320,7 @@ mod tests {
             .unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 1,
                 owner: module_owner(7, false),
                 start: 0x3000,
@@ -2252,6 +2335,7 @@ mod tests {
             .unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 2,
                 owner: ModuleOwner::Kernel,
                 start: 0xffff_ffff_8100_0000,
@@ -2346,6 +2430,7 @@ mod tests {
             .unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 0,
                 owner: module_owner(7, false),
                 start: 0x1000,
@@ -2580,6 +2665,7 @@ mod tests {
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 7,
                 owner: module_owner(7, false),
                 start: 0x1000,
@@ -2612,6 +2698,7 @@ mod tests {
         read_frame(
             &mut bytes.as_slice(),
             &[ModuleRecord {
+                jit_symbols: None,
                 id: 0,
                 owner: module_owner(7, false),
                 start: 0x1000,
@@ -2734,7 +2821,7 @@ mod tests {
         let mut reader = MmapSpoolCursor::new(mmap);
 
         assert_invalid_data_contains(
-            read_module_mmap(&mut reader, 0),
+            read_module_record(&mut reader, 0, REC_MODULE),
             "process id",
             "reader accepted an out-of-range module process id",
         );

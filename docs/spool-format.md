@@ -49,11 +49,26 @@ Each record starts with a one-byte tag.
 | 6 | Python runtime | Marks a process as entering or leaving Python-runtime mode. |
 | 7 | process module deactivation | Retires active mappings for one process. |
 | 8 | module deactivation | Retires one mapping generation. |
+| 9 | JIT module | Defines a code range with symbols copied from a GDB JIT registration. |
 
 Definitions are ordered and ids are dense. A record may only refer to an id
 defined earlier in the stream. Readers reject forward references, duplicate
 definition ids, overflowing address arithmetic, and references outside a
 module's mapped span.
+
+## JIT modules
+
+Tag 9 contains the tag 1 module payload followed by a symbol count. Each symbol
+stores its absolute start and end addresses, then a length-prefixed UTF-8 name.
+Names are limited to 1 MiB and each module to one million symbols. Symbol ranges
+must be nonempty and contained in the module's code range.
+
+JIT modules are immediately deactivated from ordinary mapping lookup. Recorded
+JIT frames refer to their module id explicitly, so a code range can overlap a
+named executable mapping without replacing it. Each new registration receives
+new module ids; earlier samples retain their original names after unregistration,
+address reuse, or process exit. Old readers reject tag 9; recordings without JIT
+modules retain the previous encoding.
 
 ## Frame encoding
 

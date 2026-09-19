@@ -3485,6 +3485,7 @@ mod tests {
 
     fn test_module(start: u64, end: u64) -> ModuleRecord {
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: ModuleOwner::Process(crate::Pid::new(7).unwrap()),
             start,

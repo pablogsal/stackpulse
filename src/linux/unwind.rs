@@ -200,6 +200,7 @@ mod tests {
     fn fork_reuse_keeps_parent_entry_without_reloading_inherited_module() {
         let pid = crate::Pid::try_from(std::process::id()).unwrap();
         let parent = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: ModuleOwner::Process(pid),
             start: 0x1000,
@@ -246,6 +247,7 @@ mod tests {
     #[test]
     fn fork_reuse_retries_missing_parent_entry_under_child_id() {
         let child = ModuleRecord {
+            jit_symbols: None,
             id: 2,
             owner: ModuleOwner::Process(crate::Pid::try_from(std::process::id()).unwrap()),
             start: 0x3000,
