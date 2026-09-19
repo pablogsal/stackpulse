@@ -162,7 +162,6 @@ impl Module {
     /// # Errors
     ///
     /// Returns an invalid-input error when `addresses` is empty or reversed.
-    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn new(
         id: u32,
         process_id: Pid,

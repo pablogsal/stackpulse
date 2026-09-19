@@ -5,29 +5,63 @@ use std::ops::Range;
 
 use crate::elf::{ElfSectionData, ElfSectionInfo};
 use crate::native_module::{ElfSectionCache, LoadedElfMapping};
-use crate::spool::{ModuleRecord, ModuleUpdate};
+use crate::spool::{
+    FrameMode, FrameRecord, ModuleRecord, ModuleTable, ModuleUpdate, PerfSpoolWriter,
+};
 
-type UnwindPolicy = framehop::MayAllocateDuringUnwind;
-pub(super) type NativeUnwinder = framehop::UnwinderNative<ElfSectionData, UnwindPolicy>;
-pub(super) type NativeCache = framehop::CacheNative<UnwindPolicy>;
+mod backend;
+#[cfg(test)]
+pub(super) use backend::test_module;
+pub(super) use backend::{NativeCache, NativeUnwinder};
 
+/// Per-process executable metadata and caches used to capture native stacks.
 #[derive(Default)]
 pub(super) struct ProcessUnwinder {
+    jit: super::jit::JitRegistry,
     pub(super) unwinder: NativeUnwinder,
     pub(super) cache: NativeCache,
     refreshed_uncovered_pages: FxHashSet<u64>,
 }
 
 impl ProcessUnwinder {
-    /// Copy inherited module state while resetting per-process unwind caches.
+    /// Refresh live runtime metadata before unwinding a captured sample.
+    /// Polling and retry deadlines are enforced by the runtime registry.
+    /// Target-memory failures are best-effort; spool write failures propagate.
+    pub(super) fn refresh_runtime_modules<W: std::io::Write>(
+        &mut self,
+        pid: i32,
+        modules: &mut ModuleTable,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> std::io::Result<()> {
+        self.jit.refresh(pid, &mut self.unwinder, modules, writer)
+    }
+
+    /// Pin runtime frames to their registration, then fall back to mapped files.
+    /// The caller supplies the lookup address, already adjusted for returns.
+    pub(super) fn resolve_frame(
+        &self,
+        pid: i32,
+        address: u64,
+        mode: FrameMode,
+        modules: &mut ModuleTable,
+    ) -> FrameRecord {
+        if mode == FrameMode::User {
+            if let Some(frame) = self.jit.frame(address) {
+                return frame;
+            }
+        }
+        modules.resolve_frame(pid, address, mode)
+    }
+
+    /// Copy ordinary modules and reset caches; rediscover runtime code in the child.
     pub(super) fn inherit_for_fork(&self) -> Self {
         Self {
-            unwinder: self.unwinder.clone(),
-            cache: NativeCache::default(),
-            refreshed_uncovered_pages: FxHashSet::default(),
+            unwinder: self.unwinder.inherit_for_fork(),
+            ..Self::default()
         }
     }
 
+    /// Apply file mapping changes and invalidate runtime discovery after topology changes.
     pub(super) fn apply_module_update(
         &mut self,
         update: &ModuleUpdate,
@@ -58,10 +92,12 @@ impl ProcessUnwinder {
             elf_sections.remove(module.id);
         }
         if update.mapping_changed {
+            self.jit.mappings_changed();
             self.refreshed_uncovered_pages.clear();
         }
     }
 
+    /// Reuse the parent's ELF sections, loading only missing inherited modules.
     pub(super) fn reuse_inherited_modules(
         &mut self,
         update: &ModuleUpdate,
@@ -82,6 +118,7 @@ impl ProcessUnwinder {
         }
     }
 
+    /// Install unwind sections only when the ELF image matches its mapping.
     fn load_and_install_module(
         &mut self,
         module: &ModuleRecord,
@@ -96,6 +133,7 @@ impl ProcessUnwinder {
         }
     }
 
+    /// Retry mapping discovery once per uncovered page until mappings change.
     pub(super) fn should_refresh_for_uncovered_pc(&mut self, pc: u64) -> bool {
         self.refreshed_uncovered_pages.insert(refresh_page(pc))
     }
@@ -195,6 +233,54 @@ mod tests {
     use super::*;
     use crate::elf::fake_hard_case_section_info;
     use crate::spool::{ModuleActivation, ModuleOwner};
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fork_resets_runtime_registrations_and_caches_without_changing_parent() {
+        use backend::tests::{cfi_module, unwind_overlay_frame};
+
+        let mut parent = ProcessUnwinder::default();
+        parent.unwinder.add_module(cfi_module(16));
+        let runtime = cfi_module(48);
+        let mut module = ModuleRecord::new(
+            0,
+            crate::Pid::new(7).unwrap(),
+            runtime.avma_range(),
+            0,
+            "[jit-fork-test]",
+        )
+        .unwrap();
+        module.jit_symbols = Some([].into());
+        parent.jit =
+            super::super::jit::JitRegistry::test_with_module(module, runtime, &mut parent.unwinder);
+        parent.refreshed_uncovered_pages.insert(0x9000);
+        for _ in 0..2 {
+            let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+            assert_eq!(outcome.return_address(), Some(0xbbbb));
+            assert_eq!(sp, 0x8030);
+        }
+        assert!(parent.cache.stats().hits() > 0);
+        let parent_hits = parent.cache.stats().hits();
+        let parent_frame = parent.jit.frame(0x1001).unwrap();
+
+        let mut child = parent.inherit_for_fork();
+        assert!(child.jit.frame(0x1001).is_none());
+        assert!(child.refreshed_uncovered_pages.is_empty());
+        assert_eq!(child.cache.stats().hits(), 0);
+        assert_eq!(child.cache.stats().misses(), 0);
+        let (outcome, sp) = unwind_overlay_frame(&child.unwinder, &mut child.cache);
+        assert_eq!(outcome.return_address(), Some(0xaaaa));
+        assert_eq!(sp, 0x8010);
+        assert!(outcome.fallback_reason().is_none());
+
+        assert_eq!(parent.cache.stats().hits(), parent_hits);
+        assert_eq!(parent.jit.frame(0x1001), Some(parent_frame));
+        assert!(parent.refreshed_uncovered_pages.contains(&0x9000));
+        let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+        assert_eq!(outcome.return_address(), Some(0xbbbb));
+        assert_eq!(sp, 0x8030);
+        assert!(parent.cache.stats().hits() > parent_hits);
+    }
 
     #[test]
     fn fork_reuse_keeps_parent_entry_without_reloading_inherited_module() {

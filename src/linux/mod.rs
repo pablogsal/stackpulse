@@ -13,6 +13,7 @@ pub mod process;
 pub use builder::{
     AttachPolicy, FinishError, PreparedRecording, ProcessScope, RecorderBuilder, RecordingMetadata,
 };
+mod jit;
 mod ring_buffer;
 mod sorter;
 mod types;
@@ -2306,6 +2307,7 @@ fn record_prepared_sample_input<W: std::io::Write>(
         .state_mut(pid)
         .unwinder
         .get_or_insert_default();
+    unwinder.refresh_runtime_modules(pid, ctx.modules, ctx.writer)?;
     build_sample_stack::<ConvertRegsNative>(
         input,
         privilege,
@@ -2324,7 +2326,7 @@ fn record_prepared_sample_input<W: std::io::Write>(
             ctx.stack_scratch
                 .iter()
                 .copied()
-                .filter_map(|frame| resolve_stack_frame(modules, summary, pid, frame)),
+                .map(|frame| resolve_stack_frame(unwinder, modules, summary, pid, frame)),
         )
     };
     match stack_id? {
@@ -2624,21 +2626,23 @@ fn read_stack_u64(stack: &[[u8; 8]], index: usize) -> Result<u64, ()> {
     stack.get(index).copied().map(u64::from_ne_bytes).ok_or(())
 }
 
+/// Normalize sampled addresses and preserve explicit truncation markers.
 fn resolve_stack_frame(
+    unwinder: &ProcessUnwinder,
     modules: &mut ModuleTable,
     summary: &mut RecordingSummary,
     process_id: i32,
     frame: StackFrame,
-) -> Option<FrameRecord> {
+) -> FrameRecord {
     let (address, mode) = match frame {
         StackFrame::InstructionPointer(address, mode) => (address, mode),
         StackFrame::ReturnAddress(address, mode) => (address.saturating_sub(1), mode),
         StackFrame::TruncatedStackMarker => {
             summary.truncated_frame_markers = summary.truncated_frame_markers.saturating_add(1);
-            return Some(FrameRecord::truncated_stack_marker());
+            return FrameRecord::truncated_stack_marker();
         }
     };
-    Some(modules.resolve_frame(process_id, address, frame_mode(mode)))
+    unwinder.resolve_frame(process_id, address, frame_mode(mode), modules)
 }
 
 fn frame_mode(mode: StackMode) -> FrameMode {
@@ -3584,12 +3588,12 @@ mod tests {
         let mut summary = RecordingSummary::default();
 
         let frame = resolve_stack_frame(
+            &ProcessUnwinder::default(),
             &mut modules,
             &mut summary,
             123,
             StackFrame::TruncatedStackMarker,
-        )
-        .expect("truncated marker frame");
+        );
 
         assert!(frame.is_truncated_stack_marker());
         assert_eq!(summary.truncated_frame_markers, 1);
@@ -3601,12 +3605,12 @@ mod tests {
         let mut summary = RecordingSummary::default();
 
         let frame = resolve_stack_frame(
+            &ProcessUnwinder::default(),
             &mut modules,
             &mut summary,
             123,
             StackFrame::InstructionPointer(0x1000, StackMode::User),
-        )
-        .expect("regular frame");
+        );
 
         assert!(!frame.is_truncated_stack_marker());
         assert_eq!(summary.truncated_frame_markers, 0);
@@ -3750,7 +3754,15 @@ mod tests {
 
         let frames: Vec<_> = stack
             .into_iter()
-            .map(|frame| resolve_stack_frame(&mut modules, &mut summary, 7, frame).unwrap())
+            .map(|frame| {
+                resolve_stack_frame(
+                    &ProcessUnwinder::default(),
+                    &mut modules,
+                    &mut summary,
+                    7,
+                    frame,
+                )
+            })
             .collect();
 
         assert_eq!(frames[0].abs_ip, 0xffff_1000);
