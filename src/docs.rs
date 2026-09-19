@@ -3,3 +3,4 @@
 #![doc = include_str!("../docs/reference.md")]
 #![doc = include_str!("../docs/explanation.md")]
 #![doc = include_str!("../docs/spool-format.md")]
+#![doc = include_str!("../docs/jit.md")]

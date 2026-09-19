@@ -39,6 +39,36 @@ impl Drop for TempDir {
     }
 }
 
+/// Link the JIT test function at a fixed address with the requested CFA rule.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn assemble_jit_overlay(directory: &Path, cfa_offset: u64) -> PathBuf {
+    let output = directory.join(format!("overlay-{cfa_offset}"));
+    let compiler = std::process::Command::new("cc")
+        .args([
+            "-nostdlib",
+            "-no-pie",
+            "-Wl,--build-id=none",
+            "-Wl,--no-eh-frame-hdr",
+            "-Wl,-Ttext=0x1000",
+            "-Wl,-e,overlay_leaf",
+        ])
+        .arg(format!("-DCFA_OFFSET={cfa_offset}"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/gdb_jit/overlay.S"
+        ))
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("assemble registered program");
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    output
+}
+
 pub(crate) fn mmap_from_bytes(bytes: &[u8]) -> Arc<Mmap> {
     let mut mmap = MmapOptions::new()
         .len(bytes.len())

@@ -1,3 +1,6 @@
+mod common;
+
+use common::{attach_is_not_allowed, environment_skips_allowed};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1126,21 +1129,6 @@ fn parse_pid_line(buffer: &[u8], prefix: &str) -> io::Result<i32> {
         .trim()
         .parse::<i32>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-}
-
-fn attach_is_not_allowed(err: &stackpulse::Error) -> bool {
-    if matches!(
-        err.kind(),
-        stackpulse::ErrorKind::Permission | stackpulse::ErrorKind::Unsupported
-    ) {
-        return true;
-    }
-    matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
-        || err.to_string().to_ascii_lowercase().contains("permission")
-}
-
-fn environment_skips_allowed() -> bool {
-    std::env::var_os("CI").is_none() || std::env::var_os("STACKPULSE_ALLOW_PERF_SKIP").is_some()
 }
 
 fn require_python_perf() -> bool {

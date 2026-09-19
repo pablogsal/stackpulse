@@ -46,6 +46,7 @@ pub use session::{
     StackValue, VacantStack,
 };
 
+mod jit;
 mod kernel;
 mod perf_map;
 #[cfg(any(test, feature = "bench-support"))]
@@ -79,6 +80,9 @@ impl NativeContractError {
 }
 
 /// Resolves raw profile frames into displayable frames.
+///
+/// Recorded GDB JIT symbols resolve without the target process or an ELF backend.
+/// Captured names follow each frame's recorded module id even after address reuse.
 ///
 /// A symbolizer is intentionally single-threaded and may be `!Send`. Keep it
 /// on the worker thread that owns symbolization instead of placing it behind a
@@ -442,6 +446,7 @@ impl<'a> SymbolizerBuilder<'a> {
     }
 
     /// Disable Python perf-map lookup.
+    /// Recorded GDB JIT symbols remain available.
     #[must_use]
     pub fn disable_perf_maps(mut self) -> Self {
         self.perf_map_processes = PerfMapProcesses::Pids(FxHashSet::default());
@@ -592,7 +597,7 @@ struct NativeLookupPreparation {
 }
 
 enum PendingResolution {
-    PerfMap(Frame),
+    Resolved(Frame),
     Native {
         module: Option<(u32, u64)>,
         request_index: Option<usize>,
@@ -1070,8 +1075,8 @@ impl Symbolizer {
     /// Return whether native ELF symbolization has a configured backend.
     ///
     /// This is `false` with `--no-default-features` unless the builder's
-    /// [`native`](SymbolizerBuilder::native) method supplied one. Kernel and
-    /// perf-map resolution remain available independently.
+    /// [`native`](SymbolizerBuilder::native) method supplied one. Kernel, perf-map,
+    /// and recorded GDB JIT resolution remain available independently.
     #[must_use]
     pub fn has_native_backend(&self) -> bool {
         self.native_factory.is_some()
@@ -1290,12 +1295,23 @@ impl Symbolizer {
             return;
         }
 
-        if let Some(module_id) = frame.module_id.filter(|&module_id| {
-            self.module_by_id(module_id)
-                .is_some_and(|module| !perf_map_module_allowed(module))
-        }) {
-            let module = (module_id, frame.file_relative_ip);
-            let native = self.prepare_native_lookup(process_id, module_id, frame.abs_ip);
+        let pinned_module = frame.module_id.and_then(|id| self.module_by_id(id));
+        if let Some(resolved) =
+            pinned_module.and_then(|module| jit::resolve_frame(module, process_id, frame.abs_ip))
+        {
+            self.pending_frames.push(PendingFrame {
+                cache_key,
+                frame,
+                resolution: PendingResolution::Resolved(resolved),
+                transient: false,
+                perf_map_dependent: false,
+            });
+            return;
+        }
+
+        if let Some(module) = pinned_module.filter(|module| !perf_map_module_allowed(module)) {
+            let module = (module.id, frame.file_relative_ip);
+            let native = self.prepare_native_lookup(process_id, module.0, frame.abs_ip);
             self.pending_frames.push(PendingFrame {
                 cache_key,
                 frame,
@@ -1342,7 +1358,7 @@ impl Symbolizer {
             self.pending_frames.push(PendingFrame {
                 cache_key,
                 frame,
-                resolution: PendingResolution::PerfMap(perf_map_symbol_to_frame(
+                resolution: PendingResolution::Resolved(perf_map_symbol_to_frame(
                     frame.abs_ip,
                     symbol,
                     perf_map_module,
@@ -1491,7 +1507,7 @@ impl Symbolizer {
             let appended_start = self.resolved_frames.len();
             let mut retry = false;
             match pending.resolution {
-                PendingResolution::PerfMap(frame) => self.push_resolved_frame(frame),
+                PendingResolution::Resolved(frame) => self.push_resolved_frame(frame),
                 PendingResolution::Native {
                     module,
                     request_index,
@@ -1947,6 +1963,7 @@ mod tests {
 
     fn module_with_path(id: u32, process_id: i32, start: u64, path: &str) -> ModuleRecord {
         ModuleRecord {
+            jit_symbols: None,
             id,
             owner: user_owner(process_id),
             start,
@@ -1969,6 +1986,7 @@ mod tests {
             .find(|region| region.is_executable && region.path == executable)
             .expect("executable mapping");
         ModuleRecord {
+            jit_symbols: None,
             id,
             owner: user_owner(process_id),
             start: region.address.start,
@@ -2495,6 +2513,29 @@ mod tests {
             1
         );
         assert_eq!(&*descriptors.borrow(), &[true]);
+    }
+
+    #[test]
+    fn jit_symbols_only_resolve_for_the_owning_process() {
+        let mut module = module_with_path(0, 7, 0x1000, "[jit]");
+        module.jit_symbols = Some(
+            [crate::spool::model::JitSymbol {
+                start: 0x1100,
+                end: 0x1200,
+                name: "generated".into(),
+            }]
+            .into(),
+        );
+        let mut symbolizer = SymbolizerBuilder::for_modules(&[module])
+            .disable_perf_maps()
+            .build()
+            .unwrap();
+        let frame = pinned_frame(0, 0x1108);
+        let owner = symbolizer.resolve_frame(7, &frame);
+        assert_eq!(owner.name(), Some("generated"));
+        assert!(matches!(owner, Frame::Native(frame) if frame.origin == SymbolOrigin::GdbJit));
+        let other = symbolizer.resolve_frame(8, &frame);
+        assert!(matches!(other, Frame::Native(frame) if frame.origin == SymbolOrigin::AddressOnly));
     }
 
     #[test]
@@ -3139,6 +3180,7 @@ mod tests {
             .unwrap();
         writer
             .write_module(&ModuleRecord {
+                jit_symbols: None,
                 id: 0,
                 owner: user_owner(7),
                 start: 0x1000,

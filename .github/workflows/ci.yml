@@ -85,7 +85,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            build-essential ca-certificates clang curl git libclang-dev make \
+            build-essential ca-certificates clang curl git libclang-dev llvm-dev make \
             pkg-config procps python3
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -243,11 +243,11 @@ jobs:
           if [[ "${{ matrix.family }}" == "apt" ]]; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-              build-essential ca-certificates clang curl git libclang-dev make pkg-config procps python3
+              build-essential ca-certificates clang curl git libclang-dev llvm-dev make pkg-config procps python3
           elif [[ "${{ matrix.family }}" == "dnf" ]]; then
-            dnf install --assumeyes ca-certificates clang clang-devel curl gcc gcc-c++ git make pkgconf-pkg-config procps-ng python3
+            dnf install --assumeyes ca-certificates clang clang-devel curl gcc gcc-c++ git llvm-devel make pkgconf-pkg-config procps-ng python3
           else
-            pacman -Syu --noconfirm --needed base-devel ca-certificates clang curl git make pkgconf procps-ng python
+            pacman -Syu --noconfirm --needed base-devel ca-certificates clang curl git llvm make pkgconf procps-ng python
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

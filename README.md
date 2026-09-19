@@ -79,7 +79,7 @@ locally with `make doc`.
 | Architectures | x86-64 and AArch64 |
 | Native stacks | DWARF and frame-pointer unwinding through Framehop |
 | Native symbols | Bundled `wholesym` backend or a caller-supplied symbolizer |
-| Dynamic runtimes | Python perf maps and Python runtime frames |
+| Dynamic runtimes | Python perf maps, Python runtime frames, and GDB JIT registrations |
 | Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
 | Profile files | Reads and writes SPULSE4 |
 | Rust version | 1.88 or newer |
@@ -126,6 +126,14 @@ overrides local debug-file search roots, and
 User-space sampling often works with the default perf permissions. Kernel frames,
 high sample rates, and restrictive `perf_event_paranoid` settings may require
 `CAP_PERFMON` or a sysctl change.
+
+## GDB JIT registrations
+
+The Linux recorder reads generated function names and unwind rules through the
+GDB JIT interface. Support includes LLVM MCJIT. Saved names remain available after
+process exit. Capture requires read access to `/proc/<pid>/mem`. See
+[JIT capture and replay](docs/jit.md) for runtime setup, frame identification,
+update timing, and replay limits.
 
 ## License
 
