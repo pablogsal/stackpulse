@@ -72,6 +72,10 @@ name = "integration"
 required-features = ["builtin-wholesym"]
 
 [[test]]
+name = "gdb_jit"
+required-features = ["builtin-wholesym"]
+
+[[test]]
 name = "allocations"
 required-features = ["bench-support"]
 
