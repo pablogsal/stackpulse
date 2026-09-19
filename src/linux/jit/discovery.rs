@@ -10,15 +10,34 @@ use std::time::{Duration, Instant};
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Cached procfs discovery and target-memory access, owned by one process epoch.
+/// Descriptor discovery and target-memory access for one process image.
+///
+/// Mapping changes allow rediscovery while retaining usable cached addresses.
+/// Fork and exec start with fresh discovery state in the process unwinder.
 #[derive(Default)]
 pub(super) struct Discovery {
+    /// Open `/proc/<pid>/mem` handle shared by descriptor, ELF, and unwind reads.
+    /// `None` means opening has not succeeded; failures use `memory_retry_after`.
     pub(super) memory: Option<File>,
+    /// Earliest recorder-clock time to retry a failed memory open.
+    /// `None` allows an immediate attempt; a successful open clears the deadline.
     memory_retry_after: Option<Instant>,
+    /// Last successfully read `/proc/<pid>/maps` contents.
+    /// Byte equality lets complete image scans be reused without parsing the maps again.
     maps: Vec<u8>,
+    /// Descriptor scans keyed by mapped pathname, plus `/proc/<pid>/exe`.
+    /// Complete scans are reused until that image's mapping layout changes.
     images: FxHashMap<PathBuf, DiscoveredImage>,
+    /// Sorted, deduplicated target addresses of `__jit_debug_descriptor`.
+    /// An empty list can also mean discovery is incomplete; see `absent`.
     pub(super) descriptors: Vec<u64>,
+    /// Recorder-clock time of the last discovery attempt, including failed reads.
+    /// Mapping changes clear it so discovery can run on the next eligible poll.
     last_discovery: Option<Instant>,
+    /// Every image scan completed successfully and none found a descriptor.
+    /// This stops JIT checks until executable mappings change. `false` also
+    /// covers unknown or failed discovery, which must remain retryable.
+    absent: bool,
 }
 
 /// A failed scan keeps addresses from unchanged mappings and remains retryable.
@@ -28,16 +47,25 @@ struct DiscoveredImage {
     /// Descriptor addresses found in this image, in target address space.
     /// Failed scans retain addresses that still refer to the same mapped file bytes.
     descriptors: Vec<u64>,
+    /// The image was scanned successfully for its current mapping layout.
+    /// Only a complete scan with no descriptors proves absence for this image.
     complete: bool,
 }
 
 impl Discovery {
+    /// Successful scans found no descriptor; mapping changes make this unknown again.
+    pub(super) fn is_absent(&self) -> bool {
+        self.absent
+    }
+
     /// Recheck the maps on the next poll while retaining usable cached state.
     pub(super) fn mappings_changed(&mut self) {
         self.last_discovery = None;
+        self.absent = false;
     }
 
     /// Cache successful image scans and retry incomplete scans once per second.
+    /// Confirmed absence skips I/O until mappings change. Incomplete scans stay retryable.
     /// Failures in one image neither erase its usable addresses nor block others.
     pub(super) fn refresh_descriptors(&mut self, pid: i32, now: Instant) {
         self.refresh_descriptors_with(
@@ -55,9 +83,10 @@ impl Discovery {
         read_maps: impl FnOnce() -> std::io::Result<Vec<u8>>,
         mut scan: impl FnMut(i32, &Path, &[crate::proc_maps::Region<'_>]) -> Option<Vec<u64>>,
     ) {
-        if self
-            .last_discovery
-            .is_some_and(|last| now.duration_since(last) < DISCOVERY_INTERVAL)
+        if self.absent
+            || self
+                .last_discovery
+                .is_some_and(|last| now.duration_since(last) < DISCOVERY_INTERVAL)
         {
             return;
         }
@@ -65,7 +94,11 @@ impl Discovery {
         let Ok(maps) = read_maps() else {
             return;
         };
-        if maps == self.maps && self.images.values().all(|image| image.complete) {
+        if maps == self.maps
+            && !self.images.is_empty()
+            && self.images.values().all(|image| image.complete)
+        {
+            self.absent = self.descriptors.is_empty();
             return;
         }
         let regions: Vec<_> = crate::proc_maps::parse_iter(&maps).collect();
@@ -113,6 +146,8 @@ impl Discovery {
             .collect();
         self.descriptors.sort_unstable();
         self.descriptors.dedup();
+        self.absent =
+            self.descriptors.is_empty() && self.images.values().all(|image| image.complete);
     }
 
     /// Open target memory once; retry failed opens at most once per second.
@@ -290,6 +325,128 @@ mod tests {
 
     const MAPS: &[u8] = b"1000-2000 r-xp 00000000 08:01 1 /good.so\n\
         3000-4000 r-xp 00000000 08:01 2 /retry.so\n";
+
+    #[test]
+    fn confirmed_absence_skips_all_discovery_io_until_mappings_change() {
+        let mut discovery = Discovery::default();
+        assert!(!discovery.is_absent());
+        let now = Instant::now();
+        discovery.refresh_descriptors_with(
+            7,
+            now,
+            || Ok(MAPS.to_vec()),
+            |_, _, _| Some(Vec::new()),
+        );
+        assert!(discovery.is_absent());
+        for elapsed in [
+            DISCOVERY_INTERVAL / 2,
+            DISCOVERY_INTERVAL,
+            DISCOVERY_INTERVAL * 10,
+        ] {
+            discovery.refresh_descriptors_with(
+                7,
+                now + elapsed,
+                || panic!("confirmed absence must not read maps"),
+                |_, _, _| panic!("confirmed absence must not scan images"),
+            );
+        }
+
+        discovery.mappings_changed();
+        assert!(!discovery.is_absent());
+        let mut changed = MAPS.to_vec();
+        changed.extend_from_slice(b"5000-6000 r-xp 00000000 08:01 3 /runtime.so\n");
+        discovery.refresh_descriptors_with(
+            7,
+            now + DISCOVERY_INTERVAL * 10,
+            || Ok(changed),
+            |_, path, _| {
+                Some(if path == Path::new("/runtime.so") {
+                    vec![0x5100]
+                } else {
+                    Vec::new()
+                })
+            },
+        );
+        assert!(!discovery.is_absent());
+        assert_eq!(discovery.descriptors, [0x5100]);
+    }
+
+    #[test]
+    fn failed_maps_read_after_invalidation_does_not_restore_cached_absence() {
+        let mut discovery = Discovery::default();
+        let now = Instant::now();
+        discovery.refresh_descriptors_with(
+            7,
+            now,
+            || Ok(MAPS.to_vec()),
+            |_, _, _| Some(Vec::new()),
+        );
+        assert!(discovery.is_absent());
+        discovery.mappings_changed();
+        discovery.refresh_descriptors_with(
+            7,
+            now,
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_, _, _| panic!("failed maps read must not scan images"),
+        );
+        assert!(!discovery.is_absent());
+        discovery.refresh_descriptors_with(
+            7,
+            now + DISCOVERY_INTERVAL / 2,
+            || panic!("failed maps reads must be rate limited"),
+            |_, _, _| panic!("failed maps reads must be rate limited"),
+        );
+        discovery.refresh_descriptors_with(
+            7,
+            now + DISCOVERY_INTERVAL,
+            || Ok(MAPS.to_vec()),
+            |_, _, _| panic!("unchanged successful image scans remain cached"),
+        );
+        assert!(discovery.is_absent());
+    }
+
+    #[test]
+    fn incomplete_empty_discovery_retries_instead_of_caching_absence() {
+        let mut discovery = Discovery::default();
+        let now = Instant::now();
+        discovery.refresh_descriptors_with(
+            7,
+            now,
+            || Ok(MAPS.to_vec()),
+            |_, path, _| (path != Path::new("/retry.so")).then(Vec::new),
+        );
+        assert!(discovery.descriptors.is_empty());
+        assert!(!discovery.is_absent());
+        discovery.refresh_descriptors_with(
+            7,
+            now + DISCOVERY_INTERVAL,
+            || Ok(MAPS.to_vec()),
+            |_, path, _| {
+                assert_eq!(path, Path::new("/retry.so"));
+                Some(vec![0x3100])
+            },
+        );
+        assert_eq!(discovery.descriptors, [0x3100]);
+        assert!(!discovery.is_absent());
+    }
+
+    #[test]
+    fn initially_empty_maps_still_require_an_executable_scan() {
+        let mut discovery = Discovery::default();
+        let mut scanned = false;
+        discovery.refresh_descriptors_with(
+            7,
+            Instant::now(),
+            || Ok(Vec::new()),
+            |_, path, _| {
+                assert_eq!(path, Path::new("/proc/7/exe"));
+                scanned = true;
+                None
+            },
+        );
+        assert!(scanned);
+        assert!(!discovery.is_absent());
+    }
 
     #[test]
     fn retries_incomplete_images_with_unchanged_maps_without_rescanning_successes() {

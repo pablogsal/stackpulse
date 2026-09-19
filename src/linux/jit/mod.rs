@@ -122,6 +122,9 @@ impl JitRegistry {
         modules: &mut ModuleTable,
         writer: &mut PerfSpoolWriter<W>,
     ) -> io::Result<()> {
+        if self.discovery.is_absent() {
+            return Ok(());
+        }
         self.refresh_at(pid, unwinder, modules, writer, Instant::now())
     }
 
@@ -134,6 +137,9 @@ impl JitRegistry {
         writer: &mut PerfSpoolWriter<W>,
         now: Instant,
     ) -> io::Result<()> {
+        if self.discovery.is_absent() {
+            return Ok(());
+        }
         if self
             .last_poll_attempt_at
             .is_some_and(|last| now.duration_since(last) < DESCRIPTOR_POLL_INTERVAL)
