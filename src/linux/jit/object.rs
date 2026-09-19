@@ -4,7 +4,7 @@
 //! unrelocated. Copy CFI from live memory instead. Even a successful read can
 //! precede finalization, so content changes invalidate copied unwind rules.
 
-use super::protocol::{invalid, read, ObjectId};
+use super::protocol::{invalid, read, read_into, ObjectId};
 use crate::elf::ElfSectionData;
 use crate::spool::model::{JitSymbol, MAX_JIT_SYMBOLS, MAX_JIT_SYMBOL_NAME};
 use crate::spool::ModuleRecord;
@@ -56,15 +56,24 @@ impl JitObject {
     /// Detect persistent metadata changes even when registration notifications were missed.
     /// Reads the entire ELF image and, when available, the copied live CFI range.
     /// An unchanged fingerprint cannot rule out address reuse.
-    pub(super) fn has_changed(&self, memory: &File, id: ObjectId) -> io::Result<bool> {
-        if fingerprint(&read(memory, id.address, id.size)?) != self.image_fingerprint {
+    pub(super) fn has_changed(
+        &self,
+        memory: &File,
+        id: ObjectId,
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        read_into(memory, id.address, id.size, scratch)?;
+        if fingerprint(scratch) != self.image_fingerprint {
             return Ok(true);
         }
         match &self.unwind.cfi {
             CfiState::Loaded {
                 range,
                 fingerprint: previous,
-            } => Ok(fingerprint(&read(memory, range.start, range.end - range.start)?) != *previous),
+            } => {
+                read_into(memory, range.start, range.end - range.start, scratch)?;
+                Ok(fingerprint(scratch) != *previous)
+            }
             CfiState::Absent | CfiState::Unreadable => Ok(false),
         }
     }

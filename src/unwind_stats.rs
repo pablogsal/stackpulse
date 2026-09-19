@@ -64,6 +64,13 @@ pub struct UnwindFallbackStats {
 }
 
 impl UnwindFallbackStats {
+    /// Commit the fallback counts from the accepted unwind attempt.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        for (count, added) in self.counts.iter_mut().zip(other.counts) {
+            *count = count.saturating_add(added);
+        }
+    }
+
     pub(crate) fn record(&mut self, kind: UnwindFallbackKind) {
         let count = &mut self.counts[kind as usize];
         *count = count.saturating_add(1);

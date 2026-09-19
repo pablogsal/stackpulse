@@ -47,15 +47,18 @@ impl NativeUnwinder {
         self.jit_ranges.remove(&start);
     }
 
-    /// Use the runtime table throughout registered ranges, including CFI gaps.
-    fn for_address(&self, address: FrameAddress) -> &FramehopUnwinder {
+    /// Identify registered runtime code, including ranges without unwind rules.
+    pub(in crate::linux) fn is_runtime_frame(&self, address: FrameAddress) -> bool {
         let address = address.address_for_lookup();
-        if self
-            .jit_ranges
+        self.jit_ranges
             .range(..=address)
             .next_back()
             .is_some_and(|(_, end)| address < *end)
-        {
+    }
+
+    /// Use the runtime table throughout registered ranges, including CFI gaps.
+    fn for_address(&self, address: FrameAddress) -> &FramehopUnwinder {
+        if self.is_runtime_frame(address) {
             &self.jit
         } else {
             &self.ordinary
@@ -147,34 +150,9 @@ pub(super) mod tests {
 
     /// Link real assembler-generated CFI at a fixed address for overlay tests.
     #[cfg(target_arch = "x86_64")]
-    pub(in crate::linux::unwind) fn cfi_module(
-        cfa_offset: u64,
-    ) -> framehop::Module<ElfSectionData> {
+    pub(in crate::linux) fn cfi_module(cfa_offset: u64) -> framehop::Module<ElfSectionData> {
         let directory = crate::test_support::TempDir::new("jit-overlay-cfi");
-        let output = directory.path().join("overlay");
-        let compiler = std::process::Command::new("cc")
-            .args([
-                "-nostdlib",
-                "-no-pie",
-                "-Wl,--build-id=none",
-                "-Wl,--no-eh-frame-hdr",
-                "-Wl,-Ttext=0x1000",
-                "-Wl,-e,overlay_leaf",
-            ])
-            .arg(format!("-DCFA_OFFSET={cfa_offset}"))
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/gdb_jit/overlay.S"
-            ))
-            .arg("-o")
-            .arg(&output)
-            .output()
-            .expect("run assembler for unwind fixture");
-        assert!(
-            compiler.status.success(),
-            "{}",
-            String::from_utf8_lossy(&compiler.stderr)
-        );
+        let output = crate::test_support::assemble_jit_overlay(directory.path(), cfa_offset);
         let mut sections = crate::elf::load_elf_sections_from_bytes(
             std::fs::read(&output).unwrap().into(),
             &output,

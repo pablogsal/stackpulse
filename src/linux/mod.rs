@@ -33,17 +33,13 @@ use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
 use crate::state::ProcessExitWatcher;
-use crate::stats::{SampleErrorKind, SampleErrorStats};
-use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};
+use crate::stats::SampleErrorStats;
+use crate::unwind_stats::UnwindFallbackStats;
 
 fn try_new_exit_watcher(pid: i32) -> Option<ProcessExitWatcher> {
     crate::Pid::new(pid).and_then(|pid| ProcessExitWatcher::try_new(pid).ok())
 }
 
-use framehop::{
-    DwarfUnwinderError, Error as FramehopError, FrameAddress, FramePointerFallbackReason, Unwinder,
-    UnwinderError,
-};
 use perf_event_open::sample::record::mmap::Mmap;
 use perf_event_open::sample::record::sample::Abi as SampleRegsAbi;
 use perf_event_open::sample::record::sample::{CallChain, Sample};
@@ -69,7 +65,7 @@ pub use perf_group::AttachMode;
 use perf_group::{EventConsumer, PerfGroupOptions, ProcessFork, RecoveredProcessFork, ThreadFork};
 use sorter::EventSorter;
 use types::{StackFrame, StackMode};
-use unwind::{NativeUnwinder, ProcessUnwinder};
+use unwind::{build_sample_stack, ProcessUnwinder, StackInput};
 
 #[cfg(target_arch = "x86_64")]
 type ConvertRegsNative = convert_regs::ConvertRegsX86_64;
@@ -2066,13 +2062,6 @@ struct SampleView<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct StackInput<'a> {
-    code_addr: Option<u64>,
-    user_regs: Option<&'a [u64]>,
-    user_stack: Option<&'a [u8]>,
-}
-
-#[derive(Clone, Copy)]
 enum SampleCallChain<'a> {
     None,
     Owned(&'a [CallChain]),
@@ -2147,17 +2136,6 @@ impl<'a> Iterator for SampleCallChainIter<'a> {
                 | CallChainEntry::GuestUser(addresses)
                 | CallChainEntry::Unknown(addresses) => (StackMode::User, addresses),
             }),
-        }
-    }
-}
-
-#[cfg(test)]
-impl<'a> SampleView<'a> {
-    fn stack_input(self) -> StackInput<'a> {
-        StackInput {
-            code_addr: self.code_addr,
-            user_regs: self.user_regs,
-            user_stack: self.user_stack,
         }
     }
 }
@@ -2315,7 +2293,8 @@ fn record_prepared_sample_input<W: std::io::Write>(
         ctx.stack_scratch,
         callchain_stack,
         ctx.summary,
-    );
+        |unwinder, address| unwinder.refresh_runtime_frame(address, pid, ctx.modules, ctx.writer),
+    )?;
     let stack_id = {
         let modules = &mut *ctx.modules;
         let summary = &mut *ctx.summary;
@@ -2385,63 +2364,6 @@ fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-fn record_unwind_error(
-    summary: &mut RecordingSummary,
-    kind: SampleErrorKind,
-    context: impl FnOnce() -> String,
-) {
-    summary.error_stats.record_with_log(kind, context);
-}
-
-#[inline]
-fn sample_error_for_framehop(error: FramehopError) -> SampleErrorKind {
-    match error {
-        FramehopError::CouldNotReadStack(_) => SampleErrorKind::NativeStackTruncated,
-        FramehopError::DidNotAdvance => SampleErrorKind::NativeFramehopDidNotAdvance,
-        FramehopError::ReturnAddressIsNull => SampleErrorKind::NativeFramehopReturnAddressNull,
-        FramehopError::FramepointerUnwindingMovedBackwards => {
-            SampleErrorKind::NativeFramehopMovedBackwards
-        }
-        FramehopError::IntegerOverflow => SampleErrorKind::NativeFramehopIntegerOverflow,
-    }
-}
-
-fn fallback_kind(reason: FramePointerFallbackReason) -> UnwindFallbackKind {
-    match reason {
-        FramePointerFallbackReason::NoModule => UnwindFallbackKind::NoModule,
-        // Other Framehop format features can be enabled by another crate in the
-        // dependency graph even though this Linux recorder cannot produce them.
-        #[allow(unreachable_patterns)]
-        FramePointerFallbackReason::UnwindInfo(error) => match error {
-            UnwinderError::NoModuleUnwindData => UnwindFallbackKind::NoModuleUnwindData,
-            UnwinderError::EhFrameHdrCouldNotFindAddress => UnwindFallbackKind::EhFrameHdrLookup,
-            UnwinderError::DwarfCfiIndexCouldNotFindAddress => {
-                UnwindFallbackKind::DwarfCfiIndexLookup
-            }
-            UnwinderError::Dwarf(error) => match error {
-                DwarfUnwinderError::FdeFromOffsetFailed(_) => UnwindFallbackKind::DwarfFdeRead,
-                DwarfUnwinderError::UnwindInfoForAddressFailed(_) => {
-                    UnwindFallbackKind::DwarfUnwindInfo
-                }
-                DwarfUnwinderError::StackPointerMovedBackwards => {
-                    UnwindFallbackKind::DwarfStackPointerMovedBackwards
-                }
-                DwarfUnwinderError::DidNotAdvance => UnwindFallbackKind::DwarfDidNotAdvance,
-                DwarfUnwinderError::CouldNotRecoverCfa => {
-                    UnwindFallbackKind::DwarfCouldNotRecoverCfa
-                }
-                DwarfUnwinderError::CouldNotRecoverReturnAddress => {
-                    UnwindFallbackKind::DwarfCouldNotRecoverReturnAddress
-                }
-                DwarfUnwinderError::CouldNotRecoverFramePointer => {
-                    UnwindFallbackKind::DwarfCouldNotRecoverFramePointer
-                }
-            },
-            _ => UnwindFallbackKind::OtherUnwindFormat,
-        },
-    }
-}
-
 fn is_kernel_mode(privilege: Priv) -> bool {
     matches!(privilege, Priv::Kernel | Priv::GuestKernel)
 }
@@ -2467,145 +2389,6 @@ fn open_perf_group(
     )
 }
 
-#[cfg(test)]
-fn get_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
-    sample: SampleView<'_>,
-    privilege: Priv,
-    process_unwinder: &mut ProcessUnwinder,
-    stack: &mut Vec<StackFrame>,
-    callchain_stack: &mut Vec<StackFrame>,
-    summary: &mut RecordingSummary,
-) {
-    callchain_stack.clear();
-    push_sample_callchain(sample.call_chain, callchain_stack);
-    build_sample_stack::<C>(
-        sample.stack_input(),
-        privilege,
-        process_unwinder,
-        stack,
-        callchain_stack,
-        summary,
-    );
-}
-
-fn build_sample_stack<C: ConvertRegs<UnwindRegs = <NativeUnwinder as Unwinder>::UnwindRegs>>(
-    sample: StackInput<'_>,
-    privilege: Priv,
-    process_unwinder: &mut ProcessUnwinder,
-    stack: &mut Vec<StackFrame>,
-    callchain_stack: &[StackFrame],
-    summary: &mut RecordingSummary,
-) {
-    const MAX_NATIVE_UNWIND_FRAMES: usize = 1_024;
-
-    stack.clear();
-
-    let kernel_frame_count = callchain_stack
-        .iter()
-        .take_while(|&&frame| stack_frame_is_kernel(frame))
-        .count();
-    let (kernel_callchain_frames, user_callchain_frames) =
-        callchain_stack.split_at(kernel_frame_count);
-    stack.extend_from_slice(kernel_callchain_frames);
-    let dwarf_start = stack.len();
-    let mut dwarf_truncated = false;
-    let user_stack = sample.user_stack.filter(|stack| !stack.is_empty());
-
-    if sample.user_stack.is_some() && user_stack.is_none() {
-        record_unwind_error(summary, SampleErrorKind::NativeStackRead, || {
-            "perf sample reported zero user stack bytes".to_string()
-        });
-    }
-    match (sample.user_regs, user_stack) {
-        (Some(raw_regs), Some(user_stack)) => {
-            if let Some((pc, sp, regs)) = C::convert_regs(raw_regs) {
-                let (user_stack_words, _) = user_stack.as_chunks::<8>();
-                let mut read_stack = |addr: u64| {
-                    let index = addr
-                        .checked_sub(sp)
-                        .filter(|offset| offset % 8 == 0)
-                        .and_then(|offset| usize::try_from(offset / 8).ok())
-                        .ok_or(())?;
-                    read_stack_u64(user_stack_words, index)
-                };
-
-                let mut frames = process_unwinder.unwinder.iter_frames(
-                    pc,
-                    regs,
-                    &mut process_unwinder.cache,
-                    &mut read_stack,
-                );
-                loop {
-                    if stack.len().saturating_sub(dwarf_start) >= MAX_NATIVE_UNWIND_FRAMES {
-                        dwarf_truncated = true;
-                        break;
-                    }
-                    match frames.next_with_details() {
-                        Ok(None) => break,
-                        Ok(Some(frame)) => {
-                            if let Some(reason) = frame.fallback_reason() {
-                                summary.unwind_fallbacks.record(fallback_kind(reason));
-                            }
-                            match frame.address() {
-                                FrameAddress::InstructionPointer(address) => stack
-                                    .push(StackFrame::InstructionPointer(address, StackMode::User)),
-                                FrameAddress::ReturnAddress(address) => stack.push(
-                                    StackFrame::ReturnAddress(address.into(), StackMode::User),
-                                ),
-                            }
-                        }
-                        Err(err) => {
-                            record_unwind_error(summary, sample_error_for_framehop(err), || {
-                                format!("framehop error during perf native unwind: {err}")
-                            });
-                            dwarf_truncated = true;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                record_unwind_error(summary, SampleErrorKind::NativeRegisterCapture, || {
-                    "perf sample contained incomplete user register state".to_string()
-                });
-            }
-        }
-        _ if !is_kernel_mode(privilege) => {
-            if sample.user_regs.is_none() {
-                record_unwind_error(summary, SampleErrorKind::NativeUserRegistersMissing, || {
-                    "perf sample did not include user register state".to_string()
-                });
-            }
-            if sample.user_stack.is_none() {
-                record_unwind_error(summary, SampleErrorKind::NativeStackRead, || {
-                    "perf sample did not include user stack bytes".to_string()
-                });
-            }
-        }
-        _ => {}
-    }
-
-    summary.ignored_user_callchain_frames = summary
-        .ignored_user_callchain_frames
-        .saturating_add(user_callchain_frames.len() as u64);
-    if dwarf_truncated {
-        stack.push(StackFrame::TruncatedStackMarker);
-    }
-
-    if stack.is_empty() {
-        if let Some(ip) = sample.code_addr {
-            stack.push(StackFrame::InstructionPointer(ip, privilege.into()));
-        }
-    }
-}
-
-fn stack_frame_is_kernel(frame: StackFrame) -> bool {
-    matches!(
-        frame,
-        StackFrame::InstructionPointer(_, StackMode::Kernel)
-            | StackFrame::ReturnAddress(_, StackMode::Kernel)
-    )
-}
-
 fn push_sample_callchain(call_chain: SampleCallChain<'_>, stack: &mut Vec<StackFrame>) {
     for (mode, addresses) in call_chain.iter() {
         push_callchain_addresses(mode, addresses, stack);
@@ -2620,10 +2403,6 @@ fn push_callchain_addresses(mode: StackMode, addresses: &[u64], stack: &mut Vec<
             StackFrame::ReturnAddress(address, mode)
         });
     }
-}
-
-fn read_stack_u64(stack: &[[u8; 8]], index: usize) -> Result<u64, ()> {
-    stack.get(index).copied().map(u64::from_ne_bytes).ok_or(())
 }
 
 /// Normalize sampled addresses and preserve explicit truncation markers.
@@ -2658,6 +2437,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::stats::SampleErrorKind;
     use crate::test_support::{SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
     use perf_event_open::sample::record::lost::{LostRecords, LostSamples};
@@ -3643,89 +3423,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    struct TestConvertRegs;
-
-    #[cfg(target_arch = "x86_64")]
-    impl ConvertRegs for TestConvertRegs {
-        type UnwindRegs = framehop::x86_64::UnwindRegsX86_64;
-
-        fn convert_regs(regs: &[u64]) -> Option<(u64, u64, Self::UnwindRegs)> {
-            let [pc, sp, bp] = *regs else {
-                return None;
-            };
-            Some((pc, sp, Self::UnwindRegs::new(pc, sp, bp)))
-        }
-
-        fn regs_mask() -> u64 {
-            0
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    impl ConvertRegs for TestConvertRegs {
-        type UnwindRegs = framehop::aarch64::UnwindRegsAarch64;
-
-        fn convert_regs(regs: &[u64]) -> Option<(u64, u64, Self::UnwindRegs)> {
-            let [pc, sp, fp] = *regs else {
-                return None;
-            };
-            Some((pc, sp, Self::UnwindRegs::new(0, sp, fp)))
-        }
-
-        fn regs_mask() -> u64 {
-            0
-        }
-    }
-
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[test]
-    fn truncated_dwarf_stack_ignores_user_callchain() {
-        let user_regs = [0x1000, 0, 8];
-        let user_stack: Vec<_> = [0, 40, 0x2000]
-            .into_iter()
-            .flat_map(u64::to_ne_bytes)
-            .collect();
-        let input = StackInput {
-            code_addr: None,
-            user_regs: Some(&user_regs),
-            user_stack: Some(&user_stack),
-        };
-        let callchain_stack = [
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-            StackFrame::ReturnAddress(0x3000, StackMode::User),
-        ];
-        let mut process_unwinder = ProcessUnwinder::default();
-        let mut stack = Vec::new();
-        let mut summary = RecordingSummary::default();
-
-        build_sample_stack::<TestConvertRegs>(
-            input,
-            Priv::User,
-            &mut process_unwinder,
-            &mut stack,
-            &callchain_stack,
-            &mut summary,
-        );
-
-        assert_eq!(
-            stack,
-            vec![
-                StackFrame::InstructionPointer(0x1000, StackMode::User),
-                StackFrame::ReturnAddress(0x2000, StackMode::User),
-                StackFrame::TruncatedStackMarker,
-            ]
-        );
-        assert_eq!(summary.ignored_user_callchain_frames, 3);
-        assert_eq!(
-            summary
-                .error_stats
-                .count(SampleErrorKind::NativeStackTruncated),
-            1
-        );
-    }
-
     #[test]
     fn each_callchain_context_starts_with_an_instruction_pointer() {
         let mut stack = Vec::new();
@@ -3769,123 +3466,6 @@ mod tests {
         assert_eq!(frames[1].abs_ip, 0xffff_1fff);
         assert_eq!(frames[2].abs_ip, 0x1000);
         assert_eq!(frames[3].abs_ip, 0x1fff);
-    }
-
-    #[test]
-    fn get_sample_stack_ignores_unexpected_user_callchain() {
-        let chains = vec![CallChain::User(vec![0x1000, 0x2000])];
-        let sample = SampleView {
-            task: None,
-            timestamp_ns: None,
-            code_addr: Some(0x3000),
-            user_regs: None,
-            user_stack: None,
-            call_chain: SampleCallChain::Owned(&chains),
-        };
-        let mut process_unwinder = ProcessUnwinder::default();
-        let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
-        let mut summary = RecordingSummary::default();
-
-        get_sample_stack::<ConvertRegsNative>(
-            sample,
-            Priv::User,
-            &mut process_unwinder,
-            &mut stack,
-            &mut callchain_stack,
-            &mut summary,
-        );
-
-        assert_eq!(
-            stack,
-            vec![StackFrame::InstructionPointer(0x3000, StackMode::User)]
-        );
-        assert_eq!(summary.ignored_user_callchain_frames, 2);
-        assert_eq!(
-            summary
-                .error_stats
-                .count(SampleErrorKind::NativeUserRegistersMissing),
-            1
-        );
-        assert_eq!(
-            summary.error_stats.count(SampleErrorKind::NativeStackRead),
-            1
-        );
-    }
-
-    #[test]
-    fn build_sample_stack_keeps_kernel_callchain_and_ignores_user_tail() {
-        let callchain_stack = [
-            StackFrame::InstructionPointer(0xffff_1000, StackMode::Kernel),
-            StackFrame::ReturnAddress(0xffff_2000, StackMode::Kernel),
-            StackFrame::InstructionPointer(0x1000, StackMode::User),
-            StackFrame::ReturnAddress(0x2000, StackMode::User),
-        ];
-        let mut process_unwinder = ProcessUnwinder::default();
-        let mut stack = Vec::new();
-        let mut summary = RecordingSummary::default();
-
-        build_sample_stack::<ConvertRegsNative>(
-            StackInput {
-                code_addr: None,
-                user_regs: None,
-                user_stack: None,
-            },
-            Priv::Kernel,
-            &mut process_unwinder,
-            &mut stack,
-            &callchain_stack,
-            &mut summary,
-        );
-
-        assert_eq!(stack, &callchain_stack[..2]);
-        assert_eq!(summary.ignored_user_callchain_frames, 2);
-    }
-
-    #[test]
-    fn get_sample_stack_treats_zero_user_stack_as_bad_sample() {
-        let sample = SampleView {
-            task: None,
-            timestamp_ns: None,
-            code_addr: Some(0x1000),
-            user_regs: Some(&[]),
-            user_stack: Some(&[]),
-            call_chain: SampleCallChain::Owned(&[]),
-        };
-        let mut process_unwinder = ProcessUnwinder::default();
-        let mut stack = Vec::new();
-        let mut callchain_stack = Vec::new();
-        let mut summary = RecordingSummary::default();
-
-        get_sample_stack::<ConvertRegsNative>(
-            sample,
-            Priv::User,
-            &mut process_unwinder,
-            &mut stack,
-            &mut callchain_stack,
-            &mut summary,
-        );
-
-        assert_eq!(
-            stack,
-            vec![StackFrame::InstructionPointer(0x1000, StackMode::User)]
-        );
-        assert_eq!(
-            summary.error_stats.count(SampleErrorKind::NativeStackRead),
-            1
-        );
-        assert_eq!(
-            summary
-                .error_stats
-                .count(SampleErrorKind::NativeRegisterCapture),
-            0
-        );
-        assert_eq!(
-            summary
-                .error_stats
-                .count(SampleErrorKind::NativeStackTruncated),
-            0
-        );
     }
 
     #[test]

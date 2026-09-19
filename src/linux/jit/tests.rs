@@ -81,10 +81,21 @@ impl RegistryFixture {
 
     /// Publish a registration notification with the given list head.
     fn set_head(&self, first: u64) {
+        self.notify(1, first, first);
+    }
+
+    /// Remove an entry and publish its unregistration notification.
+    fn unregister(&self, id: ObjectId, remaining: &[ObjectId]) {
+        self.write_entries(remaining);
+        self.notify(2, id.entry, remaining.first().map_or(0, |id| id.entry));
+    }
+
+    /// Encode the target's latest notification in the GDB descriptor.
+    fn notify(&self, action: u32, relevant: u64, first: u64) {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&1_u32.to_ne_bytes()); // Protocol version.
-        encoded.extend_from_slice(&1_u32.to_ne_bytes()); // Register action.
-        encoded.extend_from_slice(&first.to_ne_bytes()); // Relevant entry.
+        encoded.extend_from_slice(&action.to_ne_bytes());
+        encoded.extend_from_slice(&relevant.to_ne_bytes());
         encoded.extend_from_slice(&first.to_ne_bytes());
         self.memory
             .write_all_at(&encoded, Self::DESCRIPTOR_ADDRESS)
@@ -104,6 +115,7 @@ impl RegistryFixture {
             .unwrap()
     }
 
+    /// Run an ordinary refresh at the supplied processing time.
     fn poll(&mut self, now: Instant) {
         // No real target: failed discovery retains our injected memory and descriptors.
         self.registry
@@ -113,8 +125,22 @@ impl RegistryFixture {
                 &mut self.modules,
                 &mut self.writer,
                 now,
+                None,
             )
             .unwrap();
+    }
+
+    /// Request a refresh for a failing frame, using the registry's normal clock.
+    fn demand(&mut self, address: u64) -> bool {
+        self.registry
+            .refresh_for_frame(
+                address,
+                i32::MAX,
+                &mut self.unwinder,
+                &mut self.modules,
+                &mut self.writer,
+            )
+            .unwrap()
     }
 }
 
@@ -123,6 +149,102 @@ fn jit_object(code: Range<u64>) -> JitObject {
         ModuleRecord::new(0, crate::Pid::new(7).unwrap(), code.clone(), 0, "jit").unwrap();
     module.jit_symbols = Some([].into());
     JitObject::test_with_module(module, test_module(code), OBJECT_IMAGE)
+}
+
+#[test]
+fn oversized_registries_back_off_and_resume_after_shrinking() {
+    let entries = |count: usize, size: u64| {
+        (0..count)
+            .map(|index| ObjectId {
+                entry: 0x1000 + index as u64 * 32,
+                address: 0x100000,
+                size,
+            })
+            .collect::<Vec<_>>()
+    };
+    for oversized in [
+        entries(4097, OBJECT_IMAGE.len() as u64),
+        entries(5, 64 * 1024 * 1024),
+        entries(1, 64 * 1024 * 1024 + 1),
+    ] {
+        let mut target = RegistryFixture::new(&oversized);
+        assert!(target.publish(HEAD, 0x200000..0x201000));
+        let captured = target.registry.frame(0x200000);
+        let now = Instant::now();
+
+        target.poll(now);
+        let retry = now + REGISTRY_LIMIT_RETRY_INTERVAL;
+        assert_eq!(target.registry.registry_retry_after, Some(retry));
+        assert_eq!(target.registry.frame(0x200000), captured);
+        assert!(target.registry.last_revalidation_cycle_at.is_none());
+
+        target.set_head(0);
+        target.registry.mappings_changed();
+        for millis in [100, 500, 999] {
+            target.poll(now + Duration::from_millis(millis));
+            assert_eq!(target.registry.last_poll_attempt_at, Some(now));
+            assert_eq!(target.registry.frame(0x200000), captured);
+        }
+        // Demand refreshes cannot bypass the registry limit either.
+        assert!(!target.demand(0x200000));
+        assert_eq!(target.registry.registry_retry_after, Some(retry));
+        assert_eq!(target.registry.frame(0x200000), captured);
+
+        target.poll(retry);
+        assert!(target.registry.registry_retry_after.is_none());
+        assert!(target.registry.frame(0x200000).is_none());
+        assert_eq!(target.registry.last_revalidation_cycle_at, Some(retry));
+    }
+}
+
+#[test]
+fn cyclic_registries_are_read_errors_instead_of_size_limits() {
+    let target = RegistryFixture::new(&[HEAD]);
+    target
+        .memory
+        .write_all_at(&HEAD.entry.to_ne_bytes(), HEAD.entry)
+        .unwrap();
+    assert!(matches!(
+        snapshot(&target.memory, target.registry.last_descriptors.clone()),
+        Err(SnapshotError::Read(_))
+    ));
+}
+
+#[test]
+fn revalidation_reuses_its_buffer_and_still_checks_every_byte() {
+    let mut target = RegistryFixture::new(&[HEAD]);
+    assert!(target.publish(HEAD, 0x1000..0x2000));
+    target
+        .memory
+        .write_all_at(OBJECT_IMAGE, HEAD.address)
+        .unwrap();
+    let object = &target.registry.objects[&HEAD];
+    let mut scratch = Vec::new();
+    assert!(!object
+        .has_changed(&target.memory, HEAD, &mut scratch)
+        .unwrap());
+
+    let allocations = allocation_counter::measure(|| {
+        for _ in 0..100 {
+            assert!(!object
+                .has_changed(&target.memory, HEAD, &mut scratch)
+                .unwrap());
+        }
+    });
+    assert_eq!(allocations.count_total, 0);
+
+    // The last byte matters too; reusing storage must not shorten the fingerprint.
+    target
+        .memory
+        .write_all_at(b"!", HEAD.address + HEAD.size - 1)
+        .unwrap();
+    assert!(object
+        .has_changed(&target.memory, HEAD, &mut scratch)
+        .unwrap());
+    target.memory.set_len(HEAD.address + HEAD.size - 1).unwrap();
+    assert!(object
+        .has_changed(&target.memory, HEAD, &mut scratch)
+        .is_err());
 }
 
 #[test]
@@ -332,9 +454,227 @@ fn changed_membership_rejects_staged_reads_without_backoff_or_retirement() {
 
     // The list changes while the descriptor returns to its previous values.
     target.write_entries(&[head]);
-    assert!(target.registry.stage_refresh(7, snapshot, now).is_none());
+    assert!(target
+        .registry
+        .stage_refresh(7, snapshot, now, None)
+        .is_none());
     assert_eq!(target.registry.frame(0x3000), before);
     assert_eq!(target.registry.objects.len(), 2);
     assert_eq!(target.registry.retry_after.len(), 1);
     assert_eq!(target.registry.retry_after.get(&head), Some(&now));
+}
+
+#[test]
+fn demand_preserves_other_frames_until_the_next_ordinary_refresh() {
+    for notified in [false, true] {
+        let mut target = RegistryFixture::new(&[HEAD, TAIL]);
+        assert!(target.publish(HEAD, 0x1000..0x2000));
+        assert!(target.publish(TAIL, 0x3000..0x4000));
+        target
+            .memory
+            .write_all_at(OBJECT_IMAGE, HEAD.address)
+            .unwrap();
+        let captured_tail = target.registry.frame(0x3000).unwrap();
+        let now = Instant::now();
+        target.registry.last_revalidation_cycle_at = Some(now - METADATA_REVALIDATION_INTERVAL);
+        target.registry.retry_after.insert(TAIL, now);
+
+        if notified {
+            target.unregister(TAIL, &[HEAD]);
+        } else {
+            target.write_entries(&[HEAD]);
+        }
+
+        assert!(!target.demand(0x1000));
+        assert_eq!(target.registry.frame(0x3000), Some(captured_tail));
+        assert_eq!(target.unwinder.max_known_code_address(), 0x4000);
+        assert_eq!(target.registry.retry_after.get(&TAIL), Some(&now));
+        assert_eq!(
+            target.registry.last_revalidation_cycle_at,
+            Some(now - METADATA_REVALIDATION_INTERVAL)
+        );
+        assert!(target.registry.last_poll_attempt_at.is_none());
+
+        target.poll(Instant::now());
+        assert!(target.registry.frame(0x3000).is_none());
+        assert!(target.registry.frame(0x1000).is_some());
+        assert!(!target.registry.retry_after.contains_key(&TAIL));
+    }
+}
+
+#[test]
+fn demand_defers_removal_and_unreadable_replacements_of_captured_frames() {
+    for removed in [false, true] {
+        let mut target = RegistryFixture::new(&[HEAD]);
+        assert!(target.publish(HEAD, 0x1000..0x2000));
+        let captured = target.registry.frame(0x1000);
+        if removed {
+            target.set_head(0);
+        } else {
+            // Changed bytes are readable, but do not form a valid replacement ELF.
+            target
+                .memory
+                .write_all_at(b"changed fixture object", HEAD.address)
+                .unwrap();
+        }
+        assert!(!target.demand(0x1000));
+        assert_eq!(target.registry.frame(0x1000), captured);
+        assert!(target.registry.needs_reconciliation);
+        target.poll(Instant::now());
+        assert!(target.registry.frame(0x1000).is_none());
+    }
+}
+
+#[test]
+fn unknown_frame_does_not_read_memory_or_consume_demand_deadline() {
+    let mut target = RegistryFixture::new(&[HEAD]);
+    assert!(target.publish(HEAD, 0x1000..0x2000));
+    target.memory.set_len(0).unwrap();
+
+    assert!(!target.demand(0x2000));
+    assert!(target.registry.last_demand_refresh_at.is_none());
+    assert!(target.registry.last_poll_attempt_at.is_none());
+    assert!(target.registry.retry_after.is_empty());
+    assert!(target.registry.frame(0x1000).is_some());
+}
+
+#[test]
+fn failed_and_unchanged_demands_are_throttled() {
+    for readable in [false, true] {
+        let mut target = RegistryFixture::new(&[HEAD]);
+        assert!(target.publish(HEAD, 0x1000..0x2000));
+        if readable {
+            target
+                .memory
+                .write_all_at(OBJECT_IMAGE, HEAD.address)
+                .unwrap();
+        }
+        target.registry.last_revalidation_cycle_at = Some(Instant::now());
+
+        assert!(!target.demand(0x1000));
+        let first_attempt = target.registry.last_demand_refresh_at;
+        assert!(first_attempt.is_some());
+        assert_eq!(target.registry.retry_after.contains_key(&HEAD), !readable);
+
+        // If another attempt reads the descriptor, this removal would retire the object.
+        target.set_head(0);
+        target.registry.last_poll_attempt_at = None;
+        assert!(!target.demand(0x1000));
+        assert_eq!(target.registry.last_demand_refresh_at, first_attempt);
+        assert!(target.registry.last_poll_attempt_at.is_none());
+        assert!(target.registry.frame(0x1000).is_some());
+    }
+}
+
+#[test]
+fn pending_object_retry_prevents_demand_without_consuming_its_deadline() {
+    let mut target = RegistryFixture::new(&[HEAD]);
+    assert!(target.publish(HEAD, 0x1000..0x2000));
+    let retry = Instant::now() + OBJECT_RETRY_INTERVAL;
+    target.registry.retry_after.insert(HEAD, retry);
+    target.set_head(0);
+
+    assert!(!target.demand(0x1000));
+    assert!(target.registry.last_demand_refresh_at.is_none());
+    assert!(target.registry.last_poll_attempt_at.is_none());
+    assert_eq!(target.registry.retry_after.get(&HEAD), Some(&retry));
+    assert!(target.registry.frame(0x1000).is_some());
+}
+
+/// Copy linked CFI into the target address advertised by the registered ELF.
+#[cfg(target_arch = "x86_64")]
+fn write_live_cfi(memory: &File, image: &[u8]) {
+    let elf = goblin::elf::Elf::parse(image).unwrap();
+    let section = elf
+        .section_headers
+        .iter()
+        .find(|section| elf.shdr_strtab.get_at(section.sh_name) == Some(".eh_frame"))
+        .unwrap();
+    let offset = usize::try_from(section.sh_offset).unwrap();
+    let size = usize::try_from(section.sh_size).unwrap();
+    memory
+        .write_all_at(&image[offset..offset + size], section.sh_addr)
+        .unwrap();
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn demand_refreshes_changed_live_cfi_inside_the_normal_poll_interval() {
+    use crate::linux::unwind::NativeCache;
+    use framehop::{FrameAddress, UnwinderWithDetails};
+
+    let directory = TempDir::new("jit-demand-cfi");
+    let initial = std::fs::read(crate::test_support::assemble_jit_overlay(
+        directory.path(),
+        16,
+    ))
+    .unwrap();
+    let updated = std::fs::read(crate::test_support::assemble_jit_overlay(
+        directory.path(),
+        48,
+    ))
+    .unwrap();
+    let id = ObjectId {
+        entry: HEAD.entry,
+        address: 0x10000,
+        size: initial.len() as u64,
+    };
+    let mut target = RegistryFixture::new(&[id, TAIL]);
+    target.memory.write_all_at(&initial, id.address).unwrap();
+    write_live_cfi(&target.memory, &initial);
+    let object = load_object(&target.memory, i32::MAX, id).unwrap();
+    assert!(target
+        .registry
+        .publish_object(
+            id,
+            object,
+            &mut target.unwinder,
+            &mut target.modules,
+            &mut target.writer
+        )
+        .unwrap());
+    assert!(target.publish(TAIL, 0x3000..0x4000));
+    let original_frame = target.registry.frame(0x1001).unwrap();
+    let other_frame = target.registry.frame(0x3000);
+    let mut cache = NativeCache::default();
+    let unwind = |target: &RegistryFixture, cache: &mut NativeCache| {
+        let mut regs = framehop::UnwindRegsNative::new(0x1001, 0x8000, 0x8100);
+        let result = target
+            .unwinder
+            .unwind_frame_with_details(
+                FrameAddress::from_instruction_pointer(0x1001),
+                &mut regs,
+                cache,
+                &mut |address| match address {
+                    0x8008 => Ok(0xaaaa),
+                    0x8028 => Ok(0xbbbb),
+                    _ => Err(()),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.fallback_reason(), None);
+        result.return_address()
+    };
+    assert_eq!(unwind(&target, &mut cache), Some(0xaaaa));
+
+    // Only live CFI changes: the descriptor, registered ELF, and list stay identical.
+    write_live_cfi(&target.memory, &updated);
+    let now = Instant::now();
+    target.registry.last_revalidation_cycle_at = Some(now);
+    target.registry.last_poll_attempt_at = Some(now);
+    target.poll(now);
+    assert_eq!(unwind(&target, &mut cache), Some(0xaaaa));
+
+    assert!(target.demand(0x1001));
+    assert_eq!(unwind(&target, &mut cache), Some(0xbbbb));
+    assert_ne!(
+        target.registry.frame(0x1001).unwrap().module_id,
+        original_frame.module_id
+    );
+    assert_eq!(target.registry.frame(0x3000), other_frame);
+    assert!(target.registry.retry_after.is_empty());
+    assert_eq!(target.registry.last_revalidation_cycle_at, Some(now));
+    assert!(!target.registry.objects[&id]
+        .has_changed(&target.memory, id, &mut Vec::new())
+        .unwrap());
 }

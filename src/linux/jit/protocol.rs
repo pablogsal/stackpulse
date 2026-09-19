@@ -12,6 +12,17 @@ const MAX_READ: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Distinguish unsupported registry sizes from unreadable or inconsistent target data.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SnapshotError {
+    /// A failed read or invalid linked list; a later poll can observe consistent data.
+    #[error(transparent)]
+    Read(#[from] io::Error),
+    /// A bounded-read limit was reached; report incomplete coverage and slow retries.
+    #[error("GDB JIT registry exceeds {0}")]
+    Limit(&'static str),
+}
+
 /// Remote allocation identity, not a lifetime identifier: runtimes can reuse every field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) struct ObjectId {
@@ -54,7 +65,10 @@ impl Snapshot {
 }
 
 /// Walk every list with backlink, cycle, entry-count, and total-size checks.
-pub(super) fn snapshot(memory: &File, descriptors: Vec<(u64, Descriptor)>) -> io::Result<Snapshot> {
+pub(super) fn snapshot(
+    memory: &File,
+    descriptors: Vec<(u64, Descriptor)>,
+) -> Result<Snapshot, SnapshotError> {
     let mut snapshot = Snapshot {
         descriptors,
         objects: FxHashSet::default(),
@@ -65,28 +79,34 @@ pub(super) fn snapshot(memory: &File, descriptors: Vec<(u64, Descriptor)>) -> io
         let mut previous = 0;
         let mut visited = FxHashSet::default();
         while next != 0 {
-            if !visited.insert(next) || snapshot.objects.len() >= MAX_ENTRIES {
-                return Err(invalid("cyclic or oversized GDB JIT registry"));
+            if !visited.insert(next) {
+                return Err(invalid("cyclic GDB JIT registry").into());
+            }
+            if snapshot.objects.len() >= MAX_ENTRIES {
+                return Err(SnapshotError::Limit("4096 registrations"));
             }
             let data = read_array::<32>(memory, next)?;
             let (words, _) = data.as_chunks::<8>();
             if u64::from_ne_bytes(words[1]) != previous {
-                return Err(invalid("inconsistent GDB JIT back link"));
+                return Err(invalid("inconsistent GDB JIT back link").into());
             }
             let id = ObjectId {
                 entry: next,
                 address: u64::from_ne_bytes(words[2]),
                 size: u64::from_ne_bytes(words[3]),
             };
-            if id.size == 0 || id.size > MAX_READ {
-                return Err(invalid("invalid GDB JIT object size"));
+            if id.size == 0 {
+                return Err(invalid("invalid GDB JIT object size").into());
+            }
+            if id.size > MAX_READ {
+                return Err(SnapshotError::Limit("64 MiB per object"));
             }
             if snapshot.objects.insert(id) {
                 total = total
                     .checked_add(id.size)
                     .ok_or_else(|| invalid("GDB JIT size overflow"))?;
                 if total > MAX_TOTAL_BYTES {
-                    return Err(invalid("GDB JIT objects exceed memory limit"));
+                    return Err(SnapshotError::Limit("256 MiB of registered objects"));
                 }
             }
             previous = next;
@@ -127,10 +147,24 @@ fn read_array<const N: usize>(memory: &File, address: u64) -> io::Result<[u8; N]
 
 /// Copy a bounded target-memory range without overflowing its end address.
 pub(super) fn read(memory: &File, address: u64, size: u64) -> io::Result<Vec<u8>> {
-    check_read_bounds(address, size)?;
-    let mut bytes = vec![0; usize::try_from(size).map_err(|_| invalid("GDB JIT size overflow"))?];
-    memory.read_exact_at(&mut bytes, address)?;
+    let mut bytes = Vec::new();
+    read_into(memory, address, size, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Reuse a refresh's temporary buffer while keeping the same target-read bounds.
+pub(super) fn read_into(
+    memory: &File,
+    address: u64,
+    size: u64,
+    bytes: &mut Vec<u8>,
+) -> io::Result<()> {
+    check_read_bounds(address, size)?;
+    bytes.resize(
+        usize::try_from(size).map_err(|_| invalid("GDB JIT size overflow"))?,
+        0,
+    );
+    memory.read_exact_at(bytes, address)
 }
 
 pub(super) fn invalid(message: &str) -> io::Error {

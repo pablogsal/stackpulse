@@ -10,16 +10,23 @@ use crate::spool::{
 };
 
 mod backend;
+mod sample;
 #[cfg(test)]
 pub(super) use backend::test_module;
 pub(super) use backend::{NativeCache, NativeUnwinder};
+pub(super) use sample::{build_sample_stack, StackInput};
 
 /// Per-process executable metadata and caches used to capture native stacks.
 #[derive(Default)]
 pub(super) struct ProcessUnwinder {
+    /// Runtime registrations and recorded frame ownership, rediscovered after fork or exec.
     jit: super::jit::JitRegistry,
-    pub(super) unwinder: NativeUnwinder,
-    pub(super) cache: NativeCache,
+    /// Ordinary and JIT unwind tables for this process's current executable code.
+    unwinder: NativeUnwinder,
+    /// Unwind-rule cache reused across samples; a forked child starts with an empty cache.
+    cache: NativeCache,
+    /// Page-aligned user addresses for which mapping rediscovery was already attempted.
+    /// Cleared when executable mappings change so uncovered pages can be checked again.
     refreshed_uncovered_pages: FxHashSet<u64>,
 }
 
@@ -34,6 +41,18 @@ impl ProcessUnwinder {
         writer: &mut PerfSpoolWriter<W>,
     ) -> std::io::Result<()> {
         self.jit.refresh(pid, &mut self.unwinder, modules, writer)
+    }
+
+    /// Refresh failed runtime metadata before retrying the original captured stack.
+    pub(super) fn refresh_runtime_frame<W: std::io::Write>(
+        &mut self,
+        address: u64,
+        pid: i32,
+        modules: &mut ModuleTable,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> std::io::Result<bool> {
+        self.jit
+            .refresh_for_frame(address, pid, &mut self.unwinder, modules, writer)
     }
 
     /// Pin runtime frames to their registration, then fall back to mapped files.
