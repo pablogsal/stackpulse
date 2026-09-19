@@ -21,7 +21,7 @@ newer.
 
 ```toml
 [dependencies]
-stackpulse = "0.11"
+stackpulse = "0.12"
 ```
 
 ## Record a profile
