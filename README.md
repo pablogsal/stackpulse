@@ -117,6 +117,10 @@ make coverage CARGO_FLAGS="--features debuginfod"
 Consumers that supply `SymbolizerBuilder::native` can disable default features
 to omit `wholesym` and Tokio.
 
+Native profilers that only need the shared GDB JIT registry can depend on
+[`stackpulse-jit`](crates/stackpulse-jit/README.md). StackPulse also exposes it as
+`stackpulse::jit`.
+
 Two environment variables tune the default backend: `STACKPULSE_DEBUG_DIRS`
 overrides local debug-file search roots, and
 `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod cache directory.

@@ -44,6 +44,7 @@ object = { version = "0.40", default-features = false, features = ["std", "read_
 perf-event-open = { version = "0.6", features = ["linux-6.0"] }
 perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
+stackpulse-jit = { path = "crates/stackpulse-jit", version = "0.1.0" }
 tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"], optional = true }
 tracing = "0.1"
 thiserror = "2.0.20"
@@ -80,7 +81,7 @@ name = "allocations"
 required-features = ["bench-support"]
 
 [workspace]
-members = ["crates/framehop-stackpulse"]
+members = ["crates/framehop-stackpulse", "crates/stackpulse-jit"]
 resolver = "2"
 
 [workspace.lints.clippy]

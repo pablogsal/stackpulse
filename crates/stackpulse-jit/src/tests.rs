@@ -1,6 +1,7 @@
 use super::object::{jit_symbols, JitUnwind};
 use super::protocol::JitCodeEntry;
 use super::*;
+#[cfg(target_arch = "x86_64")]
 use crate::elf::find_section_range;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -301,9 +302,9 @@ fn compiled_image(name: &str, cfa_offset: u8, text_address: u64, aliases: bool) 
     images
         .entry(key)
         .or_insert_with(|| {
-            let dir = crate::test_support::TempDir::new("shared-jit");
+            let dir = tempfile::tempdir().unwrap();
             let output = dir.path().join("overlay");
-            let assembly = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jit/tests/overlay.S");
+            let assembly = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tests/overlay.S");
             let mut compiler = std::process::Command::new("cc");
             compiler
                 .args([

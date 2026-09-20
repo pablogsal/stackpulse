@@ -20,7 +20,7 @@ pub const GDB_JIT_REGISTRY_SOURCE: &str = include_str!("../tests/fixtures/gdb_ji
 pub const GDB_JIT_LEAF_SOURCE: &str = include_str!("../tests/fixtures/gdb_jit/leaf.S");
 
 #[doc(hidden)]
-pub const GDB_JIT_OVERLAY_SOURCE: &str = include_str!("jit/tests/overlay.S");
+pub use stackpulse_jit::fixtures::GDB_JIT_OVERLAY_SOURCE;
 
 #[doc(hidden)]
 pub fn path_name(path: &Path) -> &str {

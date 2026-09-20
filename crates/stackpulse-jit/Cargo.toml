@@ -1,0 +1,32 @@
+[package]
+name = "stackpulse-jit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Linux GDB JIT registry discovery, symbols, and unwind data"
+license = "MIT"
+repository = "https://github.com/pablogsal/stackpulse"
+readme = "README.md"
+keywords = ["profiler", "linux", "jit", "unwind"]
+categories = ["development-tools::profiling"]
+include = ["Cargo.toml", "Cargo.lock", "LICENSE-MIT", "README.md", "src/**"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[lints]
+workspace = true
+
+[dependencies]
+framehop = { package = "framehop-stackpulse", path = "../framehop-stackpulse", version = "0.17.0", default-features = false, features = ["std"] }
+gimli = { version = "0.34", default-features = false, features = ["read"] }
+goblin = "0.10"
+libc = "0.2"
+memmap2 = "0.9"
+rustc-hash = "2.1"
+thiserror = "2.0.20"
+tracing = "0.1"
+
+[dev-dependencies]
+allocation-counter = "0.8.1"
+tempfile = "3"

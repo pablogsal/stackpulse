@@ -1,8 +1,17 @@
-//! Linux GDB JIT-interface discovery and in-memory ELF loading.
+#![doc = include_str!("../README.md")]
 //!
 //! Protocol and producer references:
 //! - <https://sourceware.org/gdb/current/onlinedocs/gdb.html/JIT-Interface.html>
 //! - <https://github.com/llvm/llvm-project/blob/main/llvm/lib/ExecutionEngine/GDBRegistrationListener.cpp>
+
+#![cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
+
+// Internal helpers shared with StackPulse's native ELF loader.
+#[doc(hidden)]
+pub mod elf;
+pub mod fixtures;
 
 mod discovery;
 mod object;

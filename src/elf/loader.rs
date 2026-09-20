@@ -4,7 +4,6 @@
 //! symbolization. Both consumers share these results through `native_module`.
 
 use super::types::{ElfSectionData, ElfSectionInfo};
-use super::LoadSegment;
 use crate::error::ElfParseError;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
@@ -13,6 +12,7 @@ use goblin::elf::Elf;
 use goblin::strtab::Strtab;
 use memmap2::Mmap;
 use object::{CompressionFormat, Object, ObjectSection};
+use stackpulse_jit::elf::{collect_load_segments, find_section_header, find_section_range};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -143,32 +143,6 @@ fn calculate_base_svma(elf: &Elf) -> u64 {
         .map_or(0, |ph| ph.p_vaddr)
 }
 
-pub(crate) fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
-    let mut segments: Vec<_> = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .map(|ph| LoadSegment {
-            p_offset: ph.p_offset,
-            p_filesz: ph.p_filesz,
-            p_memsz: ph.p_memsz,
-            p_vaddr: ph.p_vaddr,
-            p_flags: ph.p_flags,
-        })
-        .collect();
-    segments.sort_by_key(|segment| segment.p_offset);
-    segments
-}
-
-/// Find a section header by name.
-fn find_section_header<'a>(name: &str, elf: &'a Elf) -> Option<&'a goblin::elf::SectionHeader> {
-    elf.section_headers.iter().find(|sh| {
-        elf.shdr_strtab
-            .get_at(sh.sh_name)
-            .is_some_and(|n| n == name)
-    })
-}
-
 #[cfg(test)]
 fn find_section_range_in_file(name: &str, elf: &Elf) -> Option<(u64, Range<usize>)> {
     let sh = find_section_header(name, elf)?;
@@ -240,12 +214,6 @@ fn checked_usize_range(start: u64, size: u64) -> Option<Range<usize>> {
 
 fn checked_u64_range(start: u64, size: u64) -> Option<Range<u64>> {
     Some(start..start.checked_add(size)?)
-}
-
-/// Find a section by name and return its SVMA range.
-pub(crate) fn find_section_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
-    let sh = find_section_header(name, elf)?;
-    checked_u64_range(sh.sh_addr, sh.sh_size)
 }
 
 /// Find a section by name and return its file-offset range.

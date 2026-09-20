@@ -269,12 +269,12 @@ fn image_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
     use goblin::elf::program_header::{PF_X, PT_LOAD};
     use rustc_hash::FxHashSet as HashSet;
+    use tempfile::TempDir;
 
     fn descriptor_image() -> (TempDir, PathBuf, Vec<u8>) {
-        let directory = TempDir::new("jit-discovery");
+        let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("registry.c");
         let path = directory.path().join("registry.so");
         std::fs::write(

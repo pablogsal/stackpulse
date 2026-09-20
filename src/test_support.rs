@@ -43,6 +43,8 @@ impl Drop for TempDir {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn assemble_jit_overlay(directory: &Path, cfa_offset: u64) -> PathBuf {
     let output = directory.join(format!("overlay-{cfa_offset}"));
+    let source = directory.join("overlay.S");
+    fs::write(&source, crate::bench_support::GDB_JIT_OVERLAY_SOURCE).expect("write JIT fixture");
     let compiler = std::process::Command::new("cc")
         .args([
             "-nostdlib",
@@ -54,10 +56,7 @@ pub(crate) fn assemble_jit_overlay(directory: &Path, cfa_offset: u64) -> PathBuf
             "-DFUNCTION_NAME=overlay_leaf",
         ])
         .arg(format!("-DCFA_OFFSET={cfa_offset}"))
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/jit/tests/overlay.S"
-        ))
+        .arg(&source)
         .arg("-o")
         .arg(&output)
         .output()
