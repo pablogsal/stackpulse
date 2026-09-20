@@ -1157,10 +1157,13 @@ fn failed_metadata_renews_retry_without_revalidating_every_poll() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn demand_defers_removal_and_image_replacement_to_the_next_poll() {
-    for removed in [false, true] {
+    let replacement = registered_image("other");
+    for (removed, valid) in [(false, true), (false, false), (true, false)] {
         let (mut reader, id) = registered_reader();
-        reader.refresh_objects(0).unwrap();
+        reader.descriptor_search_generation = Some(1);
+        reader.refresh(1, &[] as &[TestMapping]);
         let original = reader.objects[&id].image_fingerprint;
+        take_updates(&mut reader);
         if removed {
             reader.process.set_value(
                 0x100,
@@ -1171,16 +1174,31 @@ fn demand_defers_removal_and_image_replacement_to_the_next_poll() {
                     first_entry: 0,
                 },
             );
+        } else if valid {
+            assert_eq!(replacement.len() as u64, id.symfile_size);
+            reader.process.set_memory(0x3000, &replacement);
         } else {
             reader
                 .process
                 .set_memory(0x3000, &vec![b'!'; id.symfile_size as usize]);
         }
+        reader.last_revalidation = Some(Instant::now() + Duration::from_secs(60));
         assert!(!reader.refresh_for_address(0x8001));
         assert_eq!(reader.objects[&id].image_fingerprint, original);
-        reader.last_revalidation = None;
-        reader.refresh_objects(1).unwrap();
-        assert!(!reader.objects.contains_key(&id));
+        assert!(take_updates(&mut reader).is_empty());
+        reader.last_poll = Some(Instant::now() - POLL_INTERVAL);
+        reader.refresh(1, &[] as &[TestMapping]);
+        if valid {
+            assert_ne!(reader.objects[&id].image_fingerprint, original);
+            assert!(take_updates(&mut reader)
+                .iter()
+                .any(|update| matches!(update,
+                    Update::Loaded { symbols: Some(symbols), .. }
+                    if symbols.iter().any(|symbol| symbol.name.as_deref() == Some("other"))
+                )));
+        } else {
+            assert!(!reader.objects.contains_key(&id));
+        }
     }
 }
 

@@ -317,6 +317,11 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             MAX_JIT_TOTAL_CFI_SIZE.saturating_sub(retained_cfi - loaded_cfi_size(object));
         let update = match object.inspect(&self.process, id, &mut scratch, &mut remaining_cfi) {
             Ok(ObjectChange::Unwind(update)) => update,
+            Ok(ObjectChange::Image) => {
+                // Keep this batch's identity; recheck it at the next ordinary poll.
+                self.last_revalidation = None;
+                return false;
+            }
             Err(SnapshotError::Limit(limit)) => {
                 if let Some(object) = self.objects.get_mut(&id) {
                     object.unwind.cfi.mark_budget_limited();
@@ -324,7 +329,6 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
                 self.report_limit(Some(limit));
                 return false;
             }
-            // Changed image identity waits for the next batch poll.
             _ => return false,
         };
         if !self
