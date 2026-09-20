@@ -4,6 +4,7 @@ use super::unwind::NativeUnwinder;
 use crate::elf::ElfSectionData;
 use crate::jit::{FileIdentity, Mapping, MemoryReader, Registry, Update};
 use crate::spool::{FrameMode, FrameRecord, ModuleRecord, ModuleTable, PerfSpoolWriter};
+use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -80,6 +81,7 @@ pub(super) struct JitRegistry {
     generation: u64,
     mappings_changed: bool,
     maps_retry_at: Option<Instant>,
+    last_maps_read: Option<Instant>,
     code_ranges: BTreeMap<u64, CodeRange>,
 }
 
@@ -105,11 +107,21 @@ impl JitRegistry {
         modules: &mut ModuleTable,
         writer: &mut PerfSpoolWriter<W>,
     ) -> io::Result<()> {
-        if (self.registry.is_none() || self.mappings_changed)
+        // Perf reports new mappings, but an unloaded descriptor owner can disappear
+        // without another mapping event. Confirmed absence needs only event checks.
+        let reconcile = self
+            .registry
+            .as_ref()
+            .is_none_or(|registry| !registry.is_absent())
+            && self
+                .last_maps_read
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+        if (reconcile || self.mappings_changed)
             && self
                 .maps_retry_at
                 .is_none_or(|retry| Instant::now() >= retry)
         {
+            self.last_maps_read = Some(Instant::now());
             match std::fs::read(format!("/proc/{pid}/maps")) {
                 Ok(maps) => {
                     let mappings = crate::proc_maps::parse_iter(&maps)
@@ -182,10 +194,12 @@ impl JitRegistry {
             return Ok(());
         };
         let mut result = Ok(());
+        let mut retired = FxHashSet::default();
         registry.drain_updates(|update| {
             if result.is_ok() {
                 result = apply_update(
                     &mut self.code_ranges,
+                    &mut retired,
                     update,
                     pid,
                     unwinder,
@@ -194,12 +208,14 @@ impl JitRegistry {
                 );
             }
         });
+        retire_ranges(&mut self.code_ranges, &mut retired, unwinder);
         result
     }
 }
 
 fn apply_update<W: io::Write>(
     code_ranges: &mut BTreeMap<u64, CodeRange>,
+    retired: &mut FxHashSet<PathBuf>,
     update: Update<ElfSectionData>,
     pid: i32,
     unwinder: &mut NativeUnwinder,
@@ -207,19 +223,15 @@ fn apply_update<W: io::Write>(
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<()> {
     match update {
-        Update::Removed { path } => code_ranges.retain(|&start, range| {
-            if range.path.as_ref() == path {
-                unwinder.remove_jit_module(start);
-                false
-            } else {
-                true
-            }
-        }),
+        Update::Removed { path } => {
+            retired.insert(path);
+        }
         Update::Loaded {
             path,
             modules: unwind,
             symbols,
         } => {
+            retire_ranges(code_ranges, retired, unwinder);
             if let Some(symbols) = symbols {
                 let path: Arc<Path> = path.into();
                 let pid = crate::Pid::try_from(pid).map_err(crate::Error::from)?;
@@ -258,6 +270,25 @@ fn apply_update<W: io::Write>(
         }
     }
     Ok(())
+}
+
+fn retire_ranges(
+    code_ranges: &mut BTreeMap<u64, CodeRange>,
+    retired: &mut FxHashSet<PathBuf>,
+    unwinder: &mut NativeUnwinder,
+) {
+    if retired.is_empty() {
+        return;
+    }
+    code_ranges.retain(|&start, range| {
+        if retired.contains(range.path.as_ref()) {
+            unwinder.remove_jit_module(start);
+            false
+        } else {
+            true
+        }
+    });
+    retired.clear();
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use super::{FileIdentity, Mapping};
 use crate::elf::{collect_load_segments, compute_vma_bias, find_load_contribution_for_file_range};
 use goblin::elf::section_header::SHN_UNDEF;
 use memmap2::Mmap;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::fs::File;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -88,38 +88,56 @@ fn executable_descriptor(pid: i32) -> std::io::Result<Option<JitDescriptorLocati
     }))
 }
 
-/// Successful image searches are retained only for the current mapping generation.
-/// Failed opens remain retryable without reparsing every other loaded image.
+#[derive(PartialEq, Eq)]
+struct ImageMapping {
+    range: std::ops::Range<u64>,
+    file_offset: u64,
+    executable: bool,
+    deleted: bool,
+    identity: Option<FileIdentity>,
+}
+
+struct ImageSearch {
+    mappings: Vec<ImageMapping>,
+    descriptors: Vec<JitDescriptorLocation>,
+}
+
+/// Successful searches remain valid until that image's own mappings change.
 #[derive(Default)]
 pub(super) struct DescriptorDiscovery {
-    generation: Option<u64>,
-    images: HashMap<PathBuf, Vec<JitDescriptorLocation>>,
+    images: HashMap<PathBuf, ImageSearch>,
 }
 
 impl DescriptorDiscovery {
     pub(super) fn find(
         &mut self,
         pid: i32,
-        generation: u64,
         modules: &[impl Mapping],
     ) -> (Vec<JitDescriptorLocation>, bool) {
-        if self.generation != Some(generation) {
-            self.images.clear();
-            self.generation = Some(generation);
-        }
         let executable = PathBuf::from(format!("/proc/{pid}/exe"));
-        let mut paths: HashSet<&Path> = modules
-            .iter()
-            .filter(|module| module.executable())
-            .map(|module| module.path())
-            .collect();
-        paths.insert(&executable);
-        self.images.retain(|path, _| paths.contains(path.as_path()));
+        let mut layouts: HashMap<&Path, Vec<ImageMapping>> = HashMap::default();
+        for module in modules {
+            layouts
+                .entry(module.path())
+                .or_default()
+                .push(ImageMapping {
+                    range: module.range(),
+                    file_offset: module.file_offset(),
+                    executable: module.executable(),
+                    deleted: module.deleted(),
+                    identity: module.file_identity(),
+                });
+        }
+        layouts.retain(|_, mappings| mappings.iter().any(|mapping| mapping.executable));
+        // Exec creates a fresh registry. Anonymous remappings do not change its executable.
+        layouts.entry(&executable).or_default();
+        self.images
+            .retain(|path, cached| layouts.get(path.as_path()) == Some(&cached.mappings));
         let mut complete = true;
         let mut locations = Vec::new();
-        for path in paths {
+        for (path, mappings) in layouts {
             if let Some(cached) = self.images.get(path) {
-                locations.extend(cached.iter().cloned());
+                locations.extend(cached.descriptors.iter().cloned());
                 continue;
             }
             let (found, image_complete) = if path == executable {
@@ -134,7 +152,13 @@ impl DescriptorDiscovery {
             complete &= image_complete;
             // Cache only complete searches so unreadable instances remain retryable.
             if image_complete && self.images.len() < super::MAX_JIT_ENTRIES {
-                self.images.insert(path.to_path_buf(), found);
+                self.images.insert(
+                    path.to_path_buf(),
+                    ImageSearch {
+                        mappings,
+                        descriptors: found,
+                    },
+                );
             }
         }
         // Preserve executable ownership when both procfs and its ordinary
@@ -246,6 +270,7 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use goblin::elf::program_header::{PF_X, PT_LOAD};
+    use rustc_hash::FxHashSet as HashSet;
 
     fn descriptor_image() -> (TempDir, PathBuf, Vec<u8>) {
         let directory = TempDir::new("jit-discovery");
@@ -404,12 +429,103 @@ mod tests {
         let mut discovery = DescriptorDiscovery::default();
 
         for _ in 0..2 {
-            let (found, complete) = discovery.find(std::process::id() as i32, 1, &modules);
+            let (found, complete) = discovery.find(std::process::id() as i32, &modules);
 
             assert!(found.iter().any(|location| location.address == address));
             assert!(!complete);
             assert!(!discovery.images.contains_key(&path));
             modules.reverse();
+        }
+    }
+    #[test]
+    fn unrelated_mapping_changes_reuse_completed_image_searches() {
+        let (directory, path, bytes) = descriptor_image();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let address = 0x100000 + descriptor_symbol(&elf).unwrap();
+        let mut modules: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|segment| segment.p_type == PT_LOAD)
+            .map(|segment| {
+                mapping(
+                    &path,
+                    0x100000 + segment.p_vaddr,
+                    segment.p_memsz,
+                    segment.p_offset,
+                    segment.p_flags & PF_X != 0,
+                )
+            })
+            .collect();
+        let mut discovery = DescriptorDiscovery::default();
+        let pid = std::process::id() as i32;
+        assert!(discovery
+            .find(pid, &modules)
+            .0
+            .iter()
+            .any(|found| found.address == address));
+        // A rescan would now fail. Unrelated mappings must retain this completed search.
+        std::fs::remove_file(&path).unwrap();
+        let other = directory.path().join("other");
+        std::fs::write(&other, b"not an ELF image").unwrap();
+        modules.push(mapping(&other, 0x400000, 0x1000, 0, true));
+        for has_other in [true, false] {
+            let (found, complete) = discovery.find(pid, &modules);
+            assert!(complete);
+            assert!(found.iter().any(|found| found.address == address));
+            if has_other {
+                modules.pop();
+            }
+        }
+        // A change to this image's own mappings makes the missing file retryable.
+        modules[0].offset += 1;
+        let (found, complete) = discovery.find(pid, &modules);
+        assert!(!complete);
+        assert!(!found.iter().any(|found| found.address == address));
+        assert!(!discovery.images.contains_key(&path));
+    }
+
+    #[test]
+    fn cached_searches_are_invalidated_by_file_identity_changes() {
+        for change_device in [false, true] {
+            let (_directory, path, bytes) = descriptor_image();
+            let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let identity = FileIdentity {
+                inode: metadata.ino(),
+                device: metadata.dev(),
+            };
+            let mut modules: Vec<_> = elf
+                .program_headers
+                .iter()
+                .filter(|segment| segment.p_type == PT_LOAD)
+                .map(|segment| {
+                    let mut module = mapping(
+                        &path,
+                        0x100000 + segment.p_vaddr,
+                        segment.p_memsz,
+                        segment.p_offset,
+                        segment.p_flags & PF_X != 0,
+                    );
+                    module.identity = Some(identity);
+                    module
+                })
+                .collect();
+            let mut discovery = DescriptorDiscovery::default();
+            let pid = std::process::id() as i32;
+            discovery.find(pid, &modules);
+            assert!(discovery.images.contains_key(&path));
+            for module in &mut modules {
+                let identity = module.identity.as_mut().unwrap();
+                if change_device {
+                    identity.device ^= 1;
+                } else {
+                    identity.inode += 1;
+                }
+            }
+            let (found, complete) = discovery.find(pid, &modules);
+            assert!(!complete);
+            assert!(!found.iter().any(|found| found.owner == path));
+            assert!(!discovery.images.contains_key(&path));
         }
     }
 }

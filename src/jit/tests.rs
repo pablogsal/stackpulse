@@ -586,9 +586,7 @@ fn aggregate_registry_limit_is_checked_before_reading_objects() {
         .read_snapshot()
         .err()
         .expect("registry exceeds 256 MiB");
-    assert!(error
-        .to_string()
-        .contains("registered objects exceed bounds"));
+    assert!(matches!(error, SnapshotError::Limit(_)));
 }
 
 #[test]
@@ -1039,6 +1037,7 @@ fn overlapping_registration_waits_until_the_current_owner_retires() {
     reader.refresh_objects(1).unwrap();
     assert!(reader.objects.contains_key(&first));
     assert!(!reader.objects.contains_key(&second));
+    assert_eq!(reader.code_ranges[&0x8000].1, first);
     let retry = reader.load_failures[&second].retry_at;
     reader.process.set_value(
         0x2000,
@@ -1056,6 +1055,14 @@ fn overlapping_registration_waits_until_the_current_owner_retires() {
     reader.refresh_objects(retry).unwrap();
     assert!(!reader.objects.contains_key(&first));
     assert!(reader.objects.contains_key(&second));
+    assert_eq!(reader.code_ranges[&0x8000].1, second);
+    install_cfi(&reader.process, &image);
+    reader.poll_count = retry;
+    assert!(reader.refresh_for_address(0x8001));
+    reader.update_descriptors(Vec::new(), &[] as &[TestMapping]);
+    assert!(reader.code_ranges.is_empty());
+    reader.last_demand_refresh = None;
+    assert!(!reader.refresh_for_address(0x8001));
 }
 
 #[test]
@@ -1222,4 +1229,39 @@ fn pending_object_retry_does_not_read_or_consume_the_demand_deadline() {
     install_cfi(&reader.process.memory, &registered_image("first"));
     reader.poll_count = reader.load_failures[&id].retry_at;
     assert!(reader.refresh_for_address(0x8001));
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn registry_limit_warning_resets_after_a_bounded_snapshot() {
+    let (mut reader, id) = registered_reader();
+    reader.descriptor_search_generation = Some(1);
+    for oversized in [false, true, true, false, true] {
+        reader.process.set_value(
+            0x1000,
+            entry(
+                0,
+                0,
+                id.symfile_addr,
+                if oversized {
+                    MAX_JIT_READ_SIZE + 1
+                } else {
+                    id.symfile_size
+                },
+            ),
+        );
+        reader.last_poll = None;
+        reader.last_revalidation = None;
+        if let Some(backoff) = reader.refresh_backoff {
+            reader.poll_count = backoff.retry_at;
+        }
+        reader.refresh(1, &[] as &[TestMapping]);
+        assert_eq!(reader.limit_warned, oversized);
+        assert!(
+            reader.objects.contains_key(&id),
+            "limit errors must preserve committed metadata"
+        );
+    }
+    reader.update_descriptors(Vec::new(), &[] as &[TestMapping]);
+    assert!(!reader.limit_warned);
 }
