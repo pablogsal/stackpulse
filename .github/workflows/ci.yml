@@ -57,6 +57,12 @@ jobs:
       - name: Lint without default features
         run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 
+      - name: Check the standalone JIT consumer
+        run: |
+          cargo fmt --manifest-path test-crates/jit-consumer/Cargo.toml -- --check
+          cargo clippy --manifest-path test-crates/jit-consumer/Cargo.toml --locked -- -D warnings
+          cargo tree --manifest-path test-crates/jit-consumer/Cargo.toml --locked --edges normal,build
+
       - name: Enforce panic and unsafe boundaries in production code
         run: make clippy-strict
 
@@ -105,6 +111,9 @@ jobs:
         env:
           STACKPULSE_REQUIRE_PYTHON_PERF: "1"
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Test the standalone JIT crate
+        run: cargo test --package stackpulse-jit --locked
 
       - name: Test without default features
         if: ${{ matrix.test_no_default_features }}

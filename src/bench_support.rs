@@ -14,6 +14,15 @@ use crate::spool::PerfSpoolWriter;
 pub const CURRENT_SPOOL_MAGIC: &[u8; 8] = crate::spool::CURRENT_MAGIC;
 
 #[doc(hidden)]
+pub const GDB_JIT_REGISTRY_SOURCE: &str = include_str!("../tests/fixtures/gdb_jit/registry.c");
+
+#[doc(hidden)]
+pub const GDB_JIT_LEAF_SOURCE: &str = include_str!("../tests/fixtures/gdb_jit/leaf.S");
+
+#[doc(hidden)]
+pub use stackpulse_jit::fixtures::GDB_JIT_OVERLAY_SOURCE;
+
+#[doc(hidden)]
 pub fn path_name(path: &Path) -> &str {
     crate::path_name(path)
 }

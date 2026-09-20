@@ -1,0 +1,14 @@
+[package]
+name = "jit-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# Keep recorder and workspace dev-dependency features out of this build.
+[workspace]
+resolver = "2"
+
+[dependencies]
+stackpulse-jit = { path = "../../crates/stackpulse-jit" }
+framehop = { package = "framehop-stackpulse", path = "../../crates/framehop-stackpulse", version = "0.17.1", default-features = false, features = ["std"] }

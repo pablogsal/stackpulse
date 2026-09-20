@@ -9,6 +9,24 @@ StackPulse reads this information through the GDB JIT interface. Support
 includes LLVM MCJIT on 64-bit little-endian targets. Saved function names remain
 available after the process exits.
 
+## Use the registry without perf recording
+
+The `stackpulse-jit` workspace crate provides `MemoryReader`, `Mapping`,
+`FileIdentity`, `Symbol`, `Registry<P, D>`, and `Update<D>` without perf or a
+symbolization backend. StackPulse exposes the same types as `stackpulse::jit`.
+Disabling StackPulse's default features still selects custom symbolization;
+recording remains available.
+
+Native profilers can depend directly on `stackpulse-jit = "0.1.0"`. They supply
+their existing memory reader and mapping snapshot, then install the returned
+`framehop-stackpulse` 0.17 modules. Mapping generations, sample capture, unwind
+retries, and symbol lifetimes remain the caller's responsibility. A custom
+section type can retain the shared unwind bytes through `From<Arc<[u8]>>`.
+
+`stackpulse_jit::fixtures::GDB_JIT_OVERLAY_SOURCE` provides the Linux x86-64
+assembler fixture for consumer tests. The existing
+`stackpulse::bench_support::GDB_JIT_OVERLAY_SOURCE` import remains available.
+
 ## Record a JIT workload
 
 1. Check the required runtime settings in the [tested runtimes](#tested-runtimes) table.
