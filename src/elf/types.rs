@@ -63,6 +63,12 @@ impl Deref for ElfSectionData {
     }
 }
 
+impl From<Arc<[u8]>> for ElfSectionData {
+    fn from(data: Arc<[u8]>) -> Self {
+        Self::owned(data)
+    }
+}
+
 impl AsRef<[u8]> for ElfSectionData {
     fn as_ref(&self) -> &[u8] {
         self

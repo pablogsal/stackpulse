@@ -9,7 +9,10 @@ mod loader;
 mod test_fixtures;
 mod types;
 
-pub(crate) use loader::{load_elf_sections_from_bytes, load_elf_sections_from_file};
+pub(crate) use loader::{
+    collect_load_segments, find_section_range, load_elf_sections_from_bytes,
+    load_elf_sections_from_file,
+};
 #[cfg(test)]
 pub(crate) use test_fixtures::fake_hard_case_section_info;
 pub(crate) use types::{ElfSectionData, ElfSectionInfo};
@@ -169,7 +172,7 @@ impl PageSize {
 /// Find the PT_LOAD segment whose file contribution should be used as the
 /// reference for computing an image-wide AVMA bias for an executable mapping.
 ///
-fn find_load_contribution_for_file_range(
+pub(crate) fn find_load_contribution_for_file_range(
     segments: &[LoadSegment],
     file_off: u64,
     mapping_span: u64,
@@ -272,7 +275,7 @@ pub(crate) fn system_page_size() -> u64 {
 /// Given a reference whose file offset and SVMA are known, together with the
 /// mapping's start file offset and start AVMA, returns the bias such that
 /// `svma + bias == avma` for any address in the image.
-fn compute_vma_bias(
+pub(crate) fn compute_vma_bias(
     reference_file_offset: u64,
     reference_svma: u64,
     mapping_start_file_offset: u64,

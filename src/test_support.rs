@@ -51,11 +51,12 @@ pub(crate) fn assemble_jit_overlay(directory: &Path, cfa_offset: u64) -> PathBuf
             "-Wl,--no-eh-frame-hdr",
             "-Wl,-Ttext=0x1000",
             "-Wl,-e,overlay_leaf",
+            "-DFUNCTION_NAME=overlay_leaf",
         ])
         .arg(format!("-DCFA_OFFSET={cfa_offset}"))
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/gdb_jit/overlay.S"
+            "/src/jit/tests/overlay.S"
         ))
         .arg("-o")
         .arg(&output)
