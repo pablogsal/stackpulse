@@ -6,6 +6,8 @@
 
 - Discard and count kernel-mode records when kernel capture is disabled, before using their saved user registers for unwinding.
 
+- Use the registered object's text base consistently across executable sections sharing JIT unwind data.
+
 ### Added
 
 - `RecorderBuilder::sampling_event` can select software CPU-clock sampling. Hardware CPU cycles remain the default.
