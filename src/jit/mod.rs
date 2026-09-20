@@ -309,6 +309,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             .get(&id.entry_addr)
             .is_some_and(|entry| JitObjectId::new(id.entry_addr, *entry) == id)
         {
+            self.needs_reconciliation = true;
             return false;
         }
         let mut scratch = Vec::new();

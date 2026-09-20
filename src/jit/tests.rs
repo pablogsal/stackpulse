@@ -1203,6 +1203,59 @@ fn demand_defers_removal_and_image_replacement_to_the_next_poll() {
 }
 
 #[test]
+#[cfg(target_arch = "x86_64")]
+fn demand_reconciles_membership_changes_with_unchanged_descriptors() {
+    let image = compiled_image("other", 48, 0xa000, false);
+    for removed in [false, true] {
+        let (mut reader, first) = registered_reader();
+        let second = entry(0, 0x1000, 0x13000, image.len() as u64);
+        let old_id = JitObjectId::new(0x2000, second);
+        reader.process.set_memory(0x13000, &image);
+        reader.process.set_value(0x2000, second);
+        reader.process.set_value(
+            0x1000,
+            entry(0x2000, 0, first.symfile_addr, first.symfile_size),
+        );
+        reader.descriptor_search_generation = Some(1);
+        reader.refresh(1, &[] as &[TestMapping]);
+        take_updates(&mut reader);
+
+        let replacement = entry(0, 0x1000, 0x23000, image.len() as u64);
+        if removed {
+            reader
+                .process
+                .set_value(0x1000, entry(0, 0, first.symfile_addr, first.symfile_size));
+        } else {
+            reader.process.set_memory(0x23000, &image);
+            reader.process.set_value(0x2000, replacement);
+        }
+        assert_eq!(
+            reader.read_snapshot().unwrap().descriptors,
+            reader.last_descriptors
+        );
+        reader.last_revalidation = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!reader.refresh_for_address(0xa001));
+        assert!(reader.objects.contains_key(&old_id));
+        assert!(take_updates(&mut reader).is_empty());
+
+        reader.last_poll = Some(Instant::now() - POLL_INTERVAL);
+        reader.refresh(1, &[] as &[TestMapping]);
+        assert!(reader.objects.contains_key(&first));
+        assert!(!reader.objects.contains_key(&old_id));
+        if !removed {
+            let new_id = JitObjectId::new(0x2000, replacement);
+            assert!(reader.objects.contains_key(&new_id));
+            assert!(take_updates(&mut reader)
+                .iter()
+                .any(|update| matches!(update,
+                    Update::Loaded { symbols: Some(symbols), .. }
+                    if symbols.iter().any(|symbol| symbol.name.as_deref() == Some("other"))
+                )));
+        }
+    }
+}
+
+#[test]
 fn shared_elf_names_are_bounded_before_copying() {
     use goblin::container::{Container, Ctx, Endian};
     use goblin::elf::{
