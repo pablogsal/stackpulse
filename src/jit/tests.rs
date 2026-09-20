@@ -599,6 +599,8 @@ fn periodic_polls_are_throttled_and_initialization_preserves_batch_symbols() {
         .process
         .set_memory(0x3000, &registered_image("other"));
     reader.last_revalidation = None;
+    // Fixture compilation and scheduler delays must not expire this test phase.
+    reader.last_poll = Some(Instant::now() + Duration::from_secs(60));
     reader.refresh(1, &[] as &[TestMapping]);
     assert!(reader.objects[&id]
         .symbols
@@ -826,7 +828,7 @@ fn cfi_budget_is_checked_before_remote_reads_and_recovers_after_release() {
     assert_eq!(remaining, 0);
     let before = process.reads.get();
     let second = JitObject::<Arc<[u8]>>::load(&process, id, &mut remaining).unwrap();
-    assert!(matches!(second.unwind.cfi, CfiState::Unreadable { .. }));
+    assert!(matches!(second.unwind.cfi, CfiState::BudgetLimited { .. }));
     assert!(!second.symbols.as_ref().unwrap().is_empty());
     assert_eq!(
         process.reads.get() - before,
@@ -836,9 +838,10 @@ fn cfi_budget_is_checked_before_remote_reads_and_recovers_after_release() {
 
     let mut scratch = Vec::new();
     let before = process.reads.get();
-    assert!(second
-        .inspect(&process, id, &mut scratch, &mut remaining)
-        .is_err());
+    assert!(matches!(
+        second.inspect(&process, id, &mut scratch, &mut remaining),
+        Err(SnapshotError::Limit("256 MiB of live unwind data"))
+    ));
     assert_eq!(process.reads.get() - before, 1, "CFI retry is budgeted too");
     remaining += loaded_cfi_size(&first);
     assert!(matches!(
@@ -859,6 +862,36 @@ fn cfi_budget_is_checked_before_remote_reads_and_recovers_after_release() {
     assert_eq!(
         remaining, cfi_size,
         "unchanged CFI does not reserve a replacement"
+    );
+
+    let elf = goblin::elf::Elf::parse(&image).unwrap();
+    let section = elf
+        .section_headers
+        .iter()
+        .position(|section| elf.shdr_strtab.get_at(section.sh_name) == Some(".eh_frame"))
+        .unwrap();
+    let size_offset = elf.header.e_shoff as usize + section * elf.header.e_shentsize as usize + 32;
+    let mut oversized = image.clone();
+    oversized[size_offset..size_offset + 8].copy_from_slice(&(MAX_JIT_READ_SIZE + 1).to_le_bytes());
+    process
+        .memory
+        .set_memory(id.symfile_addr as usize, &oversized);
+    remaining = MAX_JIT_TOTAL_CFI_SIZE;
+    let before = process.reads.get();
+    let limited = JitObject::<Arc<[u8]>>::load(&process, id, &mut remaining).unwrap();
+    assert_eq!(
+        limited.unwind.cfi.budget_limit(),
+        Some("64 MiB per unwind section")
+    );
+    assert!(!limited.symbols.as_ref().unwrap().is_empty());
+    assert!(matches!(
+        limited.inspect(&process, id, &mut scratch, &mut remaining),
+        Err(SnapshotError::Limit("64 MiB per unwind section"))
+    ));
+    assert_eq!(
+        process.reads.get() - before,
+        2,
+        "both paths read only the ELF image"
     );
 }
 
@@ -891,12 +924,20 @@ fn active_cfi_consumes_budget_until_its_registration_is_retired() {
             first_entry: 0x1000,
         },
     );
+    reader.last_revalidation = Some(Instant::now() + Duration::from_secs(60));
     reader.refresh_objects(1).unwrap();
     assert!(matches!(
         reader.objects[&second_id].unwind.cfi,
-        CfiState::Unreadable { .. }
+        CfiState::BudgetLimited { .. }
     ));
+    assert!(reader.limit_warned);
+    reader.refresh_objects(1).unwrap();
+    assert!(
+        reader.limit_warned,
+        "unchanged polls retain the warning episode"
+    );
     assert!(!reader.refresh_for_address(0x18001));
+    assert!(reader.limit_warned);
 
     // Removing the holder makes room for the surviving object's periodic retry.
     reader.process.set_value(
@@ -912,13 +953,26 @@ fn active_cfi_consumes_budget_until_its_registration_is_retired() {
             first_entry: 0x2000,
         },
     );
+    reader
+        .process
+        .memory
+        .borrow_mut()
+        .remove(&(live_cfi(&second_image).0 as u64));
     reader.last_revalidation = None;
     reader.refresh_objects(2).unwrap();
     assert!(!reader.objects.contains_key(&first_id));
+    assert!(reader.limit_warned, "a failed read is not budget recovery");
+    install_cfi(&reader.process, &second_image);
+    let retry = reader.load_failures[&second_id].retry_at;
+    reader.refresh_objects(retry).unwrap();
     assert!(matches!(
         reader.objects[&second_id].unwind.cfi,
         CfiState::Loaded { .. }
     ));
+    assert!(
+        !reader.limit_warned,
+        "recovered CFI ends the warning episode"
+    );
 
     // A full snapshot still permits replacing an existing allocation in place.
     let second_size = loaded_cfi_size(&reader.objects[&second_id]);

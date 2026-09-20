@@ -78,6 +78,7 @@ struct CodeRange {
 pub(super) struct JitRegistry {
     registry: Option<Registry<ProcessMemory, ElfSectionData>>,
     mappings: Vec<ProcessMapping>,
+    maps: Vec<u8>,
     generation: u64,
     mappings_changed: bool,
     maps_retry_at: Option<Instant>,
@@ -124,27 +125,34 @@ impl JitRegistry {
             self.last_maps_read = Some(Instant::now());
             match std::fs::read(format!("/proc/{pid}/maps")) {
                 Ok(maps) => {
-                    let mappings = crate::proc_maps::parse_iter(&maps)
-                        .filter(|region| region.inode != 0)
-                        .map(|region| {
-                            let bytes = region.path.as_os_str().as_bytes();
-                            let linked = bytes.strip_suffix(b" (deleted)");
-                            ProcessMapping {
-                                range: region.address,
-                                path: Path::new(OsStr::from_bytes(linked.unwrap_or(bytes))).into(),
-                                offset: region.file_offset,
-                                executable: region.is_executable,
-                                deleted: linked.is_some(),
-                                identity: FileIdentity {
-                                    inode: region.inode,
-                                    device: libc::makedev(region.device_major, region.device_minor),
-                                },
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    if self.mappings != mappings {
-                        self.mappings = mappings;
-                        self.generation = self.generation.wrapping_add(1);
+                    if maps != self.maps {
+                        let mappings = crate::proc_maps::parse_iter(&maps)
+                            .filter(|region| region.inode != 0)
+                            .map(|region| {
+                                let bytes = region.path.as_os_str().as_bytes();
+                                let linked = bytes.strip_suffix(b" (deleted)");
+                                ProcessMapping {
+                                    range: region.address,
+                                    path: Path::new(OsStr::from_bytes(linked.unwrap_or(bytes)))
+                                        .into(),
+                                    offset: region.file_offset,
+                                    executable: region.is_executable,
+                                    deleted: linked.is_some(),
+                                    identity: FileIdentity {
+                                        inode: region.inode,
+                                        device: libc::makedev(
+                                            region.device_major,
+                                            region.device_minor,
+                                        ),
+                                    },
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        if self.mappings != mappings {
+                            self.mappings = mappings;
+                            self.generation = self.generation.wrapping_add(1);
+                        }
+                        self.maps = maps;
                     }
                     self.mappings_changed = false;
                     self.maps_retry_at = None;
