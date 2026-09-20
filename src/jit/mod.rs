@@ -255,15 +255,10 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             return;
         }
         match self.refresh_objects(poll) {
-            Ok(()) => {
-                self.refresh_backoff = None;
-                self.limit_warned = false;
-            }
+            Ok(()) => self.refresh_backoff = None,
             Err(error) => {
-                if matches!(error, SnapshotError::Limit(_)) && !self.limit_warned {
-                    tracing::warn!(pid = self.process.pid(), %error,
-                        "JIT coverage is incomplete; keeping previous metadata and retrying");
-                    self.limit_warned = true;
+                if let SnapshotError::Limit(limit) = error {
+                    self.report_limit(Some(limit));
                 } else {
                     tracing::trace!(%error, "failed to refresh GDB JIT registrations");
                 }
@@ -320,11 +315,17 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         let retained_cfi: u64 = self.objects.values().map(loaded_cfi_size).sum();
         let mut remaining_cfi =
             MAX_JIT_TOTAL_CFI_SIZE.saturating_sub(retained_cfi - loaded_cfi_size(object));
-        let Ok(ObjectChange::Unwind(update)) =
-            object.inspect(&self.process, id, &mut scratch, &mut remaining_cfi)
-        else {
+        let update = match object.inspect(&self.process, id, &mut scratch, &mut remaining_cfi) {
+            Ok(ObjectChange::Unwind(update)) => update,
+            Err(SnapshotError::Limit(limit)) => {
+                if let Some(object) = self.objects.get_mut(&id) {
+                    object.unwind.cfi.mark_budget_limited();
+                }
+                self.report_limit(Some(limit));
+                return false;
+            }
             // Changed image identity waits for the next batch poll.
-            return false;
+            _ => return false,
         };
         if !self
             .read_snapshot()
@@ -338,6 +339,13 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         object.apply_unwind(update);
         self.load_failures.remove(&id);
         self.updates_pending = true;
+        if self.limit_warned {
+            let limit = self
+                .objects
+                .values()
+                .find_map(|object| object.unwind.cfi.budget_limit());
+            self.report_limit(limit);
+        }
         true
     }
 
@@ -431,7 +439,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
                 Err(error) => {
                     remaining_cfi = before_check;
                     tracing::trace!(error = %error, "failed to revalidate registered JIT object");
-                    failed_checks.push(id);
+                    failed_checks.push((id, matches!(error, SnapshotError::Limit(_))));
                     continue;
                 }
             }
@@ -494,7 +502,12 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         for id in checked {
             self.load_failures.remove(&id);
         }
-        for id in failed_checks {
+        for (id, budget_limited) in failed_checks {
+            if budget_limited {
+                if let Some(object) = self.objects.get_mut(&id) {
+                    object.unwind.cfi.mark_budget_limited();
+                }
+            }
             let failure = RetryBackoff::next(self.load_failures.get(&id).copied(), poll);
             self.load_failures.insert(id, failure);
         }
@@ -537,7 +550,25 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
                 }
             }
         }
+        let limit = self
+            .objects
+            .values()
+            .find_map(|object| object.unwind.cfi.budget_limit());
+        self.report_limit(limit);
         Ok(())
+    }
+
+    fn report_limit(&mut self, limit: Option<&'static str>) {
+        if let Some(limit) = limit {
+            if !self.limit_warned {
+                tracing::warn!(
+                    pid = self.process.pid(),
+                    limit,
+                    "JIT coverage is incomplete; retaining available metadata and retrying"
+                );
+            }
+        }
+        self.limit_warned = limit.is_some();
     }
 
     /// Read a bounded registry snapshot for validation around metadata reads.
@@ -600,7 +631,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
 fn loaded_cfi_size<D>(object: &JitObject<D>) -> u64 {
     match &object.unwind.cfi {
         CfiState::Loaded { range, .. } => range.end - range.start,
-        CfiState::Absent | CfiState::Unreadable { .. } => 0,
+        CfiState::Absent | CfiState::Unreadable { .. } | CfiState::BudgetLimited { .. } => 0,
     }
 }
 

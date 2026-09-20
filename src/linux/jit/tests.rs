@@ -236,61 +236,118 @@ fn removals_are_batched_before_replacement_and_preserve_other_owners() {
     assert!(unwinder.is_runtime_frame(FrameAddress::from_instruction_pointer(0x1001)));
 }
 
-struct LoadedLibrary(*mut libc::c_void);
-impl Drop for LoadedLibrary {
+struct TestProcess(std::process::Child);
+impl Drop for TestProcess {
     fn drop(&mut self) {
-        // SAFETY: The handle is returned by dlopen and this owner closes it once.
-        unsafe {
-            libc::dlclose(self.0);
-        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
 #[test]
 fn periodic_maps_read_detects_descriptor_unload_without_a_mapping_event() {
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+
     let directory = TempDir::new("jit-adapter-unload");
     let source = directory.path().join("registry.c");
     let library = directory.path().join("registry.so");
-    std::fs::write(&source,
-        "struct { unsigned version, action; void *relevant, *first; } __jit_debug_descriptor = {1,0,0,0};"
-    ).unwrap();
-    assert!(std::process::Command::new("cc")
-        .args(["-shared", "-fPIC"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&library)
-        .status()
-        .unwrap()
-        .success());
-    let path = std::ffi::CString::new(library.as_os_str().as_bytes()).unwrap();
-    // SAFETY: The NUL-terminated path names the compiled test library.
-    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-    assert!(!handle.is_null());
-    let loaded = LoadedLibrary(handle);
+    let program = directory.path().join("target");
+    std::fs::write(
+        &source,
+        r#"
+#ifdef REGISTRY_LIBRARY
+struct { unsigned version, action; void *relevant, *first; } __jit_debug_descriptor = {1,0,0,0};
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    int fd = open(argv[1], O_RDONLY);
+    struct stat status;
+    if (!library || fd < 0 || fstat(fd, &status)) return 2;
+    void *view = mmap(0, status.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (view == MAP_FAILED) return 3;
+    puts("loaded"); fflush(stdout);
+    if (getchar() == EOF) return 0;
+    if (dlclose(library)) return 4;
+    puts("unloaded"); fflush(stdout);
+    getchar();
+    munmap(view, status.st_size);
+    return 0;
+}
+#endif
+"#,
+    )
+    .unwrap();
+    for (output, options) in [
+        (&library, &["-shared", "-fPIC", "-DREGISTRY_LIBRARY"][..]),
+        (&program, &[][..]),
+    ] {
+        let compiled = Command::new("cc")
+            .args(options)
+            .arg(&source)
+            .args(["-ldl", "-o"])
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+    let mut child = TestProcess(
+        Command::new(&program)
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+    let mut phase = String::new();
+    output.read_line(&mut phase).unwrap();
+    assert_eq!(phase, "loaded\n");
     let mut registry = JitRegistry::default();
     let mut unwinder = NativeUnwinder::default();
     let mut modules = ModuleTable::default();
     let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
-    let pid = std::process::id() as i32;
+    let pid = child.0.id() as i32;
     registry
         .refresh(pid, &mut unwinder, &mut modules, &mut writer)
         .unwrap();
     assert!(registry
         .mappings
         .iter()
-        .any(|mapping| mapping.path == library));
+        .any(|mapping| mapping.path == library && mapping.executable));
     assert!(!registry.registry.as_ref().unwrap().is_absent());
     let generation = registry.generation;
-    drop(loaded);
+    child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    phase.clear();
+    output.read_line(&mut phase).unwrap();
+    assert_eq!(phase, "unloaded\n");
     registry.last_maps_read = Some(Instant::now() - Duration::from_secs(2));
     registry
         .refresh(pid, &mut unwinder, &mut modules, &mut writer)
         .unwrap();
     assert!(registry.generation > generation);
+    assert!(registry
+        .mappings
+        .iter()
+        .any(|mapping| mapping.path == library && !mapping.executable));
     assert!(!registry
         .mappings
         .iter()
-        .any(|mapping| mapping.path == library));
+        .any(|mapping| mapping.path == library && mapping.executable));
+    assert!(
+        registry.registry.as_ref().unwrap().is_absent(),
+        "unloaded descriptor must retire despite the surviving file view"
+    );
 }
 
 #[test]

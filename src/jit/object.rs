@@ -1,5 +1,5 @@
 //! Registered ELF images, symbol ownership, and live unwind sections.
-use super::protocol::{self, JitObjectId};
+use super::protocol::{self, JitObjectId, SnapshotError};
 use super::{jit_error, MAX_JIT_READ_SIZE};
 use super::{MemoryReader, Symbol};
 use crate::elf::find_section_range;
@@ -25,7 +25,28 @@ pub(super) struct JitObject<D> {
 pub(super) enum CfiState {
     Absent,
     Unreadable { range: Range<u64> },
+    BudgetLimited { range: Range<u64> },
     Loaded { range: Range<u64>, fingerprint: u64 },
+}
+
+impl CfiState {
+    pub(super) fn mark_budget_limited(&mut self) {
+        if let Self::Unreadable { range } = self {
+            *self = Self::BudgetLimited {
+                range: range.clone(),
+            };
+        }
+    }
+
+    pub(super) fn budget_limit(&self) -> Option<&'static str> {
+        match self {
+            Self::BudgetLimited { range } if range.end - range.start > MAX_JIT_READ_SIZE => {
+                Some("64 MiB per unwind section")
+            }
+            Self::BudgetLimited { .. } => Some("256 MiB of live unwind data"),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct JitUnwind {
@@ -82,7 +103,7 @@ impl<D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> JitObject<D> {
             .filter(|range| range.start != 0 && !range.is_empty());
         let bytes = range.as_ref().and_then(|range| {
             let size = range.end - range.start;
-            if size > *remaining_cfi {
+            if size > (*remaining_cfi).min(MAX_JIT_READ_SIZE) {
                 return None;
             }
             let bytes = protocol::read_memory(process, range.start, size).ok()?;
@@ -91,6 +112,11 @@ impl<D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> JitObject<D> {
         });
         let cfi = match (range, &bytes) {
             (None, _) => CfiState::Absent,
+            (Some(range), None)
+                if range.end - range.start > (*remaining_cfi).min(MAX_JIT_READ_SIZE) =>
+            {
+                CfiState::BudgetLimited { range }
+            }
             (Some(range), None) => CfiState::Unreadable { range },
             (Some(range), Some(bytes)) => CfiState::Loaded {
                 range,
@@ -119,22 +145,22 @@ impl<D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> JitObject<D> {
         id: JitObjectId,
         scratch: &mut Vec<u8>,
         remaining_cfi: &mut u64,
-    ) -> io::Result<ObjectChange<D>> {
+    ) -> Result<ObjectChange<D>, SnapshotError> {
         protocol::read_memory_into(process, id.symfile_addr, id.symfile_size, scratch)?;
         if fingerprint(scratch) != self.image_fingerprint {
             return Ok(ObjectChange::Image);
         }
         let (range, old_fingerprint) = match &self.unwind.cfi {
             CfiState::Absent => return Ok(ObjectChange::Unchanged),
-            CfiState::Unreadable { range } => (range, None),
+            CfiState::Unreadable { range } | CfiState::BudgetLimited { range } => (range, None),
             CfiState::Loaded { range, fingerprint } => (range, Some(*fingerprint)),
         };
         let size = range.end - range.start;
+        if size > MAX_JIT_READ_SIZE {
+            return Err(SnapshotError::Limit("64 MiB per unwind section"));
+        }
         if size > *remaining_cfi {
-            return Err(jit_error(
-                "GDB JIT CFI",
-                "live sections exceed aggregate bounds".into(),
-            ));
+            return Err(SnapshotError::Limit("256 MiB of live unwind data"));
         }
         protocol::read_memory_into(process, range.start, size, scratch)?;
         let new_fingerprint = fingerprint(scratch);
@@ -175,7 +201,9 @@ impl JitUnwind {
         let text = self.text.as_ref().unwrap_or(first);
         let eh_frame = match &self.cfi {
             CfiState::Absent => None,
-            CfiState::Unreadable { range } | CfiState::Loaded { range, .. } => Some(range.clone()),
+            CfiState::Unreadable { range }
+            | CfiState::BudgetLimited { range }
+            | CfiState::Loaded { range, .. } => Some(range.clone()),
         };
         // Share one index across sections; absolute addresses also cover sparse images.
         let eh_frame_hdr = bytes

@@ -261,6 +261,7 @@ fn image_descriptor(
                 owner_identity: module.file_identity(),
             }));
         }
+        return Err(std::io::Error::other("descriptor mapping is not available"));
     }
     Ok(None)
 }
@@ -527,5 +528,44 @@ mod tests {
             assert!(!found.iter().any(|found| found.owner == path));
             assert!(!discovery.images.contains_key(&path));
         }
+    }
+    #[test]
+    fn missing_descriptor_mapping_retries_when_data_arrives() {
+        let (_directory, path, bytes) = descriptor_image();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let address = 0x100000 + descriptor_symbol(&elf).unwrap();
+        let module = |segment: &goblin::elf::ProgramHeader| {
+            mapping(
+                &path,
+                0x100000 + segment.p_vaddr,
+                segment.p_memsz,
+                segment.p_offset,
+                segment.p_flags & PF_X != 0,
+            )
+        };
+        let mut modules: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|segment| segment.p_type == PT_LOAD && segment.p_flags & PF_X != 0)
+            .map(module)
+            .collect();
+        let mut discovery = DescriptorDiscovery::default();
+        let pid = std::process::id() as i32;
+        let (found, complete) = discovery.find(pid, &modules);
+        assert!(
+            !complete,
+            "executable mapping does not prove descriptor data is ready"
+        );
+        assert!(!found.iter().any(|found| found.owner == path));
+        assert!(!discovery.images.contains_key(&path));
+        modules.extend(
+            elf.program_headers
+                .iter()
+                .filter(|segment| segment.p_type == PT_LOAD && segment.p_flags & PF_X == 0)
+                .map(module),
+        );
+        let (found, complete) = discovery.find(pid, &modules);
+        assert!(complete);
+        assert!(found.iter().any(|found| found.address == address));
     }
 }
