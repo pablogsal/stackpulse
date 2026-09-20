@@ -369,7 +369,7 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
-    use framehop::{FrameAddress, MayAllocateDuringUnwind, Unwinder};
+    use framehop::{FrameAddress, MayAllocateDuringUnwind, Unwinder, UnwinderWithDetails};
 
     #[test]
     fn malformed_cfi_preserves_distant_code_ranges() {
@@ -408,7 +408,7 @@ mod tests {
                         cfi.extend_from_slice(&24_u32.to_le_bytes());
                         cfi.extend_from_slice(&cie_pointer.to_le_bytes());
                         let pc = if text_relative {
-                            address.wrapping_sub(addresses[text_index])
+                            address.wrapping_sub(addresses[text_index] - 16)
                         } else {
                             address
                         };
@@ -423,10 +423,10 @@ mod tests {
                             range: 0x9000..0x9000 + cfi.len() as u64,
                             fingerprint: fingerprint(&cfi),
                         },
-                        text: Some(addresses[text_index]..addresses[text_index] + 16),
+                        text: Some(addresses[text_index] - 16..addresses[text_index] + 16),
                         got: None,
                     };
-                    let ranges = addresses.map(|address| address..address + 16);
+                    let ranges = addresses.map(|address| address - 16..address + 16);
                     let modules = unwind.build_modules::<Arc<[u8]>>(
                         Path::new("[jit-wide]"),
                         &ranges,
@@ -437,25 +437,52 @@ mod tests {
                         unwinder.add_module(module);
                     }
                     let mut cache = CacheX86_64::new();
-                    for (index, address) in addresses.into_iter().enumerate() {
-                        let cfa_offset = 48 + index as u64 * 16;
-                        let mut regs = UnwindRegsX86_64::new(address + 1, 0x1000, 0);
-                        let caller = unwinder
-                            .unwind_frame(
-                                FrameAddress::from_instruction_pointer(address + 1),
+                    // Exercise missing FDEs with both cold and warm rule caches.
+                    for _ in 0..2 {
+                        let address = addresses[0] - 8;
+                        let mut regs = UnwindRegsX86_64::new(address, 0x1000, 0x1020);
+                        let result = unwinder
+                            .unwind_frame_with_details(
+                                FrameAddress::from_instruction_pointer(address),
                                 &mut regs,
                                 &mut cache,
-                                &mut |address| {
-                                    if address == 0x1000 + cfa_offset - 8 {
-                                        Ok(0xbeef)
-                                    } else {
-                                        Err(())
-                                    }
+                                &mut |slot| match slot {
+                                    0x1000 => Ok(0xdead),
+                                    0x1020 => Ok(0x1100),
+                                    0x1028 => Ok(0xbeef),
+                                    _ => Err(()),
                                 },
                             )
                             .unwrap();
-                        assert_eq!(caller, Some(0xbeef), "section at {address:#x}");
-                        assert_eq!(regs.sp(), 0x1000 + cfa_offset);
+                        assert_eq!(result.return_address(), Some(0xbeef));
+                        assert_eq!(regs.sp(), 0x1030);
+                        assert!(result.fallback_reason().is_some());
+
+                        for (index, address) in addresses.into_iter().enumerate() {
+                            let cfa_offset = 48 + index as u64 * 16;
+                            let mut regs = UnwindRegsX86_64::new(address + 1, 0x1000, 0);
+                            let result = unwinder
+                                .unwind_frame_with_details(
+                                    FrameAddress::from_instruction_pointer(address + 1),
+                                    &mut regs,
+                                    &mut cache,
+                                    &mut |address| {
+                                        if address == 0x1000 + cfa_offset - 8 {
+                                            Ok(0xbeef)
+                                        } else {
+                                            Err(())
+                                        }
+                                    },
+                                )
+                                .unwrap();
+                            assert_eq!(result.fallback_reason(), None, "section at {address:#x}");
+                            assert_eq!(
+                                result.return_address(),
+                                Some(0xbeef),
+                                "section at {address:#x}"
+                            );
+                            assert_eq!(regs.sp(), 0x1000 + cfa_offset);
+                        }
                     }
                 }
             }

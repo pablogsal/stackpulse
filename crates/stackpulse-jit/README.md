@@ -17,7 +17,7 @@ After an unresolved known JIT frame, `refresh_for_address` can refresh its CFI;
 drain the resulting updates before retrying the captured stack.
 
 `Update<D>::Loaded` returns `framehop::Module<D>` from `framehop-stackpulse`
-0.17 with its `std` feature. Consumers must resolve the same Framehop package
+0.17.1 with its `std` feature. Consumers must resolve the same Framehop package
 version and source. Section storage defaults to `Arc<[u8]>`; a caller-owned
 type can implement `From<Arc<[u8]>> + Deref<Target = [u8]> + Clone`. A load with
 `symbols: None` preserves the current symbol identity. Retained symbols remain
@@ -34,5 +34,4 @@ is needed.
 When releasing the workspace, publish `framehop-stackpulse` first if its version
 changed, then `stackpulse-jit`, then `stackpulse`. Path dependencies also declare
 registry versions so packaged crates resolve in that order.
-The tag workflow publishes only StackPulse, so publish new dependency versions
-before tagging it.
+The tag workflow publishes unpublished workspace versions in dependency order.

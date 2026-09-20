@@ -18,7 +18,7 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 workspace = true
 
 [dependencies]
-framehop = { package = "framehop-stackpulse", path = "../framehop-stackpulse", version = "0.17.0", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "../framehop-stackpulse", version = "0.17.1", default-features = false, features = ["std"] }
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 goblin = "0.10"
 libc = "0.2"

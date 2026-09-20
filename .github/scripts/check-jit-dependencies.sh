@@ -15,7 +15,7 @@ edition = "2021"
 
 [dependencies]
 stackpulse-jit = { path = "$root/crates/stackpulse-jit" }
-framehop = { package = "framehop-stackpulse", path = "$root/crates/framehop-stackpulse", version = "0.17.0", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "$root/crates/framehop-stackpulse", version = "0.17.1", default-features = false, features = ["std"] }
 EOF
 cat > "$consumer/src/lib.rs" <<'EOF'
 pub use stackpulse_jit::{FileIdentity, Mapping, MemoryReader, Registry, Symbol, Update};
