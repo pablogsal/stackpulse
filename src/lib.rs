@@ -15,6 +15,8 @@ mod elf;
 mod error;
 /// Validated Linux process and thread identifiers.
 mod identity;
+#[cfg(target_pointer_width = "64")]
+pub mod jit;
 mod linux;
 mod module_base;
 mod native_module;

@@ -143,7 +143,7 @@ fn calculate_base_svma(elf: &Elf) -> u64 {
         .map_or(0, |ph| ph.p_vaddr)
 }
 
-fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
+pub(crate) fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
     let mut segments: Vec<_> = elf
         .program_headers
         .iter()
@@ -243,7 +243,7 @@ fn checked_u64_range(start: u64, size: u64) -> Option<Range<u64>> {
 }
 
 /// Find a section by name and return its SVMA range.
-fn find_section_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
+pub(crate) fn find_section_range(name: &str, elf: &Elf) -> Option<Range<u64>> {
     let sh = find_section_header(name, elf)?;
     checked_u64_range(sh.sh_addr, sh.sh_size)
 }
