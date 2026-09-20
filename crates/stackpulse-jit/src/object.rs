@@ -125,7 +125,8 @@ impl<D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> JitObject<D> {
         };
         let unwind = JitUnwind {
             cfi,
-            text: find_section_range(".text", &elf).filter(|range| !range.is_empty()),
+            text: find_section_range(".text", &elf)
+                .filter(|range| range.start != 0 && !range.is_empty()),
             got: find_section_range(".got", &elf).filter(|range| !range.is_empty()),
         };
         let pending_modules = unwind.build_modules(&path, &code_ranges, bytes);

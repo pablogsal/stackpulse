@@ -393,6 +393,80 @@ fn reader_for_image(image: Vec<u8>) -> (Registry<MockProcess, Arc<[u8]>>, JitObj
 
 #[test]
 #[cfg(target_arch = "x86_64")]
+fn zero_address_text_uses_the_first_executable_section_for_relative_cfi() {
+    use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+    use framehop::{FrameAddress, MayAllocateDuringUnwind, Unwinder, UnwinderWithDetails};
+
+    let mut image = registered_image("first");
+    let elf = goblin::elf::Elf::parse(&image).unwrap();
+    let section_offset = |name| {
+        let index = elf
+            .section_headers
+            .iter()
+            .position(|section| elf.shdr_strtab.get_at(section.sh_name) == Some(name))
+            .unwrap();
+        elf.header.e_shoff as usize + index * elf.header.e_shentsize as usize
+    };
+    let text = section_offset(".text");
+    let eh_frame = section_offset(".eh_frame");
+    let section_size = elf.header.e_shentsize as usize;
+    let section_count = elf.header.e_shnum;
+    assert_eq!(
+        elf.header.e_shoff as usize + section_size * section_count as usize,
+        image.len()
+    );
+
+    // Keep the relocated code in a second section while .text is unrelocated.
+    let mut relocated = image[text..text + section_size].to_vec();
+    relocated[..4].copy_from_slice(&0_u32.to_le_bytes());
+    image.extend_from_slice(&relocated);
+    image[60..62].copy_from_slice(&(section_count + 1).to_le_bytes());
+    image[text + 16..text + 24].copy_from_slice(&0_u64.to_le_bytes());
+
+    // Text-relative FDE at offset zero, with CFA = rsp + 48 and RA at CFA - 8.
+    let mut cfi = vec![
+        20, 0, 0, 0, 0, 0, 0, 0, 1, b'z', b'R', 0, 1, 0x78, 16, 1, 0x2c, 0x0c, 7, 48, 0x90, 1, 0, 0,
+    ];
+    cfi.extend_from_slice(&24_u32.to_le_bytes());
+    cfi.extend_from_slice(&28_u32.to_le_bytes());
+    cfi.extend_from_slice(&0_u64.to_le_bytes());
+    cfi.extend_from_slice(&3_u64.to_le_bytes());
+    cfi.extend_from_slice(&[0; 4]);
+    cfi.extend_from_slice(&0_u32.to_le_bytes());
+    image[eh_frame + 32..eh_frame + 40].copy_from_slice(&(cfi.len() as u64).to_le_bytes());
+    let (reader, id) = reader_for_image(image);
+    reader.process.set_memory(0x9000, &cfi);
+    let mut remaining = MAX_JIT_TOTAL_CFI_SIZE;
+    let object = JitObject::<Arc<[u8]>>::load(&reader.process, id, &mut remaining).unwrap();
+    assert_eq!(object.code_ranges.len(), 1);
+    assert_eq!(object.code_ranges[0], 0x8000..0x8003);
+
+    let mut unwinder = UnwinderX86_64::<_, MayAllocateDuringUnwind>::new();
+    for module in object.pending_modules {
+        unwinder.add_module(module);
+    }
+    let mut regs = UnwindRegsX86_64::new(0x8001, 0x1000, 0);
+    let result = unwinder
+        .unwind_frame_with_details(
+            FrameAddress::from_instruction_pointer(0x8001),
+            &mut regs,
+            &mut CacheX86_64::new(),
+            &mut |address| {
+                if address == 0x1028 {
+                    Ok(0xbeef)
+                } else {
+                    Err(())
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(result.return_address(), Some(0xbeef));
+    assert_eq!(result.fallback_reason(), None);
+    assert_eq!(regs.sp(), 0x1030);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
 fn unreadable_cfi_keeps_symbols_and_late_cfi_can_be_refreshed() {
     let (mut reader, id) = registered_reader();
     reader.refresh_objects(0).unwrap();
