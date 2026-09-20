@@ -35,8 +35,10 @@ fn recorded_identities_survive_cfi_updates_retirement_and_address_reuse() {
                  unwinder: &mut NativeUnwinder,
                  modules: &mut ModuleTable,
                  writer: &mut PerfSpoolWriter<Vec<u8>>| {
+        let mut retired = FxHashSet::default();
         apply_update(
             &mut registry.code_ranges,
+            &mut retired,
             update,
             7,
             unwinder,
@@ -44,6 +46,7 @@ fn recorded_identities_survive_cfi_updates_retirement_and_address_reuse() {
             writer,
         )
         .unwrap();
+        retire_ranges(&mut registry.code_ranges, &mut retired, unwinder);
     };
     apply(
         &mut registry,
@@ -139,6 +142,7 @@ fn persistence_failure_is_returned_before_frame_or_unwind_publication() {
     let mut unwinder = NativeUnwinder::default();
     let error = apply_update(
         &mut ranges,
+        &mut FxHashSet::default(),
         loaded("failed"),
         7,
         &mut unwinder,
@@ -172,4 +176,152 @@ fn failed_maps_reads_wait_before_retrying() {
         .unwrap();
     assert_eq!(registry.maps_retry_at, Some(retry));
     assert!(registry.registry.is_none());
+}
+
+#[test]
+fn removals_are_batched_before_replacement_and_preserve_other_owners() {
+    let mut registry = JitRegistry::default();
+    let mut unwinder = NativeUnwinder::default();
+    for index in 0..128 {
+        let start = 0x1000 + index * 0x100;
+        registry.code_ranges.insert(
+            start,
+            CodeRange {
+                end: start + 0x100,
+                module_id: index as u32,
+                path: PathBuf::from(format!("[jit-{index}]")).into(),
+            },
+        );
+        unwinder.add_jit_module(test_module(start..start + 0x100));
+    }
+    let mut modules = ModuleTable::default();
+    let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+    let mut retired = FxHashSet::default();
+    for index in 0..127 {
+        apply_update(
+            &mut registry.code_ranges,
+            &mut retired,
+            Update::Removed {
+                path: format!("[jit-{index}]").into(),
+            },
+            7,
+            &mut unwinder,
+            &mut modules,
+            &mut writer,
+        )
+        .unwrap();
+    }
+    // A removal batch leaves the range table untouched until publication starts.
+    assert_eq!(registry.code_ranges.len(), 128);
+    apply_update(
+        &mut registry.code_ranges,
+        &mut retired,
+        Update::Loaded {
+            path: "[jit-0]".into(),
+            modules: vec![test_module(0x1000..0x1100)].into(),
+            symbols: Some(Vec::new()),
+        },
+        7,
+        &mut unwinder,
+        &mut modules,
+        &mut writer,
+    )
+    .unwrap();
+    retire_ranges(&mut registry.code_ranges, &mut retired, &mut unwinder);
+    assert_eq!(registry.code_ranges.len(), 2);
+    assert!(registry.frame(0x1001).is_some());
+    assert!(registry.frame(0x1101).is_none());
+    assert!(registry.frame(0x8f01).is_some());
+    assert!(!unwinder.is_runtime_frame(FrameAddress::from_instruction_pointer(0x1101)));
+    assert!(unwinder.is_runtime_frame(FrameAddress::from_instruction_pointer(0x1001)));
+}
+
+struct LoadedLibrary(*mut libc::c_void);
+impl Drop for LoadedLibrary {
+    fn drop(&mut self) {
+        // SAFETY: The handle is returned by dlopen and this owner closes it once.
+        unsafe {
+            libc::dlclose(self.0);
+        }
+    }
+}
+
+#[test]
+fn periodic_maps_read_detects_descriptor_unload_without_a_mapping_event() {
+    let directory = TempDir::new("jit-adapter-unload");
+    let source = directory.path().join("registry.c");
+    let library = directory.path().join("registry.so");
+    std::fs::write(&source,
+        "struct { unsigned version, action; void *relevant, *first; } __jit_debug_descriptor = {1,0,0,0};"
+    ).unwrap();
+    assert!(std::process::Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap()
+        .success());
+    let path = std::ffi::CString::new(library.as_os_str().as_bytes()).unwrap();
+    // SAFETY: The NUL-terminated path names the compiled test library.
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null());
+    let loaded = LoadedLibrary(handle);
+    let mut registry = JitRegistry::default();
+    let mut unwinder = NativeUnwinder::default();
+    let mut modules = ModuleTable::default();
+    let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+    let pid = std::process::id() as i32;
+    registry
+        .refresh(pid, &mut unwinder, &mut modules, &mut writer)
+        .unwrap();
+    assert!(registry
+        .mappings
+        .iter()
+        .any(|mapping| mapping.path == library));
+    assert!(!registry.registry.as_ref().unwrap().is_absent());
+    let generation = registry.generation;
+    drop(loaded);
+    registry.last_maps_read = Some(Instant::now() - Duration::from_secs(2));
+    registry
+        .refresh(pid, &mut unwinder, &mut modules, &mut writer)
+        .unwrap();
+    assert!(registry.generation > generation);
+    assert!(!registry
+        .mappings
+        .iter()
+        .any(|mapping| mapping.path == library));
+}
+
+#[test]
+fn confirmed_absence_skips_periodic_maps_reads_until_an_event() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("10")
+        .spawn()
+        .unwrap();
+    let mut registry = JitRegistry::default();
+    let mut unwinder = NativeUnwinder::default();
+    let mut modules = ModuleTable::default();
+    let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+    let pid = child.id() as i32;
+    registry
+        .refresh(pid, &mut unwinder, &mut modules, &mut writer)
+        .unwrap();
+    let absent = registry.registry.as_ref().unwrap().is_absent();
+    let old_read = Instant::now() - Duration::from_secs(2);
+    registry.last_maps_read = Some(old_read);
+    registry
+        .refresh(pid, &mut unwinder, &mut modules, &mut writer)
+        .unwrap();
+    let periodic_read = registry.last_maps_read;
+    registry.mappings_changed();
+    registry
+        .refresh(pid, &mut unwinder, &mut modules, &mut writer)
+        .unwrap();
+    let event_read = registry.last_maps_read;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(absent);
+    assert_eq!(periodic_read, Some(old_read));
+    assert!(event_read > periodic_read);
 }

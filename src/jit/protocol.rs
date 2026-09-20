@@ -6,6 +6,14 @@ use rustc_hash::FxHashMap as HashMap;
 use std::io;
 use std::path::PathBuf;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SnapshotError {
+    #[error(transparent)]
+    Read(#[from] io::Error),
+    #[error("GDB JIT registry exceeds {0}")]
+    Limit(&'static str),
+}
+
 /// Version 1 GDB JIT descriptor as laid out in a 64-bit target process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct JitDescriptor {
@@ -101,7 +109,7 @@ pub(super) fn read_descriptors<P: MemoryReader>(
 pub(super) fn read_snapshot<P: MemoryReader>(
     process: &P,
     descriptors: Vec<(u64, JitDescriptor)>,
-) -> io::Result<JitSnapshot> {
+) -> Result<JitSnapshot, SnapshotError> {
     let mut entries = HashMap::default();
     let mut total_size = 0_u64;
     for (_, descriptor) in &descriptors {
@@ -111,18 +119,19 @@ pub(super) fn read_snapshot<P: MemoryReader>(
                     return Err(jit_error(
                         "GDB JIT registry",
                         "inconsistent shared registration".into(),
-                    ));
+                    )
+                    .into());
                 }
                 continue;
             }
             total_size = total_size
                 .checked_add(entry.symfile_size)
                 .ok_or_else(|| io::Error::other("JIT registry size overflow"))?;
-            if entries.len() > MAX_JIT_ENTRIES || total_size > MAX_JIT_TOTAL_SIZE {
-                return Err(jit_error(
-                    "GDB JIT registry",
-                    "registered objects exceed bounds".into(),
-                ));
+            if entries.len() > MAX_JIT_ENTRIES {
+                return Err(SnapshotError::Limit("4096 registrations"));
+            }
+            if total_size > MAX_JIT_TOTAL_SIZE {
+                return Err(SnapshotError::Limit("256 MiB of registered objects"));
             }
         }
     }
@@ -135,22 +144,16 @@ pub(super) fn read_snapshot<P: MemoryReader>(
 pub(super) fn read_entries<P: MemoryReader>(
     process: &P,
     first_entry: u64,
-) -> io::Result<HashMap<u64, JitCodeEntry>> {
+) -> Result<HashMap<u64, JitCodeEntry>, SnapshotError> {
     let mut entries = HashMap::default();
     let mut address = first_entry;
     let mut previous = 0;
     while address != 0 {
         if entries.len() == MAX_JIT_ENTRIES {
-            return Err(jit_error(
-                "GDB JIT traversal",
-                format!("exceeded {MAX_JIT_ENTRIES} entries"),
-            ));
+            return Err(SnapshotError::Limit("4096 registrations"));
         }
         if entries.contains_key(&address) {
-            return Err(jit_error(
-                "GDB JIT traversal",
-                format!("cycle at 0x{address:x}"),
-            ));
+            return Err(jit_error("GDB JIT traversal", format!("cycle at 0x{address:x}")).into());
         }
         let bytes = read_array::<32>(process, address)?;
         let (words, _) = bytes.as_chunks::<8>();
@@ -160,11 +163,11 @@ pub(super) fn read_entries<P: MemoryReader>(
             symfile_addr: u64::from_ne_bytes(words[2]),
             symfile_size: u64::from_ne_bytes(words[3]),
         };
-        if entry.symfile_size == 0 || entry.symfile_size > MAX_JIT_READ_SIZE {
-            return Err(jit_error(
-                "GDB JIT symfile",
-                format!("invalid size {}", entry.symfile_size),
-            ));
+        if entry.symfile_size > MAX_JIT_READ_SIZE {
+            return Err(SnapshotError::Limit("64 MiB per object"));
+        }
+        if entry.symfile_size == 0 {
+            return Err(jit_error("GDB JIT symfile", "invalid size 0".into()).into());
         }
         if entry.prev_entry != previous {
             return Err(jit_error(
@@ -173,7 +176,8 @@ pub(super) fn read_entries<P: MemoryReader>(
                     "entry 0x{address:x} points back to 0x{:x}, expected 0x{previous:x}",
                     entry.prev_entry
                 ),
-            ));
+            )
+            .into());
         }
         entries.insert(address, entry);
         previous = address;
@@ -219,4 +223,64 @@ pub(super) fn read_memory_into<P: MemoryReader>(
     let size = usize::try_from(size).map_err(|_| io::Error::other("JIT read overflow"))?;
     buffer.resize(size, 0);
     process.read(address, buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RegistryList {
+        count: usize,
+        image_size: u64,
+    }
+
+    impl MemoryReader for RegistryList {
+        fn pid(&self) -> i32 {
+            1
+        }
+
+        fn read(&self, address: u64, buffer: &mut [u8]) -> io::Result<()> {
+            let index = ((address - 0x1000) / 32) as usize;
+            let words = [
+                if index + 1 < self.count {
+                    address + 32
+                } else {
+                    0
+                },
+                if index == 0 { 0 } else { address - 32 },
+                0x100000,
+                self.image_size,
+            ];
+            for (chunk, word) in buffer.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+                chunk.copy_from_slice(&word.to_ne_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registry_limits_remain_distinct_from_invalid_target_data() {
+        let descriptor = JitDescriptor {
+            version: 1,
+            action_flag: 0,
+            relevant_entry: 0,
+            first_entry: 0x1000,
+        };
+        for (count, image_size, limit) in [
+            (MAX_JIT_ENTRIES + 1, 1, "4096 registrations"),
+            (1, MAX_JIT_READ_SIZE + 1, "64 MiB per object"),
+            (5, MAX_JIT_READ_SIZE, "256 MiB of registered objects"),
+        ] {
+            let error = read_snapshot(&RegistryList { count, image_size }, vec![(1, descriptor)]);
+            assert!(matches!(error, Err(SnapshotError::Limit(actual)) if actual == limit));
+        }
+        let error = read_snapshot(
+            &RegistryList {
+                count: 1,
+                image_size: 0,
+            },
+            vec![(1, descriptor)],
+        );
+        assert!(matches!(error, Err(SnapshotError::Read(_))));
+    }
 }

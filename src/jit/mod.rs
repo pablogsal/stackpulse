@@ -10,8 +10,9 @@ mod protocol;
 
 use discovery::{DescriptorDiscovery, JitDescriptorLocation};
 use object::{CfiState, JitObject, ObjectChange};
-use protocol::{JitDescriptor, JitObjectId, JitSnapshot};
+use protocol::{JitDescriptor, JitObjectId, JitSnapshot, SnapshotError};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::ops::{Deref, Range};
 use std::path::Path;
@@ -28,7 +29,7 @@ pub trait MemoryReader {
 }
 
 /// File identity used to reject pathname replacements during discovery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     /// Inode recorded in the process mapping.
     pub inode: u64,
@@ -122,6 +123,8 @@ pub struct Registry<P, D = Arc<[u8]>> {
     descriptor_search_generation: Option<u64>,
     /// Successfully parsed objects from the last committed stable snapshot.
     objects: HashMap<JitObjectId, JitObject<D>>,
+    code_ranges: BTreeMap<u64, (u64, JitObjectId)>,
+    limit_warned: bool,
     /// Per-object retry schedules for active registrations that failed to load.
     load_failures: HashMap<JitObjectId, RetryBackoff>,
     /// Retry schedule after a descriptor or list snapshot could not be read.
@@ -152,6 +155,8 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             descriptors: Vec::new(),
             descriptor_search_generation: None,
             objects: HashMap::default(),
+            code_ranges: BTreeMap::new(),
+            limit_warned: false,
             load_failures: HashMap::default(),
             refresh_backoff: None,
             poll_count: 0,
@@ -165,6 +170,12 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             discovery: DescriptorDiscovery::default(),
             needs_reconciliation: true,
         }
+    }
+
+    /// Whether complete discovery found no registry in the last mapping generation.
+    /// A changed mapping generation must still be passed to `refresh`.
+    pub fn is_absent(&self) -> bool {
+        self.descriptor_search_generation.is_some() && self.descriptors.is_empty()
     }
 
     /// Consume changes coalesced since the previous drain, before capturing samples.
@@ -225,9 +236,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         {
             self.last_discovery = Some((module_generation, now));
             self.descriptor_search_generation = Some(module_generation);
-            let (locations, complete) =
-                self.discovery
-                    .find(self.process.pid(), module_generation, modules);
+            let (locations, complete) = self.discovery.find(self.process.pid(), modules);
             self.update_descriptors(locations, modules);
             if !complete {
                 self.descriptor_search_generation = None;
@@ -246,12 +255,18 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             return;
         }
         match self.refresh_objects(poll) {
-            Ok(()) => self.refresh_backoff = None,
+            Ok(()) => {
+                self.refresh_backoff = None;
+                self.limit_warned = false;
+            }
             Err(error) => {
-                tracing::trace!(
-                    error = %error,
-                    "failed to refresh GDB JIT registrations"
-                );
+                if matches!(error, SnapshotError::Limit(_)) && !self.limit_warned {
+                    tracing::warn!(pid = self.process.pid(), %error,
+                        "JIT coverage is incomplete; keeping previous metadata and retrying");
+                    self.limit_warned = true;
+                } else {
+                    tracing::trace!(%error, "failed to refresh GDB JIT registrations");
+                }
                 self.refresh_backoff = Some(RetryBackoff::next(self.refresh_backoff, poll));
             }
         }
@@ -267,13 +282,17 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         {
             return false;
         }
-        let Some((&id, object)) = self.objects.iter().find(|(_, object)| {
-            object
-                .code_ranges
-                .iter()
-                .any(|range| range.contains(&address))
-        }) else {
+        let Some(&(_, id)) = self
+            .code_ranges
+            .range(..=address)
+            .next_back()
+            .map(|(_, range)| range)
+            .filter(|(end, _)| address < *end)
+        else {
             self.last_demand_refresh = Some(now);
+            return false;
+        };
+        let Some(object) = self.objects.get(&id) else {
             return false;
         };
         if self
@@ -327,7 +346,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
     /// Each descriptor is read again after loading remote ELF buffers. A change
     /// between those reads discards the candidate updates because the target
     /// was allowed to run throughout the operation.
-    fn refresh_objects(&mut self, poll: u64) -> io::Result<()> {
+    fn refresh_objects(&mut self, poll: u64) -> Result<(), SnapshotError> {
         let snapshots = protocol::read_descriptors(&self.process, &self.descriptors)?;
         let revalidate = self
             .last_revalidation
@@ -459,10 +478,14 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         };
         let stale_paths = &mut self.stale_paths;
         let updates_pending = &mut self.updates_pending;
-        self.objects.retain(|id, _| {
+        let code_ranges = &mut self.code_ranges;
+        self.objects.retain(|id, object| {
             let active = is_active(id) && !invalidated.contains(id);
             if !active {
                 stale_paths.insert(id.path());
+                for range in &object.code_ranges {
+                    code_ranges.remove(&range.start);
+                }
                 *updates_pending = true;
             }
             active
@@ -484,19 +507,20 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         for (id, update) in updates {
             match update {
                 Ok(object) => {
-                    if self.objects.values().any(|existing| {
-                        existing.code_ranges.iter().any(|a| {
-                            object
-                                .code_ranges
-                                .iter()
-                                .any(|b| a.start < b.end && b.start < a.end)
-                        })
+                    if object.code_ranges.iter().any(|range| {
+                        self.code_ranges
+                            .range(..range.end)
+                            .next_back()
+                            .is_some_and(|(_, (end, _))| *end > range.start)
                     }) {
                         self.load_failures.insert(
                             id,
                             RetryBackoff::next(self.load_failures.get(&id).copied(), poll),
                         );
                         continue;
+                    }
+                    for range in &object.code_ranges {
+                        self.code_ranges.insert(range.start, (range.end, id));
                     }
                     self.objects.insert(id, object);
                     self.updates_pending = true;
@@ -517,7 +541,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
     }
 
     /// Read a bounded registry snapshot for validation around metadata reads.
-    fn read_snapshot(&self) -> io::Result<JitSnapshot> {
+    fn read_snapshot(&self) -> Result<JitSnapshot, SnapshotError> {
         let descriptors = protocol::read_descriptors(&self.process, &self.descriptors)?;
         protocol::read_snapshot(&self.process, descriptors)
     }
@@ -528,6 +552,8 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         self.stale_paths
             .extend(self.objects.keys().map(|id| id.path()));
         self.objects.clear();
+        self.code_ranges.clear();
+        self.limit_warned = false;
         self.load_failures.clear();
     }
 
