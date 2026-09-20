@@ -57,8 +57,11 @@ jobs:
       - name: Lint without default features
         run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 
-      - name: Check the standalone JIT dependency boundary
-        run: bash .github/scripts/check-jit-dependencies.sh
+      - name: Check the standalone JIT consumer
+        run: |
+          cargo fmt --manifest-path test-crates/jit-consumer/Cargo.toml -- --check
+          cargo clippy --manifest-path test-crates/jit-consumer/Cargo.toml --locked -- -D warnings
+          cargo tree --manifest-path test-crates/jit-consumer/Cargo.toml --locked --edges normal,build
 
       - name: Enforce panic and unsafe boundaries in production code
         run: make clippy-strict
