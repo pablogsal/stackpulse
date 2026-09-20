@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "framehop-stackpulse"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "arrayvec",
  "cfg-if",

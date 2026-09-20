@@ -56,6 +56,23 @@ If you enable kernel capture, StackPulse also keeps the captured kernel frames.
 Kernel symbols supply their names. Optional perf-map lookup supplies another
 source of function names. A perf map does not supply unwind rules.
 
+Hardware CPU cycles drive sampling by default. To select software CPU-clock
+sampling, use `Recorder::builder(rate).sampling_event(SamplingEvent::CpuClock)`;
+`SamplingEvent` is available in `stackpulse::record`. This provides an alternative
+when hardware-interrupt samples produce inconsistent saved user state.
+
+When kernel capture is disabled, StackPulse discards kernel-mode records before
+unwinding and reports them in `RecordingSummary::excluded_kernel_samples`. These
+records still count toward `sample_events`; they are separate from events lost
+by the kernel. Enabling kernel capture permits kernel-mode records and does not
+guarantee that their saved user state is consistent.
+
+Linux perf accepts at most 65,528 bytes of requested user stack per sample and
+can return fewer bytes. If a generated frame places its caller outside the
+captured bytes, increasing the sampling rate cannot recover that caller. Use a
+profiler's native-only capture mode with a sufficient stack size for that
+workload. Selecting CPU-clock sampling does not change this limit.
+
 GDB JIT capture does not require a perf map or an LLVM jitdump file. It reads
 JIT information from the target process during recording.
 

@@ -4,6 +4,7 @@
 mod common;
 
 use common::{attach_is_not_allowed, environment_skips_allowed};
+use stackpulse::record::SamplingEvent;
 use stackpulse::{Pid, Recorder, SampleRate, Snapshot, Spool};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -309,6 +310,66 @@ fn matching_samples<'a>(
 #[test]
 fn anonymous_jit_unwinds_and_replays_after_exit() {
     record_and_replay(FixtureOptions::default());
+}
+
+#[test]
+fn selected_events_preserve_registered_callers() {
+    let rate = stackpulse::record::max_sample_rate().unwrap().min(5_000) as u32;
+    for (event, kernel) in [
+        (SamplingEvent::CpuCycles, false),
+        (SamplingEvent::CpuClock, false),
+        (SamplingEvent::CpuClock, true),
+    ] {
+        let mut target = JitTarget::spawn(&FixtureOptions::default());
+        let mut ready = String::new();
+        BufReader::new(target.child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert!(ready.starts_with("ready "));
+        let path = target.directory.join("events.spool");
+        let mut recorder = match Recorder::builder(SampleRate::hz(rate).unwrap())
+            .sampling_event(event)
+            .include_kernel(kernel)
+            .attach(
+                Pid::try_from(target.child.id()).unwrap(),
+                Spool::retained(File::create(&path).unwrap()).unwrap(),
+            ) {
+            Ok(recorder) => recorder,
+            Err(error) if attach_is_not_allowed(&error) && environment_skips_allowed() => {
+                eprintln!("skipping event-source test: profiling is not allowed here: {error}");
+                return;
+            }
+            Err(error) => panic!("could not attach {event:?} recorder: {error}"),
+        };
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end {
+            recorder.poll(Duration::from_millis(20)).unwrap();
+        }
+        let summary = recorder.finish().unwrap();
+        let snapshot = Snapshot::open(&path).unwrap();
+        let mut symbolizer = snapshot.symbolizer().build().unwrap();
+        let mut jit = 0;
+        let mut wrong = 0;
+        for sample in snapshot.samples() {
+            let stack = symbolizer.resolve(sample.stack()).unwrap();
+            let mut frames = stack.frames();
+            if frames.any(|frame| {
+                matches!(frame, stackpulse::profile::Frame::Native(native)
+                if native.origin == stackpulse::profile::SymbolOrigin::GdbJit
+                    && native.name() == Some("registered_leaf"))
+            }) {
+                jit += 1;
+                wrong +=
+                    usize::from(frames.next().and_then(|frame| frame.name()) != Some("jit_caller"));
+            }
+        }
+        eprintln!("event={event:?} requested_kernel={kernel} rate={rate} jit={jit} wrong={wrong} summary={summary:?}");
+        assert!(
+            jit >= 5,
+            "recording did not recover enough registered frames"
+        );
+        assert_eq!(wrong, 0, "{event:?}, kernel={kernel}");
+    }
 }
 #[test]
 fn named_jit_with_interposed_registry_unwinds_and_replays_after_exit() {

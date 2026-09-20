@@ -137,6 +137,12 @@ where
         let lookup_svma = self.base_svma + rel_lookup_address as u64;
         let eh_frame_hdr = self.eh_frame_hdr.as_ref()?;
         let table = eh_frame_hdr.table()?;
+        // Gimli's lookup returns the first entry even for an earlier address.
+        // Preserve the missing-index fallback instead of evaluating that FDE.
+        let (first_address, _) = table.iter(&self.bases).next().ok()??;
+        if lookup_svma < first_address.direct().ok()? {
+            return None;
+        }
         let fde_ptr = table.lookup(lookup_svma, &self.bases).ok()?;
         let fde_offset = table.pointer_to_offset(fde_ptr).ok()?;
         fde_offset.0.into_u64().try_into().ok()
@@ -521,6 +527,42 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn header_lookup_rejects_addresses_before_its_first_entry() {
+        use crate::x86_64::ArchX86_64;
+
+        for base in [0, 0x1_0000_0000_u64] {
+            let encoding = gimli::DW_EH_PE_udata8.0;
+            let mut header = vec![1, encoding, encoding, encoding];
+            header.extend_from_slice(&0x9000_u64.to_le_bytes());
+            header.extend_from_slice(&2_u64.to_le_bytes());
+            for (address, fde) in [(base + 0x1000, 0x9020_u64), (base + 0x2000, 0x9040)] {
+                header.extend_from_slice(&address.to_le_bytes());
+                header.extend_from_slice(&fde.to_le_bytes());
+            }
+            let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+            let unwinder = DwarfUnwinder::<_, ArchX86_64, _>::new(
+                EndianSlice::new(&[], LittleEndian),
+                UnwindSectionType::EhFrame,
+                Some(&header),
+                &mut context,
+                BaseAddresses::default(),
+                base,
+            );
+            for (address, expected) in [
+                (0x0fff, None),
+                (0x1000, Some(0x20)),
+                (0x1fff, Some(0x20)),
+                (0x2000, Some(0x40)),
+            ] {
+                assert_eq!(
+                    unwinder.get_fde_offset_for_relative_address(address),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn eh_frame_and_debug_frame_preserve_unwind_and_error_outcomes() {

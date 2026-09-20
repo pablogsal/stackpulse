@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- Discard and count kernel-mode records when kernel capture is disabled, before using their saved user registers for unwinding.
+- Use the registered object's text base consistently across executable sections sharing JIT unwind data.
+- Index shared JIT unwind tables with 64-bit addresses when executable sections are more than 4 GiB apart.
+- Require `framehop-stackpulse` 0.17.1 to preserve frame-pointer fallback before the first indexed FDE.
+
+### Added
+
+- `RecorderBuilder::sampling_event` can select software CPU-clock sampling. Hardware CPU cycles remain the default.
+
 ## 0.12.0 - 2026-09-19
 
 ### Added

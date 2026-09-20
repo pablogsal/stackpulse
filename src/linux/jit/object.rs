@@ -184,14 +184,24 @@ fn load_unwind_modules(
         },
         None => None,
     };
-    // Every range shares this CFI table, including entries in earlier sections.
-    let base = ranges.first().map_or(0, |range| range.start);
+    // All sections must decode the shared CFI with the same image text base.
     let got = section_range(elf, ".got");
+    let text = section_range(elf, ".text")
+        .filter(|range| range.start != 0 && !range.is_empty())
+        .or_else(|| ranges.first().cloned());
+    let header = cfi.as_ref().zip(eh_frame.as_ref()).and_then(|(bytes, eh)| {
+        absolute_cfi_header(
+            bytes,
+            eh.start,
+            text.as_ref().map_or(0, |range| range.start),
+            got.as_ref(),
+        )
+    });
     let mut unwind = Vec::new();
     for range in ranges {
         let sections = framehop::ExplicitModuleSectionInfo {
-            base_svma: base,
-            text_svma: Some(range.clone()),
+            base_svma: range.start,
+            text_svma: text.clone(),
             text: None,
             stubs_svma: None,
             stub_helper_svma: None,
@@ -199,8 +209,8 @@ fn load_unwind_modules(
             unwind_info: None,
             eh_frame_svma: eh_frame.clone(),
             eh_frame: cfi.clone(),
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
+            eh_frame_hdr_svma: header.as_ref().map(|header| 0..header.len() as u64),
+            eh_frame_hdr: header.clone(),
             debug_frame: None,
             text_segment_svma: None,
             text_segment: None,
@@ -210,7 +220,7 @@ fn load_unwind_modules(
         unwind.push(framehop::Module::new(
             name.into(),
             range.clone(),
-            base,
+            range.start,
             sections,
         ));
     }
@@ -226,6 +236,45 @@ fn load_unwind_modules(
         modules: unwind,
         cfi,
     }
+}
+
+/// Share a 64-bit FDE index across sections without changing live CFI pointers.
+fn absolute_cfi_header(
+    bytes: &[u8],
+    address: u64,
+    text: u64,
+    got: Option<&Range<u64>>,
+) -> Option<ElfSectionData> {
+    use gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
+
+    let mut section = EhFrame::new(bytes, LittleEndian);
+    section.set_address_size(8);
+    let bases = BaseAddresses::default()
+        .set_eh_frame(address)
+        .set_text(text)
+        .set_got(got.map_or(0, |range| range.start));
+    let mut entries = section.entries(&bases);
+    let mut table = Vec::new();
+    while let Some(entry) = entries.next().ok()? {
+        if let CieOrFde::Fde(entry) = entry {
+            let fde = entry.parse(EhFrame::cie_from_offset).ok()?;
+            table.push((
+                fde.initial_address(),
+                address.checked_add(fde.offset() as u64)?,
+            ));
+        }
+    }
+    table.sort_unstable_by_key(|&(pc, _)| pc);
+    let encoding = gimli::DW_EH_PE_udata8.0;
+    let mut header = Vec::with_capacity(20 + table.len() * 16);
+    header.extend_from_slice(&[1, encoding, encoding, encoding]);
+    header.extend_from_slice(&address.to_le_bytes());
+    header.extend_from_slice(&(table.len() as u64).to_le_bytes());
+    for (pc, fde) in table {
+        header.extend_from_slice(&pc.to_le_bytes());
+        header.extend_from_slice(&fde.to_le_bytes());
+    }
+    Some(ElfSectionData::owned(header))
 }
 
 /// Find a named section's non-overflowing target-memory address range.
@@ -323,6 +372,147 @@ mod tests {
         sym::{Symtab, STT_FUNC},
     };
     use goblin::strtab::Strtab;
+
+    /// Give each function a different CFA so selecting the wrong FDE cannot pass.
+    fn check_shared_cfi(second: u64, text_relative: bool) {
+        use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+        use framehop::{FrameAddress, MayAllocateDuringUnwind, Unwinder, UnwinderWithDetails};
+        use std::os::unix::fs::FileExt;
+
+        let addresses = [0x8000_u64, second];
+        for text_index in [0, 1] {
+            let encoding = if text_relative { 0x2c } else { 0x04 };
+            // zR CIE: CFA = rsp + 48, return address at CFA - 8.
+            let mut cfi = vec![
+                20, 0, 0, 0, 0, 0, 0, 0, 1, b'z', b'R', 0, 1, 0x78, 16, 1, encoding, 0x0c, 7, 48,
+                0x90, 1, 0, 0,
+            ];
+            for (index, address) in addresses.into_iter().enumerate() {
+                let cie_pointer = cfi.len() as u32 + 4;
+                cfi.extend_from_slice(&24_u32.to_le_bytes());
+                cfi.extend_from_slice(&cie_pointer.to_le_bytes());
+                let pc = if text_relative {
+                    address.wrapping_sub(addresses[text_index] - 16)
+                } else {
+                    address
+                };
+                cfi.extend_from_slice(&pc.to_le_bytes());
+                cfi.extend_from_slice(&16_u64.to_le_bytes());
+                cfi.extend_from_slice(&[0, 0x0e, 48 + index as u8 * 16, 0]);
+            }
+            cfi.extend_from_slice(&0_u32.to_le_bytes());
+            let directory = crate::test_support::TempDir::new("shared-jit-cfi");
+            let memory = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(directory.path().join("memory"))
+                .unwrap();
+            memory.write_all_at(&cfi, 0x9000).unwrap();
+
+            let mut elf =
+                Elf::lazy_parse(Header::new(Ctx::new(Container::Big, Endian::Little))).unwrap();
+            let names = b"\0.text\0.extra\0.eh_frame\0";
+            elf.shdr_strtab = Strtab::parse(names, 0, names.len(), 0).unwrap();
+            elf.section_headers = addresses
+                .iter()
+                .enumerate()
+                .map(|(index, &address)| SectionHeader {
+                    sh_name: if index == text_index { 1 } else { 7 },
+                    sh_addr: address - 16,
+                    sh_size: 32,
+                    sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
+                    ..SectionHeader::default()
+                })
+                .collect();
+            elf.section_headers.push(SectionHeader {
+                sh_name: 14,
+                sh_addr: 0x9000,
+                sh_size: cfi.len() as u64,
+                ..SectionHeader::default()
+            });
+            let ranges = executable_ranges(&elf).unwrap();
+            let modules = load_unwind_modules(&memory, &elf, &ranges, "[jit-shared]");
+            let mut unwinder = UnwinderX86_64::<_, MayAllocateDuringUnwind>::new();
+            for module in modules.modules() {
+                unwinder.add_module(module.clone());
+            }
+            let mut cache = CacheX86_64::new();
+            // Repeat with a warm rule cache as well as the initial CFI lookup.
+            for _ in 0..2 {
+                // An uncovered function before the first FDE has stack locals
+                // and a valid frame-pointer chain. Its caller is not at rsp.
+                let address = addresses[0] - 8;
+                let mut regs = UnwindRegsX86_64::new(address, 0x1000, 0x1020);
+                let result = unwinder
+                    .unwind_frame_with_details(
+                        FrameAddress::from_instruction_pointer(address),
+                        &mut regs,
+                        &mut cache,
+                        &mut |slot| match slot {
+                            0x1000 => Ok(0xdead),
+                            0x1020 => Ok(0x1100),
+                            0x1028 => Ok(0xbeef),
+                            _ => Err(()),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(result.return_address(), Some(0xbeef));
+                assert_eq!(regs.sp(), 0x1030);
+                assert!(result.fallback_reason().is_some());
+
+                for (index, address) in addresses.into_iter().enumerate() {
+                    let cfa_offset = 48 + index as u64 * 16;
+                    let mut regs = UnwindRegsX86_64::new(address + 1, 0x1000, 0);
+                    let result = unwinder
+                        .unwind_frame_with_details(
+                            FrameAddress::from_instruction_pointer(address + 1),
+                            &mut regs,
+                            &mut cache,
+                            &mut |slot| {
+                                if slot == 0x1000 + cfa_offset - 8 {
+                                    Ok(0xbeef)
+                                } else {
+                                    Err(())
+                                }
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        result.fallback_reason(),
+                        None,
+                        "section {address:#x}, text index {text_index}"
+                    );
+                    assert_eq!(
+                        result.return_address(),
+                        Some(0xbeef),
+                        "section {address:#x}"
+                    );
+                    assert_eq!(regs.sp(), 0x1000 + cfa_offset);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cfi_absolute_nearby_sections() {
+        check_shared_cfi(0x8100, false);
+    }
+
+    #[test]
+    fn shared_cfi_text_relative_nearby_sections() {
+        check_shared_cfi(0x8100, true);
+    }
+
+    #[test]
+    fn shared_cfi_absolute_distant_sections() {
+        check_shared_cfi(0x1_0000_8100, false);
+    }
+
+    #[test]
+    fn shared_cfi_text_relative_distant_sections() {
+        check_shared_cfi(0x1_0000_8100, true);
+    }
 
     #[test]
     fn shared_elf_names_are_bounded_before_copying() {
