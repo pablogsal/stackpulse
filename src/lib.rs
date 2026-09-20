@@ -64,7 +64,7 @@ pub mod record {
     pub use crate::linux::perf_event::{PerfFrequencyLimit, MAX_SAMPLE_USER_STACK};
     pub use crate::linux::{
         AttachOutcome, AttachPolicy, FinishError, PollSummary, PreparedRecording, ProcessScope,
-        Recorder, RecorderBuilder, RecordingMetadata, RecordingSummary, SampleRate,
+        Recorder, RecorderBuilder, RecordingMetadata, RecordingSummary, SampleRate, SamplingEvent,
     };
     pub use crate::stats::{SampleErrorKind, SampleErrorStats};
     pub use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};

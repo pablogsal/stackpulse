@@ -12,6 +12,7 @@ mod perf_group;
 pub mod process;
 pub use builder::{
     AttachPolicy, FinishError, PreparedRecording, ProcessScope, RecorderBuilder, RecordingMetadata,
+    SamplingEvent,
 };
 mod jit;
 mod ring_buffer;
@@ -230,6 +231,7 @@ impl SampleRate {
 #[non_exhaustive]
 pub(crate) struct RecorderOptions {
     sample_rate: SampleRate,
+    sampling_event: SamplingEvent,
     stack_size: u32,
     ring_stacks: u32,
     include_kernel: bool,
@@ -242,6 +244,7 @@ impl RecorderOptions {
     pub fn new(sample_rate: SampleRate) -> Self {
         Self {
             sample_rate,
+            sampling_event: SamplingEvent::CpuCycles,
             stack_size: 32 * 1024,
             ring_stacks: DEFAULT_RING_BUFFER_STACKS,
             include_kernel: false,
@@ -267,6 +270,9 @@ pub struct RecordingSummary {
     pub samples: u64,
     /// Events reported lost by the kernel.
     pub lost_events: u64,
+    /// Kernel-mode samples discarded because kernel capture was disabled.
+    /// These records can arrive despite perf's `exclude_kernel` setting.
+    pub excluded_kernel_samples: u64,
     /// Nonzero loss batches that made lifecycle state potentially incomplete.
     pub lifecycle_gaps: u64,
     /// Whether kernel frame capture remained enabled after attach.
@@ -2270,6 +2276,10 @@ fn record_prepared_sample_input<W: std::io::Write>(
     input: StackInput<'_>,
     callchain: PreparedCallChain<'_>,
 ) -> io::Result<()> {
+    if is_kernel_mode(privilege) && !ctx.summary.kernel_enabled {
+        bump(&mut ctx.summary.excluded_kernel_samples);
+        return Ok(());
+    }
     let pid = meta.pid;
     refresh_maps_for_uncovered_user_pc(ctx, meta, privilege, input)?;
     let callchain_stack = match callchain {
@@ -2381,7 +2391,10 @@ fn open_perf_group(
             frequency: options.sample_rate.resolve()?,
             stack_size: options.stack_size,
             ring_stacks: options.ring_stacks,
-            event_source: EventSource::HwCpuCycles,
+            event_source: match options.sampling_event {
+                SamplingEvent::CpuCycles => EventSource::HwCpuCycles,
+                SamplingEvent::CpuClock => EventSource::SwCpuClock,
+            },
             regs_mask,
             include_kernel: options.include_kernel,
             inherit_child_processes: options.inherit_child_processes,
@@ -3280,6 +3293,57 @@ mod tests {
             device_minor: 0,
             inode_generation: 0,
             path: std::path::Path::new("/tmp/libtest.so").into(),
+        }
+    }
+
+    #[test]
+    fn excluded_kernel_records_never_reach_unwinding() {
+        for (privilege, kernel_enabled) in [
+            (Priv::Kernel, false),
+            (Priv::GuestKernel, false),
+            (Priv::Kernel, true),
+        ] {
+            let mut modules = ModuleTable::default();
+            let mut processes = ProcessTable::default();
+            let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+            let mut summary = RecordingSummary {
+                kernel_enabled,
+                ..RecordingSummary::default()
+            };
+            let mut stack_scratch = Vec::new();
+            let mut callchain_scratch = Vec::new();
+            let mut lifecycle_actions = Vec::new();
+            let sample = SampleView {
+                task: Some((7, 8)),
+                timestamp_ns: Some(42),
+                code_addr: Some(0xffff_ffff_8100_0000),
+                user_regs: Some(&[]),
+                user_stack: Some(&[0_u8; 8]),
+                call_chain: SampleCallChain::None,
+            };
+            let prepared = prepare_sample_view(&mut summary, sample, privilege).unwrap();
+            let mut ctx = EventContext {
+                modules: &mut modules,
+                processes: &mut processes,
+                writer: &mut writer,
+                summary: &mut summary,
+                stack_scratch: &mut stack_scratch,
+                callchain_scratch: &mut callchain_scratch,
+                lifecycle_actions: &mut lifecycle_actions,
+                inherit_child_processes: false,
+            };
+            finish_prepared_event(prepared, &mut ctx).unwrap();
+            assert_eq!(processes.states.is_empty(), !kernel_enabled);
+            assert_eq!(summary.sample_events, 1);
+            assert_eq!(summary.samples, u64::from(kernel_enabled));
+            assert_eq!(summary.excluded_kernel_samples, u64::from(!kernel_enabled));
+            assert_eq!(summary.truncated_frame_markers, 0);
+            assert_eq!(
+                summary
+                    .error_stats
+                    .count(SampleErrorKind::NativeRegisterCapture),
+                u64::from(kernel_enabled)
+            );
         }
     }
 

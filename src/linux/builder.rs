@@ -6,6 +6,16 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use crate::spool::{ClockOrigin, LiveReader, Spool};
 
+/// Event that drives periodic stack capture.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SamplingEvent {
+    /// Hardware cycle interrupts, with a software CPU-clock fallback when unavailable.
+    #[default]
+    CpuCycles,
+    /// Software CPU-clock timer interrupts.
+    CpuClock,
+}
+
 /// Processes included in the recording.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessScope {
@@ -39,6 +49,12 @@ impl RecorderBuilder {
             policy: AttachPolicy::StopWhileAttaching,
             publish_interval: Duration::from_millis(500),
         }
+    }
+
+    /// Choose the event source. Hardware CPU cycles remain the default.
+    pub fn sampling_event(mut self, event: SamplingEvent) -> Self {
+        self.options.sampling_event = event;
+        self
     }
 
     /// Set the user-stack snapshot size in bytes.

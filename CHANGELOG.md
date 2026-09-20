@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Discard and count kernel-mode records when kernel capture is disabled, before using their saved user registers for unwinding.
+
+### Added
+
+- `RecorderBuilder::sampling_event` can select software CPU-clock sampling. Hardware CPU cycles remain the default.
+
 ## 0.12.0 - 2026-09-19
 
 ### Added
