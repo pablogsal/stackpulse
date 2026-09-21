@@ -1,6 +1,6 @@
 [package]
 name = "stackpulse"
-version = "0.11.1"
+version = "0.12.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Linux perf_event stack sampling with native unwinding, symbolization, and compact spooling"
@@ -31,7 +31,7 @@ workspace = true
 
 [dependencies]
 bitflags = "2.4"
-framehop = { package = "framehop-stackpulse", path = "crates/framehop-stackpulse", version = "0.16.5", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "crates/framehop-stackpulse", version = "0.17.1", default-features = false, features = ["std"] }
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 goblin = "0.10"
 integer-encoding = { version = "4.1.0", default-features = false }
@@ -44,6 +44,7 @@ object = { version = "0.40", default-features = false, features = ["std", "read_
 perf-event-open = { version = "0.6", features = ["linux-6.0"] }
 perf-event-open-sys = "6.0"
 rustc-hash = "2.1"
+stackpulse-jit = { path = "crates/stackpulse-jit", version = "0.1.0" }
 tokio = { version = "1.38", features = ["rt", "io-util", "sync", "time", "net"], optional = true }
 tracing = "0.1"
 thiserror = "2.0.20"
@@ -72,11 +73,15 @@ name = "integration"
 required-features = ["builtin-wholesym"]
 
 [[test]]
+name = "gdb_jit"
+required-features = ["builtin-wholesym"]
+
+[[test]]
 name = "allocations"
 required-features = ["bench-support"]
 
 [workspace]
-members = ["crates/framehop-stackpulse"]
+members = ["crates/framehop-stackpulse", "crates/stackpulse-jit"]
 resolver = "2"
 
 [workspace.lints.clippy]

@@ -724,6 +724,7 @@ mod tests {
             .into_boxed_slice(),
         };
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(42),
             start: 0x7000_0000,
@@ -742,6 +743,7 @@ mod tests {
     #[test]
     fn loaded_elf_is_retained_when_mapping_cannot_be_correlated() {
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x7000_0000,
@@ -770,6 +772,7 @@ mod tests {
         std::fs::write(&path, b"not-elf").unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
         let mut module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(42),
             start: 0x1000,
@@ -809,6 +812,7 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let module = |path: &std::path::Path| ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(42),
             start: 0x1000,
@@ -833,6 +837,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(42),
             start: 0x1000,
@@ -864,6 +869,7 @@ mod tests {
         let first_file = File::open(&path).unwrap();
         let modified = first_file.metadata().unwrap().modified().unwrap();
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -896,6 +902,7 @@ mod tests {
         let path = temp.path().join("image");
         std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(2_000_000_000),
             start: 0x1000,
@@ -937,6 +944,7 @@ mod tests {
         let path = temp.path().join("image");
         std::fs::copy("/bin/true", &path).unwrap();
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -981,6 +989,7 @@ mod tests {
         let path = temp.path().join("image");
         std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
         let mut module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -1005,6 +1014,7 @@ mod tests {
     fn cached_sections_can_be_reused_and_retired_by_module_id() {
         let path = std::env::current_exe().unwrap();
         let mut module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -1031,6 +1041,7 @@ mod tests {
     fn shared_image_cache_hit_skips_file_parse_and_retains_file() {
         let path = std::fs::canonicalize("/bin/true").unwrap();
         let mut module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -1107,6 +1118,7 @@ mod tests {
             namespaced_identity(1, 1, 1).file().clone(),
         );
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -1283,6 +1295,7 @@ mod tests {
         std::fs::write(&textual_path, b"replacement").unwrap();
         let mapped_inode = std::fs::metadata(&map_path).unwrap().ino();
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: 0x1000,
@@ -1309,6 +1322,7 @@ mod tests {
             .find(|region| region.path == Path::new("[vdso]"))
             .expect("current process has a vDSO mapping");
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 1,
             owner: user_owner(i32::try_from(std::process::id()).unwrap()),
             start: region.address.start,

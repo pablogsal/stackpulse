@@ -73,6 +73,7 @@ pub(super) fn record_mmap<W: std::io::Write>(
         processes,
         writer,
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner,
             start: mmap.addr,
@@ -123,6 +124,7 @@ pub(super) fn executable_modules_from_maps(
         .filter(|region| region.is_executable && !region.path.as_os_str().is_empty())
         .filter_map(move |region| {
             Some(ModuleRecord {
+                jit_symbols: None,
                 id: 0,
                 owner: owner?,
                 start: region.address.start,

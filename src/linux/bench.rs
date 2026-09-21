@@ -198,6 +198,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
     };
     vec![
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: ModuleOwner::Process(process),
             start: LIVE_BENCH_USER_BASE,
@@ -210,6 +211,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             path: std::path::Path::new("/opt/stackpulse/live-bench/libworkload.so").into(),
         },
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: ModuleOwner::Process(process),
             start: LIVE_BENCH_USER_BASE + 0x0010_0000,
@@ -222,6 +224,7 @@ fn live_perf_sample_bench_modules() -> Vec<ModuleRecord> {
             path: std::path::Path::new("/opt/stackpulse/live-bench/python3.12").into(),
         },
         ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: ModuleOwner::Kernel,
             start: LIVE_BENCH_KERNEL_BASE,

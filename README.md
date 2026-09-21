@@ -21,7 +21,7 @@ newer.
 
 ```toml
 [dependencies]
-stackpulse = "0.11"
+stackpulse = "0.12"
 ```
 
 ## Record a profile
@@ -79,7 +79,7 @@ locally with `make doc`.
 | Architectures | x86-64 and AArch64 |
 | Native stacks | DWARF and frame-pointer unwinding through Framehop |
 | Native symbols | Bundled `wholesym` backend or a caller-supplied symbolizer |
-| Dynamic runtimes | Python perf maps and Python runtime frames |
+| Dynamic runtimes | Python perf maps, Python runtime frames, and GDB JIT registrations |
 | Kernel stacks | `/proc/kallsyms` and `System.map` fallback |
 | Profile files | Reads and writes SPULSE4 |
 | Rust version | 1.88 or newer |
@@ -117,6 +117,10 @@ make coverage CARGO_FLAGS="--features debuginfod"
 Consumers that supply `SymbolizerBuilder::native` can disable default features
 to omit `wholesym` and Tokio.
 
+Native profilers that only need the shared GDB JIT registry can depend on
+[`stackpulse-jit`](crates/stackpulse-jit/README.md). StackPulse also exposes it as
+`stackpulse::jit`.
+
 Two environment variables tune the default backend: `STACKPULSE_DEBUG_DIRS`
 overrides local debug-file search roots, and
 `STACKPULSE_DEBUGINFOD_CACHE_DIR` overrides the debuginfod cache directory.
@@ -126,6 +130,14 @@ overrides local debug-file search roots, and
 User-space sampling often works with the default perf permissions. Kernel frames,
 high sample rates, and restrictive `perf_event_paranoid` settings may require
 `CAP_PERFMON` or a sysctl change.
+
+## GDB JIT registrations
+
+The Linux recorder reads generated function names and unwind rules through the
+GDB JIT interface. Support includes LLVM MCJIT. Saved names remain available after
+process exit. Capture requires read access to `/proc/<pid>/mem`. See
+[JIT capture and replay](docs/jit.md) for runtime setup, frame identification,
+update timing, and replay limits.
 
 ## License
 

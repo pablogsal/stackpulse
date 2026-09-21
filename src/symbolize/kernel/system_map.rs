@@ -332,6 +332,7 @@ mod tests {
                            ffffffff81000100 T do_syscall_64\n\
                            ffffffff81000200 T entry_SYSCALL_64_after_hwframe\n";
         let module = ModuleRecord {
+            jit_symbols: None,
             id: 0,
             owner: crate::spool::ModuleOwner::Kernel,
             start: 0xffff_ffff_8c80_0000,

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 0.12.1 - 2026-09-20
+
+### Fixed
+
+- Discard and count kernel-mode records when kernel capture is disabled, before using their saved user registers for unwinding.
+- Use the registered object's text base consistently across executable sections sharing JIT unwind data.
+- Index shared JIT unwind tables with 64-bit addresses when executable sections are more than 4 GiB apart.
+- Keep JIT registration updates current across mapping changes, metadata retries, removal, and address reuse without replacing symbol identities during CFI-only refreshes.
+- Require `framehop-stackpulse` 0.17.1 to preserve frame-pointer fallback before the first indexed FDE.
+
+### Added
+
+- Publish `stackpulse-jit` 0.1.0 for GDB JIT discovery, symbols, and unwind data without perf dependencies. StackPulse preserves the `stackpulse::jit` API and its existing custom-symbolizer feature behavior.
+- Share the JIT overlay assembler fixture through `stackpulse_jit::fixtures`, preserving the StackPulse benchmark import.
+- `RecorderBuilder::sampling_event` can select software CPU-clock sampling. Hardware CPU cycles remain the default.
+
+## 0.12.0 - 2026-09-19
+
+### Added
+
+- Record generated function names and recover callers through the GDB JIT interface, including supported LLVM MCJIT workloads. Saved names remain available after code removal, address reuse, and process exit.
+- Refresh runtime information when unwinding fails inside known JIT code, then retry the captured stack once if the information changed.
+- Add a [JIT recording guide](https://pablogsal.com/stackpulse/stackpulse/docs/index.html#recording-generated-code) with runtime settings, update timing, and measured cost.
+
+### Changed
+
+- Recordings with registered JIT code require an updated reader. Recordings without JIT entries remain compatible with StackPulse 0.11 readers.
+- Update `framehop-stackpulse` to 0.17.0 and Gimli to 0.34. Framehop's public DWARF errors now contain Gimli 0.34 errors.
+- Update the locked rustls and rustls-webpki patch releases.
+
+### Performance
+
+- Skip repeated JIT checks after confirming that no supported runtime is present. Reuse temporary storage during metadata checks and avoid rescanning executables after unrelated anonymous mapping changes.
+
 ## 0.11.1 - 2026-09-07
 
 ### Fixed

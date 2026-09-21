@@ -33,7 +33,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            build-essential ca-certificates clang curl git gnupg libclang-dev make \
+            build-essential ca-certificates clang curl git gnupg libclang-dev llvm-dev make \
             pkg-config procps python3
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

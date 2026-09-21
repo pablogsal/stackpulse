@@ -15,6 +15,8 @@ mod elf;
 mod error;
 /// Validated Linux process and thread identifiers.
 mod identity;
+#[cfg(target_pointer_width = "64")]
+pub use stackpulse_jit as jit;
 mod linux;
 mod module_base;
 mod native_module;
@@ -64,7 +66,7 @@ pub mod record {
     pub use crate::linux::perf_event::{PerfFrequencyLimit, MAX_SAMPLE_USER_STACK};
     pub use crate::linux::{
         AttachOutcome, AttachPolicy, FinishError, PollSummary, PreparedRecording, ProcessScope,
-        Recorder, RecorderBuilder, RecordingMetadata, RecordingSummary, SampleRate,
+        Recorder, RecorderBuilder, RecordingMetadata, RecordingSummary, SampleRate, SamplingEvent,
     };
     pub use crate::stats::{SampleErrorKind, SampleErrorStats};
     pub use crate::unwind_stats::{UnwindFallbackKind, UnwindFallbackStats};

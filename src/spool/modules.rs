@@ -83,6 +83,21 @@ impl ModuleTable {
             .map_or(u32::MAX, |activation| activation.module.id))
     }
 
+    /// Record a historical module used only by frames pinned to its id.
+    ///
+    /// Immediate deactivation keeps this range out of ordinary mapping lookup.
+    /// Each call assigns a fresh id so address reuse cannot rename earlier frames.
+    pub(crate) fn record_pinned_module<W: Write>(
+        &mut self,
+        module: &mut ModuleRecord,
+        writer: &mut PerfSpoolWriter<W>,
+    ) -> io::Result<()> {
+        module.id = next_spool_id(self.next_id, "module")?;
+        writer.write_module(module)?;
+        self.next_id += 1;
+        writer.write_module_deactivation_one(module.id)
+    }
+
     pub(crate) fn process_modules_match(&self, process_id: i32, snapshot: &[ModuleRecord]) -> bool {
         let active_count = self
             .active_by_process

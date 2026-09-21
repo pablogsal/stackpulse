@@ -2,11 +2,16 @@ use crate::{Pid, Tid};
 use std::io;
 
 pub(crate) const VDSO_PATH: &str = "[vdso]";
+pub(crate) const MAX_JIT_SYMBOLS: usize = 1_000_000;
+pub(crate) const MAX_JIT_SYMBOL_NAME: usize = 1024 * 1024;
 
 /// A recorded filesystem path, preserving native operating-system bytes.
 pub type ModulePath = std::sync::Arc<std::path::Path>;
 
-/// One executable memory mapping recorded in a spool file.
+/// One executable mapping or registered JIT code section recorded in a spool file.
+///
+/// JIT sections retain their recorded identity after unregistration. They use a
+/// synthetic path and zero file offset; frames refer to their module id directly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Module {
@@ -30,6 +35,19 @@ pub struct Module {
     pub(crate) inode_generation: u64,
     /// File path or display name.
     pub(crate) path: ModulePath,
+    /// Captured JIT symbols sorted by start; `Some([])` still identifies generated code.
+    pub(crate) jit_symbols: Option<std::sync::Arc<[JitSymbol]>>,
+}
+
+/// A captured function name and its absolute, half-open address range.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JitSymbol {
+    /// Inclusive function start in the target's address space.
+    pub(crate) start: u64,
+    /// Exclusive function end, bounded by its recorded executable section.
+    pub(crate) end: u64,
+    /// Runtime-supplied function name, retained for replay after the target exits.
+    pub(crate) name: std::sync::Arc<str>,
 }
 
 /// Validated owner of an executable mapping.
@@ -88,6 +106,7 @@ impl Module {
     }
 
     /// Return the file offset backing the mapping start.
+    /// Registered JIT sections use zero because they have no backing-file offset.
     #[must_use]
     pub const fn file_offset(&self) -> u64 {
         self.file_offset
@@ -143,7 +162,6 @@ impl Module {
     /// # Errors
     ///
     /// Returns an invalid-input error when `addresses` is empty or reversed.
-    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn new(
         id: u32,
         process_id: Pid,
@@ -168,6 +186,7 @@ impl Module {
             device_minor: 0,
             inode_generation: 0,
             path: path.as_ref().into(),
+            jit_symbols: None,
         })
     }
 
@@ -216,6 +235,7 @@ impl Module {
             device_minor: 0,
             inode_generation: 0,
             path: path.as_ref().into(),
+            jit_symbols: None,
         })
     }
 }
@@ -238,6 +258,7 @@ pub struct FrameRecord {
     /// Module id when the frame was matched to a module.
     pub module_id: Option<u32>,
     /// Address in the matched module's file-offset coordinate space.
+    /// For registered JIT code, this is the offset from the code section's start.
     pub file_relative_ip: u64,
     /// Absolute instruction pointer.
     pub abs_ip: u64,

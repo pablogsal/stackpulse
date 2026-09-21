@@ -21,6 +21,9 @@ pub enum AddressSpace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SymbolOrigin {
+    /// Symbols copied from a GDB JIT registration during recording.
+    /// Also identifies registered code without a matching symbol, displayed by address.
+    GdbJit,
     /// File-backed symbol information.
     Elf,
     /// Python perf-map entry.
@@ -43,7 +46,7 @@ bitflags! {
         const PYTHON_RUNTIME = 1 << 0;
         /// Frame should be hidden from default flame-graph / report views.
         const HIDDEN_DEFAULT = 1 << 2;
-        /// Frame came from a JIT-emitted code region (perf-map entry).
+        /// Frame came from generated code identified by a perf map or GDB JIT registration.
         const JIT = 1 << 3;
 
     }
