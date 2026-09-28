@@ -1378,7 +1378,35 @@ struct MmapSpoolCursor {
 
 trait SpoolRead {
     fn read_exact_spool(&mut self, buf: &mut [u8]) -> io::Result<()>;
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI>;
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI>;
+}
+
+/// Varint types decoded from spools, with the conversion integer-encoding
+/// applies to the raw `u64` value.
+trait SpoolVarint: VarInt {
+    fn from_raw_varint(raw: u64) -> Option<Self>;
+}
+
+impl SpoolVarint for u64 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        Some(raw)
+    }
+}
+
+impl SpoolVarint for u32 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        u32::try_from(raw).ok()
+    }
+}
+
+impl SpoolVarint for i64 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        // Zigzag decoding.
+        Some((raw >> 1) as i64 ^ -((raw & 1) as i64))
+    }
 }
 
 impl MmapSpoolCursor {
@@ -1444,7 +1472,27 @@ impl MmapSpoolCursor {
     }
 
     #[inline]
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
+        // Varints that end within their first nine bytes cannot overflow a
+        // u64, so decode them inline. Longer, out-of-range and truncated
+        // varints take the integer-encoding path below.
+        let bytes = &self.mmap[self.position..];
+        let mut raw = 0_u64;
+        for (index, &byte) in bytes.iter().take(9).enumerate() {
+            raw |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                if let Some(value) = VI::from_raw_varint(raw) {
+                    self.position += index + 1;
+                    return Ok(value);
+                }
+                break;
+            }
+        }
+        self.read_varint_slow()
+    }
+
+    #[cold]
+    fn read_varint_slow<VI: VarInt>(&mut self) -> io::Result<VI> {
         let bytes = &self.mmap[self.position..];
         match VI::decode_var(bytes) {
             Some((value, len)) => {
@@ -1472,7 +1520,7 @@ impl SpoolRead for MmapSpoolCursor {
         Ok(())
     }
 
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
         MmapSpoolCursor::read_varint(self)
     }
 }
@@ -1482,7 +1530,7 @@ impl SpoolRead for &[u8] {
         Read::read_exact(self, buf)
     }
 
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
         VarIntReader::read_varint(self)
     }
 }
@@ -2148,6 +2196,27 @@ mod tests {
             assert!(err.contains(&expected), "{err}");
         }
         assert!(version.contains("unsupported stackpulse spool format version 3"));
+    }
+
+    #[test]
+    fn cursor_varints_match_integer_encoding_decoding() {
+        fn check<VI: SpoolVarint + PartialEq + std::fmt::Debug>(input: &[u8]) {
+            let mmap = crate::test_support::mmap_from_bytes(input);
+            let mut cursor = MmapSpoolCursor::at_position(mmap, 0);
+            let decoded = cursor.read_varint::<VI>().ok();
+            let decoded = decoded.map(|value| (value, cursor.position));
+            assert_eq!(decoded, VI::decode_var(input), "{input:02x?}");
+        }
+
+        // One- and nine-byte fast-path values, a u32 overflow, a ten-byte
+        // value and a truncated varint.
+        for value in [0x7f, (1 << 63) - 1, u64::from(u32::MAX) + 1, u64::MAX] {
+            let bytes = value.encode_var_vec();
+            check::<u64>(&bytes);
+            check::<u32>(&bytes);
+            check::<i64>(&bytes);
+        }
+        check::<u64>(&[0x80, 0x80]);
     }
 
     #[test]
