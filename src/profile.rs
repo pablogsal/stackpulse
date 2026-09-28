@@ -364,7 +364,7 @@ pub struct FrameKey {
 pub struct ResolvedStack<'a> {
     pub(crate) frames: &'a [Frame],
     pub(crate) frame_ids: &'a [FrameKey],
-    pub(crate) indices: &'a [usize],
+    pub(crate) indices: &'a [u32],
     pub(crate) cacheable: bool,
 }
 
@@ -402,7 +402,9 @@ impl<'a> ResolvedStack<'a> {
     ) -> impl ExactSizeIterator<Item = &'a Frame> + DoubleEndedIterator + std::iter::FusedIterator
     {
         let frames = self.frames;
-        self.indices.iter().map(move |&index| &frames[index])
+        self.indices
+            .iter()
+            .map(move |&index| &frames[index as usize])
     }
 }
 
@@ -411,14 +413,14 @@ impl<'a> ResolvedStack<'a> {
 pub struct ResolvedStackIter<'a> {
     frames: &'a [Frame],
     frame_ids: &'a [FrameKey],
-    indices: std::slice::Iter<'a, usize>,
+    indices: std::slice::Iter<'a, u32>,
 }
 
 impl<'a> Iterator for ResolvedStackIter<'a> {
     type Item = (FrameKey, &'a Frame);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let &index = self.indices.next()?;
+        let index = *self.indices.next()? as usize;
         Some((self.frame_ids[index], &self.frames[index]))
     }
 
@@ -429,7 +431,7 @@ impl<'a> Iterator for ResolvedStackIter<'a> {
 
 impl DoubleEndedIterator for ResolvedStackIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let &index = self.indices.next_back()?;
+        let index = *self.indices.next_back()? as usize;
         Some((self.frame_ids[index], &self.frames[index]))
     }
 }

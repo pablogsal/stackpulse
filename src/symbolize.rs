@@ -122,10 +122,10 @@ pub struct Symbolizer {
     resolved_frame_ids: Vec<FrameKey>,
     resolution_cache_limit: Option<usize>,
     next_resolved_frame_id: u64,
-    resolved_stack_frame_ids: Vec<usize>,
+    resolved_stack_frame_ids: Vec<u32>,
     stack_cache_mode: StackCache,
     stack_cache: FxHashMap<StackKey, Range<usize>>,
-    resolved_stack_scratch: Vec<usize>,
+    resolved_stack_scratch: Vec<u32>,
     invalidated_process_ids: FxHashSet<crate::Pid>,
     perf_map_changed_process_ids: FxHashSet<crate::Pid>,
     mapping_changed_process_ids: FxHashSet<i32>,
@@ -1011,8 +1011,11 @@ impl Symbolizer {
     }
 
     fn frame_resolution_cache_full(&self) -> bool {
-        self.resolution_cache_limit
-            .is_some_and(|limit| self.resolved_frames.len() >= limit)
+        // Stack indices are u32; see `finish_frame_batch`.
+        self.resolved_frames.len() > u32::MAX as usize
+            || self
+                .resolution_cache_limit
+                .is_some_and(|limit| self.resolved_frames.len() >= limit)
     }
 
     fn stack_resolution_cache_full(&self) -> bool {
@@ -1137,12 +1140,7 @@ impl Symbolizer {
 
         if self.stack_cache_mode == StackCache::Internal {
             if let Some(range) = self.stack_cache.get(&key).cloned() {
-                return Ok(ResolvedStack {
-                    frames: &self.resolved_frames,
-                    frame_ids: &self.resolved_frame_ids,
-                    indices: &self.resolved_stack_frame_ids[range],
-                    cacheable: true,
-                });
+                return Ok(self.cached_stack(range));
             }
         }
 
@@ -1152,31 +1150,9 @@ impl Symbolizer {
         if self.stack_cache_mode == StackCache::Internal && self.transient_frame_keys.is_empty() {
             // New stacks often reuse only frames that earlier stacks resolved,
             // so collect their cached ranges before starting a frame batch.
-            let start = self.resolved_stack_frame_ids.len();
-            let mut cached = frames.clone();
-            let mut complete = true;
-            while let Some(frame_ref) = cached.next_with_id() {
-                let cache_process = frame_cache_process_id(process.get(), frame_ref.frame);
-                let Some(resolved) = self
-                    .frame_cache
-                    .get(&(cache_process, FrameCacheKey::Spool(frame_ref.id)))
-                else {
-                    complete = false;
-                    break;
-                };
-                self.resolved_stack_frame_ids.extend(resolved.indices());
+            if let Some(range) = self.cache_stack_frame_ids(key, process.get(), frames.clone()) {
+                return Ok(self.cached_stack(range));
             }
-            if complete {
-                let range = start..self.resolved_stack_frame_ids.len();
-                self.stack_cache.insert(key, range.clone());
-                return Ok(ResolvedStack {
-                    frames: &self.resolved_frames,
-                    frame_ids: &self.resolved_frame_ids,
-                    indices: &self.resolved_stack_frame_ids[range],
-                    cacheable: true,
-                });
-            }
-            self.resolved_stack_frame_ids.truncate(start);
         }
         self.begin_frame_batch(frames.len());
         let mut pending = frames.clone();
@@ -1191,29 +1167,16 @@ impl Symbolizer {
         self.finish_frame_batch(process.get())?;
 
         if self.stack_cache_mode == StackCache::Internal && self.transient_frame_keys.is_empty() {
-            let start = self.resolved_stack_frame_ids.len();
-            while let Some(frame_ref) = frames.next_with_id() {
-                let frame_ids = self.cached_frame_ids(
-                    process.get(),
-                    frame_ref.frame,
-                    FrameCacheKey::Spool(frame_ref.id),
-                )?;
-                self.resolved_stack_frame_ids.extend(frame_ids);
-            }
-            let range = start..self.resolved_stack_frame_ids.len();
-            self.stack_cache.insert(key, range.clone());
-            return Ok(ResolvedStack {
-                frames: &self.resolved_frames,
-                frame_ids: &self.resolved_frame_ids,
-                indices: &self.resolved_stack_frame_ids[range],
-                cacheable: true,
-            });
+            let range = self
+                .cache_stack_frame_ids(key, process.get(), frames)
+                .ok_or_else(|| NativeContractError::CacheMiss.into_public())?;
+            return Ok(self.cached_stack(range));
         }
 
         let cacheable = self.transient_frame_keys.is_empty();
         self.resolved_stack_scratch.clear();
         while let Some(frame_ref) = frames.next_with_id() {
-            let frame_ids = self.cached_frame_ids(
+            let frame_ids = self.stack_frame_ids(
                 process.get(),
                 frame_ref.frame,
                 FrameCacheKey::Spool(frame_ref.id),
@@ -1227,6 +1190,40 @@ impl Symbolizer {
             indices: &self.resolved_stack_scratch,
             cacheable,
         })
+    }
+
+    /// Append the cached frame ids of every frame in `frames` as one stack
+    /// cache entry, or return `None` without an entry on any frame cache miss.
+    fn cache_stack_frame_ids(
+        &mut self,
+        key: StackKey,
+        process_id: i32,
+        mut frames: spool::StackFrames<'_>,
+    ) -> Option<Range<usize>> {
+        let start = self.resolved_stack_frame_ids.len();
+        while let Some(frame_ref) = frames.next_with_id() {
+            let Some(frame_ids) = self.cached_frame_ids(
+                process_id,
+                frame_ref.frame,
+                FrameCacheKey::Spool(frame_ref.id),
+            ) else {
+                self.resolved_stack_frame_ids.truncate(start);
+                return None;
+            };
+            self.resolved_stack_frame_ids.extend(frame_ids);
+        }
+        let range = start..self.resolved_stack_frame_ids.len();
+        self.stack_cache.insert(key, range.clone());
+        Some(range)
+    }
+
+    fn cached_stack(&self, range: Range<usize>) -> ResolvedStack<'_> {
+        ResolvedStack {
+            frames: &self.resolved_frames,
+            frame_ids: &self.resolved_frame_ids,
+            indices: &self.resolved_stack_frame_ids[range],
+            cacheable: true,
+        }
     }
 
     /// Resolve a caller-owned raw frame slice without retaining a stack entry.
@@ -1263,7 +1260,7 @@ impl Symbolizer {
         self.resolved_stack_scratch.reserve(frames.len());
         for frame in frames {
             let frame_ids =
-                self.cached_frame_ids(process_id.get(), frame, FrameCacheKey::Raw(*frame))?;
+                self.stack_frame_ids(process_id.get(), frame, FrameCacheKey::Raw(*frame))?;
             self.resolved_stack_scratch.extend(frame_ids);
         }
         self.clear_transient_frame_cache();
@@ -1298,7 +1295,11 @@ impl Symbolizer {
         self.begin_frame_batch(1);
         self.prepare_frame(process_id, *frame, cache_key.1, spool_frame_id);
         self.finish_frame_batch(process_id)?;
-        let frame_ids = self.cached_frame_ids(process_id, frame, cache_key.1);
+        let frame_ids = self
+            .frame_cache
+            .get(&cache_key)
+            .map(ResolvedFrameRange::indices)
+            .ok_or_else(|| NativeContractError::CacheMiss.into_public());
         self.clear_transient_frame_cache();
         frame_ids
     }
@@ -1308,10 +1309,23 @@ impl Symbolizer {
         process_id: i32,
         frame: &FrameRecord,
         cache_key: FrameCacheKey,
-    ) -> crate::Result<Range<usize>> {
+    ) -> Option<Range<u32>> {
+        // `finish_frame_batch` rejects frame indices outside the u32 range.
         self.frame_cache
             .get(&(frame_cache_process_id(process_id, frame), cache_key))
-            .map(ResolvedFrameRange::indices)
+            .map(|resolved| {
+                let frame_ids = resolved.indices();
+                frame_ids.start as u32..frame_ids.end as u32
+            })
+    }
+
+    fn stack_frame_ids(
+        &self,
+        process_id: i32,
+        frame: &FrameRecord,
+        cache_key: FrameCacheKey,
+    ) -> crate::Result<Range<u32>> {
+        self.cached_frame_ids(process_id, frame, cache_key)
             .ok_or_else(|| NativeContractError::CacheMiss.into_public())
     }
 
@@ -1625,6 +1639,14 @@ impl Symbolizer {
         self.native_requests.clear();
         self.native_batch_modules.clear();
         self.retryable_native_modules.clear();
+        // Resolved stacks store u32 frame indices.
+        if self.resolved_frames.len() > u32::MAX as usize {
+            self.clear_frame_batch();
+            return Err(crate::Error::message(
+                crate::ErrorKind::Unsupported,
+                "resolved frames exceed the stack index range",
+            ));
+        }
         Ok(())
     }
 
@@ -1920,7 +1942,7 @@ mod tests {
 
         assert_eq!(symbolizer.resolved_stack_frame_ids, [1, 2, 5, 6, 7, 10]);
         assert_eq!(symbolizer.stack_cache.len(), keys.len());
-        let expected: [&[usize]; 6] = [&[], &[1, 2], &[], &[5, 6, 7], &[10], &[]];
+        let expected: [&[u32]; 6] = [&[], &[1, 2], &[], &[5, 6, 7], &[10], &[]];
         for (key, expected) in keys.iter().zip(expected) {
             let range = symbolizer.stack_cache[key].clone();
             assert_eq!(&symbolizer.resolved_stack_frame_ids[range], expected);
