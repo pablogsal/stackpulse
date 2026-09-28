@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::fs::{File, OpenOptions};
 #[cfg(any(test, feature = "bench-support"))]
 use std::io::BufWriter;
@@ -73,12 +74,12 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     // the whole recording. Unpinned frames are resolved against the module
     // set visible at their position in the file, so their cache must be
     // dropped whenever that set changes (write_module / deactivation).
-    // Unpinned kernel frames only resolve against kernel modules, so their
-    // cache survives user module churn and is dropped only when a kernel
-    // module is written or deactivated.
-    pinned_frame_cache: FxHashMap<FrameRecord, u32>,
-    unpinned_frame_cache: FxHashMap<FrameRecord, u32>,
-    kernel_frame_cache: FxHashMap<FrameRecord, u32>,
+    // Keyed by the compact on-disk frame encoding. Unpinned kernel frames only
+    // resolve against kernel modules, so their cache survives user module
+    // churn and is dropped only when a kernel module is written or deactivated.
+    pinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    unpinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    kernel_frame_cache: FxHashMap<(u64, u64), u32>,
     kernel_module_ids: FxHashSet<u32>,
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
@@ -303,16 +304,20 @@ impl<W: Write> PerfSpoolWriter<W> {
         } else {
             unpinned_frame_cache
         };
-        if let Some(&id) = cache.get(frame) {
-            return Ok(id);
-        }
+        // Readers rebuild a frame from its encoding alone, so frames that
+        // encode identically are the same frame to every reader.
+        let key = compact_frame(frame)?;
+        let entry = match cache.entry(key) {
+            Entry::Occupied(entry) => return Ok(*entry.get()),
+            Entry::Vacant(entry) => entry,
+        };
         let id = *next_frame_id;
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
-        let (tag, address) = compact_frame(frame)?;
+        let (tag, address) = key;
         writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
-        cache.insert(*frame, id);
+        entry.insert(id);
         *next_frame_id = next_frame_id
             .checked_add(1)
             .ok_or_else(|| invalid_input("frame id space exhausted"))?;
@@ -327,17 +332,20 @@ impl<W: Write> PerfSpoolWriter<W> {
         let mut prefix = NONE_U32;
         for frame in frames.into_iter().rev() {
             let frame_id = self.intern_frame(&frame)?;
-            let key = (prefix, frame_id);
-            if let Some(&stack_id) = self.stack_cache.get(&key) {
-                prefix = stack_id;
-                continue;
-            }
-            let stack_id = next_spool_id(self.stack_cache.len(), "stack")?;
+            let next_stack_id = self.stack_cache.len();
+            let entry = match self.stack_cache.entry((prefix, frame_id)) {
+                Entry::Occupied(entry) => {
+                    prefix = *entry.get();
+                    continue;
+                }
+                Entry::Vacant(entry) => entry,
+            };
+            let stack_id = next_spool_id(next_stack_id, "stack")?;
             self.writer.write_record(
                 REC_STACK,
                 (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
             )?;
-            self.stack_cache.insert(key, stack_id);
+            entry.insert(stack_id);
             prefix = stack_id;
         }
         Ok((prefix != NONE_U32).then_some(prefix))
@@ -2770,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn module_lookup_after_mapping_change_rebuilds_only_the_changed_process() {
+    fn module_lookup_after_mapping_change_updates_only_that_process() {
         let mut table = ModuleTable::default();
         let mut writer = writer();
         for process_id in [7, 8] {
