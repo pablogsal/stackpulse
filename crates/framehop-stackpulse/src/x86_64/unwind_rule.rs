@@ -244,8 +244,9 @@ impl UnwindRule for UnwindRuleX86_64 {
                 (sp.checked_add(8).ok_or(Error::IntegerOverflow)?, new_bp)
             }
         };
-        let return_address =
-            read_stack(new_sp - 8).map_err(|_| Error::CouldNotReadStack(new_sp - 8))?;
+        let return_address_location = new_sp.checked_sub(8).ok_or(Error::IntegerOverflow)?;
+        let return_address = read_stack(return_address_location)
+            .map_err(|_| Error::CouldNotReadStack(return_address_location))?;
         if return_address == 0 {
             return Ok(None);
         }

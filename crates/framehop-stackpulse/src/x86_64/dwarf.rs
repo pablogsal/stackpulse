@@ -93,7 +93,11 @@ impl DwarfUnwinding for ArchX86_64 {
         ) {
             Some(ra) => ra,
             None => {
-                read_stack(cfa - 8).map_err(|_| DwarfUnwinderError::CouldNotRecoverReturnAddress)?
+                let return_address_location = cfa
+                    .checked_sub(8)
+                    .ok_or(DwarfUnwinderError::CouldNotRecoverReturnAddress)?;
+                read_stack(return_address_location)
+                    .map_err(|_| DwarfUnwinderError::CouldNotRecoverReturnAddress)?
             }
         };
         if cfa == sp && return_address == ip {

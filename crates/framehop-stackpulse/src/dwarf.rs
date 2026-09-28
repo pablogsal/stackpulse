@@ -741,6 +741,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn memory_backed_cfa_below_the_return_address_slot_is_an_error() {
+        // DW_CFA_def_cfa_expression: DW_OP_breg6(RBP) -8; DW_OP_deref
+        let instructions = [gimli::DW_CFA_def_cfa_expression.0, 3, 0x76, 0x78, 0x06];
+        let mut regs = UnwindRegsX86_64::new(0x1000, 0x2000, 0x3000);
+        let mut read_stack = |address| match address {
+            0x2ff8 => Ok(4),
+            _ => Err(()),
+        };
+        assert!(matches!(
+            unwind_x86_64_fde(&instructions, 0x1004, &mut regs, &mut read_stack),
+            Err(DwarfUnwinderError::CouldNotRecoverReturnAddress)
+        ));
+    }
+
+    #[test]
     fn undefined_return_address_ends_the_stack_even_with_saved_registers() {
         use crate::x86_64::UnwindRuleX86_64;
 
