@@ -943,7 +943,7 @@ impl Symbolizer {
             );
         }
         let kernel_changed = batch.kernel_mappings_changed() && self.refresh_host_kernel_symbols;
-        let resolution_cache_full = self.resolution_cache_full();
+        let frame_resolution_cache_full = self.frame_resolution_cache_full();
         let all = kernel_changed;
         if kernel_changed && !initialize_kernel {
             self.kernel_symbols = Some(kernel::load_sparse_kernel_symbols_for_spool(
@@ -964,7 +964,7 @@ impl Symbolizer {
                 );
             }
         }
-        if kernel_changed || resolution_cache_full {
+        if kernel_changed || frame_resolution_cache_full {
             self.clear_resolution_cache();
         } else if !self.invalidated_process_ids.is_empty() {
             self.frame_cache.retain(|&(process_id, _), cached| {
@@ -1010,12 +1010,25 @@ impl Symbolizer {
         self.clear_stack_resolution_cache();
     }
 
-    fn resolution_cache_full(&self) -> bool {
+    fn frame_resolution_cache_full(&self) -> bool {
+        self.resolution_cache_limit
+            .is_some_and(|limit| self.resolved_frames.len() >= limit)
+    }
+
+    fn stack_resolution_cache_full(&self) -> bool {
         self.resolution_cache_limit.is_some_and(|limit| {
-            self.resolved_frames.len() >= limit
-                || self.resolved_stack_frame_ids.len() >= limit
-                || self.stack_cache.len() >= limit
+            self.resolved_stack_frame_ids.len() >= limit || self.stack_cache.len() >= limit
         })
+    }
+
+    fn clear_resolution_cache_if_full(&mut self) {
+        // Stack ranges index into `resolved_frames`, so frame results survive
+        // a stack-only clear and keep their frame keys.
+        if self.frame_resolution_cache_full() {
+            self.clear_resolution_cache();
+        } else if self.stack_resolution_cache_full() {
+            self.clear_stack_resolution_cache();
+        }
     }
 
     fn clear_stack_resolution_cache(&mut self) {
@@ -1133,9 +1146,7 @@ impl Symbolizer {
             }
         }
 
-        if self.resolution_cache_full() {
-            self.clear_resolution_cache();
-        }
+        self.clear_resolution_cache_if_full();
 
         let mut frames = stack.raw_frames();
         self.begin_frame_batch(frames.len());
@@ -1212,9 +1223,7 @@ impl Symbolizer {
                 "invalid truncated stack marker frame",
             ));
         }
-        if self.resolution_cache_full() {
-            self.clear_resolution_cache();
-        }
+        self.clear_resolution_cache_if_full();
         self.begin_frame_batch(frames.len());
         for frame in frames {
             self.prepare_frame(process_id.get(), *frame, FrameCacheKey::Raw(*frame), None);
