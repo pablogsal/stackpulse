@@ -103,6 +103,10 @@ impl DrainMode {
         matches!(self, Self::Flush | Self::Final)
     }
 
+    fn defers_retirement(self) -> bool {
+        !matches!(self, Self::Final)
+    }
+
     fn opens_new_perf_events(self) -> bool {
         !matches!(self, Self::Final)
     }
@@ -419,6 +423,9 @@ struct ProcessState {
     // deliberately avoids re-reading /proc for every runtime-looking mmap.
     python_perf_support: Option<bool>,
     python_runtime: bool,
+    // Set once the process is known to be gone. The next drain retires it,
+    // after finishing the events it produced before exiting.
+    pending_retirement: Option<PendingRetirement>,
 }
 
 impl ProcessState {
@@ -428,6 +435,11 @@ impl ProcessState {
             None => Ok(false),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PendingRetirement {
+    exit_timestamp_ns: Option<u64>,
 }
 
 #[derive(Default)]
@@ -556,10 +568,14 @@ impl ProcessTable {
         }
     }
 
+    // Excludes processes already known to be gone: their numeric PID may
+    // belong to an unrelated process by now.
     fn tracked_pids(&self) -> Vec<i32> {
         self.states
             .iter()
-            .filter_map(|(&pid, state)| state.process.is_some().then_some(pid))
+            .filter_map(|(&pid, state)| {
+                (state.process.is_some() && state.pending_retirement.is_none()).then_some(pid)
+            })
             .collect()
     }
 
@@ -577,6 +593,10 @@ impl ProcessTable {
         // Poll pending pidfds in one batch; exited or pidfd-less processes
         // answer has_exited without polling.
         for (&pid, state) in states.iter_mut() {
+            if state.pending_retirement.is_some() {
+                dead_pid_scratch.push(pid);
+                continue;
+            }
             let Some(process) = &mut state.process else {
                 continue;
             };
@@ -613,12 +633,33 @@ impl ProcessTable {
         self.dead_pid_scratch = pids;
     }
 
+    /// Keep a gone process for one more drain. Returns false when it already
+    /// waited, meaning it should be retired now.
+    fn defer_retirement(&mut self, pid: i32, exit_timestamp_ns: Option<u64>) -> bool {
+        let Some(state) = self.states.get_mut(&pid) else {
+            return false;
+        };
+        if state.pending_retirement.is_some() {
+            return false;
+        }
+        state.pending_retirement = Some(PendingRetirement { exit_timestamp_ns });
+        true
+    }
+
+    fn pending_exit_timestamp(&self, pid: i32) -> Option<u64> {
+        self.states.get(&pid)?.pending_retirement?.exit_timestamp_ns
+    }
+
     /// Whether a tracked process at `pid` has exited, making the PID free
     /// for reuse. `None` when `pid` is not tracked.
     fn tracked_process_is_stale(&mut self, pid: i32) -> crate::Result<Option<bool>> {
         let Some(state) = self.states.get_mut(&pid) else {
             return Ok(None);
         };
+        // Already seen gone; only its retirement is deferred.
+        if state.pending_retirement.is_some() {
+            return Ok(Some(true));
+        }
         let Some(process) = &mut state.process else {
             return Ok(None);
         };
@@ -1037,7 +1078,7 @@ impl<W: std::io::Write> Recorder<W> {
         };
         result?;
         replay_lifecycle_actions(perf, processes, &lifecycle_actions, open_new_perf_events)?;
-        let dead_processes = processes.dead_or_reused_pids()?;
+        let mut dead_processes = processes.dead_or_reused_pids()?;
         let mut last_exit_by_pid = FxHashMap::<i32, u64>::default();
         if !dead_processes.is_empty() {
             for action in &lifecycle_actions {
@@ -1056,6 +1097,15 @@ impl<W: std::io::Write> Recorder<W> {
                     .or_insert(timestamp_ns);
             }
         }
+        if mode.defers_retirement() {
+            // Death is seen after the rings were read, so they can still hold
+            // the process's final events, and the last ring round leaves some
+            // queued in the sorter. The next drain finishes both; retiring now
+            // would leave them without the process's modules and unwinder.
+            dead_processes.retain(|&pid| {
+                !processes.defer_retirement(pid, last_exit_by_pid.get(&pid).copied())
+            });
+        }
         let retire_result = (|| {
             for &pid in &dead_processes {
                 if let Ok(pid_u32) = u32::try_from(pid) {
@@ -1064,6 +1114,7 @@ impl<W: std::io::Write> Recorder<W> {
                 let timestamp_ns = last_exit_by_pid
                     .get(&pid)
                     .copied()
+                    .or_else(|| processes.pending_exit_timestamp(pid))
                     .unwrap_or(recovery_timestamp_ns);
                 end_python_runtime_process(processes, writer, timestamp_ns, pid)?;
                 cleanup_process(pid, modules, processes, writer)?;
@@ -1086,13 +1137,18 @@ impl<W: std::io::Write> Recorder<W> {
                 let Ok(pid_u32) = u32::try_from(pid) else {
                     continue;
                 };
-                if !reconcile_process_image(
+                if reconcile_process_image(
                     pid_u32,
                     recovery_timestamp_ns,
                     modules,
                     processes,
                     writer,
                 )? {
+                    continue;
+                }
+                if mode.defers_retirement() {
+                    processes.defer_retirement(pid, None);
+                } else {
                     perf.remove_process(pid_u32)?;
                     cleanup_process(pid, modules, processes, writer)?;
                 }
@@ -1219,10 +1275,23 @@ impl<W: std::io::Write> Recorder<W> {
         let mut process = ProcessHandle::open(pid);
         let pid = pid.get_u32();
         if let Some(pid_i32) = i32_from_u32(pid) {
+            // Finish the events a known process left queued before its state
+            // can be retired or replaced below.
+            if self.processes.states.contains_key(&pid_i32) {
+                if let Err(error) = self.drain_events(DrainMode::Flush) {
+                    return Err(self.fail(error.into()));
+                }
+            }
             if let Some(stale) = self.processes.tracked_process_is_stale(pid_i32)? {
                 // Reopen only after proving that the old process is gone.
                 if !stale {
                     return Ok(AttachOutcome::AlreadyAttached);
+                }
+                // The old process can write events after the drain above read
+                // the rings and die before this check. Now that it is gone,
+                // one more drain reads all of them.
+                if let Err(error) = self.drain_events(DrainMode::Flush) {
+                    return Err(self.fail(error.into()));
                 }
                 self.perf.remove_process(pid)?;
                 cleanup_process(
@@ -3494,6 +3563,8 @@ mod tests {
 mod recording_lifecycle_tests {
     use super::*;
     use crate::test_support::TempDir;
+    use perf_event_open::sample::record::task::Exit;
+    use perf_event_open::sample::record::Task;
 
     fn empty_recorder<W: io::Write>(output: W) -> Recorder<W> {
         let origin = crate::spool::ClockOrigin::capture().unwrap();
@@ -3554,6 +3625,36 @@ mod recording_lifecycle_tests {
         let summary = recorder.poll(Duration::ZERO).unwrap();
         assert!(!summary.root_active());
         assert_eq!(summary.active_processes(), 0);
+    }
+
+    #[test]
+    fn gone_process_waits_one_drain_for_its_events() {
+        let child = crate::test_support::SleepChild::spawn();
+        let pid = child.pid_i32();
+        let mut recorder = empty_recorder(Vec::new());
+        recorder.processes.ensure_tracked(pid);
+        drop(child);
+        let exit = |timestamp_ns| PreparedEvent::Record {
+            timestamp_ns,
+            privilege: Priv::User,
+            record: Record::Exit(Box::new(Exit {
+                record_id: None,
+                task: Task {
+                    pid: pid as u32,
+                    tid: pid as u32,
+                },
+                parent_task: Task { pid: 1, tid: 1 },
+                time: timestamp_ns,
+            })),
+        };
+
+        recorder.event_sorter.push_next_round(3, 10, exit(10));
+        recorder.poll(Duration::ZERO).unwrap();
+        assert!(recorder.processes.is_tracked(pid));
+
+        recorder.event_sorter.push_next_round(3, 20, exit(20));
+        recorder.poll(Duration::ZERO).unwrap();
+        assert!(!recorder.processes.states.contains_key(&pid));
     }
 
     #[test]
