@@ -342,16 +342,14 @@ impl ModuleTable {
         mode: FrameMode,
     ) -> FrameRecord {
         self.rebuild_index_if_needed();
-        let module = self
+        let (module_id, file_relative_ip) = self
             .index
             .find(process_id, abs_ip, mode)
-            .and_then(|id| self.active.get(&id).map(|module| (id, module)));
-        let (module_id, file_relative_ip) = module
-            .and_then(|(id, module)| {
+            .and_then(|entry| {
                 abs_ip
-                    .checked_sub(module.start)?
-                    .checked_add(module.file_offset)
-                    .map(|file_relative_ip| (Some(id), file_relative_ip))
+                    .checked_sub(entry.start)?
+                    .checked_add(entry.file_offset)
+                    .map(|file_relative_ip| (Some(entry.id), file_relative_ip))
             })
             .unwrap_or((None, abs_ip));
         FrameRecord {
@@ -452,7 +450,7 @@ struct ModuleIndex {
 }
 
 impl ModuleIndex {
-    fn find(&self, process_id: i32, address: u64, mode: FrameMode) -> Option<u32> {
+    fn find(&self, process_id: i32, address: u64, mode: FrameMode) -> Option<ModuleIndexEntry> {
         match mode {
             FrameMode::User => self
                 .by_process
@@ -489,17 +487,17 @@ impl ModuleIndexGroup {
         }
     }
 
-    fn find(&self, address: u64) -> Option<u32> {
+    fn find(&self, address: u64) -> Option<ModuleIndexEntry> {
         if self.has_overlaps {
             return self
                 .entries
                 .iter()
                 .rfind(|entry| entry.start <= address && address < entry.end)
-                .map(|entry| entry.id);
+                .copied();
         }
         let idx = self.entries.partition_point(|entry| entry.start <= address);
         let entry = self.entries.get(idx.checked_sub(1)?)?;
-        (address < entry.end).then_some(entry.id)
+        (address < entry.end).then_some(*entry)
     }
 }
 
@@ -507,6 +505,7 @@ impl ModuleIndexGroup {
 struct ModuleIndexEntry {
     start: u64,
     end: u64,
+    file_offset: u64,
     id: u32,
 }
 
@@ -515,6 +514,7 @@ impl From<&ModuleRecord> for ModuleIndexEntry {
         Self {
             start: module.start,
             end: module.end,
+            file_offset: module.file_offset,
             id: module.id,
         }
     }
@@ -537,6 +537,7 @@ mod tests {
                 group.entries.push(ModuleIndexEntry {
                     start,
                     end: start + if overlap { 64 } else { 16 },
+                    file_offset: 0,
                     id,
                 });
             }
@@ -551,7 +552,7 @@ mod tests {
             assert_eq!(group.has_overlaps, overlap);
             for (address, expected) in addresses.into_iter().zip(expected) {
                 assert_eq!(
-                    group.find(address),
+                    group.find(address).map(|entry| entry.id),
                     expected,
                     "address {address}, overlap {overlap}"
                 );
