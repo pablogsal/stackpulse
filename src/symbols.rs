@@ -19,6 +19,8 @@ use wholesym::{
 };
 
 #[cfg(feature = "builtin-wholesym")]
+use rustc_hash::FxHashSet;
+#[cfg(feature = "builtin-wholesym")]
 use std::cell::RefCell;
 #[cfg(feature = "builtin-wholesym")]
 use std::collections::{HashMap, HashSet};
@@ -650,6 +652,7 @@ impl NativeSymbolizer for SymbolizerWrapper {
         if *references == 0 {
             self.image_mapping_counts.remove(&image);
             self.symbol_maps.remove(&image);
+            self.image_strings.remove(&image);
             self.redirect_cache.remove(&image);
         }
     }
@@ -913,6 +916,9 @@ struct SymbolizerWrapper {
     /// Loaded wholesym maps keyed by StackPulse's validated image identity.
     symbol_maps: HashMap<NativeImageId, Option<WholeSymbolMap>>,
 
+    /// Strings shared by the symbols resolved from each loaded image.
+    image_strings: HashMap<NativeImageId, ImageStrings>,
+
     mappings: HashSet<u32>,
     image_mapping_counts: HashMap<NativeImageId, usize>,
 
@@ -971,32 +977,51 @@ fn build_native_symbol(
     }
 }
 
+/// Function names and source paths handed out for one image, so every PC in
+/// the same function shares one allocation instead of copying the strings.
+#[cfg(feature = "builtin-wholesym")]
+#[derive(Default)]
+struct ImageStrings {
+    strings: FxHashSet<Rc<str>>,
+    prune_at: usize,
+}
+
+#[cfg(feature = "builtin-wholesym")]
+impl ImageStrings {
+    fn intern(&mut self, value: &str) -> Rc<str> {
+        if let Some(value) = self.strings.get(value) {
+            return Rc::clone(value);
+        }
+        // Live symbolizers drop resolved frames periodically. Once the set
+        // doubles the strings still referenced at the last prune, forget the
+        // ones only it references and release their table space. The set then
+        // holds at most twice the strings alive at the last prune, or one if
+        // none were, at amortized O(1) cost; entries dropped since wait for
+        // the next prune.
+        if self.strings.len() >= self.prune_at {
+            self.strings.retain(|value| Rc::strong_count(value) > 1);
+            self.prune_at = 2 * self.strings.len();
+            self.strings.shrink_to(self.prune_at);
+        }
+        let value = Rc::<str>::from(value);
+        self.strings.insert(Rc::clone(&value));
+        value
+    }
+}
+
 #[cfg(feature = "builtin-wholesym")]
 fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
+    strings: &mut ImageStrings,
     module: &Rc<str>,
     function_offset: u64,
     is_python_runtime: bool,
 ) -> NativeSymbols {
-    let frame_parts = |frame: wholesym::FrameDebugInfo| {
-        let file = frame
-            .file_path
-            .map(|path| Rc::<str>::from(path.display_path()));
-        let source = SourceLocation {
-            file,
-            line: frame.line_number,
-            column: None,
-            function_start_line: None,
-            function_start_column: None,
-        };
-        (frame.function, source)
-    };
-
     let frames = frames.unwrap_or_default();
     if frames.is_empty() {
         return build_native_symbol(
-            symbol_name,
+            strings.intern(&symbol_name),
             SourceLocation::default(),
             module,
             function_offset,
@@ -1008,10 +1033,22 @@ fn build_native_symbols_from_wholesym_parts(
     frames
         .into_iter()
         .map(|frame| {
-            let (function, source) = frame_parts(frame);
-            let name = function.map(Rc::<str>::from).unwrap_or_else(|| {
-                Rc::clone(fallback_name.get_or_insert_with(|| Rc::from(symbol_name.as_str())))
-            });
+            let file = frame
+                .file_path
+                .map(|path| strings.intern(&path.display_path()));
+            let source = SourceLocation {
+                file,
+                line: frame.line_number,
+                column: None,
+                function_start_line: None,
+                function_start_column: None,
+            };
+            let name = match frame.function {
+                Some(function) => strings.intern(&function),
+                None => {
+                    Rc::clone(fallback_name.get_or_insert_with(|| strings.intern(&symbol_name)))
+                }
+            };
             build_native_symbol(name, source, module, function_offset, is_python_runtime)
         })
         .collect()
@@ -1034,6 +1071,7 @@ impl SymbolizerWrapper {
             redirect_cache: HashMap::new(),
             symbol_manager,
             symbol_maps: HashMap::new(),
+            image_strings: HashMap::new(),
             mappings: HashSet::new(),
             image_mapping_counts: HashMap::new(),
             runtime: std::mem::ManuallyDrop::new(runtime),
@@ -1097,6 +1135,7 @@ impl SymbolizerWrapper {
         Some(build_native_symbols_from_wholesym_parts(
             addr_info.symbol.name,
             frames,
+            self.image_strings.entry(image).or_default(),
             module_rc,
             function_offset,
             is_python_runtime,
@@ -1222,6 +1261,7 @@ mod tests {
             let symbols = build_native_symbols_from_wholesym_parts(
                 fallback.into(),
                 frames,
+                &mut ImageStrings::default(),
                 &module,
                 17,
                 true,
@@ -1250,6 +1290,7 @@ mod tests {
             let symbols = build_native_symbols_from_wholesym_parts(
                 fallback.into(),
                 Some(frames),
+                &mut ImageStrings::default(),
                 &module,
                 17,
                 true,
