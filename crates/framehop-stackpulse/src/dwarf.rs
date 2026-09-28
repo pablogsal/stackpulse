@@ -717,6 +717,52 @@ pub(crate) mod tests {
         assert!(matches!(result, Ok(UnwindResult::ExecRule(_))));
     }
 
+    /// Unwinds a caller frame at `address` with an `.eh_frame` FDE for [0x1000, 0x1010)
+    /// that runs `instructions` after the x86-64 entry CIE.
+    fn unwind_x86_64_fde(
+        instructions: &[u8],
+        address: u32,
+        regs: &mut UnwindRegsX86_64,
+        read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
+    ) -> Result<UnwindResult<crate::x86_64::UnwindRuleX86_64>, DwarfUnwinderError> {
+        use crate::x86_64::ArchX86_64;
+
+        let (data, fde_offset) = eh_frame_with_fde(&X86_64_CIE, 0x1000..0x1010, instructions);
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        DwarfUnwinder::<_, ArchX86_64, _>::new(
+            EndianSlice::new(&data, LittleEndian),
+            UnwindSectionType::EhFrame,
+            None,
+            &mut context,
+            BaseAddresses::default(),
+            0,
+        )
+        .unwind_frame_with_fde::<_, StoreOnHeap>(regs, false, address, fde_offset, read_stack)
+    }
+
+    #[test]
+    fn undefined_return_address_ends_the_stack_even_with_saved_registers() {
+        use crate::x86_64::UnwindRuleX86_64;
+
+        let instructions = [
+            gimli::DW_CFA_undefined.0,
+            X86_64::RA.0 as u8,
+            gimli::DW_CFA_offset.0 | X86_64::RBX.0 as u8,
+            2,
+        ];
+        let mut regs = UnwindRegsX86_64::new(0x1004, 0x2000, 0x3000);
+        let result = unwind_x86_64_fde(&instructions, 0x1004, &mut regs, &mut |_| Ok(0x5555));
+        assert!(
+            matches!(
+                result,
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                    UnwindRuleX86_64::EndOfStack,
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
     fn encoding() -> Encoding {
         Encoding {
             address_size: 8,

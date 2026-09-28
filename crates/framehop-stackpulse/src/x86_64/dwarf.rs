@@ -60,6 +60,14 @@ impl DwarfUnwinding for ArchX86_64 {
         let bp_rule = unwind_info.register(X86_64::RBP);
         let ra_rule = unwind_info.register(X86_64::RA);
 
+        // An undefined return address marks the outermost frame, even when the
+        // row also saves general registers.
+        if matches!(ra_rule, None | Some(RegisterRule::Undefined)) {
+            return Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                UnwindRuleX86_64::EndOfStack,
+            ));
+        }
+
         if !has_explicit_general_register_rules(unwind_info) {
             if let Some(unwind_rule) =
                 translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref())
@@ -188,12 +196,8 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
     bp_rule: Option<&RegisterRule<RO>>,
     ra_rule: Option<&RegisterRule<RO>>,
 ) -> Option<UnwindRuleX86_64> {
-    match ra_rule {
-        None | Some(RegisterRule::Undefined) => {
-            return Some(UnwindRuleX86_64::EndOfStack);
-        }
-        Some(RegisterRule::Offset(-8)) => {}
-        _ => return None,
+    if !matches!(ra_rule, Some(RegisterRule::Offset(-8))) {
+        return None;
     }
 
     match cfa_rule {
