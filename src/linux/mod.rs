@@ -423,6 +423,7 @@ struct ProcessState {
     // deliberately avoids re-reading /proc for every runtime-looking mmap.
     python_perf_support: Option<bool>,
     python_runtime: bool,
+    unreadable_maps_reported: bool,
     // Set once the process is known to be gone. The next drain retires it,
     // after finishing the events it produced before exiting.
     pending_retirement: Option<PendingRetirement>,
@@ -457,6 +458,10 @@ struct ProcessTable {
     pidfd_pids: Vec<i32>,
     pidfd_poll: Vec<libc::pollfd>,
     dead_pid_scratch: Vec<i32>,
+    // Descendants whose maps were unreadable when found, so each is warned
+    // about once. Kept apart from `states` and pruned by every descendant
+    // scan, since nothing would retire a state for an untracked process.
+    unreadable_descendants: FxHashMap<i32, ProcessHandle>,
 }
 
 impl ProcessTable {
@@ -586,6 +591,7 @@ impl ProcessTable {
             pidfd_poll,
             dead_pid_scratch,
             elf_sections: _,
+            unreadable_descendants: _,
         } = self;
         pidfd_pids.clear();
         pidfd_poll.clear();
@@ -631,6 +637,12 @@ impl ProcessTable {
     fn recycle_dead_pid_scratch(&mut self, mut pids: Vec<i32>) {
         pids.clear();
         self.dead_pid_scratch = pids;
+    }
+
+    /// Forget unreadable descendants that a new scan no longer finds.
+    fn retain_unreadable_descendants(&mut self, edges: &[(i32, i32)]) {
+        self.unreadable_descendants
+            .retain(|pid, _| edges.iter().any(|&(child, _)| child == *pid));
     }
 
     /// Keep a gone process for one more drain. Returns false when it already
@@ -1156,8 +1168,9 @@ impl<W: std::io::Write> Recorder<W> {
         }
         if open_new_perf_events && recovered_lifecycle_gap && inherit_child_processes {
             let roots = processes.tracked_pids();
-            for (child, parent) in crate::children::discover_descendant_edges_raw_for_roots(&roots)
-            {
+            let edges = crate::children::discover_descendant_edges_raw_for_roots(&roots);
+            processes.retain_unreadable_descendants(&edges);
+            for (child, parent) in edges {
                 if processes.is_tracked(child) {
                     continue;
                 }
@@ -1787,15 +1800,21 @@ fn reconcile_process_image<W: std::io::Write>(
         .read_tracked(pid_i32, read_process_image_identity)
         .ok();
 
-    let maps =
-        match processes.read_tracked(pid_i32, |pid| std::fs::read(format!("/proc/{pid}/maps"))) {
-            Ok(maps) => maps,
-            Err(err) if crate::error::is_target_gone_io(&err) => {
-                processes.forget_image(pid_i32);
-                return Ok(false);
-            }
-            Err(err) => return Err(err),
-        };
+    let maps = match processes.read_tracked(pid_i32, read_existing_maps) {
+        Ok(maps) => maps,
+        Err(err) if crate::error::is_target_gone_io(&err) => {
+            processes.forget_image(pid_i32);
+            return Ok(false);
+        }
+        Err(err) if crate::error::is_access_denied_io(&err) => {
+            // Counters keep sampling a process that called
+            // PR_SET_DUMPABLE(0), though a secure exec detaches them, so
+            // keep its last known modules and unwinder.
+            report_unreadable_maps(pid_i32, &err, processes);
+            return Ok(true);
+        }
+        Err(err) => return Err(err),
+    };
     let snapshot: Vec<_> = executable_modules_from_maps(pid, &maps).collect();
     if snapshot.is_empty() {
         // A live group whose leader has exited can expose an empty maps file.
@@ -1841,6 +1860,23 @@ fn reconcile_process_image<W: std::io::Write>(
     }
 }
 
+/// Warn once per process when `/proc/<pid>/maps` is unreadable, as when a
+/// same-uid process turns non-dumpable after a setuid, setgid or
+/// file-capability exec, an exec of an unreadable binary, or
+/// `PR_SET_DUMPABLE=0`; that must not fail the whole recording.
+fn report_unreadable_maps(pid: i32, err: &io::Error, processes: &mut ProcessTable) {
+    let state = processes.state_mut(pid);
+    if !std::mem::replace(&mut state.unreadable_maps_reported, true) {
+        warn_unreadable_maps(pid, err);
+    }
+}
+
+fn warn_unreadable_maps(pid: i32, err: &io::Error) {
+    tracing::warn!(
+        "{err}; access was denied, so the maps snapshot of pid {pid} cannot be refreshed"
+    );
+}
+
 fn register_recovered_descendant<W: std::io::Write>(
     child: i32,
     parent: i32,
@@ -1854,9 +1890,24 @@ fn register_recovered_descendant<W: std::io::Write>(
     };
     let mut process = ProcessHandle::open(child_pid);
     let child_pid = child_pid.get_u32();
+    // Create no process state before the maps are read: an untracked entry
+    // left by a skipped child is never retired.
     let maps = match process.read_checked(read_existing_maps) {
         Ok(maps) => maps,
         Err(err) if crate::error::is_target_gone_io(&err) => return Ok(None),
+        Err(err) if crate::error::is_access_denied_io(&err) => {
+            // Without a maps snapshot the child cannot be registered, so
+            // treat it like a descendant that could not be attached.
+            let warned = match processes.unreadable_descendants.get_mut(&child) {
+                Some(previous) => !previous.has_exited()?,
+                None => false,
+            };
+            if !warned {
+                processes.unreadable_descendants.insert(child, process);
+                warn_unreadable_maps(child, &err);
+            }
+            return Ok(None);
+        }
         Err(err) => return Err(err),
     };
     processes.track(process);
@@ -2344,6 +2395,10 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     let maps = match ctx.processes.read_process(meta.pid, read_existing_maps) {
         Ok(maps) => maps,
         Err(err) if crate::error::is_target_gone_io(&err) => return Ok(()),
+        Err(err) if crate::error::is_access_denied_io(&err) => {
+            report_unreadable_maps(meta.pid, &err, ctx.processes);
+            return Ok(());
+        }
         Err(err) => return Err(err),
     };
     match register_existing_maps_snapshot(pid, &maps, ctx.modules, ctx.processes, ctx.writer) {
@@ -3260,6 +3315,30 @@ mod tests {
         let mut inherited = unwinder.inherit_for_fork();
 
         assert!(inherited.should_refresh_for_uncovered_pc(0x3000));
+    }
+
+    #[test]
+    fn recovery_sweep_keeps_non_dumpable_process_modules() {
+        let child = SleepChild::spawn_non_dumpable();
+        let (pid, pid_i32) = (child.pid_u32(), child.pid_i32());
+        if read_existing_maps(pid).is_ok() {
+            return; // Privileged enough to read non-dumpable processes.
+        }
+        let pc = recovery_sweep_keeps_non_dumpable_process_modules as *const () as u64;
+        let mut modules = ModuleTable::default();
+        let mut processes = ProcessTable::default();
+        let mut writer = PerfSpoolWriter::from_writer(Vec::new(), 0, 0).unwrap();
+        // The forked child still runs this test binary's mappings.
+        let maps = read_existing_maps(std::process::id()).unwrap();
+        register_existing_maps_snapshot(pid, &maps, &mut modules, &mut processes, &mut writer)
+            .unwrap();
+        processes.ensure_tracked(pid_i32);
+        processes.capture_image(pid_i32);
+
+        assert!(
+            reconcile_process_image(pid, 0, &mut modules, &mut processes, &mut writer).unwrap()
+        );
+        assert!(modules.covers_user_pc(pid_i32, pc));
     }
 
     fn test_module(start: u64, end: u64) -> ModuleRecord {

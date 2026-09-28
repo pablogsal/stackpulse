@@ -131,6 +131,10 @@ User-space sampling often works with the default perf permissions. Kernel frames
 high sample rates, and restrictive `perf_event_paranoid` settings may require
 `CAP_PERFMON` or a sysctl change.
 
+Descendants that become non-dumpable, such as setuid, setgid or file-capability
+programs, hide `/proc/<pid>/maps`. The recorder logs a warning and keeps their
+last known mappings. The kernel stops sampling a process after such an exec.
+
 ## GDB JIT registrations
 
 The Linux recorder reads generated function names and unwind rules through the

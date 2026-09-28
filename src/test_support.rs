@@ -111,23 +111,29 @@ pub(crate) struct SleepChild {
 
 impl SleepChild {
     pub(crate) fn spawn() -> Self {
-        Self::spawn_with(None)
+        Self::spawn_with(true, None)
+    }
+
+    /// Spawn a child that has cleared its dumpable flag before this returns,
+    /// so ptrace access checks deny it even to the same user and
+    /// `/proc/<pid>/maps` is unreadable to unprivileged same-uid observers.
+    pub(crate) fn spawn_non_dumpable() -> Self {
+        Self::spawn_with(false, None)
     }
 
     /// Spawn a child whose kernel command name is `name`, which need not be UTF-8.
     pub(crate) fn spawn_named(name: &CStr) -> Self {
-        let child = Self::spawn_with(Some(name));
-        let comm = format!("/proc/{}/comm", child.pid_i32());
-        let expected = [name.to_bytes(), b"\n"].concat();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while fs::read(&comm).ok().as_deref() != Some(expected.as_slice()) {
-            assert!(Instant::now() < deadline, "test child was not renamed");
-            thread::sleep(Duration::from_millis(1));
-        }
-        child
+        Self::spawn_with(true, Some(name))
     }
 
-    fn spawn_with(name: Option<&CStr>) -> Self {
+    fn spawn_with(dumpable: bool, name: Option<&CStr>) -> Self {
+        let mut ready = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "create ready pipe: {}",
+            io::Error::last_os_error()
+        );
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork test child: {}", io::Error::last_os_error());
         if pid == 0 {
@@ -140,10 +146,22 @@ impl SleepChild {
                 let mut mask = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                if !dumpable {
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0);
+                }
+                libc::write(ready[1], [0_u8].as_ptr().cast(), 1);
                 loop {
                     libc::pause();
                 }
             }
+        }
+        // Other test threads may fork and inherit the write end, so wait for
+        // the child's byte rather than for end of file.
+        let mut byte = 0_u8;
+        unsafe {
+            libc::close(ready[1]);
+            libc::read(ready[0], (&raw mut byte).cast(), 1);
+            libc::close(ready[0]);
         }
         Self { pid: Some(pid) }
     }

@@ -112,6 +112,13 @@ pub(crate) fn is_target_gone_io(source: &io::Error) -> bool {
         || matches!(find_raw_os_error(source), Some(libc::ENOENT | libc::ESRCH))
 }
 
+/// Whether a `/proc/<pid>` read was denied: `mm_access` fails its ptrace
+/// check with `EACCES`, and under the `hidepid=noaccess` mount option
+/// `proc_pid_permission` fails the same check with `EPERM`.
+pub(crate) fn is_access_denied_io(source: &io::Error) -> bool {
+    matches!(find_raw_os_error(source), Some(libc::EACCES | libc::EPERM))
+}
+
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         let kind = if find_in_chain::<crate::record::PerfFrequencyLimit>(&error).is_some() {
@@ -152,7 +159,7 @@ where
     }
 }
 
-fn find_raw_os_error(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+pub(crate) fn find_raw_os_error(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
     loop {
         if let Some(io_error) = error.downcast_ref::<io::Error>() {
             if let Some(code) = io_error.raw_os_error() {

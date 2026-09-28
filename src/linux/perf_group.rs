@@ -356,6 +356,9 @@ impl PerfGroup {
         let mut threads = match process.read_checked(get_threads) {
             Ok(threads) => threads,
             Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
+            // Under `hidepid=noaccess`, a process that turned non-dumpable
+            // denies its task list; keep the threads already tracked.
+            Err(err) if crate::error::is_access_denied_io(&err) => return Ok(true),
             Err(err) => return Err(err),
         };
         threads.sort_unstable();
@@ -623,7 +626,16 @@ impl PerfGroup {
     ) -> io::Result<Option<bool>> {
         match self.open_task_perfs(target, cpu_ids, attach_mode, frequency, pending) {
             Ok(inherits) => Ok(Some(inherits)),
-            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            // EACCES: access to the thread is denied, as once its process
+            // turned non-dumpable. Skip it like a gone thread.
+            Err(err)
+                if matches!(
+                    crate::error::find_raw_os_error(&err),
+                    Some(libc::ESRCH | libc::EACCES)
+                ) =>
+            {
+                Ok(None)
+            }
             Err(err) => Err(err),
         }
     }
@@ -1097,7 +1109,7 @@ mod tests {
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
-    use crate::test_support::process_handle;
+    use crate::test_support::{process_handle, SleepChild};
 
     const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
         frequency: 1,
@@ -1679,6 +1691,39 @@ mod tests {
         assert_eq!(group.members.len(), 1);
         group.remove_process(owner_pid).expect("remove process");
         assert!(group.members.is_empty());
+    }
+
+    #[test]
+    fn threads_of_non_dumpable_process_are_skipped() {
+        let child = SleepChild::spawn_non_dumpable();
+        let pid = child.pid_u32();
+        if std::fs::read(format!("/proc/{pid}/maps")).is_ok() {
+            // Privileged enough to open counters for it anyway.
+            return;
+        }
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
+            return;
+        };
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
+        // Only a denial specific to the non-dumpable child is under test, not
+        // perf events being unavailable to this process altogether.
+        let own_pid = std::process::id();
+        if open_fixed_cpu_events(&group, own_pid, own_pid, cpu, 1, TaskInheritance::Threads)
+            .is_none()
+        {
+            return;
+        }
+
+        // After a secure exec closed its counters, a process's threads are
+        // opened explicitly, which the kernel denies.
+        group
+            .open_forked_threads(&[ThreadFork {
+                tid: pid,
+                owner_pid: pid,
+                parent_tid: pid,
+            }])
+            .expect("open forked thread");
+        assert!(group.tracked_threads.is_empty());
     }
 
     fn open_fixed_cpu_events(
