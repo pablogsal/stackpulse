@@ -465,9 +465,14 @@ fn write_profile(profile: &Profile, output: &Path) -> io::Result<()> {
     let file = File::create(output)?;
     let mut writer = BufWriter::new(file);
     if output.extension() == Some(OsStr::new("gz")) {
-        let mut gz = GzEncoder::new(&mut writer, Compression::new(2));
+        // serde_json emits many tiny writes; batch them before they reach the
+        // encoder, which does fixed per-write work regardless of the chunk size.
+        let gz = GzEncoder::new(&mut writer, Compression::new(2));
+        let mut gz = BufWriter::with_capacity(256 * 1024, gz);
         serde_json::to_writer(&mut gz, profile).map_err(io::Error::other)?;
-        gz.try_finish()?;
+        gz.into_inner()
+            .map_err(io::IntoInnerError::into_error)?
+            .try_finish()?;
     } else {
         serde_json::to_writer(&mut writer, profile).map_err(io::Error::other)?;
     }
