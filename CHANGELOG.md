@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Fixed
+
+- Keep recordings running when a tracked process becomes non-dumpable, warning and retaining its last known mappings. A privileged exec can still stop kernel sampling of that target.
+- Prevent dropping an unstarted `PreparedRecording` from hanging while another prepared child remains suspended.
+- Preserve module information for samples queued when a process exits.
+- Avoid debug-build panics and leaked image references when a child is discovered before its fork event is processed.
+- Close inherited perf event descriptors after their owning tasks and remaining descendants exit.
+- Avoid confusing reused PIDs with tracked processes when pidfds are available.
+- Recognize exited, unreaped processes when pidfds are unavailable, so recordings do not keep waiting for them.
+- Allow attachment and descendant discovery for processes whose command names contain non-UTF-8 bytes.
+- Retry attachment with smaller buffers across CPUs when the shared ring-buffer budget is exhausted, down to the minimum capacity.
+- Fall back from hardware CPU-cycle sampling to software CPU-clock sampling when the hardware lacks sampling support, including in some virtual machines.
+- Reject attachment to a non-leader thread ID with `ErrorKind::InvalidInput`, naming the owning process ID to use.
+- Reject a zero `RecorderBuilder::stack_size` with `ErrorKind::InvalidInput` when attaching or preparing a recording, before opening perf events.
+- Report execution failures from `PreparedRecording::start` as `ErrorKind::ProcessLaunch`, naming the program and failing any linked `LiveReader`.
+- Restore default `SIGPIPE` handling in launched programs, matching `std::process::Command`.
+- Unwind AArch64 code built with return-address signing through its DWARF information.
+- Preserve AArch64 caller frames when DWARF restores x29 as a general-purpose register.
+- Stop x86-64 stacks at DWARF's undefined return address, including thread entry points that also describe saved registers.
+- Bound DWARF expression evaluation so looping unwind expressions cannot hang the unwinder.
+- Prevent x86-64 unwind panics when corrupt stack data or unwind information causes return-address arithmetic to underflow.
+- Preserve exact x86-64 DWARF stack offsets and avoid premature unwinding failures when a saved frame pointer is unreadable.
+- Avoid panics when `framehop-stackpulse` unwinds x86-64 PE files with truncated instruction data.
+- Recover native unwinding and symbols through a target's chroot or mount namespace when accessible files match the recorded device and inode. This fallback does not cover overlayfs containers.
+- Recover native unwinding and symbols for running executables replaced on disk when the original image remains accessible through `/proc/<pid>/exe`.
+- Resolve vDSO function names with the built-in backend for recorder-linked live readers when the target's vDSO can be verified against the recorder's. Saved spools remain address-only.
+- Keep perf-map symbols containing invalid UTF-8, replacing invalid bytes with U+FFFD instead of discarding the map.
+
+### Changed
+
+- Add target and operation details to attach setup errors, including the CPU for perf failures and relevant permission or ring-buffer limit hints.
+- Report `ErrorKind::Unsupported` with the Linux 6.0 requirement when attachment confirms that the kernel lacks `PERF_FORMAT_LOST` support.
+- Include record tags and byte offsets in spool record-decoding errors. Recognized unsupported spool versions name the recorded and supported versions while retaining `ErrorKind::CorruptSpool`.
+- Log a ptrace-permission warning once per `stackpulse_jit::Registry` when GDB JIT registration reads are denied.
+- Require `framehop-stackpulse` 0.17.2 in both `stackpulse` and `stackpulse-jit`.
+
+### Performance
+
+- Reduce symbolization time and memory for recordings with many exited processes sharing the same libraries.
+- Speed up DWARF unwinding, especially optimized x86-64 code and mixed native/JIT stacks after many module changes.
+- Speed up opening and reading spools with many short-lived processes or loaded modules, and reduce spool size when kernel stacks are recorded alongside frequent user-space mapping changes.
+- Reduce recorder CPU and memory use: skip unneeded loss-counter reads when idle, copy less per sample, make mapping changes cheaper, and allocate no unwind cache for child processes that are never sampled.
+- Reduce JIT discovery overhead, especially with large libraries or frequent anonymous executable mapping changes.
+- Reduce symbolization CPU and memory use: share function names and source paths, store cached stacks compactly, resolve new stacks of known frames faster, and load kernel symbols more cheaply, including on systems that hide kernel symbol addresses.
+- Speed up live perf-map updates and lookups for addresses between symbols.
+- Speed up gzip-compressed output from the `gecko_profile` example.
+
 ## 0.12.1 - 2026-09-20
 
 ### Fixed
