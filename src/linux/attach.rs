@@ -142,12 +142,8 @@ struct ProcStat {
     start_time: u64,
 }
 
-fn parse_proc_stat(stat: &str) -> io::Result<ProcStat> {
-    let after_comm = stat
-        .rfind(')')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))?;
-    let mut fields = stat
-        .get(after_comm + 2..)
+fn parse_proc_stat(stat: &[u8]) -> io::Result<ProcStat> {
+    let mut fields = crate::children::proc_stat_fields(stat)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))?
         .split_whitespace();
     let state = fields
@@ -162,7 +158,7 @@ fn parse_proc_stat(stat: &str) -> io::Result<ProcStat> {
 }
 
 fn read_proc_stat(path: &str) -> io::Result<ProcStat> {
-    parse_proc_stat(&fs::read_to_string(path)?)
+    parse_proc_stat(&fs::read(path)?)
 }
 
 pub(crate) fn read_process_start_time(pid: u32) -> io::Result<u64> {
@@ -177,7 +173,7 @@ mod tests {
     #[test]
     fn parses_comm_with_parentheses() {
         let stat = parse_proc_stat(
-            "42 (a tricky ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987",
+            b"42 (a tricky ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987",
         )
         .expect("parse stat");
         assert_eq!(stat.state, 'S');
@@ -187,7 +183,7 @@ mod tests {
     #[test]
     fn rejects_malformed_stat() {
         assert_eq!(
-            parse_proc_stat("42 malformed")
+            parse_proc_stat(b"42 malformed")
                 .expect_err("reject stat")
                 .kind(),
             io::ErrorKind::InvalidData

@@ -1,5 +1,5 @@
 use memmap2::{Mmap, MmapOptions};
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -111,10 +111,30 @@ pub(crate) struct SleepChild {
 
 impl SleepChild {
     pub(crate) fn spawn() -> Self {
+        Self::spawn_with(None)
+    }
+
+    /// Spawn a child whose kernel command name is `name`, which need not be UTF-8.
+    pub(crate) fn spawn_named(name: &CStr) -> Self {
+        let child = Self::spawn_with(Some(name));
+        let comm = format!("/proc/{}/comm", child.pid_i32());
+        let expected = [name.to_bytes(), b"\n"].concat();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read(&comm).ok().as_deref() != Some(expected.as_slice()) {
+            assert!(Instant::now() < deadline, "test child was not renamed");
+            thread::sleep(Duration::from_millis(1));
+        }
+        child
+    }
+
+    fn spawn_with(name: Option<&CStr>) -> Self {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork test child: {}", io::Error::last_os_error());
         if pid == 0 {
             unsafe {
+                if let Some(name) = name {
+                    libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+                }
                 reset_signal(libc::SIGINT);
                 reset_signal(libc::SIGTERM);
                 let mut mask = std::mem::zeroed();

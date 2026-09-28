@@ -2552,6 +2552,22 @@ mod tests {
     }
 
     #[test]
+    fn default_attach_accepts_process_with_non_utf8_name() {
+        let child = SleepChild::spawn_named(c"sl\xffeep");
+        let recorder = match Recorder::builder(SampleRate::hz(1).unwrap()).attach_writer(
+            crate::Pid::try_from(child.pid_u32()).expect("child pid is valid"),
+            Vec::new(),
+        ) {
+            Ok(recorder) => recorder,
+            Err(err) if perf_unavailable(&err) => {
+                return;
+            }
+            Err(err) => panic!("attach recorder: {err}"),
+        };
+        recorder.finish().expect("finish recording");
+    }
+
+    #[test]
     fn reopening_the_same_process_is_idempotent() {
         let child = SleepChild::spawn();
         let temp = TempDir::new("duplicate-open");
