@@ -222,19 +222,29 @@ impl PreparedRecording {
         self.recorder.take_reader()
     }
     /// Execute the child and transfer ownership of capture and child handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::ProcessLaunch`] when the program cannot be
+    /// executed. A linked reader then reports the same failure instead of
+    /// finishing.
     pub fn start(self) -> crate::Result<(Recorder, process::Child)> {
         let Self { recorder, child } = self;
         match child.unsuspend_and_run() {
             Ok(child) => Ok((recorder, child)),
             Err(error) => {
+                // Publish the failure first; finish would otherwise mark the
+                // empty recording as successfully finished.
+                let failure = Arc::new(error);
+                recorder.publisher.abort(Some(Arc::clone(&failure)));
+                let error = crate::Error::new(failure.kind(), SharedFailure(failure));
                 let cleanup = recorder.finish();
                 match cleanup {
                     Ok(_) => Err(error),
-                    Err(cleanup) => Err(crate::error::with_cleanup_error(
-                        error.into(),
-                        io::Error::other(cleanup),
-                    )
-                    .into()),
+                    Err(cleanup) => Err(crate::Error::new(
+                        error.kind(),
+                        crate::error::with_cleanup_error(error.into(), io::Error::other(cleanup)),
+                    )),
                 }
             }
         }
@@ -264,7 +274,7 @@ pub(super) struct SharedFailure(#[source] pub Arc<crate::Error>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{perf_unavailable, TempDir};
 
     #[test]
     fn prepare_distinguishes_launch_and_recorder_setup_errors() {
@@ -303,5 +313,34 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(error.to_string().contains("sample_user_stack"));
+    }
+
+    #[test]
+    fn start_reports_exec_failure_as_process_launch() {
+        let directory = TempDir::new("start-exec-errors");
+        let program = directory.path().join("missing-program");
+        let spool =
+            Spool::retained(std::fs::File::create(directory.path().join("capture")).unwrap())
+                .unwrap();
+        let mut prepared = match Recorder::builder(SampleRate::hz(99).unwrap())
+            .prepare(process::Launch::new(&program), spool)
+        {
+            Ok(prepared) => prepared,
+            Err(err) if perf_unavailable(&err) => return,
+            Err(err) => panic!("prepare recording: {err}"),
+        };
+        let mut reader = prepared.take_reader().unwrap();
+
+        let error = prepared.start().expect_err("exec must fail");
+        assert_eq!(error.kind(), crate::ErrorKind::ProcessLaunch);
+        assert!(error.to_string().contains(&*program.to_string_lossy()));
+        let reader_error = loop {
+            match reader.poll(Duration::from_millis(100)) {
+                Ok(crate::spool::ReadStatus::Finished(_)) => panic!("reader finished"),
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(reader_error.kind(), crate::ErrorKind::ProcessLaunch);
     }
 }

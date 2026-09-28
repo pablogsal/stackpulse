@@ -26,6 +26,7 @@ unsafe extern "C" {
 pub struct SuspendedLaunchedProcess {
     pid: NixPid,
     public_pid: Pid,
+    program: OsString,
     suspended: Option<Suspended>,
 }
 
@@ -34,6 +35,14 @@ struct Suspended {
     process: ProcessHandle,
     resume_tx: OwnedFd,
     exec_error_rx: OwnedFd,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to execute `{}`: {source}", program.to_string_lossy())]
+struct ExecError {
+    program: OsString,
+    #[source]
+    source: io::Error,
 }
 
 impl SuspendedLaunchedProcess {
@@ -79,6 +88,7 @@ impl SuspendedLaunchedProcess {
                 Ok(Self {
                     pid: child,
                     public_pid,
+                    program: command_name.to_owned(),
                     suspended: Some(Suspended {
                         // Race-free: only this parent can reap the child.
                         process: ProcessHandle::open(public_pid),
@@ -101,15 +111,22 @@ impl SuspendedLaunchedProcess {
     ///
     /// # Errors
     ///
-    /// Returns an error when the child cannot be resumed or `exec` fails.
+    /// Returns [`crate::ErrorKind::ProcessLaunch`] naming the program when the
+    /// child cannot be resumed or `exec` fails.
     pub fn unsuspend_and_run(mut self) -> crate::Result<RunningProcess> {
-        let result = self.unsuspend_inner().map_err(crate::Error::from);
+        let result = self.unsuspend_inner();
         if result.is_err() {
             // Reap the child on any failure after we took ownership of the
             // pipes; Drop's reap path is gated on `suspended` still being Some.
             reap(self.pid);
         }
-        result
+        result.map_err(|source| {
+            let program = std::mem::take(&mut self.program);
+            crate::Error::new(
+                crate::ErrorKind::ProcessLaunch,
+                ExecError { program, source },
+            )
+        })
     }
 
     fn unsuspend_inner(&mut self) -> io::Result<RunningProcess> {
