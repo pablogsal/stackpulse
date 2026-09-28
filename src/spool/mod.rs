@@ -526,28 +526,6 @@ impl SpoolFrameModuleContexts {
         self.frame_module_limits.push(module_limit);
     }
 
-    fn deactivate_process(
-        &mut self,
-        modules: &[ModuleRecord],
-        process_id: i32,
-        deactivated_at: usize,
-    ) {
-        for (module_id, module) in modules.iter().enumerate() {
-            if module.pid().is_some_and(|pid| pid.get() == process_id) {
-                let active = self.module_active(
-                    module_id,
-                    FrameLookupContext {
-                        frame_index: deactivated_at,
-                        module_limit: modules.len(),
-                    },
-                );
-                if active {
-                    self.deactivate_module(module_id, deactivated_at);
-                }
-            }
-        }
-    }
-
     #[expect(
         clippy::expect_used,
         reason = "module contexts are appended atomically with module records"
@@ -1247,6 +1225,9 @@ fn open_spool_with_range_limit(
     #[cfg(test)]
     let mut python_runtime_records = Vec::new();
     let mut frame_contexts = SpoolFrameModuleContexts::default();
+    // Forked children re-record their parent's modules, so scanning every
+    // module on each process exit would be quadratic in the process count.
+    let mut modules_by_process: FxHashMap<crate::Pid, Vec<usize>> = FxHashMap::default();
     let mut sample_count = 0_usize;
     let mut sample_ranges =
         (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
@@ -1269,8 +1250,15 @@ fn open_spool_with_range_limit(
         let parsed = (|| -> io::Result<()> {
             match tag {
                 REC_MODULE | REC_JIT_MODULE => {
-                    modules.push(read_module_record(&mut reader, modules.len(), tag)?);
+                    let module = read_module_record(&mut reader, modules.len(), tag)?;
+                    if let Some(process) = module.pid() {
+                        modules_by_process
+                            .entry(process)
+                            .or_default()
+                            .push(modules.len());
+                    }
                     frame_contexts.push_module();
+                    modules.push(module);
                 }
                 REC_FRAME => {
                     let module_limit = modules.len();
@@ -1305,7 +1293,9 @@ fn open_spool_with_range_limit(
                 }
                 REC_MODULE_DEACTIVATE => {
                     let process_id = read_pid(&mut reader)?;
-                    frame_contexts.deactivate_process(&modules, process_id.get(), frames.len());
+                    for module_id in modules_by_process.remove(&process_id).unwrap_or_default() {
+                        frame_contexts.deactivate_module(module_id, frames.len());
+                    }
                     processes.push(process_id);
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
@@ -2555,6 +2545,34 @@ mod tests {
             .unwrap()
             .module
             .is_none());
+    }
+
+    #[test]
+    fn process_deactivation_keeps_earlier_deactivations_across_reused_pids() {
+        let path = temp_spool_path("reused-pid-deactivation");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        let write_module = |writer: &mut PerfSpoolWriter<_>, id, start| {
+            let mut record = module(7, start, start + 0x100, "/lib", false);
+            record.id = id;
+            writer.write_module(&record).unwrap();
+        };
+        write_module(&mut writer, 0, 0x1000);
+        write_module(&mut writer, 1, 0x2000);
+        writer.write_sample_frames(1, 7, 7, [frame(0x10)]).unwrap();
+        writer.write_module_deactivation_one(0).unwrap();
+        writer.write_sample_frames(2, 7, 7, [frame(0x20)]).unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        write_module(&mut writer, 2, 0x3000);
+        writer.write_sample_frames(3, 7, 7, [frame(0x30)]).unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let snapshot = Snapshot::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let deactivated_at = &snapshot.definitions.frame_contexts.module_deactivated_at;
+        let deactivated_at = [0, 1, 2].map(|id| *deactivated_at.get(id).unwrap());
+        assert_eq!(deactivated_at, [Some(1), Some(2), Some(3)]);
     }
 
     #[test]
