@@ -158,6 +158,16 @@ fn format_hex_suffix(prefix: &str, value: u64) -> String {
     output
 }
 
+/// Kernel frames resolve from the shared kernel symbol table alone, so all
+/// processes share their cache entries under 0, which is never a valid pid.
+fn frame_cache_process_id(process_id: i32, frame: &FrameRecord) -> i32 {
+    if frame.mode == FrameMode::Kernel {
+        0
+    } else {
+        process_id
+    }
+}
+
 #[derive(Default)]
 struct SymbolizerModules {
     records: Vec<ModuleRecord>,
@@ -1143,8 +1153,11 @@ impl Symbolizer {
         if self.stack_cache_mode == StackCache::Internal && self.transient_frame_keys.is_empty() {
             let start = self.resolved_stack_frame_ids.len();
             while let Some(frame_ref) = frames.next_with_id() {
-                let frame_ids =
-                    self.cached_frame_ids(process.get(), FrameCacheKey::Spool(frame_ref.id))?;
+                let frame_ids = self.cached_frame_ids(
+                    process.get(),
+                    frame_ref.frame,
+                    FrameCacheKey::Spool(frame_ref.id),
+                )?;
                 self.resolved_stack_frame_ids.extend(frame_ids);
             }
             let range = start..self.resolved_stack_frame_ids.len();
@@ -1160,8 +1173,11 @@ impl Symbolizer {
         let cacheable = self.transient_frame_keys.is_empty();
         self.resolved_stack_scratch.clear();
         while let Some(frame_ref) = frames.next_with_id() {
-            let frame_ids =
-                self.cached_frame_ids(process.get(), FrameCacheKey::Spool(frame_ref.id))?;
+            let frame_ids = self.cached_frame_ids(
+                process.get(),
+                frame_ref.frame,
+                FrameCacheKey::Spool(frame_ref.id),
+            )?;
             self.resolved_stack_scratch.extend(frame_ids);
         }
         self.clear_transient_frame_cache();
@@ -1208,7 +1224,8 @@ impl Symbolizer {
         self.resolved_stack_scratch.clear();
         self.resolved_stack_scratch.reserve(frames.len());
         for frame in frames {
-            let frame_ids = self.cached_frame_ids(process_id.get(), FrameCacheKey::Raw(*frame))?;
+            let frame_ids =
+                self.cached_frame_ids(process_id.get(), frame, FrameCacheKey::Raw(*frame))?;
             self.resolved_stack_scratch.extend(frame_ids);
         }
         self.clear_transient_frame_cache();
@@ -1236,14 +1253,14 @@ impl Symbolizer {
         cache_key: FrameCacheKey,
         spool_frame_id: Option<u32>,
     ) -> crate::Result<Range<usize>> {
-        let cache_key = (process_id, cache_key);
+        let cache_key = (frame_cache_process_id(process_id, frame), cache_key);
         if let Some(cached) = self.frame_cache.get(&cache_key) {
             return Ok(cached.indices());
         }
         self.begin_frame_batch(1);
         self.prepare_frame(process_id, *frame, cache_key.1, spool_frame_id);
         self.finish_frame_batch(process_id)?;
-        let frame_ids = self.cached_frame_ids(process_id, cache_key.1);
+        let frame_ids = self.cached_frame_ids(process_id, frame, cache_key.1);
         self.clear_transient_frame_cache();
         frame_ids
     }
@@ -1251,10 +1268,11 @@ impl Symbolizer {
     fn cached_frame_ids(
         &self,
         process_id: i32,
+        frame: &FrameRecord,
         cache_key: FrameCacheKey,
     ) -> crate::Result<Range<usize>> {
         self.frame_cache
-            .get(&(process_id, cache_key))
+            .get(&(frame_cache_process_id(process_id, frame), cache_key))
             .map(ResolvedFrameRange::indices)
             .ok_or_else(|| NativeContractError::CacheMiss.into_public())
     }
@@ -1293,6 +1311,7 @@ impl Symbolizer {
         frame_key: FrameCacheKey,
         spool_frame_id: Option<u32>,
     ) {
+        let process_id = frame_cache_process_id(process_id, &frame);
         let cache_key = (process_id, frame_key);
         if self.frame_cache.contains_key(&cache_key) || !self.pending_frame_keys.insert(cache_key) {
             return;
@@ -3208,6 +3227,60 @@ mod tests {
         assert_eq!(symbolizer.resolved_frames.len(), 2);
         assert!(symbolizer.stack_cache.is_empty());
         assert!(symbolizer.resolved_stack_frame_ids.is_empty());
+    }
+
+    #[test]
+    fn kernel_frames_are_resolved_once_for_all_processes() {
+        const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
+
+        let path = temp_symbolize_spool_path("shared-kernel-frames");
+        let kernel =
+            ModuleRecord::kernel(0, KERNEL_START..KERNEL_START + 0x1000, "[kernel.kallsyms]")
+                .unwrap();
+        let kernel_frames = [
+            FrameRecord {
+                module_id: Some(kernel.id),
+                file_relative_ip: 0x10,
+                abs_ip: KERNEL_START + 0x10,
+                mode: FrameMode::Kernel,
+            },
+            FrameRecord {
+                module_id: None,
+                file_relative_ip: KERNEL_START + 0x90,
+                abs_ip: KERNEL_START + 0x90,
+                mode: FrameMode::Kernel,
+            },
+        ];
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        writer.write_module(&kernel).unwrap();
+        for process_id in [100, 101] {
+            let frames = kernel_frames.into_iter().chain([frame(0x1500)]);
+            writer
+                .write_sample_frames(1_000, process_id, process_id as u64, frames)
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = Snapshot::open(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let mut symbolizer = reader
+            .symbolizer()
+            .disable_perf_maps()
+            .kernel_symbols(KernelSymbolSource::Disabled)
+            .build()
+            .unwrap();
+        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([KernelSymbol {
+            address: KERNEL_START,
+            name: "kernel_function".to_owned(),
+            module: None,
+        }])));
+        for stack in reader.samples() {
+            symbolizer.resolve(stack.stack()).unwrap();
+        }
+
+        // The kernel frames are shared; each process has its own user frame.
+        assert_eq!(symbolizer.resolved_frames.len(), kernel_frames.len() + 2);
     }
 
     fn write_future_module_spool(label: &str) -> (std::path::PathBuf, u32) {
