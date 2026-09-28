@@ -433,6 +433,18 @@ where
     }
 }
 
+/// Iteration limit passed to gimli's `Evaluation::set_max_iterations`, which gimli
+/// provides to stop bad DWARF bytecode from causing a denial of service. Without
+/// it, gimli places no bound on evaluation, so an expression that loops forever
+/// through a backward `DW_OP_skip` or `DW_OP_bra` would never finish. One iteration
+/// is roughly one evaluated operation, and the count covers the whole evaluation,
+/// including after each register or memory resumption. An expression that needs
+/// more iterations fails with `TooManyIterations`, and `eval_expr` returns `None`,
+/// the same as for any other evaluation error. Callers handle that `None` as they
+/// handle any rule they cannot evaluate, which for some register rules means
+/// falling back to a default value rather than failing the frame.
+const MAX_EXPRESSION_ITERATIONS: u32 = 1024;
+
 fn eval_expr<R, F, UR, S>(
     expr: Expression<R>,
     encoding: Encoding,
@@ -446,6 +458,7 @@ where
     S: EvaluationStorage<R>,
 {
     let mut eval = Evaluation::<R, S>::new_in(expr.0, encoding);
+    eval.set_max_iterations(MAX_EXPRESSION_ITERATIONS);
     let mut result = eval.evaluate().ok()?;
     loop {
         match result {
@@ -882,6 +895,33 @@ pub(crate) mod tests {
             ),
             None
         );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_rejects_looping_expressions() {
+        // DW_OP_skip -3
+        let expression: &[u8] = &[0x2f, 0xfd, 0xff];
+        let mut section = DebugFrame::from(EndianSlice::new(expression, LittleEndian));
+        section.set_address_size(8);
+        let rule = CfaRule::Expression(UnwindExpression {
+            offset: 0,
+            length: expression.len(),
+        });
+        let regs = UnwindRegsX86_64::new(0x1000, 0x2000, 0x3000);
+        // Evaluate on another thread so that a hang fails the test.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(eval_cfa_rule::<_, _, _, StoreOnHeap>(
+                &section,
+                &rule,
+                encoding(),
+                &regs,
+                &mut |_| Err(()),
+            ))
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(result, Ok(None));
     }
 
     #[test]
