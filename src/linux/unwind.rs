@@ -23,8 +23,9 @@ pub(super) struct ProcessUnwinder {
     jit: super::jit::JitRegistry,
     /// Ordinary and JIT unwind tables for this process's current executable code.
     unwinder: NativeUnwinder,
-    /// Unwind-rule cache reused across samples; a forked child starts with an empty cache.
-    cache: NativeCache,
+    /// Unwind-rule cache reused across samples, allocated by the first unwind.
+    /// Forked and exec'd processes start without one until they are sampled.
+    cache: Option<NativeCache>,
     /// Page-aligned user addresses for which mapping rediscovery was already attempted.
     /// Cleared when executable mappings change so uncovered pages can be checked again.
     refreshed_uncovered_pages: FxHashSet<u64>,
@@ -274,31 +275,33 @@ mod tests {
             super::super::jit::JitRegistry::test_with_module(module, runtime, &mut parent.unwinder);
         parent.refreshed_uncovered_pages.insert(0x9000);
         for _ in 0..2 {
-            let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+            let (outcome, sp) =
+                unwind_overlay_frame(&parent.unwinder, parent.cache.get_or_insert_default());
             assert_eq!(outcome.return_address(), Some(0xbbbb));
             assert_eq!(sp, 0x8030);
         }
-        assert!(parent.cache.stats().hits() > 0);
-        let parent_hits = parent.cache.stats().hits();
+        let parent_hits = parent.cache.as_ref().unwrap().stats().hits();
+        assert!(parent_hits > 0);
         let parent_frame = parent.jit.frame(0x1001).unwrap();
 
         let mut child = parent.inherit_for_fork();
         assert!(child.jit.frame(0x1001).is_none());
         assert!(child.refreshed_uncovered_pages.is_empty());
-        assert_eq!(child.cache.stats().hits(), 0);
-        assert_eq!(child.cache.stats().misses(), 0);
-        let (outcome, sp) = unwind_overlay_frame(&child.unwinder, &mut child.cache);
+        assert!(child.cache.is_none());
+        let (outcome, sp) =
+            unwind_overlay_frame(&child.unwinder, child.cache.get_or_insert_default());
         assert_eq!(outcome.return_address(), Some(0xaaaa));
         assert_eq!(sp, 0x8010);
         assert!(outcome.fallback_reason().is_none());
 
-        assert_eq!(parent.cache.stats().hits(), parent_hits);
+        assert_eq!(parent.cache.as_ref().unwrap().stats().hits(), parent_hits);
         assert_eq!(parent.jit.frame(0x1001), Some(parent_frame));
         assert!(parent.refreshed_uncovered_pages.contains(&0x9000));
-        let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+        let (outcome, sp) =
+            unwind_overlay_frame(&parent.unwinder, parent.cache.get_or_insert_default());
         assert_eq!(outcome.return_address(), Some(0xbbbb));
         assert_eq!(sp, 0x8030);
-        assert!(parent.cache.stats().hits() > parent_hits);
+        assert!(parent.cache.as_ref().unwrap().stats().hits() > parent_hits);
     }
 
     #[test]
