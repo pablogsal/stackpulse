@@ -47,7 +47,7 @@ use crate::native_module::ElfSectionCache;
 use crate::spool::{FrameMode, FrameRecord, ModuleTable, PerfSpoolWriter};
 #[cfg(test)]
 use crate::spool::{ModuleOwner, ModuleRecord};
-pub(crate) use attach::read_process_start_time;
+pub(crate) use attach::{read_process_stat, ProcStat};
 use convert_regs::ConvertRegs;
 #[cfg(any(test, feature = "bench-support"))]
 use module_tracking::record_module;

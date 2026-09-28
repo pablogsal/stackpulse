@@ -137,9 +137,10 @@ fn process_snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
 }
 
 #[derive(Debug)]
-struct ProcStat {
-    state: char,
-    start_time: u64,
+pub(crate) struct ProcStat {
+    pub(crate) state: char,
+    pub(crate) num_threads: u64,
+    pub(crate) start_time: u64,
 }
 
 fn parse_proc_stat(stat: &[u8]) -> io::Result<ProcStat> {
@@ -150,19 +151,27 @@ fn parse_proc_stat(stat: &[u8]) -> io::Result<ProcStat> {
         .next()
         .and_then(|value| value.chars().next())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc state"))?;
+    let num_threads = fields
+        .nth(16)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc thread count"))?;
     let start_time = fields
-        .nth(18)
+        .nth(1)
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc start time"))?;
-    Ok(ProcStat { state, start_time })
+    Ok(ProcStat {
+        state,
+        num_threads,
+        start_time,
+    })
 }
 
 fn read_proc_stat(path: &str) -> io::Result<ProcStat> {
     parse_proc_stat(&fs::read(path)?)
 }
 
-pub(crate) fn read_process_start_time(pid: u32) -> io::Result<u64> {
-    Ok(read_proc_stat(&format!("/proc/{pid}/stat"))?.start_time)
+pub(crate) fn read_process_stat(pid: u32) -> io::Result<ProcStat> {
+    read_proc_stat(&format!("/proc/{pid}/stat"))
 }
 
 #[cfg(test)]
