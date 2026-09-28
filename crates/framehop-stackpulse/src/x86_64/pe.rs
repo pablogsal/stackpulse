@@ -123,9 +123,13 @@ impl PeUnwinding for ArchX86_64 {
             // Check whether the address is in the function epilog. If so, we need to
             // simulate the remaining epilog instructions (unwind codes don't account for
             // unwinding from the epilog). We only need to check this for the first unwind info (if
-            // there are chained infos).
-            let bytes = (function.end_address.get() - address) as usize;
-            let instruction = &sections.text_memory_at_rva(address)?[..bytes];
+            // there are chained infos). If the text data does not cover the rest of the
+            // function, we cannot tell whether the address is in an epilog.
+            let text = sections.text_memory_at_rva(address)?;
+            let bytes = function.end_address.get().saturating_sub(address) as usize;
+            let instruction = text
+                .get(..bytes)
+                .ok_or(PeUnwinderError::MissingInstructionData(address))?;
             if let Ok(epilog_instructions) =
                 FunctionEpilogInstruction::parse_sequence(instruction, unwind_info.frame_register())
             {
@@ -220,5 +224,43 @@ impl PeUnwinding for ArchX86_64 {
         regs.set(Reg::RSP, rsp + 8);
 
         Ok(UnwindResult::Uncacheable(ra))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe::DataAtRvaRange;
+    use crate::x86_64::UnwindRegsX86_64;
+    use alloc::vec;
+
+    #[test]
+    fn epilog_check_with_text_data_shorter_than_the_function() {
+        // A function at [0x1000, 0x1100) with version 1 unwind info without any
+        // unwind codes, but only 16 bytes of text data.
+        let pdata: Vec<u8> = [0x1000_u32, 0x1100, 0x3000]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let rdata = DataAtRvaRange {
+            data: vec![1, 0, 0, 0],
+            rva_range: 0x3000..0x3100,
+        };
+        let text = DataAtRvaRange {
+            data: vec![0x90; 0x10],
+            rva_range: 0x1000..0x2000,
+        };
+        let sections = PeSections {
+            pdata: &pdata,
+            rdata: Some(&rdata),
+            xdata: None,
+            text: Some(&text),
+        };
+        let mut regs = UnwindRegsX86_64::new(0x1008, 0x2000, 0x3000);
+        let result = ArchX86_64::unwind_frame(sections, 0x1008, &mut regs, true, &mut |_| Err(()));
+        assert!(
+            matches!(result, Err(PeUnwinderError::MissingInstructionData(0x1008))),
+            "{result:?}"
+        );
     }
 }

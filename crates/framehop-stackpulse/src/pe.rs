@@ -80,7 +80,7 @@ fn memory_at_rva<D: core::ops::Deref<Target = [u8]>>(
 ) -> Option<&[u8]> {
     if rva_range.contains(&address) {
         let offset = address - rva_range.start;
-        Some(&data[(offset as usize)..])
+        data.get((offset as usize)..)
     } else {
         None
     }
