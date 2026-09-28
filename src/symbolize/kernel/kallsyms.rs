@@ -4,8 +4,9 @@
 //! source for kernel frames because addresses already include the current KASLR
 //! slide and loaded module symbols. Spool symbolization usually needs only the
 //! program counters (PCs) that appeared in samples, so this module can stream
-//! the sorted file and keep only the nearest preceding symbol for each requested
-//! PC. If the file is not sorted, the code falls back to an in-memory parse.
+//! the file once and keep only the nearest preceding symbol for each requested
+//! PC. Module symbols are not listed in address order, so the sparse scan does
+//! not depend on it.
 //!
 //! Zero addresses are ignored because kernels commonly expose symbol names but
 //! replace addresses with `0` when symbol addresses are restricted.
@@ -16,9 +17,7 @@ use std::io::{self, BufRead};
 use memchr::memchr;
 use rustc_hash::FxHashMap;
 
-use super::{
-    find_kernel_symbol, is_kernel_text_symbol, FullKernelSymbol, FullKernelSymbols, KernelSymbol,
-};
+use super::{is_kernel_text_symbol, FullKernelSymbol, FullKernelSymbols, KernelSymbol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KernelSymbolMetadata<'a> {
@@ -137,11 +136,7 @@ pub(super) fn load_sparse_kernel_symbols_from_file(
 ) -> io::Result<Vec<(u64, KernelSymbol)>> {
     let file = fs::File::open("/proc/kallsyms")?;
     let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
-    match parse_sparse_kernel_symbols_sorted_streaming(&mut reader, requested_addresses)? {
-        Some(symbols) => Ok(symbols),
-        None => fs::read("/proc/kallsyms")
-            .map(|data| parse_sparse_kernel_symbols_unsorted(&data, requested_addresses)),
-    }
+    parse_sparse_kernel_symbols_streaming(&mut reader, requested_addresses)
 }
 
 #[cfg(any(test, feature = "bench-support"))]
@@ -149,13 +144,8 @@ fn parse_sparse_kernel_symbols(
     data: &[u8],
     requested_addresses: &[u64],
 ) -> Vec<(u64, KernelSymbol)> {
-    match parse_sparse_kernel_symbols_sorted_streaming(
-        &mut io::Cursor::new(data),
-        requested_addresses,
-    ) {
-        Ok(Some(symbols)) => symbols,
-        _ => parse_sparse_kernel_symbols_unsorted(data, requested_addresses),
-    }
+    parse_sparse_kernel_symbols_streaming(&mut io::Cursor::new(data), requested_addresses)
+        .unwrap_or_default()
 }
 
 #[cfg(any(test, feature = "bench-support"))]
@@ -177,134 +167,106 @@ pub(crate) fn bench_parse_sparse_kernel_symbols(
     checksum
 }
 
-fn parse_sparse_kernel_symbols_unsorted(
-    data: &[u8],
-    requested_addresses: &[u64],
-) -> Vec<(u64, KernelSymbol)> {
-    let symbols = parse_kernel_symbols(data);
-    requested_addresses
-        .iter()
-        .filter_map(|&address| {
-            find_kernel_symbol(&symbols, address).map(|symbol| (address, symbol.clone()))
-        })
-        .collect()
-}
-
-fn parse_sparse_kernel_symbols_sorted_streaming(
+fn parse_sparse_kernel_symbols_streaming(
     reader: &mut impl BufRead,
     requested_addresses: &[u64],
-) -> io::Result<Option<Vec<(u64, KernelSymbol)>>> {
+) -> io::Result<Vec<(u64, KernelSymbol)>> {
     let mut scan = SparseKernelSymbolScan::new(requested_addresses);
     let mut carry = Vec::new();
 
     loop {
-        let mut consumed = 0;
-        let mut unsorted = false;
-        {
-            let buffer = reader.fill_buf()?;
-            if buffer.is_empty() {
-                if !carry.is_empty() {
-                    match scan.process_line(&carry) {
-                        SparseScanState::Continue => {}
-                        SparseScanState::Unsorted => return Ok(None),
-                    }
-                }
-                return Ok(Some(scan.finish()));
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            if !carry.is_empty() {
+                scan.process_line(&carry);
             }
+            return Ok(scan.finish());
+        }
 
-            while consumed < buffer.len() {
-                let tail = &buffer[consumed..];
-                let Some(newline) = memchr(b'\n', tail) else {
-                    carry.extend_from_slice(tail);
-                    consumed = buffer.len();
-                    break;
-                };
-                let line_end = consumed + newline + 1;
-                let state = if carry.is_empty() {
-                    scan.process_line(&buffer[consumed..line_end])
-                } else {
-                    carry.extend_from_slice(&buffer[consumed..line_end]);
-                    let state = scan.process_line(&carry);
-                    carry.clear();
-                    state
-                };
-                consumed = line_end;
-                if let SparseScanState::Unsorted = state {
-                    unsorted = true;
-                    break;
-                }
+        let mut consumed = 0;
+        while consumed < buffer.len() {
+            let tail = &buffer[consumed..];
+            let Some(newline) = memchr(b'\n', tail) else {
+                carry.extend_from_slice(tail);
+                consumed = buffer.len();
+                break;
+            };
+            let line_end = consumed + newline + 1;
+            if carry.is_empty() {
+                scan.process_line(&buffer[consumed..line_end]);
+            } else {
+                carry.extend_from_slice(&buffer[consumed..line_end]);
+                scan.process_line(&carry);
+                carry.clear();
             }
+            consumed = line_end;
         }
         reader.consume(consumed);
-        if unsorted {
-            return Ok(None);
-        }
     }
 }
 
+/// Finds the nearest preceding symbol for each requested PC in one pass over
+/// kallsyms, whatever the file order.
+///
+/// Requests split the address space into buckets: bucket `i` holds addresses
+/// above request `i - 1` and at or below request `i`. Each bucket keeps only its
+/// highest included symbol, as a copy of the raw line, and `finish` carries the
+/// last non-empty bucket forward. Names are decoded only for those winners.
 struct SparseKernelSymbolScan<'a> {
     requested_addresses: &'a [u64],
-    result: Vec<(u64, KernelSymbol)>,
-    request_idx: usize,
+    best_lines: Vec<Option<(u64, Vec<u8>)>>,
     text_addr: Option<u64>,
-    last_address: Option<u64>,
-    last_symbol: Option<KernelSymbol>,
-}
-
-enum SparseScanState {
-    Continue,
-    Unsorted,
 }
 
 impl<'a> SparseKernelSymbolScan<'a> {
     fn new(requested_addresses: &'a [u64]) -> Self {
         Self {
             requested_addresses,
-            result: Vec::with_capacity(requested_addresses.len()),
-            request_idx: 0,
+            best_lines: vec![None; requested_addresses.len()],
             text_addr: None,
-            last_address: None,
-            last_symbol: None,
         }
     }
 
-    fn process_line(&mut self, line: &[u8]) -> SparseScanState {
+    fn process_line(&mut self, line: &[u8]) {
         let Some((address, name)) = parse_kernel_symbol_line_bytes(line) else {
-            return SparseScanState::Continue;
+            return;
         };
+        // The filter must see every line in file order: `_text` anchors which
+        // core symbols are kept.
         if !should_include_kernel_symbol(&mut self.text_addr, address, name) {
-            return SparseScanState::Continue;
+            return;
         }
-        if self.last_address.is_some_and(|last| address < last) {
-            return SparseScanState::Unsorted;
-        }
-        self.last_address = Some(address);
-
-        while self.request_idx < self.requested_addresses.len()
-            && self.requested_addresses[self.request_idx] < address
-        {
-            if let Some(symbol) = &self.last_symbol {
-                self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
+        let bucket = self
+            .requested_addresses
+            .partition_point(|&requested| requested < address);
+        let Some(best) = self.best_lines.get_mut(bucket) else {
+            return;
+        };
+        match best {
+            // `>=` keeps the last alias at an address, like the full table.
+            Some((best_address, best_line)) if address >= *best_address => {
+                *best_address = address;
+                best_line.clear();
+                best_line.extend_from_slice(line);
             }
-            self.request_idx += 1;
+            Some(_) => {}
+            None => *best = Some((address, line.to_vec())),
         }
-        if self.request_idx >= self.requested_addresses.len() {
-            return SparseScanState::Continue;
-        }
-        self.last_symbol = Some(kernel_symbol_from_name(address, name));
-        SparseScanState::Continue
     }
 
-    fn finish(mut self) -> Vec<(u64, KernelSymbol)> {
-        while self.request_idx < self.requested_addresses.len() {
-            if let Some(symbol) = &self.last_symbol {
-                self.result
-                    .push((self.requested_addresses[self.request_idx], symbol.clone()));
+    fn finish(self) -> Vec<(u64, KernelSymbol)> {
+        let mut result = Vec::with_capacity(self.requested_addresses.len());
+        let mut symbol = None;
+        for (&requested, best) in self.requested_addresses.iter().zip(self.best_lines) {
+            if let Some((_, line)) = best {
+                symbol = parse_kernel_symbol_line_bytes(&line)
+                    .map(|(address, name)| kernel_symbol_from_name(address, name));
             }
-            self.request_idx += 1;
+            if let Some(symbol) = &symbol {
+                result.push((requested, symbol.clone()));
+            }
         }
-        self.result
+        result
     }
 }
 
@@ -429,9 +391,22 @@ fn kernel_symbol_module_to_string(module: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
 
     use super::*;
+
+    #[test]
+    fn sparse_kernel_symbols_scan_module_symbols_out_of_order() {
+        // Module symbols follow the core kernel without continuing its order.
+        let kallsyms = b"ffffffff81000000 T _text\n\
+                         ffffffff81000100 T core_symbol\n\
+                         ffffffffc0100000 t second\t[module_1]\n\
+                         ffffffffc0000000 t first\t[module_0]\n";
+        let requested = [0xffff_ffff_8100_0104, 0xffff_ffff_c010_0004];
+
+        let symbols = parse_sparse_kernel_symbols(kallsyms, &requested);
+        let names = symbols.iter().map(|(_, symbol)| symbol.name.as_str());
+        assert!(names.eq(["core_symbol", "second"]));
+    }
 
     #[test]
     fn parses_kernel_symbol_lines() {
@@ -475,13 +450,6 @@ mod tests {
 
         assert!(parse_kernel_symbols(kallsyms).is_empty());
         assert!(parse_sparse_kernel_symbols(kallsyms, &[0xffff_ffff_8000_1234]).is_empty());
-
-        let mut reader = io::Cursor::new(kallsyms);
-        let sparse =
-            parse_sparse_kernel_symbols_sorted_streaming(&mut reader, &[0xffff_ffff_8000_1234])
-                .unwrap()
-                .unwrap();
-        assert!(sparse.is_empty());
     }
 
     #[test]
@@ -631,20 +599,6 @@ mod tests {
         assert_eq!(symbols[0].1.module.as_deref(), Some("[tls]"));
         assert_eq!(symbols[1].1.name, "_text");
         assert_eq!(symbols[1].1.module, None);
-    }
-
-    #[test]
-    fn streaming_sparse_kernel_symbols_detects_late_unsorted_lines() {
-        let kallsyms = b"ffffffff89800000 T _text\n\
-                         ffffffff89803000 T late\n\
-                         ffffffff89802000 T middle\n";
-        let mut reader = io::Cursor::new(kallsyms);
-        let symbols =
-            parse_sparse_kernel_symbols_sorted_streaming(&mut reader, &[0xffff_ffff_8980_2500])
-                .unwrap();
-
-        assert!(symbols.is_none());
-        assert_eq!(reader.position() as usize, kallsyms.len());
     }
 
     #[test]
