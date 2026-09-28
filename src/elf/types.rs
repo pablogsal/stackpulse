@@ -44,6 +44,21 @@ impl ElfSectionData {
         })
     }
 
+    /// Whether `other` holds the same section of an equally sized ELF file.
+    ///
+    /// File-backed sections compare their ranges rather than their bytes, so
+    /// checking a reopened file does not fault in every mapped page.
+    /// Decompressed sections compare their contents.
+    pub(crate) fn same_layout(&self, other: &Self) -> bool {
+        match (&self.storage, &other.storage) {
+            (ElfSectionStorage::Mmap(mmap), ElfSectionStorage::Mmap(other_mmap)) => {
+                self.range == other.range && mmap.len() == other_mmap.len()
+            }
+            (ElfSectionStorage::Owned(_), ElfSectionStorage::Owned(_)) => self == other,
+            _ => false,
+        }
+    }
+
     pub(crate) fn owned_storage_identity(&self) -> Option<(usize, usize)> {
         match &self.storage {
             ElfSectionStorage::Owned(data) => Some((data.as_ptr() as usize, data.len())),
@@ -91,44 +106,11 @@ impl PartialEq for ElfSectionData {
 
 impl Eq for ElfSectionData {}
 
-/// Check over immutable section data, run at most once per parsed image.
-///
-/// It never takes part in equality and is dropped by `clone`, so images compare
-/// equal whether or not it ran, and edited copies check again.
-#[derive(Default)]
-pub(crate) struct SectionCheck(OnceLock<bool>);
-
-impl SectionCheck {
-    pub(crate) fn get_or_run(&self, check: impl FnOnce() -> bool) -> bool {
-        *self.0.get_or_init(check)
-    }
-}
-
-impl Clone for SectionCheck {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
-impl fmt::Debug for SectionCheck {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("SectionCheck").field(&self.0.get()).finish()
-    }
-}
-
-impl PartialEq for SectionCheck {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for SectionCheck {}
-
 /// ELF section addresses and data needed for DWARF unwinding.
 ///
 /// `eh_frame` and `eh_frame_hdr` clone cheaply so multiple mappings of the same
 /// library share storage.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(crate) struct ElfSectionInfo {
     /// Base stated virtual address from the first PT_LOAD segment.
     pub(crate) base_svma: u64,
@@ -156,13 +138,51 @@ pub(crate) struct ElfSectionInfo {
 
     /// Whether .eh_frame_hdr holds a search table that indexes .eh_frame,
     /// validated once and shared by every mapping of this image.
-    pub(crate) eh_frame_hdr_indexed: SectionCheck,
+    pub(crate) eh_frame_hdr_indexed: OnceLock<bool>,
 
     /// .got section range (SVMA)
     pub(crate) got_svma: Option<Range<u64>>,
 
     /// PT_LOAD segments sorted by file offset.
     pub(crate) load_segments: Box<[LoadSegment]>,
+}
+
+impl ElfSectionInfo {
+    /// Whether `other` was parsed from a file with the same section layout.
+    pub(crate) fn same_layout(&self, other: &Self) -> bool {
+        fn same_section(left: Option<&ElfSectionData>, right: Option<&ElfSectionData>) -> bool {
+            match (left, right) {
+                (Some(left), Some(right)) => left.same_layout(right),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        let Self {
+            base_svma,
+            text_svma,
+            text_file_range,
+            text,
+            eh_frame_svma,
+            eh_frame,
+            eh_frame_hdr_svma,
+            eh_frame_hdr,
+            // A memo over the section bytes, not part of the layout.
+            eh_frame_hdr_indexed: _,
+            got_svma,
+            load_segments,
+        } = self;
+        *base_svma == other.base_svma
+            && *text_svma == other.text_svma
+            && *text_file_range == other.text_file_range
+            && same_section(text.as_ref(), other.text.as_ref())
+            && *eh_frame_svma == other.eh_frame_svma
+            && same_section(eh_frame.as_ref(), other.eh_frame.as_ref())
+            && *eh_frame_hdr_svma == other.eh_frame_hdr_svma
+            && same_section(eh_frame_hdr.as_ref(), other.eh_frame_hdr.as_ref())
+            && *got_svma == other.got_svma
+            && *load_segments == other.load_segments
+    }
 }
 
 #[cfg(test)]

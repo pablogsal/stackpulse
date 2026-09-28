@@ -471,13 +471,23 @@ impl ElfSectionCache {
         let identity =
             elf_file_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
         let shared_identity = elf_image_identity(module, identity.clone());
+        let image = self
+            .by_module
+            .get(&module.id)
+            .ok_or(ElfLoadError::Unsupported)?;
+        if image.identity.as_ref() != Some(&identity) {
+            return Err(ElfLoadError::Unsupported);
+        }
         let current_sections = self.parse_file(&file, module.path())?;
         let shared = {
             let image = self
                 .by_module
                 .get_mut(&module.id)
                 .ok_or(ElfLoadError::Unsupported)?;
-            if image.identity.as_ref() != Some(&identity) || *image.sections != current_sections {
+            // The cached sections still map the inode named by this identity,
+            // so both views read the same page cache. Comparing their bytes
+            // would only fault in every mapped section page.
+            if !image.sections.same_layout(&current_sections) {
                 return Err(ElfLoadError::Unsupported);
             }
             let exact = Arc::new(NativeImage::new(Arc::clone(&file)));

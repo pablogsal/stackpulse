@@ -192,10 +192,10 @@ fn indexed_eh_frame_hdr(section_info: &ElfSectionInfo) -> Option<(Range<u64>, El
     let addr = section_info.eh_frame_hdr_svma?;
     let data = section_info.eh_frame_hdr.as_ref()?;
     let range = svma_range(Some(addr), Some(data))?;
-    section_info
+    let indexed = section_info
         .eh_frame_hdr_indexed
-        .get_or_run(|| eh_frame_hdr_indexes_eh_frame(section_info, addr, data).is_some())
-        .then(|| (range, data.clone()))
+        .get_or_init(|| eh_frame_hdr_indexes_eh_frame(section_info, addr, data).is_some());
+    indexed.then(|| (range, data.clone()))
 }
 
 /// Check that every search-table entry resolves to an FDE inside .eh_frame.
@@ -474,7 +474,7 @@ mod tests {
         overflowing_count.extend_from_slice(&u64::MAX.to_le_bytes());
 
         let section_info = |header, address| {
-            let mut section_info = Arc::unwrap_or_clone(fake_hard_case_section_info());
+            let mut section_info = Arc::try_unwrap(fake_hard_case_section_info()).unwrap();
             section_info.eh_frame_svma = Some(u64::from(EH_FRAME_ADDRESS));
             section_info.eh_frame = Some(ElfSectionData::owned(vec![0; 0x100]));
             section_info.eh_frame_hdr_svma = address;
