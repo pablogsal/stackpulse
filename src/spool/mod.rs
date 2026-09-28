@@ -506,9 +506,7 @@ impl<T: Clone> ChunkedFrameContext<T> {
         {
             Arc::make_mut(chunk).push(value);
         } else {
-            let mut chunk = Vec::with_capacity(FRAME_CONTEXT_CHUNK_SIZE);
-            chunk.push(value);
-            chunks.push(Arc::new(chunk));
+            chunks.push(Arc::new(vec![value]));
         }
     }
 
@@ -523,11 +521,46 @@ impl<T: Clone> ChunkedFrameContext<T> {
 pub(crate) struct SpoolFrameModuleContexts {
     frame_module_limits: ChunkedFrameContext<usize>,
     module_deactivated_at: ChunkedFrameContext<Option<usize>>,
+    /// Ascending module indices per owner. Moduleless frames scan only the
+    /// mappings their owner could contain instead of every recorded module.
+    owned_modules: Arc<FxHashMap<ModuleOwner, ChunkedFrameContext<usize>>>,
 }
 
 impl SpoolFrameModuleContexts {
-    fn push_module(&mut self) {
+    fn push_module(&mut self, module_index: usize, owner: ModuleOwner) {
         self.module_deactivated_at.push(None);
+        Arc::make_mut(&mut self.owned_modules)
+            .entry(owner)
+            .or_default()
+            .push(module_index);
+    }
+
+    /// Module indices of `owner` below `module_limit`, newest first.
+    fn owned_modules_before(
+        &self,
+        owner: ModuleOwner,
+        module_limit: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let chunks = self
+            .owned_modules
+            .get(&owner)
+            .map_or(&[][..], |modules| modules.chunks.as_slice());
+        // Indices ascend across chunks, so the chunks starting below the
+        // limit form a prefix and only the last of them can straddle it.
+        let chunks = &chunks[..chunks
+            .partition_point(|chunk| chunk.first().is_some_and(|&index| index < module_limit))];
+        chunks
+            .iter()
+            .rev()
+            .enumerate()
+            .flat_map(move |(position, chunk)| {
+                let len = if position == 0 {
+                    chunk.partition_point(|&index| index < module_limit)
+                } else {
+                    chunk.len()
+                };
+                chunk[..len].iter().rev().copied()
+            })
     }
 
     fn push_frame(&mut self, module_limit: usize) {
@@ -538,17 +571,34 @@ impl SpoolFrameModuleContexts {
         clippy::expect_used,
         reason = "module contexts are appended atomically with module records"
     )]
-    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) {
-        if self
+    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) -> bool {
+        let slot = self
             .module_deactivated_at
-            .get(module_id)
-            .expect("every module has a context")
-            .is_none()
-        {
-            *self
-                .module_deactivated_at
-                .get_mut(module_id)
-                .expect("every module has a context") = Some(deactivated_at);
+            .get_mut(module_id)
+            .expect("every module has a context");
+        let was_active = slot.is_none();
+        if was_active {
+            *slot = Some(deactivated_at);
+        }
+        was_active
+    }
+
+    /// Deactivates every module of `owner` that is still active, passing each
+    /// one's index to `deactivated` in ascending order.
+    fn deactivate_owner(
+        &mut self,
+        owner: ModuleOwner,
+        deactivated_at: usize,
+        mut deactivated: impl FnMut(usize),
+    ) {
+        let owned_modules = Arc::clone(&self.owned_modules);
+        let Some(modules) = owned_modules.get(&owner) else {
+            return;
+        };
+        for &module_id in modules.chunks.iter().flat_map(|chunk| chunk.iter()) {
+            if self.deactivate_module(module_id, deactivated_at) {
+                deactivated(module_id);
+            }
         }
     }
 
@@ -1233,9 +1283,6 @@ fn open_spool_with_range_limit(
     #[cfg(test)]
     let mut python_runtime_records = Vec::new();
     let mut frame_contexts = SpoolFrameModuleContexts::default();
-    // Forked children re-record their parent's modules, so scanning every
-    // module on each process exit would be quadratic in the process count.
-    let mut modules_by_process: FxHashMap<crate::Pid, Vec<usize>> = FxHashMap::default();
     let mut sample_count = 0_usize;
     let mut sample_ranges =
         (sample_storage == SampleStorage::Replay).then(Vec::<Range<usize>>::new);
@@ -1259,13 +1306,7 @@ fn open_spool_with_range_limit(
             match tag {
                 REC_MODULE | REC_JIT_MODULE => {
                     let module = read_module_record(&mut reader, modules.len(), tag)?;
-                    if let Some(process) = module.pid() {
-                        modules_by_process
-                            .entry(process)
-                            .or_default()
-                            .push(modules.len());
-                    }
-                    frame_contexts.push_module();
+                    frame_contexts.push_module(modules.len(), module.owner);
                     modules.push(module);
                 }
                 REC_FRAME => {
@@ -1301,9 +1342,11 @@ fn open_spool_with_range_limit(
                 }
                 REC_MODULE_DEACTIVATE => {
                     let process_id = read_pid(&mut reader)?;
-                    for module_id in modules_by_process.remove(&process_id).unwrap_or_default() {
-                        frame_contexts.deactivate_module(module_id, frames.len());
-                    }
+                    frame_contexts.deactivate_owner(
+                        ModuleOwner::Process(process_id),
+                        frames.len(),
+                        |_| {},
+                    );
                     processes.push(process_id);
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
@@ -1715,16 +1758,19 @@ fn find_unpinned_frame_module<'a>(
     frame: &FrameRecord,
 ) -> Option<FrameModuleRef<'a>> {
     let context = contexts.for_frame_id(frame_id)?;
+    let owner = match frame.mode {
+        FrameMode::Kernel => ModuleOwner::Kernel,
+        FrameMode::User => ModuleOwner::Process(crate::Pid::new(process_id)?),
+        FrameMode::TruncatedStackMarker => return None,
+    };
     let module_limit = context.module_limit.min(modules.len());
-    let module = modules
-        .get(..module_limit)?
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, module)| {
+    let module = contexts
+        .owned_modules_before(owner, module_limit)
+        .find_map(|index| {
             if !contexts.module_active(index, context) {
                 return None;
             }
+            let module = modules.get(index)?;
             module_owns_frame(module, process_id, frame).then_some(module)
         })?;
     frame_module_ref(module, frame)
@@ -2681,6 +2727,37 @@ mod tests {
                 .map(|module| module.module.path.to_str().unwrap()),
             Some("/old")
         );
+    }
+
+    #[test]
+    fn moduleless_frames_resolve_only_to_modules_of_their_owner() {
+        let path = temp_spool_path("moduleless-owner");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        for (id, (process_id, path)) in [(7, "/seven"), (8, "/eight"), (-1, "[kernel]")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut record = module(process_id, 0x1000, 0x2000, path, process_id < 0);
+            record.id = id as u32;
+            writer.write_module(&record).unwrap();
+        }
+        let stack_id = writer
+            .write_sample_frames(1_000, 7, 7, [kernel_frame(0x1100), frame(0x1100)])
+            .unwrap()
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = Snapshot::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        for (process_id, user) in [(7, Some("/seven")), (8, Some("/eight")), (9, None)] {
+            let paths: Vec<_> = reader
+                .stack_frame_contexts(crate::Pid::try_from(process_id).unwrap(), stack_id)
+                .unwrap()
+                .map(|context| context.module.map(|m| m.module.path.to_str().unwrap()))
+                .collect();
+            assert_eq!(paths, [Some("[kernel]"), user]);
+        }
     }
 
     #[test]
