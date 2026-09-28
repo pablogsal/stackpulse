@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
 use memmap2::Mmap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 mod jit;
 mod live;
@@ -73,8 +73,13 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     // the whole recording. Unpinned frames are resolved against the module
     // set visible at their position in the file, so their cache must be
     // dropped whenever that set changes (write_module / deactivation).
+    // Unpinned kernel frames only resolve against kernel modules, so their
+    // cache survives user module churn and is dropped only when a kernel
+    // module is written or deactivated.
     pinned_frame_cache: FxHashMap<FrameRecord, u32>,
     unpinned_frame_cache: FxHashMap<FrameRecord, u32>,
+    kernel_frame_cache: FxHashMap<FrameRecord, u32>,
+    kernel_module_ids: FxHashSet<u32>,
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
     thread_cache: FxHashMap<(i32, u64), u32>,
@@ -142,6 +147,8 @@ impl<W: Write> PerfSpoolWriter<W> {
             writer: SpoolOutput::new(writer),
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
+            kernel_frame_cache: FxHashMap::default(),
+            kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
@@ -181,6 +188,10 @@ impl<W: Write> PerfSpoolWriter<W> {
             jit::write_symbols(&mut self.writer, symbols)?;
         }
         self.unpinned_frame_cache.clear();
+        if module.is_kernel() {
+            self.kernel_module_ids.insert(module.id);
+            self.kernel_frame_cache.clear();
+        }
         Ok(())
     }
 
@@ -238,6 +249,9 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE_ONE])?;
         self.writer.write_varint(u64::from(module_id))?;
         self.unpinned_frame_cache.clear();
+        if self.kernel_module_ids.remove(&module_id) {
+            self.kernel_frame_cache.clear();
+        }
         Ok(())
     }
 
@@ -276,6 +290,7 @@ impl<W: Write> PerfSpoolWriter<W> {
             writer,
             pinned_frame_cache,
             unpinned_frame_cache,
+            kernel_frame_cache,
             next_frame_id,
             ..
         } = self;
@@ -283,6 +298,8 @@ impl<W: Write> PerfSpoolWriter<W> {
         // they are as durable as module-pinned frames.
         let cache = if frame.module_id.is_some() || frame.is_truncated_stack_marker() {
             pinned_frame_cache
+        } else if frame.mode == FrameMode::Kernel {
+            kernel_frame_cache
         } else {
             unpinned_frame_cache
         };
@@ -1927,6 +1944,8 @@ mod tests {
             last_timestamp_ns: 0,
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
+            kernel_frame_cache: FxHashMap::default(),
+            kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
@@ -2641,6 +2660,26 @@ mod tests {
 
         assert_eq!(first_stack, second_stack);
         assert_eq!(reader.frames(), &[pinned]);
+    }
+
+    fn kernel_frame(abs_ip: u64) -> FrameRecord {
+        FrameRecord {
+            mode: FrameMode::Kernel,
+            ..frame(abs_ip)
+        }
+    }
+
+    #[test]
+    fn writer_keeps_kernel_frames_across_user_module_changes() {
+        let mut writer = writer();
+        let frames = [kernel_frame(0xffff_ffff_c000_0010)];
+        let before = writer.write_sample_frames(1_000, 7, 7, frames).unwrap();
+        writer
+            .write_module(&module(7, 0x1000, 0x2000, "/main", false))
+            .unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        let after = writer.write_sample_frames(2_000, 7, 7, frames).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
