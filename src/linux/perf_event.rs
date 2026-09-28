@@ -855,6 +855,15 @@ impl SampleRecordLayout {
         })
     }
 
+    fn end(&self) -> usize {
+        [&self.user_regs, &self.user_stack, &self.call_chain]
+            .into_iter()
+            .flatten()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn sample<'a>(&self, bytes: &'a [u8]) -> Option<RingSampleRef<'a>> {
         Some(RingSampleRef {
             user_regs: match &self.user_regs {
@@ -906,7 +915,9 @@ impl RingSample {
         let RingSampleStorage::Ring(record) = &mut self.storage else {
             return;
         };
-        let detached = record.detach_bytes();
+        // Records reserve the full requested user stack, but a detached sample
+        // only reads its layout ranges, so the unused stack tail stays behind.
+        let detached = record.detach_bytes(self.layout.end());
         self.storage = RingSampleStorage::Detached(detached);
     }
 }
@@ -1598,27 +1609,29 @@ mod tests {
         bytes[len - size_of::<u64>()..len].copy_from_slice(&dyn_len.to_ne_bytes());
     }
 
+    /// Drain the ring-backed sample at the start of `ring`, with its time.
+    fn read_ring_sample(ring: &mut RingBuffer, user_regs: usize) -> (RingSample, Option<u64>) {
+        let parser = Arc::new(stack_sample_parser(user_regs));
+        let end = ring.snapshot_head();
+        EventDrain {
+            ring,
+            parser: &parser,
+            end,
+        }
+        .next_event(&mut |event| match event.record {
+            EventRecord::RingSample { sample, metadata } => (sample, metadata.time),
+            _ => panic!("expected ring-backed sample"),
+        })
+        .expect("read ring sample")
+        .expect("ring sample")
+    }
+
     #[test]
     fn detached_ring_sample_releases_tail_and_remains_parseable() {
         let spec = stack_sample_spec(64);
-        let parser = Arc::new(stack_sample_parser(spec.user_regs));
         let bytes = build_bench_sample_record(&spec, 3);
         let mut ring = super::super::ring_buffer::mock_ring(0, bytes.as_bytes());
-        let (mut sample, time) = {
-            let end = ring.snapshot_head();
-            let mut drain = EventDrain {
-                ring: &mut ring,
-                parser: &parser,
-                end,
-            };
-            drain
-                .next_event(&mut |event| match event.record {
-                    EventRecord::RingSample { sample, metadata } => (sample, metadata.time),
-                    _ => panic!("expected ring-backed sample"),
-                })
-                .expect("read ring sample")
-                .expect("ring sample")
-        };
+        let (mut sample, time) = read_ring_sample(&mut ring, spec.user_regs);
 
         assert_eq!(super::super::ring_buffer::test_tail(&ring), 0);
         sample.detach();
@@ -1631,6 +1644,21 @@ mod tests {
             .expect("detached sample parses");
         assert_eq!(time, Some(1_700_000_000_000_000 + 3_000));
         assert_eq!(stack_len, 64);
+    }
+
+    #[test]
+    fn detached_ring_sample_keeps_its_used_stack_bytes() {
+        let spec = stack_sample_spec(32 * 1024);
+        let mut bytes = build_bench_sample_record(&spec, 5);
+        set_dynamic_stack_size(&mut bytes, 4_093);
+        let mut ring = super::super::ring_buffer::mock_ring(0, bytes.as_bytes());
+        let (mut sample, _) = read_ring_sample(&mut ring, spec.user_regs);
+        sample.detach();
+
+        let stack_len = sample
+            .with_sample(|sample| sample.user_stack.map(<[u8]>::len))
+            .expect("detached sample parses");
+        assert_eq!(stack_len, Some(4_093));
     }
 
     #[test]
