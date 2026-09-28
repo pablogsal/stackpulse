@@ -2683,6 +2683,23 @@ mod tests {
     }
 
     #[test]
+    fn module_lookup_after_mapping_change_rebuilds_only_the_changed_process() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        for process_id in [7, 8] {
+            let lib = module(process_id, 0x1000, 0x2000, "/lib", false);
+            table.intern_module(lib, &mut writer).unwrap();
+        }
+        assert!(table.covers_user_pc(8, 0x1000));
+        let replacement = module(7, 0x1000, 0x2000, "/new", false);
+        let replacement = table.intern_module(replacement, &mut writer).unwrap();
+
+        let resolved = table.resolve_frame(7, 0x1000, FrameMode::User);
+        assert_eq!(resolved.module_id, Some(replacement));
+        assert!(table.covers_user_pc(8, 0x1000));
+    }
+
+    #[test]
     fn module_table_dedupes_active_modules_and_reinterns_after_deactivation() {
         let mut table = ModuleTable::default();
         let mut spool = writer();

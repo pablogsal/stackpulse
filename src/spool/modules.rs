@@ -44,7 +44,8 @@ pub(crate) struct ModuleTable {
     active_by_key: FxHashMap<ModuleIdentity, u32>,
     active_by_process: FxHashMap<i32, BTreeSet<(u64, u32)>>,
     index: ModuleIndex,
-    index_dirty: bool,
+    dirty_processes: FxHashSet<i32>,
+    kernel_index_dirty: bool,
 }
 
 #[derive(Default)]
@@ -149,6 +150,9 @@ impl ModuleTable {
                         split_module_around(&self.active[id], &module).map(|module| (*id, module))
                     })
                     .collect();
+                // Mark the owner before removing anything, so an early `?`
+                // return cannot leave a stale index behind.
+                self.dirty_processes.insert(module_pid.get());
                 for id in overlapping {
                     let Some(known) = self.active.remove(&id) else {
                         continue;
@@ -158,7 +162,6 @@ impl ModuleTable {
                     writer.write_module_deactivation_one(id)?;
                     update.retired.push(known);
                 }
-                self.index_dirty = true;
                 for (source_id, survivor) in survivors {
                     let id = self.intern_without_overlap(survivor, writer)?;
                     update.active.push(ModuleActivation {
@@ -225,9 +228,11 @@ impl ModuleTable {
                 .entry(pid.get())
                 .or_default()
                 .insert((module.start, module.id));
+            self.dirty_processes.insert(pid.get());
+        } else {
+            self.kernel_index_dirty = true;
         }
         self.active.insert(id, module);
-        self.index_dirty = true;
         Ok(id)
     }
 
@@ -240,6 +245,7 @@ impl ModuleTable {
         let Some(active_ids) = self.active_by_process.remove(&process_id) else {
             return Ok(());
         };
+        self.dirty_processes.insert(process_id);
         for &(_, id) in &active_ids {
             let module = self.active.remove(&id).ok_or_else(|| {
                 io::Error::new(
@@ -249,7 +255,6 @@ impl ModuleTable {
             })?;
             self.active_by_key.remove(&ModuleIdentity::from(&module));
         }
-        self.index_dirty = true;
         writer.write_module_deactivation(process_id)?;
         for (_, id) in active_ids {
             retire(id);
@@ -365,11 +370,28 @@ impl ModuleTable {
     }
 
     fn rebuild_index_if_needed(&mut self) {
-        if self.index_dirty {
-            let mut active_ids: Vec<_> = self.active.keys().copied().collect();
-            active_ids.sort_unstable();
-            self.index = ModuleIndex::build(&self.active, active_ids.into_iter());
-            self.index_dirty = false;
+        if !self.dirty_processes.is_empty() || self.kernel_index_dirty {
+            self.rebuild_dirty_index_groups();
+        }
+    }
+
+    // Only the groups of owners whose mappings changed are rebuilt, so one
+    // mapping event does not cost a pass over every traced process.
+    #[cold]
+    #[inline(never)]
+    fn rebuild_dirty_index_groups(&mut self) {
+        for process_id in self.dirty_processes.drain() {
+            let Some(modules) = self.active_by_process.get(&process_id) else {
+                self.index.by_process.remove(&process_id);
+                continue;
+            };
+            let group = self.index.by_process.entry(process_id).or_default();
+            group.rebuild(modules.iter().map(|(_, id)| &self.active[id]));
+        }
+        if self.kernel_index_dirty {
+            let kernel_modules = self.active.values().filter(|module| module.is_kernel());
+            self.index.kernel.rebuild(kernel_modules);
+            self.kernel_index_dirty = false;
         }
     }
 
@@ -430,29 +452,6 @@ struct ModuleIndex {
 }
 
 impl ModuleIndex {
-    fn build(active: &FxHashMap<u32, ModuleRecord>, active_ids: impl Iterator<Item = u32>) -> Self {
-        let mut index = Self::default();
-        for id in active_ids {
-            let module = &active[&id];
-            let entry = ModuleIndexEntry {
-                start: module.start,
-                end: module.end,
-                id: module.id,
-            };
-            match module.owner {
-                ModuleOwner::Kernel => index.kernel.push(entry),
-                ModuleOwner::Process(pid) => {
-                    index.by_process.entry(pid.get()).or_default().push(entry);
-                }
-            }
-        }
-        index.kernel.finish();
-        for group in index.by_process.values_mut() {
-            group.finish();
-        }
-        index
-    }
-
     fn find(&self, process_id: i32, address: u64, mode: FrameMode) -> Option<u32> {
         match mode {
             FrameMode::User => self
@@ -472,8 +471,10 @@ struct ModuleIndexGroup {
 }
 
 impl ModuleIndexGroup {
-    fn push(&mut self, entry: ModuleIndexEntry) {
-        self.entries.push(entry);
+    fn rebuild<'a>(&mut self, modules: impl Iterator<Item = &'a ModuleRecord>) {
+        self.entries.clear();
+        self.entries.extend(modules.map(ModuleIndexEntry::from));
+        self.finish();
     }
 
     fn finish(&mut self) {
@@ -509,6 +510,16 @@ struct ModuleIndexEntry {
     id: u32,
 }
 
+impl From<&ModuleRecord> for ModuleIndexEntry {
+    fn from(module: &ModuleRecord) -> Self {
+        Self {
+            start: module.start,
+            end: module.end,
+            id: module.id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,7 +534,7 @@ mod tests {
             let mut group = ModuleIndexGroup::default();
             for id in 0..4096 {
                 let start = u64::from(4096 - id) * 32;
-                group.push(ModuleIndexEntry {
+                group.entries.push(ModuleIndexEntry {
                     start,
                     end: start + if overlap { 64 } else { 16 },
                     id,
