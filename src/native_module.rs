@@ -61,6 +61,17 @@ impl ExactImageStore {
         identity: ElfFileIdentity,
     ) {
         let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        // A child mapping registered before its fork record is published again
+        // as an alias of the parent's module. Release the entry it replaces: a
+        // leaked reference would outlive the image and hand its token to a
+        // later image allocated at the same address.
+        if let Some(previous) = store.by_module.get(&module_id) {
+            if Arc::ptr_eq(&previous.image, &image) {
+                return;
+            }
+            store.remove_entry(module_id);
+            store.order.retain(|id| *id != module_id);
+        }
         let token = store.add_ref(&sections, &image);
         let retained = RetainedElfImage {
             sections,
@@ -68,8 +79,7 @@ impl ExactImageStore {
             token,
             identity,
         };
-        let previous = store.by_module.insert(module_id, retained);
-        debug_assert!(previous.is_none(), "module image IDs are never reused");
+        store.by_module.insert(module_id, retained);
         store.order.push_back(module_id);
         while store.by_module.len() > MAX_EXACT_IMAGE_ALIASES
             || store.image_refs.len() > MAX_SHARED_ELF_IMAGES
@@ -91,6 +101,21 @@ impl ExactImageStore {
                 retained.identity,
             );
         }
+    }
+
+    /// Return retained module entries, queued module IDs and image references.
+    #[cfg(test)]
+    pub(crate) fn retained_counts(&self) -> (usize, usize, usize) {
+        let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            store.by_module.len(),
+            store.order.len(),
+            store
+                .image_refs
+                .values()
+                .map(|(references, _, _)| references)
+                .sum(),
+        )
     }
 }
 
@@ -1142,6 +1167,29 @@ mod tests {
             &second.load_mapping(&module).unwrap().image.unwrap(),
             &image
         ));
+    }
+
+    #[test]
+    fn republishing_an_exact_image_keeps_one_reference_per_module() {
+        let store = ExactImageStore::default();
+        let sections = empty_sections();
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
+        store.insert(
+            1,
+            Arc::clone(&sections),
+            Arc::clone(&image),
+            namespaced_identity(1, 1, 1).file().clone(),
+        );
+        let token = store.get(1).unwrap().token;
+
+        store.insert(
+            1,
+            sections,
+            image,
+            namespaced_identity(1, 1, 1).file().clone(),
+        );
+        assert_eq!(store.get(1).unwrap().token, token);
+        assert_eq!(store.retained_counts(), (1, 1, 1));
     }
 
     #[test]
