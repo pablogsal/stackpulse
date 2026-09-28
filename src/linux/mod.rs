@@ -5,7 +5,7 @@ mod bench;
 mod builder;
 mod convert_regs;
 mod cpu;
-mod module_tracking;
+pub(crate) mod module_tracking;
 pub(crate) mod perf_event;
 mod perf_group;
 /// Launch a process suspended and attach recording before `execve`.

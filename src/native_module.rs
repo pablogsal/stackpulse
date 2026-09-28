@@ -615,8 +615,28 @@ fn open_module_file_with_mapping_path(
     // win over a textual pathname that may now refer to a replacement file or
     // resolve in a different mount namespace. The pathname remains a useful
     // fallback after the process exits and map_files disappears.
-    validated_module_file(map_file, module, true)
-        .or_else(|| validated_module_file(module.path(), module, false))
+    if let Some(file) = validated_module_file(map_file, module, true) {
+        return Some(file);
+    }
+    // map_files needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN. Without it,
+    // resolve the pathname in the target's root before the recorder's, and
+    // reach a replaced main executable through /proc/<pid>/exe. Those two
+    // candidates are only tried when the recorded inode and device are both
+    // known, so each is accepted only on an exact identity match.
+    let path = module.path();
+    let identity_known =
+        module.inode != 0 && (module.device_major != 0 || module.device_minor != 0);
+    let pid = module.pid().filter(|_| identity_known);
+    pid.and_then(|pid| {
+        let relative_path = path.strip_prefix("/").ok()?;
+        let target_path = PathBuf::from(format!("/proc/{pid}/root")).join(relative_path);
+        validated_module_file(&target_path, module, false)
+    })
+    .or_else(|| validated_module_file(path, module, false))
+    .or_else(|| {
+        let executable = PathBuf::from(format!("/proc/{}/exe", pid?));
+        validated_module_file(&executable, module, true)
+    })
 }
 
 fn validated_module_file(
@@ -1329,5 +1349,39 @@ mod tests {
 
         assert!(loaded.image_base.is_some());
         assert!(!loaded.sections.load_segments.is_empty());
+    }
+
+    #[test]
+    fn replaced_executable_is_opened_through_the_process_image() {
+        let temp = TempDir::new("native-module-replaced-exe");
+        let path = temp.path().join("sleep");
+        // Copy in a child process: a writable descriptor held here could leak
+        // into a concurrently forked test child and make its exec fail.
+        let copied = std::process::Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&path)
+            .status();
+        assert!(copied.unwrap().success());
+        let mut child = std::process::Command::new(&path).arg("30").spawn().unwrap();
+        let pid = child.id();
+        // uutils sleep exits at startup if its executable is already deleted.
+        for _ in 0..500 {
+            if crate::linux::read_process_stat(pid).unwrap().state == 'S' {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let maps = std::fs::read(format!("/proc/{pid}/maps")).unwrap();
+        let module = crate::linux::module_tracking::executable_modules_from_maps(pid, &maps)
+            .find(|module| *module.path == *path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+
+        let opened =
+            open_module_file_with_mapping_path(&module, Path::new("/proc/self/map_files/0-0"));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(opened.unwrap().metadata().unwrap().ino(), module.inode);
     }
 }

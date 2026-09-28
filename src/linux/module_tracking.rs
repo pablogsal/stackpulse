@@ -117,7 +117,7 @@ pub(super) fn register_existing_maps_snapshot<W: std::io::Write>(
     )
 }
 
-pub(super) fn executable_modules_from_maps(
+pub(crate) fn executable_modules_from_maps(
     pid: u32,
     maps: &(impl AsRef<[u8]> + ?Sized),
 ) -> impl Iterator<Item = ModuleRecord> + '_ {
