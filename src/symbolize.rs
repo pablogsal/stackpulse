@@ -1149,6 +1149,35 @@ impl Symbolizer {
         self.clear_resolution_cache_if_full();
 
         let mut frames = stack.raw_frames();
+        if self.stack_cache_mode == StackCache::Internal && self.transient_frame_keys.is_empty() {
+            // New stacks often reuse only frames that earlier stacks resolved,
+            // so collect their cached ranges before starting a frame batch.
+            let start = self.resolved_stack_frame_ids.len();
+            let mut cached = frames.clone();
+            let mut complete = true;
+            while let Some(frame_ref) = cached.next_with_id() {
+                let cache_process = frame_cache_process_id(process.get(), frame_ref.frame);
+                let Some(resolved) = self
+                    .frame_cache
+                    .get(&(cache_process, FrameCacheKey::Spool(frame_ref.id)))
+                else {
+                    complete = false;
+                    break;
+                };
+                self.resolved_stack_frame_ids.extend(resolved.indices());
+            }
+            if complete {
+                let range = start..self.resolved_stack_frame_ids.len();
+                self.stack_cache.insert(key, range.clone());
+                return Ok(ResolvedStack {
+                    frames: &self.resolved_frames,
+                    frame_ids: &self.resolved_frame_ids,
+                    indices: &self.resolved_stack_frame_ids[range],
+                    cacheable: true,
+                });
+            }
+            self.resolved_stack_frame_ids.truncate(start);
+        }
         self.begin_frame_batch(frames.len());
         let mut pending = frames.clone();
         while let Some(frame_ref) = pending.next_with_id() {
@@ -3290,6 +3319,49 @@ mod tests {
 
         // The kernel frames are shared; each process has its own user frame.
         assert_eq!(symbolizer.resolved_frames.len(), kernel_frames.len() + 2);
+    }
+
+    #[test]
+    fn new_stacks_of_cached_frames_match_uncached_resolution() {
+        let path = temp_symbolize_spool_path("new-stacks-of-cached-frames");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        // The second stack has only cached frames; the third misses after a hit.
+        for (index, stack) in [[0x1100, 0x1200], [0x1200, 0x1100], [0x1100, 0x1300]]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .write_sample_frames(index as u64, 7, 11, stack.map(frame))
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = Snapshot::open(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let mut cached = reader.symbolizer().disable_perf_maps().build().unwrap();
+        let mut uncached = reader
+            .symbolizer()
+            .disable_perf_maps()
+            .stack_cache(StackCache::External)
+            .build()
+            .unwrap();
+        for stack in reader.samples() {
+            let expected: Vec<_> = uncached
+                .resolve(stack.stack())
+                .unwrap()
+                .frames()
+                .cloned()
+                .collect();
+            let resolved: Vec<_> = cached
+                .resolve(stack.stack())
+                .unwrap()
+                .frames()
+                .cloned()
+                .collect();
+            assert_eq!(resolved, expected);
+        }
+        assert_eq!(cached.resolved_stack_frame_ids.len(), 6);
     }
 
     fn write_future_module_spool(label: &str) -> (std::path::PathBuf, u32) {
