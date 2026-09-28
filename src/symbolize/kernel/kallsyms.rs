@@ -14,8 +14,11 @@ use std::fs;
 use std::io::{self, BufRead};
 
 use memchr::memchr;
+use rustc_hash::FxHashMap;
 
-use super::{find_kernel_symbol, is_kernel_text_symbol, KernelSymbol};
+use super::{
+    find_kernel_symbol, is_kernel_text_symbol, FullKernelSymbol, FullKernelSymbols, KernelSymbol,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KernelSymbolMetadata<'a> {
@@ -26,9 +29,83 @@ struct KernelSymbolMetadata<'a> {
 
 const PERF_KERNEL_SYMBOL_TYPES: &[u8] = b"TWDB";
 
-pub(super) fn load_kernel_symbols() -> io::Result<Vec<KernelSymbol>> {
-    let data = fs::read("/proc/kallsyms")?;
-    Ok(parse_kernel_symbols(&data))
+pub(super) fn load_kernel_symbols() -> io::Result<FullKernelSymbols> {
+    let file = fs::File::open("/proc/kallsyms")?;
+    parse_full_kernel_symbols(&mut io::BufReader::with_capacity(1024 * 1024, file))
+}
+
+pub(super) fn parse_full_kernel_symbols(
+    reader: &mut impl BufRead,
+) -> io::Result<FullKernelSymbols> {
+    let mut builder = FullKernelSymbolsBuilder::default();
+    let mut text_addr = None;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        if let Some((address, name)) = parse_kernel_symbol_line_bytes(&line) {
+            if should_include_kernel_symbol(&mut text_addr, address, name) {
+                builder.push(address, name.name, name.module)?;
+            }
+        }
+        line.clear();
+    }
+    Ok(builder.finish())
+}
+
+#[derive(Default)]
+pub(super) struct FullKernelSymbolsBuilder {
+    symbols: Vec<FullKernelSymbol>,
+    names: String,
+    modules: Vec<Box<str>>,
+    module_ids: FxHashMap<Box<[u8]>, u32>,
+}
+
+impl FullKernelSymbolsBuilder {
+    pub(super) fn push(
+        &mut self,
+        address: u64,
+        name: &[u8],
+        module: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let name_start = self.names.len();
+        self.names.push_str(&String::from_utf8_lossy(name));
+        let symbol = FullKernelSymbol {
+            address,
+            name_start: kernel_symbol_table_index(name_start)?,
+            name_len: kernel_symbol_table_index(self.names.len() - name_start)?,
+            module: module.map(|module| self.module_id(module)).transpose()?,
+        };
+        self.symbols.push(symbol);
+        Ok(())
+    }
+
+    fn module_id(&mut self, module: &[u8]) -> io::Result<u32> {
+        if let Some(&id) = self.module_ids.get(module) {
+            return Ok(id);
+        }
+        let id = kernel_symbol_table_index(self.modules.len())?;
+        self.modules
+            .push(kernel_symbol_module_to_string(module).into_boxed_str());
+        self.module_ids.insert(module.into(), id);
+        Ok(id)
+    }
+
+    pub(super) fn finish(mut self) -> FullKernelSymbols {
+        sort_and_keep_last_alias(&mut self.symbols, |s| s.address);
+        FullKernelSymbols {
+            symbols: self.symbols.into_boxed_slice(),
+            names: self.names.into_boxed_str(),
+            modules: self.modules.into_boxed_slice(),
+        }
+    }
+}
+
+fn kernel_symbol_table_index(value: usize) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel symbol names exceed 4 GiB",
+        )
+    })
 }
 
 pub(super) fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
@@ -40,15 +117,19 @@ pub(super) fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
             symbols.push(kernel_symbol_from_name(address, name));
         }
     }
-    symbols.sort_by_key(|s| s.address);
+    sort_and_keep_last_alias(&mut symbols, |s| s.address);
+    symbols
+}
+
+fn sort_and_keep_last_alias<T>(symbols: &mut Vec<T>, address: impl Fn(&T) -> u64) {
+    symbols.sort_by_key(&address);
     symbols.dedup_by(|later, earlier| {
-        if later.address != earlier.address {
+        if address(later) != address(earlier) {
             return false;
         }
         std::mem::swap(later, earlier);
         true
     });
-    symbols
 }
 
 pub(super) fn load_sparse_kernel_symbols_from_file(

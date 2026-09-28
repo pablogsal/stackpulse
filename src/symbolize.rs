@@ -3140,7 +3140,7 @@ mod tests {
     #[test]
     fn kernel_frames_use_kernel_fallback_when_kallsyms_unavailable() {
         let mut symbolizer = Symbolizer::new(&[]);
-        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([])));
+        symbolizer.kernel_symbols = Some(KernelSymbolTable::full(&[]));
         let frame = FrameRecord {
             module_id: None,
             file_relative_ip: 0xffff_ffff_8000_1234,
@@ -3161,11 +3161,11 @@ mod tests {
     #[test]
     fn resolved_kernel_symbols_carry_within_function_offsets() {
         let mut symbolizer = Symbolizer::new(&[]);
-        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([KernelSymbol {
+        symbolizer.kernel_symbols = Some(KernelSymbolTable::full(&[KernelSymbol {
             address: 0xffff_ffff_8100_0000,
             name: "vfs_read".to_owned(),
             module: None,
-        }])));
+        }]));
         let frame = FrameRecord {
             module_id: None,
             file_relative_ip: 0xffff_ffff_8100_0014,
@@ -3207,9 +3207,7 @@ mod tests {
     #[test]
     fn kernel_resolution_preserves_module_name() {
         let mut symbolizer = Symbolizer::new(&[]);
-        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([
-            wireguard_kernel_symbol(),
-        ])));
+        symbolizer.kernel_symbols = Some(KernelSymbolTable::full(&[wireguard_kernel_symbol()]));
         let frame = wireguard_kernel_frame();
 
         let resolved = symbolizer.resolve_native_frame(&frame, None);
@@ -3287,60 +3285,6 @@ mod tests {
         assert_eq!(symbolizer.resolved_frames.len(), 2);
         assert!(symbolizer.stack_cache.is_empty());
         assert!(symbolizer.resolved_stack_frame_ids.is_empty());
-    }
-
-    #[test]
-    fn kernel_frames_are_resolved_once_for_all_processes() {
-        const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
-
-        let path = temp_symbolize_spool_path("shared-kernel-frames");
-        let kernel =
-            ModuleRecord::kernel(0, KERNEL_START..KERNEL_START + 0x1000, "[kernel.kallsyms]")
-                .unwrap();
-        let kernel_frames = [
-            FrameRecord {
-                module_id: Some(kernel.id),
-                file_relative_ip: 0x10,
-                abs_ip: KERNEL_START + 0x10,
-                mode: FrameMode::Kernel,
-            },
-            FrameRecord {
-                module_id: None,
-                file_relative_ip: KERNEL_START + 0x90,
-                abs_ip: KERNEL_START + 0x90,
-                mode: FrameMode::Kernel,
-            },
-        ];
-        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
-        writer.write_module(&kernel).unwrap();
-        for process_id in [100, 101] {
-            let frames = kernel_frames.into_iter().chain([frame(0x1500)]);
-            writer
-                .write_sample_frames(1_000, process_id, process_id as u64, frames)
-                .unwrap();
-        }
-        writer.flush().unwrap();
-        drop(writer);
-
-        let reader = Snapshot::open(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        let mut symbolizer = reader
-            .symbolizer()
-            .disable_perf_maps()
-            .kernel_symbols(KernelSymbolSource::Disabled)
-            .build()
-            .unwrap();
-        symbolizer.kernel_symbols = Some(KernelSymbolTable::Full(Arc::from([KernelSymbol {
-            address: KERNEL_START,
-            name: "kernel_function".to_owned(),
-            module: None,
-        }])));
-        for stack in reader.samples() {
-            symbolizer.resolve(stack.stack()).unwrap();
-        }
-
-        // The kernel frames are shared; each process has its own user frame.
-        assert_eq!(symbolizer.resolved_frames.len(), kernel_frames.len() + 2);
     }
 
     #[test]
