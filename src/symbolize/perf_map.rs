@@ -158,15 +158,20 @@ pub(super) fn load_perf_map(path: &Path) -> Option<PerfMap> {
     if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.len() > MAX_PERF_MAP_SIZE {
         return None;
     }
-    let mut text = String::with_capacity(usize::try_from(metadata.len()).ok()?);
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
     file.by_ref()
         .take(MAX_PERF_MAP_SIZE + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .ok()?;
-    if text.len() as u64 > MAX_PERF_MAP_SIZE {
+    if bytes.len() as u64 > MAX_PERF_MAP_SIZE {
         return None;
     }
-    let mut symbols: Vec<PerfMapSymbol> = text.lines().filter_map(parse_perf_map_line).collect();
+    // Perf-map names are raw bytes, so one invalid name must not discard the
+    // whole map.
+    let mut symbols: Vec<PerfMapSymbol> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(parse_perf_map_line)
+        .collect();
     symbols.sort_by_key(|symbol| symbol.start);
     Some(PerfMap {
         symbols,
@@ -209,6 +214,14 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
+
+    fn native_name(perf_map: &PerfMap, address: u64) -> Rc<str> {
+        match &find_perf_map_symbol(perf_map, address).unwrap().0.payload {
+            PerfMapPayload::Native(name) => Rc::clone(name),
+            PerfMapPayload::Python { .. } => panic!("expected native perf-map symbol"),
+        }
+    }
 
     #[test]
     fn python_source_suffix_requires_a_line_number() {
@@ -265,5 +278,16 @@ mod tests {
         ] {
             assert!(parse_perf_map_line(line).is_none(), "accepted {line:?}");
         }
+    }
+
+    #[test]
+    fn invalid_utf8_names_do_not_discard_the_perf_map() {
+        let temp = TempDir::new("perf-map-invalid-utf8");
+        let path = temp.path().join("perf-1.map");
+        std::fs::write(&path, b"1000 10 good\n2000 10 bad_\xff\n").unwrap();
+
+        let perf_map = load_perf_map(&path).expect("perf map with invalid UTF-8 names");
+        assert_eq!(&*native_name(&perf_map, 0x1000), "good");
+        assert_eq!(&*native_name(&perf_map, 0x2000), "bad_\u{fffd}");
     }
 }
