@@ -294,27 +294,17 @@ impl PerfOptions {
     }
 
     fn open_counter_once(&self, opts: &Opts) -> io::Result<(Counter, bool)> {
-        with_guest_exclusion_fallback(opts, |opts| {
-            with_kernel_exclusion_fallback(
-                self.include_kernel,
-                || self.open_event_counter(opts),
-                || {
-                    let mut user_opts = opts.clone();
-                    user_opts.exclude.kernel = true;
-                    self.open_event_counter(&user_opts)
-                },
-            )
-        })
-    }
-
-    fn open_event_counter(&self, opts: &Opts) -> io::Result<Counter> {
+        let software =
+            |opts: &Opts| open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts);
         match self.event_source {
-            EventSource::HwCpuCycles => with_software_event_fallback(
-                || open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts),
-                || open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts),
+            EventSource::HwCpuCycles => with_cycle_event_fallbacks(
+                opts,
+                self.include_kernel,
+                |opts| open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts),
+                software,
             ),
             EventSource::SwCpuClock => {
-                open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts)
+                with_exclusion_fallbacks(opts, self.include_kernel, software)
             }
         }
     }
@@ -479,6 +469,39 @@ fn is_inherit_thread_error(err: &io::Error) -> bool {
     )
 }
 
+fn with_cycle_event_fallbacks<T>(
+    opts: &Opts,
+    include_kernel: bool,
+    hardware: impl Fn(&Opts) -> io::Result<T>,
+    software: impl Fn(&Opts) -> io::Result<T>,
+) -> io::Result<(T, bool)> {
+    // Exhaust the hardware retries before switching events: some PMUs only
+    // need guest events excluded, while one without a sampling interrupt
+    // keeps failing with EOPNOTSUPP and must fall back to cpu-clock.
+    with_software_event_fallback(
+        || with_exclusion_fallbacks(opts, include_kernel, hardware),
+        || with_exclusion_fallbacks(opts, include_kernel, software),
+    )
+}
+
+fn with_exclusion_fallbacks<T>(
+    opts: &Opts,
+    include_kernel: bool,
+    open: impl Fn(&Opts) -> io::Result<T>,
+) -> io::Result<(T, bool)> {
+    with_guest_exclusion_fallback(opts, |opts| {
+        with_kernel_exclusion_fallback(
+            include_kernel,
+            || open(opts),
+            || {
+                let mut user_opts = opts.clone();
+                user_opts.exclude.kernel = true;
+                open(&user_opts)
+            },
+        )
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "perf_event_open rejected PERF_FORMAT_LOST; StackPulse requires Linux 6.0 or newer: {source}"
@@ -526,7 +549,7 @@ fn with_software_event_fallback<T>(
         Err(err)
             if matches!(
                 err.raw_os_error(),
-                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO)
+                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO | libc::EOPNOTSUPP)
             ) =>
         {
             software()
@@ -1926,6 +1949,20 @@ mod tests {
         .expect_err("preserve retry error");
         assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn cycle_fallbacks_use_cpu_clock_when_hardware_cannot_sample() {
+        let (value, kernel_enabled) = with_cycle_event_fallbacks(
+            &Opts::default(),
+            true,
+            |_| Err::<u32, _>(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            |_| Ok(7),
+        )
+        .expect("fall back to cpu-clock");
+
+        assert_eq!(value, 7);
+        assert!(kernel_enabled);
     }
 
     #[test]
