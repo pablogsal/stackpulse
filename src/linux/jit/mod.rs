@@ -321,4 +321,8 @@ impl JitRegistry {
         unwinder.add_jit_module(unwind);
         registry
     }
+
+    pub(in crate::linux) fn maps_read_pending(&self) -> bool {
+        self.mappings_changed
+    }
 }

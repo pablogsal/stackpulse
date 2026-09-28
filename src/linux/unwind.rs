@@ -112,7 +112,16 @@ impl ProcessUnwinder {
             elf_sections.remove(module.id);
         }
         if update.mapping_changed {
-            self.jit.mappings_changed();
+            // Runtime discovery reads only file mappings, so anonymous code
+            // changes cannot affect it.
+            if update
+                .retired
+                .iter()
+                .chain(update.active.iter().map(|activation| &activation.module))
+                .any(is_file_mapping)
+            {
+                self.jit.mappings_changed();
+            }
             self.refreshed_uncovered_pages.clear();
         }
     }
@@ -157,6 +166,14 @@ impl ProcessUnwinder {
     pub(super) fn should_refresh_for_uncovered_pc(&mut self, pc: u64) -> bool {
         self.refreshed_uncovered_pages.insert(refresh_page(pc))
     }
+}
+
+/// Match runtime discovery, which keeps only mappings with an inode. Linux
+/// reports a file mapping whose path it cannot build with inode 0 and one of
+/// these exact names.
+fn is_file_mapping(module: &ModuleRecord) -> bool {
+    let path = module.path().as_os_str();
+    !module.is_kernel() && (module.inode != 0 || path == "//toolong" || path == "//enomem")
 }
 
 fn refresh_page(pc: u64) -> u64 {
@@ -384,6 +401,32 @@ mod tests {
         assert!(!elf_sections.contains(1));
         assert!(elf_sections.contains(2));
         assert_eq!(child_unwinder.unwinder.max_known_code_address(), 0x4000);
+    }
+
+    #[test]
+    fn only_file_code_mappings_invalidate_runtime_discovery() {
+        let pid = crate::Pid::new(7).unwrap();
+        let anon = ModuleRecord::new(1, pid, 0x7000_0000..0x7000_1000, 0, "//anon").unwrap();
+        let update = |module| ModuleUpdate {
+            active: vec![ModuleActivation {
+                module,
+                source_module_id: None,
+            }],
+            mapping_changed: true,
+            ..ModuleUpdate::default()
+        };
+        let mut unwinder = ProcessUnwinder::default();
+        unwinder.apply_module_update(&update(anon.clone()), &mut ElfSectionCache::default());
+        assert!(!unwinder.jit.maps_read_pending());
+
+        let file = ModuleRecord { inode: 1, ..anon };
+        unwinder.apply_module_update(&update(file), &mut ElfSectionCache::default());
+        assert!(unwinder.jit.maps_read_pending());
+
+        let unnamed = ModuleRecord::new(1, pid, 0x7000_0000..0x7000_1000, 0, "//toolong").unwrap();
+        let mut unwinder = ProcessUnwinder::default();
+        unwinder.apply_module_update(&update(unnamed), &mut ElfSectionCache::default());
+        assert!(unwinder.jit.maps_read_pending());
     }
 
     #[test]
