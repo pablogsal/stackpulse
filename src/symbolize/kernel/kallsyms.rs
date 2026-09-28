@@ -9,7 +9,9 @@
 //! not depend on it.
 //!
 //! Zero addresses are ignored because kernels commonly expose symbol names but
-//! replace addresses with `0` when symbol addresses are restricted.
+//! replace addresses with `0` when symbol addresses are restricted. The kernel
+//! restricts all addresses of an open file or none, so a zero core `_text` or
+//! `_stext` stops parsing instead of reading the rest of the file.
 
 use std::fs;
 use std::io::{self, BufRead};
@@ -41,6 +43,9 @@ pub(super) fn parse_full_kernel_symbols(
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line)? != 0 {
         if let Some((address, name)) = parse_kernel_symbol_line_bytes(&line) {
+            if is_restricted_kernel_text(address, name) {
+                return Ok(FullKernelSymbols::default());
+            }
             if should_include_kernel_symbol(&mut text_addr, address, name) {
                 builder.push(address, name.name, name.module)?;
             }
@@ -112,6 +117,9 @@ pub(super) fn parse_kernel_symbols(data: &[u8]) -> Vec<KernelSymbol> {
     let mut text_addr = None;
 
     for (address, name) in KallSymIter::new(data) {
+        if is_restricted_kernel_text(address, name) {
+            return Vec::new();
+        }
         if should_include_kernel_symbol(&mut text_addr, address, name) {
             symbols.push(kernel_symbol_from_name(address, name));
         }
@@ -178,7 +186,9 @@ fn parse_sparse_kernel_symbols_streaming(
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
             if !carry.is_empty() {
-                scan.process_line(&carry);
+                if let SparseScanState::Restricted = scan.process_line(&carry) {
+                    return Ok(Vec::new());
+                }
             }
             return Ok(scan.finish());
         }
@@ -192,12 +202,16 @@ fn parse_sparse_kernel_symbols_streaming(
                 break;
             };
             let line_end = consumed + newline + 1;
-            if carry.is_empty() {
-                scan.process_line(&buffer[consumed..line_end]);
+            let state = if carry.is_empty() {
+                scan.process_line(&buffer[consumed..line_end])
             } else {
                 carry.extend_from_slice(&buffer[consumed..line_end]);
-                scan.process_line(&carry);
+                let state = scan.process_line(&carry);
                 carry.clear();
+                state
+            };
+            if let SparseScanState::Restricted = state {
+                return Ok(Vec::new());
             }
             consumed = line_end;
         }
@@ -218,6 +232,12 @@ struct SparseKernelSymbolScan<'a> {
     text_addr: Option<u64>,
 }
 
+enum SparseScanState {
+    Continue,
+    /// Zeroed `_text`/`_stext`: the reader cannot see kernel addresses.
+    Restricted,
+}
+
 impl<'a> SparseKernelSymbolScan<'a> {
     fn new(requested_addresses: &'a [u64]) -> Self {
         Self {
@@ -227,20 +247,23 @@ impl<'a> SparseKernelSymbolScan<'a> {
         }
     }
 
-    fn process_line(&mut self, line: &[u8]) {
+    fn process_line(&mut self, line: &[u8]) -> SparseScanState {
         let Some((address, name)) = parse_kernel_symbol_line_bytes(line) else {
-            return;
+            return SparseScanState::Continue;
         };
+        if is_restricted_kernel_text(address, name) {
+            return SparseScanState::Restricted;
+        }
         // The filter must see every line in file order: `_text` anchors which
         // core symbols are kept.
         if !should_include_kernel_symbol(&mut self.text_addr, address, name) {
-            return;
+            return SparseScanState::Continue;
         }
         let bucket = self
             .requested_addresses
             .partition_point(|&requested| requested < address);
         let Some(best) = self.best_lines.get_mut(bucket) else {
-            return;
+            return SparseScanState::Continue;
         };
         match best {
             // `>=` keeps the last alias at an address, like the full table.
@@ -252,6 +275,7 @@ impl<'a> SparseKernelSymbolScan<'a> {
             Some(_) => {}
             None => *best = Some((address, line.to_vec())),
         }
+        SparseScanState::Continue
     }
 
     fn finish(self) -> Vec<(u64, KernelSymbol)> {
@@ -327,6 +351,10 @@ fn parse_hex_u64(input: &[u8]) -> Option<(u64, usize)> {
     (len != 0).then_some((value, len))
 }
 
+fn is_restricted_kernel_text(address: u64, name: KernelSymbolMetadata<'_>) -> bool {
+    address == 0 && name.module.is_none() && is_kernel_text_symbol(name.name)
+}
+
 fn should_include_kernel_symbol(
     text_addr: &mut Option<u64>,
     address: u64,
@@ -391,7 +419,6 @@ fn kernel_symbol_module_to_string(module: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]
