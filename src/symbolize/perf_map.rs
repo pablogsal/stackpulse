@@ -38,6 +38,8 @@ const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
 
 pub(super) struct PerfMap {
     symbols: Vec<PerfMapSymbol>,
+    /// Largest `end` among `symbols[..=index]`, so lookups can stop walking back early.
+    max_end: Box<[u64]>,
     module: Rc<str>,
     /// Kept only for maps that may be reloaded.
     parsed: Option<ParsedPerfMapText>,
@@ -61,8 +63,17 @@ impl PerfMap {
         // On a reload the earlier lines are already sorted, so this stable sort
         // merges in the appended ones after any earlier entries with the same start.
         symbols.sort_by_key(|symbol| symbol.start);
+        let mut running_max = 0;
+        let max_end = symbols
+            .iter()
+            .map(|symbol| {
+                running_max = symbol.end.max(running_max);
+                running_max
+            })
+            .collect();
         Self {
             symbols,
+            max_end,
             module,
             parsed,
         }
@@ -100,11 +111,15 @@ pub(super) fn find_perf_map_symbol(
     perf_map: &PerfMap,
     address: u64,
 ) -> Option<(&PerfMapSymbol, &Rc<str>)> {
-    let symbol = perf_map.symbols[..perf_map
+    let candidates = perf_map
         .symbols
-        .partition_point(|symbol| symbol.start <= address)]
+        .partition_point(|symbol| symbol.start <= address);
+    let (symbol, _) = perf_map.symbols[..candidates]
         .iter()
-        .rfind(|symbol| address < symbol.end)?;
+        .zip(&perf_map.max_end[..candidates])
+        .rev()
+        .take_while(|(_, &max_end)| address < max_end)
+        .find(|(symbol, _)| address < symbol.end)?;
     Some((symbol, &perf_map.module))
 }
 
@@ -303,6 +318,17 @@ mod tests {
         let perf_map = load_perf_map(&path, perf_map, true).unwrap();
         assert_eq!(perf_map.symbols.len(), 2);
         assert_eq!(&*native_name(&perf_map, 0x2000), "name");
+    }
+
+    #[test]
+    fn lookups_walk_back_past_shorter_nested_entries() {
+        let directory = TempDir::new("perf-map-nested");
+        let path = directory.path().join("perf-1.map");
+        std::fs::write(&path, "1000 100 outer\n1010 8 inner\n").unwrap();
+
+        let perf_map = load_perf_map(&path, None, true).unwrap();
+        assert_eq!(&*native_name(&perf_map, 0x1050), "outer");
+        assert!(find_perf_map_symbol(&perf_map, 0x1100).is_none());
     }
 
     #[test]
