@@ -239,10 +239,17 @@ fn process_exit_status(status: WaitStatus) -> io::Result<ExitStatus> {
 
 impl Drop for SuspendedLaunchedProcess {
     fn drop(&mut self) {
-        if self.suspended.take().is_none() {
+        let Some(suspended) = self.suspended.take() else {
             return;
+        };
+        // Suspended children forked later inherit our resume pipe, so the
+        // child may never see EOF. Kill it only from the parent: a forked copy
+        // of this handle gets ECHILD and must leave the owner's child alone.
+        if let Ok(WaitStatus::StillAlive) = waitpid_retry(self.pid, Some(WaitPidFlag::WNOHANG)) {
+            let _ = suspended.process.signal(libc::SIGKILL);
+            drop(suspended);
+            reap(self.pid);
         }
-        reap(self.pid);
     }
 }
 
@@ -376,6 +383,7 @@ mod tests {
     use nix::sys::signal::Signal;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -398,6 +406,24 @@ mod tests {
             waitpid(pid, Some(WaitPidFlag::WNOHANG)),
             Err(Errno::ECHILD)
         ));
+    }
+
+    #[test]
+    fn dropping_suspended_launch_does_not_wait_for_later_siblings() {
+        let launch = || {
+            SuspendedLaunchedProcess::launch_in_suspended_state(OsStr::new("unused"), &[], &[])
+                .expect("launch suspended child")
+        };
+        let first = launch();
+        // The second child inherits the first child's resume pipe.
+        let _second = launch();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(first);
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(3)).is_ok());
     }
 
     #[test]
