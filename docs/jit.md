@@ -31,6 +31,10 @@ assembler fixture for consumer tests. The existing
 
 1. Check the required runtime settings in the [tested runtimes](#tested-runtimes) table.
 2. Give StackPulse permission to read the target process memory through `/proc/<pid>/mem`.
+   This needs ptrace access. With `kernel.yama.ptrace_scope=1`, attaching to a process
+   that StackPulse did not launch needs `CAP_SYS_PTRACE`, unless the target allowed
+   StackPulse with `prctl(PR_SET_PTRACER)`. StackPulse logs a warning when this access
+   is denied.
 3. Use the usual StackPulse attach or launch operation.
 
 JIT capture needs no additional StackPulse feature flag or symbolizer backend.

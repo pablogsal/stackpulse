@@ -134,6 +134,8 @@ pub struct Registry<P, D = Arc<[u8]>> {
     objects: HashMap<JitObjectId, JitObject<D>>,
     code_ranges: BTreeMap<u64, (u64, JitObjectId)>,
     limit_warned: bool,
+    /// Whether denied access to target memory has been reported.
+    permission_warned: bool,
     /// Per-object retry schedules for active registrations that failed to load.
     load_failures: HashMap<JitObjectId, RetryBackoff>,
     /// Retry schedule after a descriptor or list snapshot could not be read.
@@ -166,6 +168,7 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
             objects: HashMap::default(),
             code_ranges: BTreeMap::new(),
             limit_warned: false,
+            permission_warned: false,
             load_failures: HashMap::default(),
             refresh_backoff: None,
             poll_count: 0,
@@ -266,10 +269,20 @@ impl<P: MemoryReader, D: From<Arc<[u8]>> + Deref<Target = [u8]> + Clone> Registr
         match self.refresh_objects(poll) {
             Ok(()) => self.refresh_backoff = None,
             Err(error) => {
-                if let SnapshotError::Limit(limit) = error {
-                    self.report_limit(Some(limit));
-                } else {
-                    tracing::trace!(%error, "failed to refresh GDB JIT registrations");
+                match error {
+                    SnapshotError::Limit(limit) => self.report_limit(Some(limit)),
+                    SnapshotError::Read(error)
+                        if error.kind() == io::ErrorKind::PermissionDenied
+                            && !self.permission_warned =>
+                    {
+                        self.permission_warned = true;
+                        tracing::warn!(
+                            pid = self.process.pid(),
+                            %error,
+                            "cannot read GDB JIT registrations; target memory access needs ptrace permission"
+                        );
+                    }
+                    error => tracing::trace!(%error, "failed to refresh GDB JIT registrations"),
                 }
                 self.refresh_backoff = Some(RetryBackoff::next(self.refresh_backoff, poll));
             }
