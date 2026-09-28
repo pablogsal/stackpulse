@@ -237,6 +237,14 @@ impl ElfSectionCache {
         }
     }
 
+    /// Whether the recorder found the target's `[vdso]` mapping `module_id`
+    /// byte-for-byte equal to the local vDSO.
+    pub(crate) fn holds_local_vdso(&self, module_id: u32) -> bool {
+        self.exact_images
+            .as_ref()
+            .is_some_and(|images| images.get(module_id).is_some())
+    }
+
     pub(crate) fn load_mapping(
         &mut self,
         module: &ModuleRecord,
@@ -260,6 +268,11 @@ impl ElfSectionCache {
 
         let (image, exact) = if module.path() == Path::new(VDSO_PATH) {
             let bytes = local_vdso_bytes().ok_or(ElfLoadError::Unsupported)?;
+            // Only the recorder reads the live target's vDSO. It publishes the
+            // local image for its live readers when the bytes are identical.
+            let exact = (self.publish_exact_images && target_vdso_is_local(module, &bytes))
+                .then(|| local_vdso_image().cloned())
+                .flatten();
             (
                 CachedElfImage {
                     sections: Arc::new(
@@ -267,11 +280,13 @@ impl ElfSectionCache {
                             .map_err(|_| ElfLoadError::Unsupported)?,
                     ),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
-                    image: Weak::new(),
-                    identity: None,
+                    image: exact.as_ref().map_or_else(Weak::new, Arc::downgrade),
+                    identity: exact
+                        .as_ref()
+                        .and_then(|image| elf_file_identity(module, image.file())),
                     trusted: false,
                 },
-                None,
+                exact,
             )
         } else if let Some(retained) = self
             .exact_images
@@ -565,7 +580,7 @@ fn elf_file_identity(module: &ModuleRecord, file: &File) -> Option<ElfFileIdenti
     })
 }
 
-fn local_vdso_bytes() -> Option<Arc<[u8]>> {
+pub(crate) fn local_vdso_bytes() -> Option<Arc<[u8]>> {
     const MAX_MAPPED_ELF_SIZE: u64 = 16 * 1024 * 1024;
     static VDSO: OnceLock<Arc<[u8]>> = OnceLock::new();
 
@@ -590,6 +605,58 @@ fn local_vdso_bytes() -> Option<Arc<[u8]>> {
     let bytes: Arc<[u8]> = bytes.into();
     let _ = VDSO.set(Arc::clone(&bytes));
     Some(bytes)
+}
+
+/// This process's `[vdso]` mapping as a module record.
+#[cfg(test)]
+pub(crate) fn current_vdso_module() -> ModuleRecord {
+    let maps = std::fs::read("/proc/self/maps").unwrap();
+    let mut modules =
+        crate::linux::module_tracking::executable_modules_from_maps(std::process::id(), &maps);
+    modules
+        .find(|module| *module.path == *Path::new(VDSO_PATH))
+        .expect("current process has a vDSO mapping")
+}
+
+/// Whether the target's `[vdso]` mapping holds exactly the local vDSO's bytes.
+fn target_vdso_is_local(module: &ModuleRecord, local: &[u8]) -> bool {
+    let Some(pid) = module.pid() else {
+        return false;
+    };
+    if module.end.checked_sub(module.start) != u64::try_from(local.len()).ok() {
+        return false;
+    }
+    let mut bytes = vec![0; local.len()];
+    File::open(format!("/proc/{pid}/mem"))
+        .and_then(|memory| memory.read_exact_at(&mut bytes, module.start))
+        .is_ok_and(|()| *bytes == *local)
+}
+
+/// Return the local vDSO as a file image.
+///
+/// Symbol backends that open images by path cannot read a target's vDSO, so
+/// the local copy used for unwinding is written once to a memfd.
+pub(crate) fn local_vdso_image() -> Option<&'static Arc<NativeImage>> {
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    static IMAGE: OnceLock<Option<Arc<NativeImage>>> = OnceLock::new();
+
+    let bytes = local_vdso_bytes()?;
+    IMAGE
+        .get_or_init(|| {
+            // SAFETY: the name is NUL-terminated and the flags are scalar.
+            let raw_fd =
+                unsafe { libc::memfd_create(c"stackpulse-vdso".as_ptr(), libc::MFD_CLOEXEC) };
+            if raw_fd < 0 {
+                return None;
+            }
+            // SAFETY: a nonnegative memfd_create result is a newly owned file descriptor.
+            let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            file.write_all(&bytes).ok()?;
+            Some(Arc::new(NativeImage::new(Arc::new(file))))
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -1325,23 +1392,7 @@ mod tests {
 
     #[test]
     fn loads_vdso_elf_from_the_target_mapping() {
-        let maps = std::fs::read("/proc/self/maps").unwrap();
-        let region = crate::proc_maps::parse_iter(&maps)
-            .find(|region| region.path == Path::new("[vdso]"))
-            .expect("current process has a vDSO mapping");
-        let module = ModuleRecord {
-            jit_symbols: None,
-            id: 1,
-            owner: user_owner(i32::try_from(std::process::id()).unwrap()),
-            start: region.address.start,
-            end: region.address.end,
-            file_offset: region.file_offset,
-            inode: region.inode,
-            device_major: region.device_major,
-            device_minor: region.device_minor,
-            inode_generation: 0,
-            path: Path::new("[vdso]").into(),
-        };
+        let module = current_vdso_module();
 
         let loaded = ElfSectionCache::default()
             .load_mapping(&module)

@@ -93,6 +93,9 @@ pub(crate) struct NativeMappingData {
     pub(crate) file_identity: NativeFileIdentity,
     pub(crate) mapping_id: u32,
     pub(crate) image_id: NativeImageId,
+    /// Whether the recorder found this `[vdso]` mapping byte-for-byte equal
+    /// to the local vDSO.
+    pub(crate) local_vdso: bool,
 }
 
 /// Stable recorded identity for a native image.
@@ -152,9 +155,19 @@ impl NativeMapping {
                 file_identity,
                 mapping_id,
                 image_id: NativeImageId(image_token),
+                local_vdso: false,
             }),
             image: None,
         }
+    }
+
+    /// Mark a new `[vdso]` mapping as the local vDSO. A mapping that is
+    /// already shared is left unchanged.
+    pub(crate) fn local_vdso(mut self) -> Self {
+        if let Some(data) = Rc::get_mut(&mut self.data) {
+            data.local_vdso = true;
+        }
+        self
     }
 
     pub(crate) fn with_image(&self, image: Option<Arc<NativeImage>>) -> Self {
@@ -868,6 +881,21 @@ fn linux_build_id_string(info: &wholesym::LibraryInfo) -> Option<String> {
     }
 }
 
+/// Return the file Wholesym reads for `module`. A `[vdso]` mapping, which
+/// custom backends see as [`NativeImageSource::Vdso`], reads the local vDSO
+/// when the recorder found the target's vDSO identical to it. Saved
+/// recordings carry no such check, so their vDSO frames stay unresolved.
+#[cfg(feature = "builtin-wholesym")]
+fn wholesym_image_path(module: &NativeMapping) -> Option<&Path> {
+    if let Some(path) = module.image_path() {
+        return Some(path);
+    }
+    if !module.data.local_vdso {
+        return None;
+    }
+    crate::native_module::local_vdso_image().map(|image| image.proc_path())
+}
+
 /// Wrapper around symbolization with caching.
 ///
 /// Note: NOT thread-safe. Each thread needs its own `SymbolizerWrapper` instance.
@@ -1098,7 +1126,7 @@ impl SymbolizerWrapper {
             for request in pending.drain(..) {
                 let image = request.image_id();
                 let module = request.mapping();
-                let Some(image_path) = module.image_path() else {
+                let Some(image_path) = wholesym_image_path(module) else {
                     self.symbol_maps.insert(image, None);
                     continue;
                 };
@@ -1117,15 +1145,14 @@ impl SymbolizerWrapper {
                     module.normalized_path().to_path_buf(),
                     image_path.to_path_buf(),
                 ));
-                round.push(request);
+                round.push((request, image_path));
             }
 
             self.rebuild_symbol_manager(&binary_redirects);
-            for request in round {
+            for (request, image_path) in round {
                 let image = request.image_id();
-                let module = request.mapping();
-                let path = module.normalized_path();
-                let loaded = self.load_symbol_map(path, module.image_path().unwrap_or(path));
+                let path = request.mapping().normalized_path();
+                let loaded = self.load_symbol_map(path, image_path);
                 if let Err(err) = &loaded {
                     tracing::debug!(
                         name: "wholesym load failed",

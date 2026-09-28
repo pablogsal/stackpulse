@@ -629,7 +629,7 @@ fn prepare_native_mapping(
     if mapping.image.is_none() && !is_vdso {
         return Ok(None);
     }
-    let template = NativeMapping::from_recording(
+    let mut template = NativeMapping::from_recording(
         module.path.clone(),
         module.start..module.end,
         image_base,
@@ -643,6 +643,9 @@ fn prepare_native_mapping(
         module.id,
         mapping.image_token,
     );
+    if is_vdso && elf_sections.holds_local_vdso(module.id) {
+        template = template.local_vdso();
+    }
     let batch_module = template.with_image(mapping.image);
     native_modules.insert(module.id, template);
     Ok(Some(batch_module))
@@ -2203,6 +2206,43 @@ mod tests {
         let resolved = symbolizer.resolve_raw(pid, &[frame]).unwrap();
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved.frames().next(), Some(Frame::Native(_))));
+    }
+
+    #[test]
+    #[cfg(feature = "builtin-wholesym")]
+    fn builtin_backend_symbolizes_vdso_frames() {
+        use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
+
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let bytes = crate::native_module::local_vdso_bytes().unwrap();
+        let elf = object::File::parse(&*bytes).unwrap();
+        let load_address = elf.segments().map(|segment| segment.address()).min();
+        let clock_gettime = elf
+            .dynamic_symbols()
+            .find(|symbol| {
+                symbol
+                    .name()
+                    .is_ok_and(|name| name.contains("clock_gettime"))
+            })
+            .unwrap();
+        let offset = clock_gettime.address() - load_address.unwrap() + 2;
+        let module = crate::native_module::current_vdso_module();
+        let frame = FrameRecord {
+            module_id: Some(0),
+            file_relative_ip: offset,
+            abs_ip: module.start + offset,
+            mode: FrameMode::User,
+        };
+        let store = ExactImageStore::default();
+        let mut recorder = ElfSectionCache::publishing_exact_images_to(store.clone());
+        recorder.load_mapping(&module).unwrap();
+        let mut live = Symbolizer::new(std::slice::from_ref(&module));
+        live.elf_sections = ElfSectionCache::using_exact_images(store);
+
+        let Frame::Native(frame) = live.resolve_frame(pid, &frame) else {
+            panic!("expected a native vDSO frame");
+        };
+        assert!(frame.symbol.unwrap().name().contains("clock_gettime"));
     }
 
     #[test]
