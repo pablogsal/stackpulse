@@ -22,6 +22,7 @@ use super::ring_buffer::{RingBuffer, RingRecord};
 #[cfg(test)]
 use super::DEFAULT_RING_BUFFER_STACKS;
 use super::{invalid_data, normalized_ring_stacks};
+use crate::error::{AttachError, AttachStep};
 
 /// Maximum accepted `sample_stack_user` request, in bytes. The kernel may
 /// return fewer bytes so the complete perf record still fits its size field.
@@ -204,7 +205,11 @@ impl PerfOptions {
             plan.requested_exp,
             plan.fallback_exp,
             |page_exp| self.open_counter_with_page_exp(page_exp),
-            |opened, page_exp| RingBuffer::new(opened.counter.file(), page_exp),
+            |opened, page_exp| {
+                RingBuffer::new(opened.counter.file(), page_exp).map_err(|err| {
+                    AttachError::wrap(AttachStep::PerfRingMmap { cpu: self.cpu }, self.pid, err)
+                })
+            },
         )?;
         let OpenedCounter {
             counter,
@@ -241,7 +246,7 @@ impl PerfOptions {
 
     fn open_counter_with_page_exp(&self, page_exp: u8) -> io::Result<OpenedCounter> {
         let opts = self.perf_open_opts(ring_wakeup_bytes(page_exp)?);
-        match self.open_counter_once(&opts) {
+        let opened = match self.open_counter_once(&opts) {
             Ok((counter, include_kernel)) => Ok(OpenedCounter {
                 counter,
                 inherit: self.inherit,
@@ -260,7 +265,11 @@ impl PerfOptions {
                     })
             }
             Err(err) => Err(err),
-        }
+        };
+        // Every errno-based fallback has run; name the target for the caller.
+        opened.map_err(|err| {
+            AttachError::wrap(AttachStep::PerfEventOpen { cpu: self.cpu }, self.pid, err)
+        })
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -568,6 +577,16 @@ fn ring_buffer_budget_page_exp(maximum_bytes: u64) -> io::Result<u8> {
     Ok((u64::BITS - 1 - pages.leading_zeros()) as u8)
 }
 
+/// Whether a ring mmap failed because the locked or mapped memory budget
+/// ran out, so a smaller ring may still fit. Looks through attach context
+/// wrappers, which hide the errno from `raw_os_error`.
+pub(super) fn is_ring_budget_error(error: &io::Error) -> bool {
+    matches!(
+        crate::error::find_raw_os_error(error),
+        Some(libc::EPERM | libc::ENOMEM)
+    )
+}
+
 fn open_ring_with_fallback<C, R>(
     requested_exp: u8,
     fallback_exp: u8,
@@ -578,10 +597,7 @@ fn open_ring_with_fallback<C, R>(
     loop {
         let counter = open_counter(page_exp)?;
         match open_ring(&counter, page_exp) {
-            Err(error)
-                if page_exp > fallback_exp
-                    && matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOMEM)) =>
-            {
+            Err(error) if page_exp > fallback_exp && is_ring_budget_error(&error) => {
                 page_exp -= 1;
             }
             Ok(ring) => return Ok((counter, ring)),

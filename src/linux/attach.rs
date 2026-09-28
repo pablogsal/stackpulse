@@ -30,7 +30,9 @@ impl StoppedProcess {
             return Ok((stopped, without_leader(initial.tids, pid)));
         }
 
-        stopped.process.signal(libc::SIGSTOP)?;
+        stopped.process.signal(libc::SIGSTOP).map_err(|err| {
+            crate::error::AttachError::wrap(crate::error::AttachStep::StopTarget, pid, err)
+        })?;
         stopped.resume_on_drop = true;
         let deadline = Instant::now() + STOP_TIMEOUT;
         let mut previous = None;

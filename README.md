@@ -131,6 +131,13 @@ User-space sampling often works with the default perf permissions. Kernel frames
 high sample rates, and restrictive `perf_event_paranoid` settings may require
 `CAP_PERFMON` or a sysctl change.
 
+Attaching also needs ptrace-level access to the target: a non-dumpable process or
+one owned by another user requires `CAP_SYS_PTRACE`, and stopping another user's
+process while attaching requires `CAP_KILL`. Perf ring buffers count against
+`kernel.perf_event_mlock_kb` per CPU plus `RLIMIT_MEMLOCK`; when that budget is
+exhausted, lower `ring_buffer_stacks` or `stack_size`, or raise the limits.
+Attach errors name the failing step and target, plus the CPU for perf steps.
+
 Descendants that become non-dumpable, such as setuid, setgid or file-capability
 programs, hide `/proc/<pid>/maps`. The recorder logs a warning and keeps their
 last known mappings. The kernel stops sampling a process after such an exec.

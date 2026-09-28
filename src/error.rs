@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 #[cfg(test)]
 use std::path::Path;
@@ -68,9 +69,17 @@ impl Error {
     /// `kill`, or perf attachment means that the target disappeared.
     pub(crate) fn target(source: io::Error) -> Self {
         if is_target_gone_io(&source) {
-            return Self::new(ErrorKind::TargetGone, source);
+            return Self::from_io(ErrorKind::TargetGone, source);
         }
         Self::from(source)
+    }
+
+    fn from_io(kind: ErrorKind, source: io::Error) -> Self {
+        // Unwrap attach context so io_error() still reaches the OS error.
+        match source.downcast::<AttachError>() {
+            Ok(context) => Self::new(kind, context),
+            Err(source) => Self::new(kind, source),
+        }
     }
 
     pub(crate) fn spool(source: io::Error) -> Self {
@@ -131,7 +140,7 @@ impl From<io::Error> for Error {
                 _ => ErrorKind::Io,
             }
         };
-        Self::new(kind, error)
+        Self::from_io(kind, error)
     }
 }
 
@@ -222,6 +231,81 @@ pub(crate) fn and_cleanup(operation: io::Result<()>, cleanup: io::Result<()>) ->
 #[error("{0}")]
 struct MessageError(String);
 
+/// Attach step whose OS error needs the target named to be actionable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttachStep {
+    StopTarget,
+    PerfEventOpen { cpu: u32 },
+    PerfRingMmap { cpu: u32 },
+    ReadMaps,
+}
+
+#[derive(Debug)]
+pub(crate) struct AttachError {
+    step: AttachStep,
+    pid: u32,
+    source: io::Error,
+}
+
+impl AttachError {
+    /// Wrap `source` without changing its kind; errno checks that walk the
+    /// source chain still see the original error.
+    pub(crate) fn wrap(step: AttachStep, pid: u32, source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), Self { step, pid, source })
+    }
+
+    fn hint(&self) -> Option<&'static str> {
+        let errno = find_raw_os_error(&self.source);
+        let denied = is_access_denied_io(&self.source);
+        match self.step {
+            AttachStep::StopTarget if denied => {
+                Some("the target may be owned by another user; check CAP_KILL")
+            }
+            // perf_event_open reports paranoid and ptrace-access denials alike.
+            AttachStep::PerfEventOpen { .. } if denied => Some(
+                "check kernel.perf_event_paranoid or CAP_PERFMON, and whether the \
+                 target is non-dumpable or owned by another user (CAP_SYS_PTRACE)",
+            ),
+            AttachStep::PerfRingMmap { .. } if denied || errno == Some(libc::ENOMEM) => Some(
+                "perf ring buffers are limited by kernel.perf_event_mlock_kb per CPU \
+                 plus RLIMIT_MEMLOCK; lower ring_buffer_stacks or stack_size, or raise \
+                 those limits",
+            ),
+            AttachStep::ReadMaps if denied => Some(
+                "the target may be non-dumpable or owned by another user; check CAP_SYS_PTRACE",
+            ),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AttachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pid = self.pid;
+        match self.step {
+            AttachStep::StopTarget => write!(f, "sending SIGSTOP to pid {pid}")?,
+            AttachStep::PerfEventOpen { cpu } => {
+                write!(f, "perf_event_open for pid {pid} on CPU {cpu}")?;
+            }
+            AttachStep::PerfRingMmap { cpu } => {
+                write!(f, "perf ring buffer mmap for pid {pid} on CPU {cpu}")?;
+            }
+            AttachStep::ReadMaps => write!(f, "reading /proc/{pid}/maps")?,
+        }
+        write!(f, " failed: {}", self.source)?;
+        if let Some(hint) = self.hint() {
+            write!(f, "; {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AttachError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("failed to read spool: {source}")]
 struct SpoolReadError {
@@ -310,6 +394,24 @@ mod tests {
         assert_eq!(
             Error::from(crate::Tid::try_from(0_i32).unwrap_err()).kind(),
             ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn attach_context_keeps_classification_and_os_error() {
+        let denied = Error::target(AttachError::wrap(
+            AttachStep::PerfEventOpen { cpu: 3 },
+            1234,
+            io::Error::from_raw_os_error(libc::EACCES),
+        ));
+        assert_eq!(denied.kind(), ErrorKind::Permission);
+        assert_eq!(denied.raw_os_error(), Some(libc::EACCES));
+        let message = denied.to_string();
+        assert!(
+            message.starts_with(
+                "perf_event_open for pid 1234 on CPU 3 failed: Permission denied (os error 13); "
+            ),
+            "{message}"
         );
     }
 
