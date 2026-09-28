@@ -266,9 +266,14 @@ impl PerfOptions {
             }
             Err(err) => Err(err),
         };
-        // Every errno-based fallback has run; name the target for the caller.
+        // Every errno-based fallback has run; explain a pre-6.0 kernel's
+        // EINVAL, then name the target for the caller.
         opened.map_err(|err| {
-            AttachError::wrap(AttachStep::PerfEventOpen { cpu: self.cpu }, self.pid, err)
+            AttachError::wrap(
+                AttachStep::PerfEventOpen { cpu: self.cpu },
+                self.pid,
+                classify_open_error(err, lost_format_supported),
+            )
         })
     }
 
@@ -472,6 +477,45 @@ fn is_inherit_thread_error(err: &io::Error) -> bool {
         err.raw_os_error(),
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
     )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "perf_event_open rejected PERF_FORMAT_LOST; StackPulse requires Linux 6.0 or newer: {source}"
+)]
+struct LostFormatUnsupported {
+    #[source]
+    source: io::Error,
+}
+
+fn classify_open_error(err: io::Error, lost_format_supported: impl FnOnce() -> bool) -> io::Error {
+    if err.raw_os_error() == Some(libc::EINVAL) && !lost_format_supported() {
+        return io::Error::new(
+            io::ErrorKind::Unsupported,
+            LostFormatUnsupported { source: err },
+        );
+    }
+    err
+}
+
+/// Kernels before Linux 6.0 reject `PERF_FORMAT_LOST` with the same `EINVAL`
+/// as any other invalid attribute, so compare minimal counters with and
+/// without it. Anything but a clean split keeps the original error. Not
+/// cached: this runs only on a failed open, and a transient failure such as
+/// `EMFILE` must not decide later attempts.
+fn lost_format_supported() -> bool {
+    let open = |lost_records| {
+        let mut opts = Opts {
+            exclude: perf_event_open::config::Priv {
+                kernel: true,
+                ..Default::default()
+            },
+            ..Opts::default()
+        };
+        opts.stat_format.lost_records = lost_records;
+        Counter::new(Software::CpuClock, (Proc::CURRENT, Cpu::ALL), &opts)
+    };
+    !(open(false).is_ok() && open(true).is_err_and(|err| err.raw_os_error() == Some(libc::EINVAL)))
 }
 
 fn with_software_event_fallback<T>(
@@ -1845,6 +1889,15 @@ mod tests {
             assert_eq!(err.raw_os_error(), Some(errno));
             assert_eq!(calls, 1);
         }
+    }
+
+    #[test]
+    fn rejected_lost_format_is_reported_as_an_unsupported_kernel() {
+        let err = classify_open_error(io::Error::from_raw_os_error(libc::EINVAL), || false);
+        assert!(err.to_string().contains("Linux 6.0"), "{err}");
+        let err = crate::Error::from(err);
+        assert_eq!(err.kind(), crate::ErrorKind::Unsupported);
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
