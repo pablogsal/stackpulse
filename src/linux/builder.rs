@@ -71,7 +71,9 @@ impl RecorderBuilder {
     /// 64 KiB stack. Memory is pinned per CPU. Values
     /// requiring more than 256 MiB per CPU are rejected. Zero selects the
     /// default. If mmap fails with `EPERM` or `ENOMEM`, attach progressively
-    /// halves the ring down to the minimum valid capacity. All per-CPU rings
+    /// halves the ring down to the minimum valid capacity, and halves the
+    /// rings of every CPU it is opening when a later CPU still cannot fit
+    /// into the locked memory the earlier ones left. All per-CPU rings
     /// in one recorder also share a 1 GiB aggregate data budget; effective
     /// capacities are available in [`RecordingSummary`].
     pub fn ring_buffer_stacks(mut self, stacks: u32) -> Self {

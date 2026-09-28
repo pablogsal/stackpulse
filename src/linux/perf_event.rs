@@ -644,6 +644,11 @@ fn ring_buffer_budget_page_exp(maximum_bytes: u64) -> io::Result<u8> {
     Ok((u64::BITS - 1 - pages.leading_zeros()) as u8)
 }
 
+/// Smallest ring capacity that `open_ring` falls back to for `stack_size`.
+pub(super) fn minimum_ring_bytes(stack_size: u32) -> io::Result<u64> {
+    Ok(crate::elf::system_page_size() << ring_buffer_page_exp(stack_size, 1)?)
+}
+
 /// Whether a ring mmap failed because the locked or mapped memory budget
 /// ran out, so a smaller ring may still fit. Looks through attach context
 /// wrappers, which hide the errno from `raw_os_error`.

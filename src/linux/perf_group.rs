@@ -11,7 +11,10 @@ use rustc_hash::FxHashMap;
 use super::attach::{read_thread_group_id, StoppedProcess};
 use super::checked_loss_sum;
 use super::cpu::online_cpu_ids;
-use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
+use super::perf_event::{
+    is_ring_budget_error, minimum_ring_bytes, EventRef, EventSource, OutputRing, Perf, PerfOptions,
+    TaskInheritance,
+};
 use crate::state::ProcessHandle;
 
 const MAX_TOTAL_RING_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
@@ -582,38 +585,82 @@ impl PerfGroup {
         pending: &mut PendingEvents,
     ) -> io::Result<bool> {
         let checkpoint = pending.perfs.len();
-        let result = (|| {
-            let mut inherits = false;
-            let per_cpu_budget = MAX_TOTAL_RING_BUFFER_BYTES
-                / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
-            for &cpu in cpu_ids {
-                let remaining =
-                    MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
-                let opened = self.open_perf(
-                    target,
-                    cpu,
-                    OpenSettings {
-                        attach_mode,
-                        inherit: self.task_inheritance(),
-                        frequency,
-                        maximum_ring_bytes: per_cpu_budget.min(remaining),
-                    },
-                    pending,
-                )?;
-                match opened {
-                    OpenedEvent::Member { member, inherit } => {
-                        inherits |= inherit.is_enabled();
-                        pending.perfs.push(member);
-                    }
-                    OpenedEvent::Output { inherit } => inherits |= inherit.is_enabled(),
-                }
-            }
-            Ok(inherits)
-        })();
-        if result.is_err() {
+        let output_checkpoint = pending.outputs.len();
+        let allocated_ring_bytes = pending.allocated_ring_bytes;
+        let kernel_excluded = pending.kernel_excluded;
+        let mut ring_cap_bytes = MAX_TOTAL_RING_BUFFER_BYTES;
+        loop {
+            let result = self.open_cpu_perfs(
+                target,
+                cpu_ids,
+                attach_mode,
+                frequency,
+                ring_cap_bytes,
+                pending,
+            );
+            let Err(err) = result else {
+                return result;
+            };
             pending.perfs.truncate(checkpoint);
+            // The kernel charges every CPU's ring to one per-user budget, so
+            // full-size rings on the first CPUs can leave nothing for later
+            // ones even after their own fallback. Reopen this task's new rings
+            // at half the size until they all fit.
+            let largest_new_ring = pending.outputs[output_checkpoint..]
+                .iter()
+                .map(OutputRing::capacity_bytes)
+                .max()
+                .unwrap_or(0);
+            if !is_ring_budget_error(&err)
+                || !minimum_ring_bytes(self.stack_size)
+                    .is_ok_and(|minimum| largest_new_ring > minimum)
+            {
+                return Err(err);
+            }
+            for output in pending.outputs.drain(output_checkpoint..) {
+                pending.cpu_outputs.remove(&output.cpu());
+            }
+            pending.allocated_ring_bytes = allocated_ring_bytes;
+            pending.kernel_excluded = kernel_excluded;
+            ring_cap_bytes = largest_new_ring / 2;
         }
-        result
+    }
+
+    fn open_cpu_perfs(
+        &self,
+        target: TaskTarget,
+        cpu_ids: &[u32],
+        attach_mode: AttachMode,
+        frequency: u64,
+        ring_cap_bytes: u64,
+        pending: &mut PendingEvents,
+    ) -> io::Result<bool> {
+        let mut inherits = false;
+        let per_cpu_budget =
+            MAX_TOTAL_RING_BUFFER_BYTES / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
+        for &cpu in cpu_ids {
+            let remaining =
+                MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
+            let opened = self.open_perf(
+                target,
+                cpu,
+                OpenSettings {
+                    attach_mode,
+                    inherit: self.task_inheritance(),
+                    frequency,
+                    maximum_ring_bytes: per_cpu_budget.min(remaining).min(ring_cap_bytes),
+                },
+                pending,
+            )?;
+            match opened {
+                OpenedEvent::Member { member, inherit } => {
+                    inherits |= inherit.is_enabled();
+                    pending.perfs.push(member);
+                }
+                OpenedEvent::Output { inherit } => inherits |= inherit.is_enabled(),
+            }
+        }
+        Ok(inherits)
     }
 
     fn try_open_thread_perfs(
@@ -1109,7 +1156,7 @@ mod tests {
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
-    use crate::test_support::{process_handle, SleepChild};
+    use crate::test_support::{current_test_binary, ignored_test_args, process_handle, SleepChild};
 
     const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
         frequency: 1,
@@ -1759,6 +1806,64 @@ mod tests {
             }
         }
         Some(pending)
+    }
+
+    #[test]
+    fn attach_fits_every_cpu_ring_into_a_shared_mapping_budget() {
+        let helper = "linux::perf_group::tests::stackpulse_perf_group_helper_shared_ring_budget";
+        let output = std::process::Command::new(current_test_binary())
+            .args(ignored_test_args(helper))
+            .output()
+            .expect("run shared ring budget helper");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // Runs in its own process because the address space limit applies to
+    // every thread. The limit leaves room for half-size rings on every CPU but
+    // for full-size rings on only some of them.
+    #[test]
+    #[ignore]
+    fn stackpulse_perf_group_helper_shared_ring_budget() {
+        let options = PerfGroupOptions {
+            stack_size: 32 * 1024,
+            ring_stacks: super::super::DEFAULT_RING_BUFFER_STACKS,
+            ..TEST_OPTIONS
+        };
+        let page_size = crate::elf::system_page_size();
+        let ring_bytes =
+            u64::from(options.stack_size).max(page_size) * u64::from(options.ring_stacks);
+        let cpu_ids = online_cpu_ids().expect("online CPUs");
+        let mut group = PerfGroup::new(options).expect("create perf group");
+        let pid = std::process::id();
+        if open_fixed_cpu_events(&group, pid, pid, cpu_ids[0], 1, TaskInheritance::Threads)
+            .is_none()
+        {
+            return;
+        }
+        let status = fs::read_to_string("/proc/self/status").expect("read process status");
+        let mapped_kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSize:")?.trim().strip_suffix("kB"))
+            .and_then(|size| size.trim().parse().ok())
+            .expect("parse VmSize");
+        let budget = cpu_ids.len() as u64 * (ring_bytes / 2 + page_size) + 1024 * 1024;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is valid storage for one rlimit value.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) }, 0);
+        limit.rlim_cur = (mapped_kib * 1024 + budget).min(limit.rlim_max);
+        // SAFETY: limit is an initialized rlimit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+
+        group
+            .open_process(&mut process_handle(pid), AttachMode::OnExec)
+            .expect("open process within the ring budget");
     }
 
     #[test]
