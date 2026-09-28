@@ -1306,7 +1306,7 @@ fn open_spool_with_range_limit(
                 tracing::warn!("spool tail truncated mid-record; keeping {sample_count} samples");
                 break;
             }
-            return Err(err);
+            return Err(record_error(err, tag, record_start));
         }
         if tag == REC_SAMPLE && scan_start.is_none() {
             if let Some(ranges) = &mut sample_ranges {
@@ -1388,6 +1388,12 @@ impl MmapSpoolCursor {
         self.read_exact_spool(&mut magic)?;
         if magic == *CURRENT_MAGIC {
             Ok(())
+        } else if let [b'S', b'P', b'U', b'L', b'S', b'E', version @ b'0'..=b'9', 0] = magic {
+            Err(invalid_data(format!(
+                "unsupported stackpulse spool format version {} (this reader supports version {})",
+                char::from(version),
+                char::from(CURRENT_MAGIC[6]),
+            )))
         } else {
             Err(invalid_data("invalid stackpulse spool magic"))
         }
@@ -1681,6 +1687,15 @@ fn frame_module_ref<'a>(
             .checked_sub(module.start)?
             .checked_add(module.file_offset)?,
     })
+}
+
+/// Locates a record decode error in the file, keeping its kind so it still
+/// reads as corruption.
+fn record_error(err: io::Error, tag: u8, record_start: usize) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("{err} (record tag {tag} at byte offset {record_start})"),
+    )
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -2102,6 +2117,28 @@ mod tests {
         };
         let _ = std::fs::remove_file(&path);
         assert_eq!(err.kind(), crate::ErrorKind::CorruptSpool);
+    }
+
+    #[test]
+    fn readers_report_where_a_corrupt_record_starts() {
+        let path = temp_spool_path("corrupt-record-offset");
+        PerfSpoolWriter::create(&path, 123, 10)
+            .unwrap()
+            .flush()
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let expected = format!("record tag 238 at byte offset {}", bytes.len());
+        bytes.push(0xee);
+        std::fs::write(&path, &bytes).unwrap();
+        let errors = [Snapshot::open(&path).err(), Tail::open(&path).err()];
+        std::fs::write(&path, b"SPULSE3\0").unwrap();
+        let version = Snapshot::open(&path).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        for err in errors.map(|err| err.unwrap().to_string()) {
+            assert!(err.contains(&expected), "{err}");
+        }
+        assert!(version.contains("unsupported stackpulse spool format version 3"));
     }
 
     #[test]

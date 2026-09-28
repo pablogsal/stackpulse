@@ -11,8 +11,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::native_module::ExactImageStore;
 
 use super::{
-    decode_spool_record, invalid_data, next_source_id, DecodedSpoolRecord, MmapSpoolCursor,
-    SampleRecord, SpoolDefinitions, ThreadRecord,
+    decode_spool_record, invalid_data, next_source_id, record_error, DecodedSpoolRecord,
+    MmapSpoolCursor, SampleRecord, SpoolDefinitions, ThreadRecord,
 };
 
 const MAX_BATCH_SAMPLES: usize = 16 * 1024;
@@ -333,6 +333,7 @@ impl Tail {
     fn parse_available(&mut self) -> io::Result<bool> {
         let mut cursor = MmapSpoolCursor::at_position(Arc::clone(&self.mmap), self.position);
         loop {
+            let record_start = cursor.position;
             let record = match decode_spool_record(
                 &mut cursor,
                 &self.definitions.modules,
@@ -346,7 +347,10 @@ impl Tail {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof && cursor.at_eof() => {
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let tag = cursor.mmap[record_start];
+                    return Err(record_error(error, tag, record_start));
+                }
             };
             let ends_batch = matches!(
                 &record,
