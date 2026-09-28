@@ -918,7 +918,7 @@ impl Symbolizer {
             let retry_failed_load = identity.is_some() && state.map.is_none();
             let changed = state.identity != identity;
             let recovered = if !had_map || changed || retry_failed_load {
-                let map = load_perf_map(&state.path);
+                let map = load_perf_map(&state.path, state.map.take(), true);
                 let recovered = had_map && retry_failed_load && map.is_some();
                 state.identity = identity;
                 state.map = map;
@@ -1861,7 +1861,7 @@ impl Symbolizer {
                     .tracks_perf_map_updates
                     .then(|| perf_map_file_identity(&path))
                     .flatten();
-                let map = load_perf_map(&path);
+                let map = load_perf_map(&path, None, self.tracks_perf_map_updates);
                 PerfMapState {
                     path,
                     identity,
