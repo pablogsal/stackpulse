@@ -57,6 +57,7 @@ use module_tracking::{
 };
 use perf_event::{
     CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource, RingSample,
+    MAX_PERF_RECORD_BYTES,
 };
 pub use perf_group::AttachMode;
 use perf_group::{EventConsumer, PerfGroupOptions, RecoveredProcessFork, ThreadFork};
@@ -148,10 +149,26 @@ struct CapturePacing {
     last_lost_read: Option<Instant>,
     last_recovery_sweep: Option<Instant>,
     recovery_sweep_pending: bool,
+    lost_read_pending: bool,
 }
 
 impl CapturePacing {
+    // Until a ring first loses a write, the kernel counts a loss only when a
+    // write finds its ring full, and a full ring holds records that the next
+    // drain consumes, so paced counter reads wait for a drain that consumed
+    // records. After a loss, the pending PERF_RECORD_LOST enlarges every write
+    // to that ring and can keep a near-maximum sample from fitting even in the
+    // empty ring unless the ring holds two maximum-size records, so once any
+    // loss is counted with a smaller ring every due poll reads. Forced drains
+    // always read.
+    fn observe_ring_records(&mut self) {
+        self.lost_read_pending = true;
+    }
+
     fn should_read_lost_records(&mut self, mode: DrainMode) -> bool {
+        if !self.lost_read_pending && !mode.forces_bookkeeping() {
+            return false;
+        }
         interval_due(
             &mut self.last_lost_read,
             LOST_RECORD_READ_INTERVAL,
@@ -785,6 +802,7 @@ struct DrainSink<'a, W: std::io::Write> {
     sorter: &'a mut EventSorter<RawFd, u64, PreparedEvent>,
     result: io::Result<()>,
     last_finished_timestamp_ns: u64,
+    saw_record: bool,
 }
 
 impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
@@ -798,6 +816,7 @@ impl<W: std::io::Write> EventConsumer for DrainSink<'_, W> {
         if self.result.is_err() {
             return None;
         }
+        self.saw_record = true;
         prepare_event(event_ref, self.ctx.summary)
     }
 
@@ -1052,6 +1071,7 @@ impl<W: std::io::Write> Recorder<W> {
                 sorter: event_sorter,
                 result: Ok(()),
                 last_finished_timestamp_ns: 0,
+                saw_record: false,
             };
             let drain_result = match mode {
                 DrainMode::Consume => perf.consume_events(&mut sink),
@@ -1059,6 +1079,9 @@ impl<W: std::io::Write> Recorder<W> {
             };
             if let Err(error) = drain_result {
                 sink.result = Err(error);
+            }
+            if sink.saw_record {
+                capture_pacing.observe_ring_records();
             }
             // Forced drains read once after lifecycle replay so the same
             // syscall sweep includes final counters from retired members.
@@ -1740,6 +1763,8 @@ fn record_observed_lost_events(
 ) -> io::Result<()> {
     let lifecycle_gaps_before = summary.lifecycle_gaps;
     record_lost_events(summary, lost)?;
+    capture_pacing.lost_read_pending =
+        summary.lost_events != 0 && summary.minimum_ring_buffer_bytes < 2 * MAX_PERF_RECORD_BYTES;
     capture_pacing.observe_recovery_gap(summary.lifecycle_gaps != lifecycle_gaps_before);
     Ok(())
 }
@@ -2510,6 +2535,7 @@ mod tests {
             last_lost_read: Some(now),
             last_recovery_sweep: Some(now),
             recovery_sweep_pending: false,
+            lost_read_pending: true,
         };
 
         assert!(!pacing.should_read_lost_records(DrainMode::Consume));
@@ -2528,12 +2554,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_pacing_reads_counters_after_ring_records_or_loss_with_a_small_ring() {
+        let mut pacing = CapturePacing {
+            last_lost_read: Some(Instant::now() - LOST_RECORD_READ_INTERVAL),
+            ..CapturePacing::default()
+        };
+        let mut summary = RecordingSummary::default();
+
+        assert!(!pacing.should_read_lost_records(DrainMode::Consume));
+        pacing.observe_ring_records();
+        assert!(pacing.should_read_lost_records(DrainMode::Consume));
+        record_observed_lost_events(&mut summary, &mut pacing, 0).unwrap();
+        pacing.last_lost_read = Some(Instant::now() - LOST_RECORD_READ_INTERVAL);
+        assert!(!pacing.should_read_lost_records(DrainMode::Consume));
+
+        // A loss with a ring too small for two maximum-size records keeps
+        // every due poll reading.
+        record_observed_lost_events(&mut summary, &mut pacing, 7).unwrap();
+        pacing.last_lost_read = Some(Instant::now() - LOST_RECORD_READ_INTERVAL);
+        assert!(pacing.should_read_lost_records(DrainMode::Consume));
+    }
+
+    #[test]
     fn capture_flush_forces_pending_bookkeeping() {
         let now = Instant::now();
         let mut pacing = CapturePacing {
             last_lost_read: Some(now),
             last_recovery_sweep: Some(now),
             recovery_sweep_pending: true,
+            lost_read_pending: false,
         };
 
         assert!(pacing.should_read_lost_records(DrainMode::Flush));
@@ -2553,6 +2602,7 @@ mod tests {
             last_lost_read: Some(now),
             last_recovery_sweep: Some(now),
             recovery_sweep_pending: false,
+            lost_read_pending: false,
         };
         let mut summary = RecordingSummary::default();
 

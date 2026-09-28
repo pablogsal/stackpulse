@@ -589,7 +589,7 @@ fn with_guest_exclusion_fallback<T>(
 
 const RING_WAKEUP_FRACTION: u64 = 8;
 const MAX_RING_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_PERF_RECORD_BYTES: u64 = u16::MAX as u64;
+pub(super) const MAX_PERF_RECORD_BYTES: u64 = u16::MAX as u64;
 
 fn ring_buffer_page_exp(stack_size: u32, ring_stacks: u32) -> io::Result<u8> {
     ring_buffer_page_exp_for_page_size(stack_size, ring_stacks, crate::elf::system_page_size())
