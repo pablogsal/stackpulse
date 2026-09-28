@@ -12,8 +12,12 @@ pub trait UnwindRule: Copy + core::fmt::Debug {
     where
         F: FnMut(u64) -> Result<u64, ()>;
 
-    fn exec_with_dwarf_register_defaults<F>(
+    /// Like `exec`, but also recovers the registers that the DWARF CFI row describes.
+    /// `register_rules` is packed by the architecture's DWARF unwinder, and zero applies
+    /// the DWARF defaults.
+    fn exec_with_dwarf_register_rules<F>(
         self,
+        _register_rules: u64,
         is_first_frame: bool,
         regs: &mut Self::UnwindRegs,
         read_stack: &mut F,

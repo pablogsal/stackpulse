@@ -804,8 +804,9 @@ pub(crate) mod tests {
                     fde_offset,
                     &mut read_stack,
                 ),
-                Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
                     UnwindRuleX86_64::OffsetSp { sp_offset_by_8: 1 },
+                    0,
                 ))
             ));
             assert!(matches!(
@@ -918,8 +919,9 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 result,
-                Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
                     UnwindRuleX86_64::EndOfStack,
+                    0,
                 ))
             ),
             "{result:?}"

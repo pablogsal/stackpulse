@@ -400,77 +400,75 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
     {
         let lookup_address = address.address_for_lookup();
         let is_first_frame = !address.is_return_address();
-        let cache_handle =
+        let (unwind_rule, cached_fallback, dwarf_register_rules) =
             match cache
                 .rule_cache
                 .lookup(lookup_address, self.modules_generation, is_first_frame)
             {
-                CacheResult::Hit(unwind_rule, cached_fallback, uses_dwarf_register_defaults) => {
-                    let return_address = if uses_dwarf_register_defaults {
-                        unwind_rule.exec_with_dwarf_register_defaults(
-                            is_first_frame,
-                            regs,
-                            read_stack,
-                        )?
-                    } else {
-                        unwind_rule.exec(is_first_frame, regs, read_stack)?
-                    };
-                    return Ok(UnwindFrameOutcome::new(return_address, cached_fallback));
+                CacheResult::Hit(unwind_rule, cached_fallback, dwarf_register_rules) => {
+                    (unwind_rule, cached_fallback, dwarf_register_rules)
                 }
-                CacheResult::Miss(handle) => handle,
-            };
-
-        let (unwind_rule, cached_fallback, uses_dwarf_register_defaults) = match self
-            .find_module_for_address(lookup_address)
-        {
-            None => (
-                A::UnwindRule::fallback_rule(),
-                Some(FramePointerFallbackReason::NoModule),
-                false,
-            ),
-            Some((module_index, relative_lookup_address)) => {
-                let module = &self.modules[module_index];
-                match callback(
-                    module,
-                    address,
-                    relative_lookup_address,
-                    regs,
-                    cache,
-                    read_stack,
-                ) {
-                    Ok(UnwindResult::ExecRule(rule)) => (rule, None, false),
-                    Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(rule)) => (rule, None, true),
-                    Ok(UnwindResult::ExecRuleWithFallback(rule, error)) => {
-                        let reason = (!is_first_frame)
-                            .then_some(FramePointerFallbackReason::UnwindInfo(error));
-                        (rule, reason, false)
-                    }
-                    Ok(UnwindResult::Uncacheable(return_address)) => {
-                        return Ok(UnwindFrameOutcome::new(Some(return_address), None));
-                    }
-                    Err(error) => {
-                        let rule = A::UnwindRule::fallback_rule();
-                        let reason = FramePointerFallbackReason::UnwindInfo(error);
-                        if fallback_depends_on_sample(error) {
-                            let return_address = rule.exec(is_first_frame, regs, read_stack)?;
-                            return Ok(UnwindFrameOutcome::new(return_address, Some(reason)));
-                        } else {
-                            (rule, Some(reason), false)
+                CacheResult::Miss(cache_handle) => {
+                    let entry = match self.find_module_for_address(lookup_address) {
+                        None => (
+                            A::UnwindRule::fallback_rule(),
+                            Some(FramePointerFallbackReason::NoModule),
+                            None,
+                        ),
+                        Some((module_index, relative_lookup_address)) => {
+                            let module = &self.modules[module_index];
+                            match callback(
+                                module,
+                                address,
+                                relative_lookup_address,
+                                regs,
+                                cache,
+                                read_stack,
+                            ) {
+                                Ok(UnwindResult::ExecRule(rule)) => (rule, None, None),
+                                Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
+                                    rule,
+                                    register_rules,
+                                )) => (rule, None, Some(register_rules)),
+                                Ok(UnwindResult::ExecRuleWithFallback(rule, error)) => {
+                                    let reason = (!is_first_frame)
+                                        .then_some(FramePointerFallbackReason::UnwindInfo(error));
+                                    (rule, reason, None)
+                                }
+                                Ok(UnwindResult::Uncacheable(return_address)) => {
+                                    return Ok(UnwindFrameOutcome::new(Some(return_address), None));
+                                }
+                                Err(error) => {
+                                    let rule = A::UnwindRule::fallback_rule();
+                                    let reason = FramePointerFallbackReason::UnwindInfo(error);
+                                    if fallback_depends_on_sample(error) {
+                                        let return_address =
+                                            rule.exec(is_first_frame, regs, read_stack)?;
+                                        return Ok(UnwindFrameOutcome::new(
+                                            return_address,
+                                            Some(reason),
+                                        ));
+                                    } else {
+                                        (rule, Some(reason), None)
+                                    }
+                                }
+                            }
                         }
-                    }
+                    };
+                    cache
+                        .rule_cache
+                        .insert(cache_handle, entry.0, entry.1, entry.2);
+                    entry
                 }
-            }
-        };
-        cache.rule_cache.insert(
-            cache_handle,
-            unwind_rule,
-            cached_fallback,
-            uses_dwarf_register_defaults,
-        );
-        let return_address = if uses_dwarf_register_defaults {
-            unwind_rule.exec_with_dwarf_register_defaults(is_first_frame, regs, read_stack)?
-        } else {
-            unwind_rule.exec(is_first_frame, regs, read_stack)?
+            };
+        let return_address = match dwarf_register_rules {
+            Some(register_rules) => unwind_rule.exec_with_dwarf_register_rules(
+                register_rules,
+                is_first_frame,
+                regs,
+                read_stack,
+            )?,
+            None => unwind_rule.exec(is_first_frame, regs, read_stack)?,
         };
         Ok(UnwindFrameOutcome::new(return_address, cached_fallback))
     }
@@ -1311,6 +1309,65 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.return_address(), Some(0x6000));
         assert_eq!(cache.rule_cache.stats().misses(), 2);
+        assert_eq!(cache.rule_cache.stats().hits(), 1);
+    }
+
+    #[test]
+    fn dwarf_rows_with_callee_saved_registers_are_cached() {
+        use crate::dwarf::tests::{eh_frame_with_fde, X86_64_CIE};
+        use crate::x86_64::Reg;
+        use gimli::X86_64;
+
+        // CIE: CFA=rsp+8, ra=[CFA-8]. FDE for 0x1000..0x1100: CFA=rsp+32, rbp=[CFA-16],
+        // rbx=[CFA-24], r12=[CFA-32].
+        let (eh_frame, _) = eh_frame_with_fde(
+            &X86_64_CIE,
+            0x1000..0x1100,
+            &[
+                gimli::DW_CFA_def_cfa_offset.0,
+                32,
+                gimli::DW_CFA_offset.0 | X86_64::RBP.0 as u8,
+                2,
+                gimli::DW_CFA_offset.0 | X86_64::RBX.0 as u8,
+                3,
+                gimli::DW_CFA_offset.0 | X86_64::R12.0 as u8,
+                4,
+            ],
+        );
+        let mut unwinder = TestUnwinder::new();
+        unwinder.add_module(Module::new(
+            "test".into(),
+            0x1000..0x1100,
+            0,
+            ExplicitModuleSectionInfo {
+                eh_frame: Some(eh_frame),
+                ..Default::default()
+            },
+        ));
+        let mut cache = TestCache::new();
+        let mut read_stack = |address| match address {
+            0x8000 => Ok(0x1200),
+            0x8008 => Ok(0x1300),
+            0x8010 => Ok(0x9100),
+            0x8018 => Ok(0x3000),
+            _ => Err(()),
+        };
+        // The miss and the cache hit must recover the same registers.
+        for _ in 0..2 {
+            let mut regs = UnwindRegsX86_64::new(0x1000, 0x8000, 0x9000);
+            regs.set(Reg::RAX, 0xaa);
+            regs.set(Reg::R13, 0xdd);
+            let address = FrameAddress::from_return_address(0x1011).unwrap();
+            let outcome = unwinder
+                .unwind_frame_with_details(address, &mut regs, &mut cache, &mut read_stack)
+                .unwrap();
+            assert_eq!(outcome.return_address(), Some(0x3000));
+            assert_eq!((regs.sp(), regs.bp()), (0x8020, 0x9100));
+            assert_eq!(regs.get_if_set(Reg::RBX), Some(0x1300));
+            assert_eq!(regs.get_if_set(Reg::R12), Some(0x1200));
+            assert_eq!(regs.get_if_set(Reg::R13), Some(0xdd));
+            assert_eq!(regs.get_if_set(Reg::RAX), None);
+        }
         assert_eq!(cache.rule_cache.stats().hits(), 1);
     }
 }

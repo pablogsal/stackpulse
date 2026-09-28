@@ -6,7 +6,7 @@ use gimli::{
 
 use super::{
     arch::ArchX86_64,
-    unwind_rule::UnwindRuleX86_64,
+    unwind_rule::{DwarfRegisterRule, UnwindRuleX86_64, DWARF_CALLEE_SAVED_REGISTERS},
     unwindregs::{Reg, UnwindRegsX86_64},
 };
 use crate::dwarf::{
@@ -61,18 +61,23 @@ impl DwarfUnwinding for ArchX86_64 {
         let ra_rule = unwind_info.register(X86_64::RA);
 
         // An undefined return address marks the outermost frame, even when the
-        // row also saves general registers.
+        // row also saves general registers. Packed rules of 0 keep every
+        // callee-saved register, the DWARF default.
         if matches!(ra_rule, None | Some(RegisterRule::Undefined)) {
-            return Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+            return Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
                 UnwindRuleX86_64::EndOfStack,
+                0,
             ));
         }
 
-        if !has_explicit_general_register_rules(unwind_info) {
-            if let Some(unwind_rule) =
-                translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref())
-            {
-                return Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(unwind_rule));
+        if let Some(unwind_rule) =
+            translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref())
+        {
+            if let Some(register_rules) = translate_into_register_rules(unwind_info) {
+                return Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
+                    unwind_rule,
+                    register_rules,
+                ));
             }
         }
 
@@ -131,31 +136,57 @@ impl DwarfUnwinding for ArchX86_64 {
     }
 }
 
-const GENERAL_REGISTERS: [(Reg, Register, bool); 14] = [
-    (Reg::RAX, X86_64::RAX, false),
-    (Reg::RDX, X86_64::RDX, false),
-    (Reg::RCX, X86_64::RCX, false),
-    (Reg::RBX, X86_64::RBX, true),
-    (Reg::RSI, X86_64::RSI, false),
-    (Reg::RDI, X86_64::RDI, false),
-    (Reg::R8, X86_64::R8, false),
-    (Reg::R9, X86_64::R9, false),
-    (Reg::R10, X86_64::R10, false),
-    (Reg::R11, X86_64::R11, false),
-    (Reg::R12, X86_64::R12, true),
-    (Reg::R13, X86_64::R13, true),
-    (Reg::R14, X86_64::R14, true),
-    (Reg::R15, X86_64::R15, true),
+const GENERAL_REGISTERS: [(Reg, Register); 14] = [
+    (Reg::RAX, X86_64::RAX),
+    (Reg::RDX, X86_64::RDX),
+    (Reg::RCX, X86_64::RCX),
+    (Reg::RBX, X86_64::RBX),
+    (Reg::RSI, X86_64::RSI),
+    (Reg::RDI, X86_64::RDI),
+    (Reg::R8, X86_64::R8),
+    (Reg::R9, X86_64::R9),
+    (Reg::R10, X86_64::R10),
+    (Reg::R11, X86_64::R11),
+    (Reg::R12, X86_64::R12),
+    (Reg::R13, X86_64::R13),
+    (Reg::R14, X86_64::R14),
+    (Reg::R15, X86_64::R15),
 ];
 
-fn has_explicit_general_register_rules<RO, UCS>(unwind_info: &UnwindTableRow<RO, UCS>) -> bool
+/// Packs the general register rules of a row for `exec_with_dwarf_register_rules`, which
+/// recovers the same registers as `recover_general_registers` as long as callee-saved
+/// registers are only restored from stack slots and caller-saved registers stay undefined.
+fn translate_into_register_rules<RO, UCS>(unwind_info: &UnwindTableRow<RO, UCS>) -> Option<u64>
 where
     RO: ReaderOffset,
     UCS: UnwindContextStorage<RO>,
 {
-    unwind_info.registers().any(|&(register, _)| {
-        register.0 <= X86_64::R15.0 && register != X86_64::RBP && register != X86_64::RSP
-    })
+    let mut register_rules = [DwarfRegisterRule::SameValue; DWARF_CALLEE_SAVED_REGISTERS.len()];
+    for (dwarf_register, rule) in unwind_info.registers() {
+        let Some(&(register, ..)) = GENERAL_REGISTERS
+            .iter()
+            .find(|(_, general_register)| general_register == dwarf_register)
+        else {
+            continue;
+        };
+        let rule = match *rule {
+            RegisterRule::SameValue => DwarfRegisterRule::SameValue,
+            RegisterRule::Undefined => DwarfRegisterRule::Undefined,
+            RegisterRule::Offset(offset) if offset % 8 == 0 => DwarfRegisterRule::Offset {
+                cfa_offset_by_8: i8::try_from(offset / 8).ok()?,
+            },
+            _ => return None,
+        };
+        match DWARF_CALLEE_SAVED_REGISTERS
+            .iter()
+            .position(|&callee_saved| callee_saved == register)
+        {
+            Some(index) => register_rules[index] = rule,
+            None if rule == DwarfRegisterRule::Undefined => {}
+            None => return None,
+        }
+    }
+    Some(DwarfRegisterRule::pack(register_rules))
 }
 
 fn recover_general_registers<R, F, UCS, ES>(
@@ -174,10 +205,10 @@ where
 {
     GENERAL_REGISTERS
         .into_iter()
-        .filter_map(|(register, dwarf_register, callee_saved)| {
+        .filter_map(|(register, dwarf_register)| {
             let current = regs.get_if_set(register);
             let recovered = match unwind_info.register(dwarf_register) {
-                None if callee_saved => current,
+                None if DWARF_CALLEE_SAVED_REGISTERS.contains(&register) => current,
                 None | Some(RegisterRule::Undefined) => None,
                 Some(RegisterRule::SameValue) => current,
                 Some(rule) => eval_register_rule::<R, F, _, ES>(
@@ -206,19 +237,20 @@ fn translate_into_unwind_rule<RO: ReaderOffset>(
 
     match cfa_rule {
         CfaRule::RegisterAndOffset { register, offset } => match *register {
-            X86_64::RSP => {
+            X86_64::RSP if offset % 8 == 0 => {
                 let sp_offset_by_8 = u16::try_from(offset / 8).ok()?;
                 let fp_cfa_offset = register_rule_to_cfa_offset(bp_rule)?;
                 match fp_cfa_offset {
                     None => Some(UnwindRuleX86_64::OffsetSp { sp_offset_by_8 }),
-                    Some(bp_cfa_offset) => {
+                    Some(bp_cfa_offset) if bp_cfa_offset % 8 == 0 => {
                         let bp_storage_offset_from_sp_by_8 =
-                            i16::try_from((offset + bp_cfa_offset) / 8).ok()?;
+                            i16::try_from(offset.checked_add(bp_cfa_offset)? / 8).ok()?;
                         Some(UnwindRuleX86_64::OffsetSpAndRestoreBp {
                             sp_offset_by_8,
                             bp_storage_offset_from_sp_by_8,
                         })
                     }
+                    Some(_) => None,
                 }
             }
             X86_64::RBP => {
