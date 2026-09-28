@@ -1,8 +1,8 @@
-use core::{marker::PhantomData, ops::Range};
+use core::{cmp::Ordering, marker::PhantomData, ops::Range};
 
 use alloc::vec::Vec;
 use gimli::{
-    CfaRule, CieOrFde, DebugFrame, EhFrame, EhFrameHdr, Encoding, EndianSlice, Evaluation,
+    CfaRule, CieOrFde, DebugFrame, DwEhPe, EhFrame, EhFrameHdr, Encoding, EndianSlice, Evaluation,
     EvaluationResult, EvaluationStorage, Expression, LittleEndian, Location, ParsedEhFrameHdr,
     Reader, ReaderOffset, Register, RegisterRule, UnwindContext, UnwindContextStorage,
     UnwindOffset, UnwindSection, UnwindTableRow, Value, Vendor,
@@ -404,6 +404,101 @@ impl DwarfCfiIndex {
     }
 }
 
+/// The binary search table of an `.eh_frame_hdr` section in the layout that GNU ld,
+/// gold, lld and mold emit: a 4-byte `.eh_frame` pointer, a `udata4` FDE count and
+/// `datarel | sdata4` rows. We check the header once when the module is added, so
+/// that lookups can search the rows in place instead of re-parsing the header and
+/// decoding every probed row through gimli's generic pointer decoder.
+pub struct EhFrameHdrTable {
+    fde_count: usize,
+    base_svma: u64,
+    eh_frame_hdr_svma: u64,
+    eh_frame_ptr: u64,
+}
+
+impl EhFrameHdrTable {
+    const TABLE_OFFSET: usize = 12;
+    const ROW_SIZE: usize = 8;
+
+    /// Returns `None` for other header layouts, which keep using gimli's lookup.
+    pub fn try_new(
+        eh_frame_hdr_data: &[u8],
+        bases: &BaseAddresses,
+        base_svma: u64,
+    ) -> Option<Self> {
+        let [1, eh_frame_ptr_enc, fde_count_enc, table_enc] = *eh_frame_hdr_data.first_chunk()?
+        else {
+            return None;
+        };
+        if !matches!(
+            DwEhPe(eh_frame_ptr_enc).format(),
+            gimli::DW_EH_PE_udata4 | gimli::DW_EH_PE_sdata4
+        ) || DwEhPe(fde_count_enc) != gimli::DW_EH_PE_udata4
+            || DwEhPe(table_enc) != DwEhPe(gimli::DW_EH_PE_datarel.0 | gimli::DW_EH_PE_sdata4.0)
+        {
+            return None;
+        }
+        let hdr = EhFrameHdr::new(eh_frame_hdr_data, LittleEndian)
+            .parse(bases, 8)
+            .ok()?;
+        let eh_frame_ptr = hdr.eh_frame_ptr().direct().ok()?;
+        let fde_count = u32::from_le_bytes(*eh_frame_hdr_data.get(8..)?.first_chunk()?);
+        let fde_count = usize::try_from(fde_count).ok()?;
+        let table_end = fde_count
+            .checked_mul(Self::ROW_SIZE)?
+            .checked_add(Self::TABLE_OFFSET)?;
+        if fde_count == 0 || table_end > eh_frame_hdr_data.len() {
+            return None;
+        }
+        Some(Self {
+            fde_count,
+            base_svma,
+            eh_frame_hdr_svma: bases.eh_frame_hdr.data?,
+            eh_frame_ptr,
+        })
+    }
+
+    pub fn fde_offset_for_relative_address(
+        &self,
+        eh_frame_hdr_data: &[u8],
+        rel_lookup_address: u32,
+    ) -> Option<u32> {
+        let lookup_svma = self.base_svma + rel_lookup_address as u64;
+        let table = eh_frame_hdr_data.get(Self::TABLE_OFFSET..)?;
+        if lookup_svma < self.read_pointer(table, 0)? {
+            return None;
+        }
+        // Same search as gimli's `EhHdrTable::lookup`, so that tables with duplicate
+        // initial locations resolve to the same row.
+        let mut row = 0;
+        let mut len = self.fde_count;
+        while len > 1 {
+            let pivot = row + len / 2;
+            match self
+                .read_pointer(table, pivot * Self::ROW_SIZE)?
+                .cmp(&lookup_svma)
+            {
+                Ordering::Equal => {
+                    row = pivot;
+                    break;
+                }
+                Ordering::Less => {
+                    row = pivot;
+                    len -= len / 2;
+                }
+                Ordering::Greater => len /= 2,
+            }
+        }
+        let fde_ptr = self.read_pointer(table, row * Self::ROW_SIZE + 4)?;
+        fde_ptr.checked_sub(self.eh_frame_ptr)?.try_into().ok()
+    }
+
+    fn read_pointer(&self, table: &[u8], offset: usize) -> Option<u64> {
+        let value = i32::from_le_bytes(*table.get(offset..)?.first_chunk()?);
+        Some(self.eh_frame_hdr_svma.wrapping_add(value as i64 as u64))
+    }
+}
+
 pub trait DwarfUnwindRegs {
     fn get(&self, register: Register) -> Option<u64>;
 }
@@ -538,6 +633,8 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use alloc::vec;
+
     use gimli::{AArch64, DebugFrame, Format, StoreOnHeap, UnwindExpression, X86_64};
 
     use crate::{
@@ -625,6 +722,44 @@ pub(crate) mod tests {
                     expected
                 );
             }
+        }
+    }
+
+    #[test]
+    fn eh_frame_hdr_table_matches_gimli_lookup() {
+        use crate::x86_64::ArchX86_64;
+
+        // Common layout with duplicate initial locations, at eh_frame_hdr 0x9000.
+        let mut header = vec![1, 0x1b, 0x03, 0x3b];
+        header.extend_from_slice(&0xfc_i32.to_le_bytes());
+        header.extend_from_slice(&5_u32.to_le_bytes());
+        for (address, fde) in [
+            (-0x8000_i32, 0x100_i32),
+            (-0x7000, 0x120),
+            (-0x7000, 0x140),
+            (-0x7000, 0x160),
+            (-0x6000, 0x180),
+        ] {
+            header.extend_from_slice(&address.to_le_bytes());
+            header.extend_from_slice(&fde.to_le_bytes());
+        }
+        let bases = BaseAddresses::default().set_eh_frame_hdr(0x9000);
+        let table = EhFrameHdrTable::try_new(&header, &bases, 0).unwrap();
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        let unwinder = DwarfUnwinder::<_, ArchX86_64, _>::new(
+            EndianSlice::new(&[], LittleEndian),
+            UnwindSectionType::EhFrame,
+            Some(&header),
+            &mut context,
+            bases.clone(),
+            0,
+        );
+        for address in 0..0x4000 {
+            assert_eq!(
+                table.fde_offset_for_relative_address(&header, address),
+                unwinder.get_fde_offset_for_relative_address(address),
+                "{address:#x}"
+            );
         }
     }
 

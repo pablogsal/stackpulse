@@ -7,7 +7,8 @@ use gimli::{EndianSlice, LittleEndian};
 use crate::arch::Arch;
 use crate::cache::{AllocationPolicy, Cache};
 use crate::dwarf::{
-    DwarfCfiIndex, DwarfUnwinder, DwarfUnwinderError, DwarfUnwinding, UnwindSectionType,
+    DwarfCfiIndex, DwarfUnwinder, DwarfUnwinderError, DwarfUnwinding, EhFrameHdrTable,
+    UnwindSectionType,
 };
 use crate::error::{Error, UnwinderError};
 use crate::instruction_analysis::InstructionAnalysis;
@@ -578,6 +579,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
             }
             ModuleUnwindDataInternal::EhFrameHdrAndEhFrame {
                 eh_frame_hdr,
+                eh_frame_hdr_table,
                 eh_frame,
                 base_addresses,
             } => {
@@ -585,14 +587,18 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
                 let mut dwarf_unwinder = DwarfUnwinder::<_, A, _>::new(
                     EndianSlice::new(eh_frame, LittleEndian),
                     UnwindSectionType::EhFrame,
-                    Some(eh_frame_hdr_data),
+                    eh_frame_hdr_table.is_none().then_some(eh_frame_hdr_data),
                     &mut cache.gimli_unwind_context,
                     base_addresses.clone(),
                     module.base_svma,
                 );
-                let fde_offset = dwarf_unwinder
-                    .get_fde_offset_for_relative_address(rel_lookup_address)
-                    .ok_or(UnwinderError::EhFrameHdrCouldNotFindAddress)?;
+                let fde_offset = match eh_frame_hdr_table {
+                    Some(table) => {
+                        table.fde_offset_for_relative_address(eh_frame_hdr_data, rel_lookup_address)
+                    }
+                    None => dwarf_unwinder.get_fde_offset_for_relative_address(rel_lookup_address),
+                }
+                .ok_or(UnwinderError::EhFrameHdrCouldNotFindAddress)?;
                 dwarf_unwinder.unwind_frame_with_fde::<_, P::GimliEvaluationStorage<_>>(
                     regs,
                     is_first_frame,
@@ -702,6 +708,8 @@ enum ModuleUnwindDataInternal<D> {
     /// sections. Contains an index and DWARF CFI.
     EhFrameHdrAndEhFrame {
         eh_frame_hdr: D,
+        /// Set when `eh_frame_hdr` has a table layout that can be searched in place.
+        eh_frame_hdr_table: Option<EhFrameHdrTable>,
         eh_frame: D,
         base_addresses: crate::dwarf::BaseAddresses,
     },
@@ -801,8 +809,14 @@ impl<D: Deref<Target = [u8]>> ModuleUnwindDataInternal<D> {
                 .section_data(b".eh_frame_hdr")
                 .or_else(|| section_info.section_data(b"__eh_frame_hdr"))
             {
+                let eh_frame_hdr_table = EhFrameHdrTable::try_new(
+                    &eh_frame_hdr,
+                    &base_addresses,
+                    section_info.base_svma(),
+                );
                 ModuleUnwindDataInternal::EhFrameHdrAndEhFrame {
                     eh_frame_hdr,
+                    eh_frame_hdr_table,
                     eh_frame,
                     base_addresses,
                 }
