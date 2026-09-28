@@ -26,6 +26,9 @@ pub(crate) fn resolve_mapping_image_base(
     mapping_start_avma: u64,
     mapping_span: u64,
 ) -> Option<ModuleImageBase> {
+    // Small images can map one file page from segments with different
+    // biases. The mapping's current permissions cannot choose between them,
+    // because mprotect can make a page from any of those segments executable.
     let reference = find_load_contribution_for_file_range(
         &info.load_segments,
         mapping_start_file_offset,
@@ -81,16 +84,10 @@ mod tests {
         load_segments: Vec<LoadSegment>,
     ) -> ElfSectionInfo {
         ElfSectionInfo {
-            base_svma: 0,
             text_svma,
             text_file_range,
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
             load_segments: load_segments.into_boxed_slice(),
+            ..Default::default()
         }
     }
 

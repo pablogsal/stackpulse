@@ -3,7 +3,7 @@
 //! Loads ELF sections used by native stack unwinding and post-recording
 //! symbolization. Both consumers share these results through `native_module`.
 
-use super::types::{ElfSectionData, ElfSectionInfo};
+use super::types::{ElfSectionData, ElfSectionInfo, SectionCheck};
 use crate::error::ElfParseError;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::program_header::{ProgramHeader, PT_LOAD};
@@ -127,6 +127,7 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
         eh_frame: eh_frame.map(|(_, data)| data),
         eh_frame_hdr_svma: eh_frame_hdr.as_ref().map(|(addr, _)| *addr),
         eh_frame_hdr: eh_frame_hdr.map(|(_, data)| data),
+        eh_frame_hdr_indexed: SectionCheck::default(),
         got_svma: find_section_range(".got", &elf),
         load_segments: collect_load_segments(&elf).into_boxed_slice(),
     })

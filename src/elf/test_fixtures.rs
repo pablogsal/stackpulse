@@ -8,15 +8,8 @@ use std::sync::Arc;
 /// matching the samply hard-case test scenario.
 pub(crate) fn fake_hard_case_section_info() -> Arc<ElfSectionInfo> {
     Arc::new(ElfSectionInfo {
-        base_svma: 0,
         text_svma: Some(0x14be0c0..(0x14be0c0 + 0xf5bf60)),
         text_file_range: Some(0x14bd0c0..(0x14bd0c0 + 0xf5bf60)),
-        text: None,
-        eh_frame_svma: None,
-        eh_frame: None,
-        eh_frame_hdr_svma: None,
-        eh_frame_hdr: None,
-        got_svma: None,
         load_segments: vec![
             LoadSegment {
                 p_offset: 0x0,
@@ -48,5 +41,6 @@ pub(crate) fn fake_hard_case_section_info() -> Arc<ElfSectionInfo> {
             },
         ]
         .into_boxed_slice(),
+        ..Default::default()
     })
 }

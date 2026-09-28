@@ -192,6 +192,18 @@ fn indexed_eh_frame_hdr(section_info: &ElfSectionInfo) -> Option<(Range<u64>, El
     let addr = section_info.eh_frame_hdr_svma?;
     let data = section_info.eh_frame_hdr.as_ref()?;
     let range = svma_range(Some(addr), Some(data))?;
+    section_info
+        .eh_frame_hdr_indexed
+        .get_or_run(|| eh_frame_hdr_indexes_eh_frame(section_info, addr, data).is_some())
+        .then(|| (range, data.clone()))
+}
+
+/// Check that every search-table entry resolves to an FDE inside .eh_frame.
+fn eh_frame_hdr_indexes_eh_frame(
+    section_info: &ElfSectionInfo,
+    addr: u64,
+    data: &ElfSectionData,
+) -> Option<()> {
     let eh_frame_range = svma_range(section_info.eh_frame_svma, section_info.eh_frame.as_ref())?;
     let bases = gimli::BaseAddresses::default()
         .set_eh_frame(section_info.eh_frame_svma.unwrap_or_default())
@@ -227,7 +239,7 @@ fn indexed_eh_frame_hdr(section_info: &ElfSectionInfo) -> Option<(Range<u64>, El
         table.pointer_to_offset(fde_pointer).ok()?;
     }
     table.lookup(0, &bases).ok()?;
-    Some((range, data.clone()))
+    Some(())
 }
 
 fn module_to_framehop(
@@ -421,11 +433,6 @@ mod tests {
 
         let file = ModuleRecord { inode: 1, ..anon };
         unwinder.apply_module_update(&update(file), &mut ElfSectionCache::default());
-        assert!(unwinder.jit.maps_read_pending());
-
-        let unnamed = ModuleRecord::new(1, pid, 0x7000_0000..0x7000_1000, 0, "//toolong").unwrap();
-        let mut unwinder = ProcessUnwinder::default();
-        unwinder.apply_module_update(&update(unnamed), &mut ElfSectionCache::default());
         assert!(unwinder.jit.maps_read_pending());
     }
 

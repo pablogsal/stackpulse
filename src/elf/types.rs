@@ -4,7 +4,7 @@ use memmap2::Mmap;
 use std::fmt;
 use std::ops::Deref;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::LoadSegment;
 
@@ -91,11 +91,44 @@ impl PartialEq for ElfSectionData {
 
 impl Eq for ElfSectionData {}
 
+/// Check over immutable section data, run at most once per parsed image.
+///
+/// It never takes part in equality and is dropped by `clone`, so images compare
+/// equal whether or not it ran, and edited copies check again.
+#[derive(Default)]
+pub(crate) struct SectionCheck(OnceLock<bool>);
+
+impl SectionCheck {
+    pub(crate) fn get_or_run(&self, check: impl FnOnce() -> bool) -> bool {
+        *self.0.get_or_init(check)
+    }
+}
+
+impl Clone for SectionCheck {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for SectionCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SectionCheck").field(&self.0.get()).finish()
+    }
+}
+
+impl PartialEq for SectionCheck {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SectionCheck {}
+
 /// ELF section addresses and data needed for DWARF unwinding.
 ///
 /// `eh_frame` and `eh_frame_hdr` clone cheaply so multiple mappings of the same
 /// library share storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ElfSectionInfo {
     /// Base stated virtual address from the first PT_LOAD segment.
     pub(crate) base_svma: u64,
@@ -120,6 +153,10 @@ pub(crate) struct ElfSectionInfo {
 
     /// .eh_frame_hdr section data
     pub(crate) eh_frame_hdr: Option<ElfSectionData>,
+
+    /// Whether .eh_frame_hdr holds a search table that indexes .eh_frame,
+    /// validated once and shared by every mapping of this image.
+    pub(crate) eh_frame_hdr_indexed: SectionCheck,
 
     /// .got section range (SVMA)
     pub(crate) got_svma: Option<Range<u64>>,

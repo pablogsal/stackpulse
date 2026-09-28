@@ -693,18 +693,7 @@ mod tests {
     }
 
     fn empty_sections() -> Arc<ElfSectionInfo> {
-        Arc::new(ElfSectionInfo {
-            base_svma: 0,
-            text_svma: None,
-            text_file_range: None,
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: Box::default(),
-        })
+        Arc::new(ElfSectionInfo::default())
     }
 
     fn exact_image(file: Arc<File>) -> Arc<NativeImage> {
@@ -730,15 +719,8 @@ mod tests {
     #[test]
     fn image_base_is_not_guessed_when_mapping_cannot_be_correlated() {
         let section_info = ElfSectionInfo {
-            base_svma: 0,
             text_svma: Some(0x1000..0x2000),
             text_file_range: Some(0x1000..0x2000),
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
             load_segments: vec![LoadSegment {
                 p_offset: 0,
                 p_filesz: 0x5000,
@@ -747,6 +729,7 @@ mod tests {
                 p_flags: 0x5,
             }]
             .into_boxed_slice(),
+            ..Default::default()
         };
         let module = ModuleRecord {
             jit_symbols: None,
@@ -990,15 +973,7 @@ mod tests {
         assert!(cache.by_module[&module.id].image.upgrade().is_none());
         cache.by_module.get_mut(&module.id).unwrap().sections = Arc::new(ElfSectionInfo {
             base_svma: u64::MAX,
-            text_svma: None,
-            text_file_range: None,
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: Box::default(),
+            ..Default::default()
         });
 
         assert_eq!(
@@ -1306,15 +1281,9 @@ mod tests {
         let shared: Arc<[u8]> = vec![0_u8; 4096].into();
         let separate: Arc<[u8]> = vec![0_u8; 1024].into();
         let sections = ElfSectionInfo {
-            base_svma: 0,
-            text_svma: None,
-            text_file_range: None,
             text: ElfSectionData::owned_range(Arc::clone(&shared), 0..1024),
-            eh_frame_svma: None,
             eh_frame: ElfSectionData::owned_range(shared, 1024..4096),
-            eh_frame_hdr_svma: None,
             eh_frame_hdr: ElfSectionData::owned_range(separate, 0..1024),
-            got_svma: None,
             load_segments: vec![LoadSegment {
                 p_offset: 0,
                 p_filesz: 1,
@@ -1323,6 +1292,7 @@ mod tests {
                 p_flags: 0,
             }]
             .into_boxed_slice(),
+            ..Default::default()
         };
 
         assert_eq!(
