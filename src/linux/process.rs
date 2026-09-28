@@ -192,6 +192,13 @@ impl SuspendedLaunchedProcess {
                 // Parent gave up (closed pipe without signaling); exit silently.
                 Ok(0) => Self::exit_child(0),
                 Ok(_) => {
+                    // Match std::process::Command: the Rust runtime ignores
+                    // SIGPIPE, which would otherwise survive exec. Like
+                    // Command, keep the forking thread's signal mask.
+                    // SAFETY: signal is async-signal-safe.
+                    unsafe {
+                        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                    }
                     // SAFETY: argv and envp are null-terminated pointer arrays.
                     // Their C strings remain alive until exec or exit_child.
                     let _ = unsafe {
@@ -530,6 +537,20 @@ mod tests {
     }
 
     #[test]
+    fn launched_child_restores_default_sigpipe() {
+        let status = Launch::new("/bin/sh")
+            .args(["-c", "kill -PIPE $$; exit 0"])
+            .suspend()
+            .expect("launch suspended child")
+            .unsuspend_and_run()
+            .expect("resume child")
+            .wait()
+            .expect("wait child");
+
+        assert_eq!(status.signal(), Some(libc::SIGPIPE));
+    }
+
+    #[test]
     fn exit_status_preserves_signal_and_core_dump() {
         let pid = NixPid::from_raw(42);
         let status = process_exit_status(WaitStatus::Signaled(pid, Signal::SIGTERM, true))
@@ -650,6 +671,9 @@ mod tests {
 pub type Child = RunningProcess;
 
 /// Supported launch inputs for a child that waits before exec.
+///
+/// As with `std::process::Command`, the child starts with the default
+/// `SIGPIPE` disposition and inherits the calling thread's signal mask.
 #[derive(Clone, Debug)]
 pub struct Launch {
     program: OsString,
