@@ -1,4 +1,5 @@
 use memmap2::{Mmap, MmapOptions};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -76,6 +77,32 @@ pub(crate) fn mmap_from_bytes(bytes: &[u8]) -> Arc<Mmap> {
         .expect("create anonymous mmap");
     mmap.copy_from_slice(bytes);
     Arc::new(mmap.make_read_only().expect("make mmap read-only"))
+}
+
+pub(crate) fn current_test_binary() -> OsString {
+    std::env::current_exe()
+        .expect("current test binary")
+        .into_os_string()
+}
+
+pub(crate) fn ignored_test_args(test_name: &str) -> [OsString; 3] {
+    [
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from(test_name),
+    ]
+}
+
+/// Whether a recorder error means perf events are unavailable, so a test skips.
+pub(crate) fn perf_unavailable(err: &crate::Error) -> bool {
+    matches!(
+        err.kind(),
+        crate::ErrorKind::Permission | crate::ErrorKind::Unsupported
+    ) || matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP))
+}
+
+pub(crate) fn process_handle(pid: u32) -> crate::state::ProcessHandle {
+    crate::state::ProcessHandle::open(crate::Pid::new(pid as i32).expect("positive pid"))
 }
 
 pub(crate) struct SleepChild {

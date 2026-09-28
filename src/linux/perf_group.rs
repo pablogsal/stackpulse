@@ -12,22 +12,9 @@ use super::attach::StoppedProcess;
 use super::checked_loss_sum;
 use super::cpu::online_cpu_ids;
 use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
+use crate::state::ProcessHandle;
 
 const MAX_TOTAL_RING_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Reject pids that would not name a single real process once cast to the
-/// signed `pid_t` that `kill` takes: `0` targets the caller's own process
-/// group, and any value above `i32::MAX` wraps to a negative broadcast pid
-/// (`u32::MAX` becomes `-1`, i.e. "every process we may signal").
-fn validate_target_pid(pid: u32) -> io::Result<()> {
-    if pid == 0 || i32::try_from(pid).is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid target pid {pid}"),
-        ));
-    }
-    Ok(())
-}
 
 struct Member {
     perf: Perf,
@@ -52,12 +39,6 @@ struct OpenSettings {
 pub(super) struct ThreadFork {
     pub(super) tid: u32,
     pub(super) owner_pid: u32,
-    pub(super) parent_tid: u32,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ProcessFork {
-    pub(super) pid: u32,
     pub(super) parent_tid: u32,
 }
 
@@ -251,30 +232,30 @@ impl PerfGroup {
     }
 
     pub(super) fn open(
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
         options: PerfGroupOptions,
     ) -> io::Result<Self> {
         let mut group = PerfGroup::new(options)?;
-        let _ = group.open_process(pid, attach_mode)?;
+        let _ = group.open_process(process, attach_mode)?;
         Ok(group)
     }
 
     pub(super) fn open_process(
         &mut self,
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
     ) -> io::Result<OpenTransaction> {
-        self.open_process_with_frequency_mode(pid, attach_mode, FrequencyMode::Requested)
+        self.open_process_with_frequency_mode(process, attach_mode, FrequencyMode::Requested)
     }
 
     fn open_process_with_frequency_mode(
         &mut self,
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
         frequency_mode: FrequencyMode,
     ) -> io::Result<OpenTransaction> {
-        validate_target_pid(pid)?;
+        let pid = process.pid().get_u32();
         if attach_mode == AttachMode::StopWhileAttaching && pid == std::process::id() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -283,10 +264,10 @@ impl PerfGroup {
         }
         let frequency = frequency_for_mode(self.frequency, frequency_mode);
         let (stopped_process, threads) = if attach_mode == AttachMode::StopWhileAttaching {
-            let (stopped, threads) = StoppedProcess::new(pid)?;
+            let (stopped, threads) = StoppedProcess::new(process.try_clone()?)?;
             (Some(stopped), threads)
         } else {
-            (None, get_threads(pid)?)
+            (None, process.read_checked(get_threads)?)
         };
         let result = (|| {
             let cpu_ids = online_cpu_ids()?;
@@ -355,8 +336,9 @@ impl PerfGroup {
         }
     }
 
-    pub(super) fn refresh_threads(&mut self, pid: u32) -> io::Result<bool> {
-        let mut threads = match get_threads(pid) {
+    pub(super) fn refresh_threads(&mut self, process: &mut ProcessHandle) -> io::Result<bool> {
+        let pid = process.pid().get_u32();
+        let mut threads = match process.read_checked(get_threads) {
             Ok(threads) => threads,
             Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
             Err(err) => return Err(err),
@@ -473,71 +455,68 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub(super) fn open_forked_processes(
+    pub(super) fn open_forked_process(
         &mut self,
-        process_forks: &[ProcessFork],
+        process: &mut ProcessHandle,
+        parent_tid: u32,
     ) -> io::Result<()> {
         if !self.inherit_child_processes {
             return Ok(());
         }
 
-        for &ProcessFork { pid, parent_tid } in process_forks {
-            let parent_events_inherit = self
-                .tracked_threads
-                .get(&parent_tid)
-                .is_some_and(|track| track.events_inherit);
-            if parent_events_inherit || self.tracked_threads.contains_key(&pid) {
-                let events_inherit = parent_events_inherit
-                    || self
-                        .tracked_threads
-                        .get(&pid)
-                        .is_some_and(|track| track.events_inherit);
-                self.tracked_threads
-                    .insert(pid, ThreadTrack::new(pid, events_inherit));
-                continue;
-            }
-            match self.open_process_with_frequency_mode(
-                pid,
-                AttachMode::StopWhileAttaching,
-                FrequencyMode::ClampToKernelMax,
-            ) {
-                Ok(opened) => {
-                    if let Err(err) = self.enable_if_running() {
-                        self.rollback_open(opened);
-                        return Err(err);
-                    }
-                }
-                Err(err) if crate::error::is_target_gone_io(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let pid = process.pid().get_u32();
+        let parent_events_inherit = self
+            .tracked_threads
+            .get(&parent_tid)
+            .is_some_and(|track| track.events_inherit);
+        if parent_events_inherit || self.tracked_threads.contains_key(&pid) {
+            let events_inherit = parent_events_inherit
+                || self
+                    .tracked_threads
+                    .get(&pid)
+                    .is_some_and(|track| track.events_inherit);
+            self.tracked_threads
+                .insert(pid, ThreadTrack::new(pid, events_inherit));
+            return Ok(());
         }
-
+        match self.open_process_with_frequency_mode(
+            process,
+            AttachMode::StopWhileAttaching,
+            FrequencyMode::ClampToKernelMax,
+        ) {
+            Ok(opened) => {
+                if let Err(err) = self.enable_if_running() {
+                    self.rollback_open(opened);
+                    return Err(err);
+                }
+            }
+            Err(err) if crate::error::is_target_gone_io(&err) => {}
+            Err(err) => return Err(err),
+        }
         Ok(())
     }
 
     /// Repair process bookkeeping after LOST when only the owning parent
     /// process (not the exact forking TID) can be recovered from /proc.
+    /// Returns the forks that need [`Self::open_forked_process`].
     pub(super) fn recover_forked_processes(
         &mut self,
         process_forks: &[RecoveredProcessFork],
-    ) -> io::Result<()> {
+    ) -> Vec<RecoveredProcessFork> {
         let mut need_explicit_open = Vec::new();
-        for &RecoveredProcessFork { pid, parent_pid } in process_forks {
+        for &fork in process_forks {
             let parent_process_inherits = self
                 .tracked_threads
                 .values()
-                .any(|track| track.owner_pid == parent_pid && track.events_inherit);
+                .any(|track| track.owner_pid == fork.parent_pid && track.events_inherit);
             if parent_process_inherits {
                 self.tracked_threads
-                    .insert(pid, ThreadTrack::new(pid, true));
+                    .insert(fork.pid, ThreadTrack::new(fork.pid, true));
             } else {
-                need_explicit_open.push(ProcessFork {
-                    pid,
-                    parent_tid: parent_pid,
-                });
+                need_explicit_open.push(fork);
             }
         }
-        self.open_forked_processes(&need_explicit_open)
+        need_explicit_open
     }
 
     pub(super) fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
@@ -1103,6 +1082,7 @@ mod tests {
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
+    use crate::test_support::process_handle;
 
     const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
         frequency: 1,
@@ -1333,22 +1313,12 @@ mod tests {
         .expect("create perf group");
 
         let err = group
-            .open_process(pid, AttachMode::OnExec)
+            .open_process(&mut process_handle(pid), AttachMode::OnExec)
             .expect_err("invalid stack size should fail before opening perf events");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(group.tracked_threads.is_empty());
         assert!(group.members.is_empty());
-    }
-
-    #[test]
-    fn open_rejects_invalid_pid_before_tracking_process() {
-        let err = match PerfGroup::open(0, AttachMode::OnExec, TEST_OPTIONS) {
-            Ok(_) => panic!("pid 0 should be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1363,10 +1333,7 @@ mod tests {
             .insert(100, ThreadTrack::new(100, true));
 
         group
-            .open_forked_processes(&[ProcessFork {
-                pid: 200,
-                parent_tid: 100,
-            }])
+            .open_forked_process(&mut process_handle(200), 100)
             .expect("track inherited child process");
 
         assert!(group.tracked_threads.contains_key(&200));
@@ -1388,12 +1355,12 @@ mod tests {
             .tracked_threads
             .insert(101, ThreadTrack::new(100, true));
 
-        group
+        assert!(group
             .recover_forked_processes(&[RecoveredProcessFork {
                 pid: 200,
                 parent_pid: 100,
             }])
-            .expect("recover inherited child process");
+            .is_empty());
 
         assert_eq!(
             group.tracked_threads.get(&200),
@@ -1415,7 +1382,7 @@ mod tests {
             .insert(stale_tid, ThreadTrack::new(pid, true));
 
         group
-            .refresh_threads(pid)
+            .refresh_threads(&mut process_handle(pid))
             .expect("refresh live test process");
 
         assert!(!group.tracked_threads.contains_key(&stale_tid));
@@ -1427,10 +1394,7 @@ mod tests {
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
 
         group
-            .open_forked_processes(&[ProcessFork {
-                pid: 200,
-                parent_tid: 100,
-            }])
+            .open_forked_process(&mut process_handle(200), 100)
             .expect("ignore forked process");
 
         assert!(group.tracked_threads.is_empty());
@@ -1740,11 +1704,12 @@ mod tests {
     #[test]
     fn rollback_removes_exact_open_transaction() {
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
-        let opened = match group.open_process(std::process::id(), AttachMode::OnExec) {
-            Ok(opened) => opened,
-            Err(err) if perf_open_can_be_skipped(&err) => return,
-            Err(err) => panic!("open process: {err}"),
-        };
+        let opened =
+            match group.open_process(&mut process_handle(std::process::id()), AttachMode::OnExec) {
+                Ok(opened) => opened,
+                Err(err) if perf_open_can_be_skipped(&err) => return,
+                Err(err) => panic!("open process: {err}"),
+            };
         assert!(!group.outputs.is_empty());
 
         group.rollback_open(opened);
@@ -1837,13 +1802,6 @@ mod tests {
             frequency_for_kernel_max(123, FrequencyMode::ClampToKernelMax, None),
             123
         );
-    }
-
-    #[test]
-    fn target_pid_validation_rejects_unsafe_pids() {
-        assert!(validate_target_pid(0).is_err());
-        assert!(validate_target_pid(u32::MAX).is_err());
-        assert!(validate_target_pid(std::process::id()).is_ok());
     }
 
     #[test]

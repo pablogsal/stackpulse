@@ -13,6 +13,7 @@ use nix::fcntl::OFlag;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, pipe2, read, write, ForkResult, Pid as NixPid};
 
+use crate::state::ProcessHandle;
 use crate::Pid;
 
 unsafe extern "C" {
@@ -25,11 +26,12 @@ unsafe extern "C" {
 pub struct SuspendedLaunchedProcess {
     pid: NixPid,
     public_pid: Pid,
-    pipes: Option<SuspendPipes>,
+    suspended: Option<Suspended>,
 }
 
 #[derive(Debug)]
-struct SuspendPipes {
+struct Suspended {
+    process: ProcessHandle,
     resume_tx: OwnedFd,
     exec_error_rx: OwnedFd,
 }
@@ -77,7 +79,9 @@ impl SuspendedLaunchedProcess {
                 Ok(Self {
                     pid: child,
                     public_pid,
-                    pipes: Some(SuspendPipes {
+                    suspended: Some(Suspended {
+                        // Race-free: only this parent can reap the child.
+                        process: ProcessHandle::open(public_pid),
                         resume_tx: resume_sp,
                         exec_error_rx: execerr_rp,
                     }),
@@ -102,18 +106,19 @@ impl SuspendedLaunchedProcess {
         let result = self.unsuspend_inner().map_err(crate::Error::from);
         if result.is_err() {
             // Reap the child on any failure after we took ownership of the
-            // pipes; Drop's reap path is gated on the pipes still being Some.
+            // pipes; Drop's reap path is gated on `suspended` still being Some.
             reap(self.pid);
         }
         result
     }
 
     fn unsuspend_inner(&mut self) -> io::Result<RunningProcess> {
-        let SuspendPipes {
+        let Suspended {
+            process,
             resume_tx,
             exec_error_rx,
         } = self
-            .pipes
+            .suspended
             .take()
             .ok_or_else(|| io::Error::other("process was already resumed"))?;
 
@@ -151,7 +156,7 @@ impl SuspendedLaunchedProcess {
         }
 
         Ok(RunningProcess {
-            public_pid: self.public_pid,
+            process,
             state: ChildState::Running,
         })
     }
@@ -234,7 +239,7 @@ fn process_exit_status(status: WaitStatus) -> io::Result<ExitStatus> {
 
 impl Drop for SuspendedLaunchedProcess {
     fn drop(&mut self) {
-        if self.pipes.take().is_none() {
+        if self.suspended.take().is_none() {
             return;
         }
         reap(self.pid);
@@ -253,7 +258,7 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 /// A launched process that is now running.
 #[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
-    public_pid: Pid,
+    process: ProcessHandle,
     state: ChildState,
 }
 
@@ -266,7 +271,7 @@ enum ChildState {
 impl std::fmt::Debug for RunningProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunningProcess")
-            .field("pid", &self.public_pid)
+            .field("pid", &self.process.pid())
             .field("state", &self.state)
             .finish()
     }
@@ -275,14 +280,13 @@ impl std::fmt::Debug for RunningProcess {
 impl RunningProcess {
     /// Return the stable identity of this child, including after it exits.
     pub fn pid(&self) -> Pid {
-        self.public_pid
+        self.process.pid()
     }
 
     /// Send SIGKILL to a child that has not been reaped.
     pub fn kill(&mut self) -> crate::Result<()> {
         if let ChildState::Running = self.state {
-            nix::sys::signal::kill(self.nix_pid(), nix::sys::signal::Signal::SIGKILL)
-                .map_err(nix_error)?;
+            self.process.signal(libc::SIGKILL)?;
         }
         Ok(())
     }
@@ -324,7 +328,7 @@ impl RunningProcess {
     }
 
     fn nix_pid(&self) -> NixPid {
-        NixPid::from_raw(self.public_pid.get())
+        NixPid::from_raw(self.process.pid().get())
     }
 }
 
@@ -368,7 +372,7 @@ fn build_env(env_vars: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{current_test_binary, ignored_test_args, TempDir};
     use nix::sys::signal::Signal;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
@@ -380,20 +384,6 @@ mod tests {
     const PATH_HELPER: &str = "linux::process::tests::stackpulse_process_helper_path_override";
     const CHILD_PATH_ENV: &str = "STACKPULSE_CHILD_PATH";
     const PATH_EXECUTABLE: &str = "stackpulse-child-path-executable";
-
-    fn current_test_binary() -> OsString {
-        std::env::current_exe()
-            .expect("current test binary")
-            .into_os_string()
-    }
-
-    fn ignored_test_args(test_name: &str) -> [OsString; 3] {
-        [
-            OsString::from("--ignored"),
-            OsString::from("--exact"),
-            OsString::from(test_name),
-        ]
-    }
 
     #[test]
     fn dropping_suspended_launch_reaps_child() {
@@ -519,7 +509,7 @@ mod tests {
     #[test]
     fn try_wait_reports_missing_child() {
         let mut process = RunningProcess {
-            public_pid: Pid::new(i32::MAX).unwrap(),
+            process: ProcessHandle::open(Pid::new(i32::MAX).unwrap()),
             state: ChildState::Running,
         };
 

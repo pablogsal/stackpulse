@@ -33,13 +33,9 @@ use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
-use crate::state::ProcessExitWatcher;
+use crate::state::ProcessHandle;
 use crate::stats::SampleErrorStats;
 use crate::unwind_stats::UnwindFallbackStats;
-
-fn try_new_exit_watcher(pid: i32) -> Option<ProcessExitWatcher> {
-    crate::Pid::new(pid).and_then(|pid| ProcessExitWatcher::try_new(pid).ok())
-}
 
 use perf_event_open::sample::record::mmap::Mmap;
 use perf_event_open::sample::record::sample::Abi as SampleRegsAbi;
@@ -51,7 +47,7 @@ use crate::native_module::ElfSectionCache;
 use crate::spool::{FrameMode, FrameRecord, ModuleTable, PerfSpoolWriter};
 #[cfg(test)]
 use crate::spool::{ModuleOwner, ModuleRecord};
-use attach::read_process_start_time;
+pub(crate) use attach::read_process_start_time;
 use convert_regs::ConvertRegs;
 #[cfg(any(test, feature = "bench-support"))]
 use module_tracking::record_module;
@@ -63,7 +59,7 @@ use perf_event::{
     CallChainEntry, CallChainIter, CallChainRef, EventRecord, EventRef, EventSource, RingSample,
 };
 pub use perf_group::AttachMode;
-use perf_group::{EventConsumer, PerfGroupOptions, ProcessFork, RecoveredProcessFork, ThreadFork};
+use perf_group::{EventConsumer, PerfGroupOptions, RecoveredProcessFork, ThreadFork};
 use sorter::EventSorter;
 use types::{StackFrame, StackMode};
 use unwind::{build_sample_stack, ProcessUnwinder, StackInput};
@@ -414,72 +410,24 @@ struct ProcessImageIdentity {
 }
 
 #[derive(Default)]
-enum ProcessTracking {
-    #[default]
-    Untracked,
-    Tracked(Option<ProcessExitWatcher>),
-}
-
-enum ProcessLiveness {
-    Pidfd(bool),
-    Procfs(bool),
-}
-
-impl ProcessTracking {
-    fn is_tracked(&self) -> bool {
-        matches!(self, Self::Tracked(_))
-    }
-
-    fn poll_alive_checked(&mut self, pid: crate::Pid) -> crate::Result<Option<bool>> {
-        let Self::Tracked(watcher) = self else {
-            return Ok(None);
-        };
-        crate::state::process_is_alive(watcher, pid).map(Some)
-    }
-
-    fn pidfd(&self) -> Option<i32> {
-        let Self::Tracked(Some(watcher)) = self else {
-            return None;
-        };
-        watcher.poll_fd()
-    }
-
-    fn observe_pidfd_revents(&mut self, revents: i16) -> io::Result<()> {
-        let Self::Tracked(Some(watcher)) = self else {
-            return Ok(());
-        };
-        watcher.observe_revents(revents)?;
-        Ok(())
-    }
-
-    fn alive_after_pidfd_poll(&mut self, pid: i32) -> crate::Result<Option<ProcessLiveness>> {
-        let Self::Tracked(watcher) = self else {
-            return Ok(None);
-        };
-        Ok(match watcher {
-            Some(watcher) => Some(ProcessLiveness::Pidfd(!watcher.is_exited())),
-            None => {
-                let Some(pid) = crate::Pid::new(pid) else {
-                    return Ok(Some(ProcessLiveness::Procfs(false)));
-                };
-                Some(ProcessLiveness::Procfs(crate::state::process_is_alive(
-                    watcher, pid,
-                )?))
-            }
-        })
-    }
-}
-
-#[derive(Default)]
 struct ProcessState {
-    tracking: ProcessTracking,
+    // `None` while the process is not tracked.
+    process: Option<ProcessHandle>,
     unwinder: Option<ProcessUnwinder>,
     image: Option<ProcessImageIdentity>,
-    start_time: Option<u64>,
     // Per-exec probe result. `None` means it has not been probed; `Some(false)`
     // deliberately avoids re-reading /proc for every runtime-looking mmap.
     python_perf_support: Option<bool>,
     python_runtime: bool,
+}
+
+impl ProcessState {
+    fn is_running(&mut self) -> crate::Result<bool> {
+        match &mut self.process {
+            Some(process) => Ok(!process.has_exited()?),
+            None => Ok(false),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -550,18 +498,10 @@ impl ProcessTable {
             })
     }
 
-    fn install_fork_inheritance(
-        &mut self,
-        child_pid: i32,
-        start_time: Option<u64>,
-        inheritance: ForkInheritance,
-    ) {
+    fn install_fork_inheritance(&mut self, child_pid: i32, inheritance: ForkInheritance) {
         let child = self.state_mut(child_pid);
         if let Some(image) = inheritance.image {
             child.image = Some(image);
-        }
-        if let Some(start_time) = start_time {
-            child.start_time = Some(start_time);
         }
         if let Some(supported) = inheritance.python_perf_support {
             child.python_perf_support = Some(supported);
@@ -570,41 +510,56 @@ impl ProcessTable {
         child.unwinder = Some(inheritance.unwinder);
     }
 
-    fn track_or_refresh(&mut self, pid: i32) -> crate::Result<()> {
-        let state = self.state_mut(pid);
-        match &mut state.tracking {
-            ProcessTracking::Untracked => {
-                state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
-            }
-            ProcessTracking::Tracked(watcher) => {
-                let Some(pid) = crate::Pid::new(pid) else {
-                    return Ok(());
-                };
-                if !crate::state::process_is_alive(watcher, pid)? {
-                    *watcher = try_new_exit_watcher(pid.get());
-                }
-            }
-        }
-        Ok(())
+    fn track(&mut self, process: ProcessHandle) {
+        let pid = process.pid().get();
+        self.state_mut(pid).process = Some(process);
+        self.capture_image(pid);
     }
 
     fn ensure_tracked(&mut self, pid: i32) {
         let state = self.state_mut(pid);
-        if !state.tracking.is_tracked() {
-            state.tracking = ProcessTracking::Tracked(try_new_exit_watcher(pid));
+        if state.process.is_none() {
+            state.process = crate::Pid::new(pid).map(ProcessHandle::open);
         }
     }
 
     fn is_tracked(&self, pid: i32) -> bool {
         self.states
             .get(&pid)
-            .is_some_and(|state| state.tracking.is_tracked())
+            .is_some_and(|state| state.process.is_some())
+    }
+
+    fn process_mut(&mut self, pid: i32) -> Option<&mut ProcessHandle> {
+        self.states.get_mut(&pid)?.process.as_mut()
+    }
+
+    /// Read through a tracked process's PID with [`ProcessHandle::read_checked`].
+    fn read_tracked<T>(
+        &mut self,
+        pid: i32,
+        read: impl FnOnce(u32) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.process_mut(pid)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))?
+            .read_checked(read)
+    }
+
+    /// Like [`Self::read_tracked`], but reads an untracked PID directly.
+    fn read_process<T>(
+        &mut self,
+        pid: i32,
+        read: impl FnOnce(u32) -> io::Result<T>,
+    ) -> io::Result<T> {
+        match self.process_mut(pid) {
+            Some(process) => process.read_checked(read),
+            None => read(pid.cast_unsigned()),
+        }
     }
 
     fn tracked_pids(&self) -> Vec<i32> {
         self.states
             .iter()
-            .filter_map(|(&pid, state)| state.tracking.is_tracked().then_some(pid))
+            .filter_map(|(&pid, state)| state.process.is_some().then_some(pid))
             .collect()
     }
 
@@ -618,46 +573,36 @@ impl ProcessTable {
         } = self;
         pidfd_pids.clear();
         pidfd_poll.clear();
-        for (&pid, state) in states.iter() {
-            let Some(fd) = state.tracking.pidfd() else {
+        dead_pid_scratch.clear();
+        // Poll pending pidfds in one batch; exited or pidfd-less processes
+        // answer has_exited without polling.
+        for (&pid, state) in states.iter_mut() {
+            let Some(process) = &mut state.process else {
                 continue;
             };
-            pidfd_pids.push(pid);
-            pidfd_poll.push(libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
+            if let Some(fd) = process.poll_fd() {
+                pidfd_pids.push(pid);
+                pidfd_poll.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            } else if process.has_exited()? {
+                dead_pid_scratch.push(pid);
+            }
         }
         if !pidfd_poll.is_empty() {
             crate::state::poll_retry(pidfd_poll, 0)?;
             for (&pid, pollfd) in pidfd_pids.iter().zip(pidfd_poll.iter()) {
-                if let Some(state) = states.get_mut(&pid) {
-                    state.tracking.observe_pidfd_revents(pollfd.revents)?;
-                }
-            }
-        }
-        dead_pid_scratch.clear();
-        for (&pid, state) in states.iter_mut() {
-            match state.tracking.alive_after_pidfd_poll(pid)? {
-                None => continue,
-                Some(ProcessLiveness::Pidfd(false) | ProcessLiveness::Procfs(false)) => {
-                    dead_pid_scratch.push(pid);
+                let Some(process) = states
+                    .get_mut(&pid)
+                    .and_then(|state| state.process.as_mut())
+                else {
                     continue;
+                };
+                if process.observe_revents(pollfd.revents)? {
+                    dead_pid_scratch.push(pid);
                 }
-                Some(ProcessLiveness::Pidfd(true)) => continue,
-                Some(ProcessLiveness::Procfs(true)) => {}
-            }
-            let generation_changed = match u32::try_from(pid) {
-                Ok(pid) => match read_process_start_time(pid) {
-                    Ok(current) => state.start_time.is_some_and(|previous| current != previous),
-                    Err(error) if crate::error::is_target_gone_io(&error) => true,
-                    Err(error) => return Err(error.into()),
-                },
-                Err(_) => false,
-            };
-            if generation_changed {
-                dead_pid_scratch.push(pid);
             }
         }
         Ok(std::mem::take(dead_pid_scratch))
@@ -668,43 +613,29 @@ impl ProcessTable {
         self.dead_pid_scratch = pids;
     }
 
-    fn tracked_process_is_stale(
-        &mut self,
-        pid: i32,
-        current_start_time: Option<u64>,
-    ) -> crate::Result<Option<bool>> {
+    /// Whether a tracked process at `pid` has exited, making the PID free
+    /// for reuse. `None` when `pid` is not tracked.
+    fn tracked_process_is_stale(&mut self, pid: i32) -> crate::Result<Option<bool>> {
         let Some(state) = self.states.get_mut(&pid) else {
             return Ok(None);
         };
-        let Some(pid) = crate::Pid::new(pid) else {
+        let Some(process) = &mut state.process else {
             return Ok(None);
         };
-        let Some(alive) = state.tracking.poll_alive_checked(pid)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            !alive
-                || state
-                    .start_time
-                    .zip(current_start_time)
-                    .is_some_and(|(previous, current)| current != previous),
-        ))
+        Ok(Some(process.has_exited()?))
     }
 
     fn process_is_active(&mut self, pid: crate::Pid) -> crate::Result<bool> {
-        let Some(state) = self.states.get_mut(&pid.get()) else {
-            return Ok(false);
-        };
-        Ok(state.tracking.poll_alive_checked(pid)?.unwrap_or(false))
+        match self.states.get_mut(&pid.get()) {
+            Some(state) => state.is_running(),
+            None => Ok(false),
+        }
     }
 
     #[cfg(test)]
     fn has_active_processes_except(&mut self, excluded_pid: i32) -> crate::Result<bool> {
         for (&pid, state) in &mut self.states {
-            let Some(pid) = crate::Pid::new(pid).filter(|pid| pid.get() != excluded_pid) else {
-                continue;
-            };
-            if state.tracking.poll_alive_checked(pid)?.unwrap_or(false) {
+            if pid != excluded_pid && state.is_running()? {
                 return Ok(true);
             }
         }
@@ -715,35 +646,22 @@ impl ProcessTable {
         let root_active = self.process_is_active(root)?;
         let mut active = usize::from(root_active);
         for (&pid, state) in &mut self.states {
-            let Some(pid) = crate::Pid::new(pid).filter(|&pid| pid != root) else {
-                continue;
-            };
-            active += usize::from(state.tracking.poll_alive_checked(pid)?.unwrap_or(false));
+            if pid != root.get() {
+                active += usize::from(state.is_running()?);
+            }
         }
         Ok((root_active, active))
     }
 
-    fn capture_available_generation(&mut self, pid: i32) {
-        let Ok(proc_pid) = u32::try_from(pid) else {
-            return;
-        };
-        let image = read_process_image_identity(proc_pid).ok();
-        let start_time = read_process_start_time(proc_pid).ok();
-        let Some(state) = self.states.get_mut(&pid) else {
-            return;
-        };
-        if let Some(image) = image {
-            state.image = Some(image);
-        }
-        if let Some(start_time) = start_time {
-            state.start_time = Some(start_time);
+    fn capture_image(&mut self, pid: i32) {
+        if let Ok(image) = self.read_tracked(pid, read_process_image_identity) {
+            self.state_mut(pid).image = Some(image);
         }
     }
 
-    fn forget_generation(&mut self, pid: i32) {
+    fn forget_image(&mut self, pid: i32) {
         if let Some(state) = self.states.get_mut(&pid) {
             state.image = None;
-            state.start_time = None;
         }
     }
 }
@@ -941,9 +859,9 @@ impl<W: std::io::Write> Recorder<W> {
         let metadata = RecordingMetadata::new(&options, origin)?;
         let mut options = options;
         options.sample_rate = SampleRate::Hertz(metadata.nominal_rate);
-        let raw_pid = pid.get_u32();
+        let mut process = ProcessHandle::open(pid);
         let mut perf =
-            open_perf_group(raw_pid, attach_mode, &options).map_err(crate::Error::target)?;
+            open_perf_group(&mut process, attach_mode, &options).map_err(crate::Error::target)?;
         let writer = PerfSpoolWriter::from_writer_with_origin(
             output,
             0,
@@ -951,16 +869,17 @@ impl<W: std::io::Write> Recorder<W> {
             Some(origin),
         )
         .map_err(|err| perf.resume_error_or(err))?;
-        Self::finish_attach(pid, attach_mode, perf, writer, metadata)
+        Self::finish_attach(process, attach_mode, perf, writer, metadata)
     }
 
     fn finish_attach(
-        pid: crate::Pid,
+        process: ProcessHandle,
         attach_mode: AttachMode,
         mut perf: perf_group::PerfGroup,
         mut writer: PerfSpoolWriter<W>,
         metadata: RecordingMetadata,
     ) -> crate::Result<Self> {
+        let pid = process.pid();
         let raw_pid = pid.get_u32();
         let kernel_enabled = perf.kernel_enabled();
         let mut modules = ModuleTable::default();
@@ -969,16 +888,14 @@ impl<W: std::io::Write> Recorder<W> {
             elf_sections: ElfSectionCache::publishing_exact_images_to(exact_images.clone()),
             ..ProcessTable::default()
         };
-        if let Some(pid_i32) = i32_from_u32(raw_pid) {
-            processes.ensure_tracked(pid_i32);
-            processes.capture_available_generation(pid_i32);
-        }
+        processes.track(process);
         let python_perf_support = process_has_python_perf_support(raw_pid, &mut processes);
         let registered_existing_maps = if matches!(
             attach_mode,
             AttachMode::Running | AttachMode::StopWhileAttaching
         ) {
-            let maps = read_existing_maps(raw_pid)
+            let maps = processes
+                .read_tracked(pid.get(), read_existing_maps)
                 .map_err(|error| crate::Error::target(perf.resume_error_or(error)))?;
             register_existing_maps_snapshot(
                 raw_pid,
@@ -1119,7 +1036,7 @@ impl<W: std::io::Write> Recorder<W> {
             )
         };
         result?;
-        replay_lifecycle_actions(perf, &lifecycle_actions, open_new_perf_events)?;
+        replay_lifecycle_actions(perf, processes, &lifecycle_actions, open_new_perf_events)?;
         let dead_processes = processes.dead_or_reused_pids()?;
         let mut last_exit_by_pid = FxHashMap::<i32, u64>::default();
         if !dead_processes.is_empty() {
@@ -1201,16 +1118,16 @@ impl<W: std::io::Write> Recorder<W> {
             }
         }
         if open_new_perf_events {
-            perf.recover_forked_processes(&recovered_process_forks)?;
+            for fork in perf.recover_forked_processes(&recovered_process_forks) {
+                open_forked_process(perf, processes, fork.pid, fork.parent_pid)?;
+            }
         }
         if open_new_perf_events && recovered_lifecycle_gap {
-            for pid in processes
-                .states
-                .iter()
-                .filter_map(|(&pid, state)| state.tracking.is_tracked().then_some(pid))
-                .filter_map(|pid| u32::try_from(pid).ok())
-            {
-                if let Err(err) = perf.refresh_threads(pid) {
+            for pid in processes.tracked_pids() {
+                let Some(process) = processes.process_mut(pid) else {
+                    continue;
+                };
+                if let Err(err) = perf.refresh_threads(process) {
                     if !crate::error::is_target_gone_io(&err) {
                         return Err(err);
                     }
@@ -1250,12 +1167,12 @@ impl<W: std::io::Write> Recorder<W> {
         self.drain_events(DrainMode::Consume)?;
         if self.last_reconcile.elapsed() >= Duration::from_millis(100) {
             self.last_reconcile = Instant::now();
-            for (&pid, state) in &mut self.processes.states {
-                let Some(pid) = crate::Pid::new(pid) else {
+            for state in self.processes.states.values_mut() {
+                let Some(process) = &mut state.process else {
                     continue;
                 };
-                if state.tracking.poll_alive_checked(pid)?.unwrap_or(false) {
-                    self.perf.refresh_threads(pid.get_u32())?;
+                if !process.has_exited()? {
+                    self.perf.refresh_threads(process)?;
                     refresh_recording_summary(&mut self.summary, &self.perf);
                 }
             }
@@ -1299,25 +1216,11 @@ impl<W: std::io::Write> Recorder<W> {
         pid: crate::Pid,
         attach_mode: AttachMode,
     ) -> crate::Result<AttachOutcome> {
+        let mut process = ProcessHandle::open(pid);
         let pid = pid.get_u32();
         if let Some(pid_i32) = i32_from_u32(pid) {
-            let current_start_time = if self
-                .processes
-                .states
-                .get(&pid_i32)
-                .and_then(|state| state.start_time)
-                .is_some()
-            {
-                Some(read_process_start_time(pid).map_err(crate::Error::target)?)
-            } else {
-                None
-            };
-            if let Some(stale) = self
-                .processes
-                .tracked_process_is_stale(pid_i32, current_start_time)?
-            {
-                // Reopen only after proving that the old process is gone or
-                // that this numeric PID now identifies a new generation.
+            if let Some(stale) = self.processes.tracked_process_is_stale(pid_i32)? {
+                // Reopen only after proving that the old process is gone.
                 if !stale {
                     return Ok(AttachOutcome::AlreadyAttached);
                 }
@@ -1330,7 +1233,7 @@ impl<W: std::io::Write> Recorder<W> {
                 )?;
             }
         }
-        let opened = match self.perf.open_process(pid, attach_mode) {
+        let opened = match self.perf.open_process(&mut process, attach_mode) {
             Ok(opened) => opened,
             Err(error) if crate::error::is_target_gone_io(&error) => {
                 return Ok(AttachOutcome::Exited);
@@ -1338,10 +1241,9 @@ impl<W: std::io::Write> Recorder<W> {
             Err(error) => return Err(error.into()),
         };
         if let Some(pid_i32) = i32_from_u32(pid) {
-            self.processes.track_or_refresh(pid_i32)?;
-            self.processes.capture_available_generation(pid_i32);
+            self.processes.track(process);
             let python_perf_support = process_has_python_perf_support(pid, &mut self.processes);
-            let maps = match read_existing_maps(pid) {
+            let maps = match self.processes.read_tracked(pid_i32, read_existing_maps) {
                 Ok(maps) => maps,
                 Err(err) if crate::error::is_target_gone_io(&err) => {
                     return match self.rollback_open_process(pid, opened) {
@@ -1588,10 +1490,9 @@ fn handle_non_sample_record<W: std::io::Write>(
             // Snapshot all inherited state before touching the child: numeric
             // PID reuse can make child cleanup mutate the same table.
             let inheritance = ctx.processes.snapshot_for_fork(ppid);
-            let current_start_time = read_process_start_time(fork.task.pid).ok();
             let reused_pid = ctx
                 .processes
-                .tracked_process_is_stale(pid, current_start_time)
+                .tracked_process_is_stale(pid)
                 .map_err(io::Error::from)?
                 .unwrap_or(false);
             if reused_pid {
@@ -1605,8 +1506,7 @@ fn handle_non_sample_record<W: std::io::Write>(
                 mark_python_runtime_process(ctx.processes, ctx.writer, event_timestamp_ns, pid)?;
             }
             let cloned = ctx.modules.clone_process_modules(ppid, pid, ctx.writer)?;
-            ctx.processes
-                .install_fork_inheritance(pid, current_start_time, inheritance);
+            ctx.processes.install_fork_inheritance(pid, inheritance);
             ctx.processes.apply_fork_module_update(pid, &cloned);
             ctx.lifecycle_actions.push(LifecycleAction::ProcessFork {
                 pid: fork.task.pid,
@@ -1628,7 +1528,10 @@ fn handle_non_sample_record<W: std::io::Write>(
             let Some(pid) = i32_from_u32(comm.task.pid) else {
                 return Ok(());
             };
-            let current_identity = read_process_image_identity(comm.task.pid).ok();
+            let current_identity = ctx
+                .processes
+                .read_tracked(pid, read_process_image_identity)
+                .ok();
             let identity_changed = current_identity.as_ref().is_some_and(|identity| {
                 ctx.processes
                     .states
@@ -1637,7 +1540,11 @@ fn handle_non_sample_record<W: std::io::Write>(
                     .is_some_and(|previous| {
                         previous.device != identity.device || previous.inode != identity.inode
                     })
-                    && read_process_comm(comm.task.pid).ok().as_deref()
+                    && ctx
+                        .processes
+                        .read_tracked(pid, read_process_comm)
+                        .ok()
+                        .as_deref()
                         == Some(comm.comm.as_bytes())
             });
             if !comm.by_execve && !identity_changed {
@@ -1689,6 +1596,7 @@ fn record_lost_events(summary: &mut RecordingSummary, lost: u64) -> io::Result<(
 
 fn replay_lifecycle_actions(
     perf: &mut perf_group::PerfGroup,
+    processes: &mut ProcessTable,
     lifecycle_actions: &[LifecycleAction],
     open_new_perf_events: bool,
 ) -> io::Result<()> {
@@ -1721,7 +1629,7 @@ fn replay_lifecycle_actions(
         match lifecycle_actions[action_index] {
             LifecycleAction::ProcessRetire { pid } => perf.remove_process(pid)?,
             LifecycleAction::ProcessFork { pid, parent_tid } if open_new_perf_events => {
-                perf.open_forked_processes(&[ProcessFork { pid, parent_tid }])?;
+                open_forked_process(perf, processes, pid, parent_tid)?;
             }
             LifecycleAction::ThreadExit { tid, .. } => perf.remove_thread(tid)?,
             LifecycleAction::ProcessFork { .. } | LifecycleAction::ThreadFork { .. } => {}
@@ -1729,6 +1637,18 @@ fn replay_lifecycle_actions(
         action_index += 1;
     }
     Ok(())
+}
+
+fn open_forked_process(
+    perf: &mut perf_group::PerfGroup,
+    processes: &mut ProcessTable,
+    pid: u32,
+    parent_tid: u32,
+) -> io::Result<()> {
+    match i32_from_u32(pid).and_then(|pid| processes.process_mut(pid)) {
+        Some(process) => perf.open_forked_process(process, parent_tid),
+        None => Ok(()),
+    }
 }
 
 fn record_observed_lost_events(
@@ -1791,27 +1711,22 @@ fn reconcile_process_image<W: std::io::Write>(
         return Ok(false);
     };
 
-    let current_start_time = match read_process_start_time(pid) {
-        Ok(start_time) => start_time,
-        Err(err) if crate::error::is_target_gone_io(&err) => {
-            processes.forget_generation(pid_i32);
-            return Ok(false);
-        }
-        Err(err) => return Err(err),
-    };
     // /proc/<tgid>/exe can disappear after the thread-group leader exits even
-    // while sibling threads remain alive. Start time and the maps snapshot,
-    // not the exe symlink alone, determine whether this generation survives.
-    let current_identity = read_process_image_identity(pid).ok();
+    // while sibling threads remain alive. The maps snapshot, not the exe
+    // symlink alone, determines whether this image survives.
+    let current_identity = processes
+        .read_tracked(pid_i32, read_process_image_identity)
+        .ok();
 
-    let maps = match std::fs::read(format!("/proc/{pid}/maps")) {
-        Ok(maps) => maps,
-        Err(err) if crate::error::is_target_gone_io(&err) => {
-            processes.forget_generation(pid_i32);
-            return Ok(false);
-        }
-        Err(err) => return Err(err),
-    };
+    let maps =
+        match processes.read_tracked(pid_i32, |pid| std::fs::read(format!("/proc/{pid}/maps"))) {
+            Ok(maps) => maps,
+            Err(err) if crate::error::is_target_gone_io(&err) => {
+                processes.forget_image(pid_i32);
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
     let snapshot: Vec<_> = executable_modules_from_maps(pid, &maps).collect();
     if snapshot.is_empty() {
         // A live group whose leader has exited can expose an empty maps file.
@@ -1827,12 +1742,7 @@ fn reconcile_process_image<W: std::io::Write>(
             .and_then(|state| state.image.as_ref())
             == Some(identity)
     });
-    let start_time_matches = processes
-        .states
-        .get(&pid_i32)
-        .and_then(|state| state.start_time)
-        == Some(current_start_time);
-    if image_matches && start_time_matches && modules.process_modules_match(pid_i32, &snapshot) {
+    if image_matches && modules.process_modules_match(pid_i32, &snapshot) {
         if let Some(identity) = current_identity {
             processes.state_mut(pid_i32).image = Some(identity);
         }
@@ -1853,7 +1763,6 @@ fn reconcile_process_image<W: std::io::Write>(
             if let Some(identity) = current_identity {
                 state.image = Some(identity);
             }
-            state.start_time = Some(current_start_time);
             if should_mark_python {
                 mark_python_runtime_process(processes, writer, timestamp_ns, pid_i32)?;
             }
@@ -1871,15 +1780,18 @@ fn register_recovered_descendant<W: std::io::Write>(
     processes: &mut ProcessTable,
     writer: &mut PerfSpoolWriter<W>,
 ) -> io::Result<Option<RecoveredProcessFork>> {
-    let Ok(child_pid) = u32::try_from(child) else {
+    let Some(child_pid) = crate::Pid::new(child) else {
         return Ok(None);
     };
-    let python_perf_support = process_has_python_perf_support(child_pid, processes);
-    let maps = match read_existing_maps(child_pid) {
+    let mut process = ProcessHandle::open(child_pid);
+    let child_pid = child_pid.get_u32();
+    let maps = match process.read_checked(read_existing_maps) {
         Ok(maps) => maps,
         Err(err) if crate::error::is_target_gone_io(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
+    processes.track(process);
+    let python_perf_support = process_has_python_perf_support(child_pid, processes);
     match register_existing_maps_snapshot(child_pid, &maps, modules, processes, writer) {
         Ok(true) if python_perf_support => {
             mark_python_runtime_process(processes, writer, timestamp_ns, child)?;
@@ -1888,8 +1800,6 @@ fn register_recovered_descendant<W: std::io::Write>(
         Err(err) => return Err(err),
     }
 
-    processes.ensure_tracked(child);
-    processes.capture_available_generation(child);
     Ok(u32::try_from(parent)
         .ok()
         .map(|parent_pid| RecoveredProcessFork {
@@ -1945,7 +1855,13 @@ fn process_has_python_perf_support(pid: u32, processes: &mut ProcessTable) -> bo
     {
         return supported;
     }
-    let supported = process_has_python_perf_support_enabled(pid);
+    // An untracked child (found by a sample or mmap after a lost fork) has no
+    // handle yet; read it directly rather than caching a false result.
+    let supported = processes
+        .read_process(pid_i32, |pid| {
+            Ok(process_has_python_perf_support_enabled(pid))
+        })
+        .unwrap_or(false);
     processes.state_mut(pid_i32).python_perf_support = Some(supported);
     supported
 }
@@ -2356,7 +2272,7 @@ fn refresh_maps_for_uncovered_user_pc<W: std::io::Write>(
     {
         return Ok(());
     }
-    let maps = match read_existing_maps(pid) {
+    let maps = match ctx.processes.read_process(meta.pid, read_existing_maps) {
         Ok(maps) => maps,
         Err(err) if crate::error::is_target_gone_io(&err) => return Ok(()),
         Err(err) => return Err(err),
@@ -2379,13 +2295,13 @@ fn is_kernel_mode(privilege: Priv) -> bool {
 }
 
 fn open_perf_group(
-    pid: u32,
+    process: &mut ProcessHandle,
     attach_mode: AttachMode,
     options: &RecorderOptions,
 ) -> io::Result<perf_group::PerfGroup> {
     let regs_mask = ConvertRegsNative::regs_mask();
     perf_group::PerfGroup::open(
-        pid,
+        process,
         attach_mode,
         PerfGroupOptions {
             frequency: options.sample_rate.resolve()?,
@@ -2451,7 +2367,7 @@ mod tests {
 
     use super::*;
     use crate::stats::SampleErrorKind;
-    use crate::test_support::{SleepChild, TempDir};
+    use crate::test_support::{perf_unavailable, SleepChild, TempDir};
     use perf_event_open::sample::record::comm::Comm;
     use perf_event_open::sample::record::lost::{LostRecords, LostSamples};
     use perf_event_open::sample::record::task::{Exit, Fork};
@@ -2541,17 +2457,13 @@ mod tests {
             device: 1,
             inode: 2,
         });
-        state.start_time = Some(3);
         state.python_perf_support = Some(false);
         state.python_runtime = true;
 
         assert!(!processes.is_tracked(pid));
         assert!(processes.tracked_pids().is_empty());
         assert!(processes.dead_or_reused_pids().unwrap().is_empty());
-        assert_eq!(
-            processes.tracked_process_is_stale(pid, Some(3)).unwrap(),
-            None
-        );
+        assert_eq!(processes.tracked_process_is_stale(pid).unwrap(), None);
         assert!(!processes
             .process_is_active(crate::Pid::new(pid).unwrap())
             .unwrap());
@@ -2568,10 +2480,8 @@ mod tests {
         let missing_pid = i32::MAX;
         let mut processes = ProcessTable::default();
 
-        processes.track_or_refresh(live_pid).unwrap();
-        processes.track_or_refresh(live_pid).unwrap();
-        processes.track_or_refresh(missing_pid).unwrap();
-        processes.track_or_refresh(missing_pid).unwrap();
+        processes.ensure_tracked(live_pid);
+        processes.ensure_tracked(missing_pid);
 
         assert!(processes.is_tracked(live_pid));
         assert!(processes.is_tracked(missing_pid));
@@ -2579,13 +2489,11 @@ mod tests {
         tracked.sort_unstable();
         assert_eq!(tracked, [live_pid, missing_pid]);
         assert_eq!(
-            processes.tracked_process_is_stale(live_pid, None).unwrap(),
+            processes.tracked_process_is_stale(live_pid).unwrap(),
             Some(false)
         );
         assert_eq!(
-            processes
-                .tracked_process_is_stale(missing_pid, None)
-                .unwrap(),
+            processes.tracked_process_is_stale(missing_pid).unwrap(),
             Some(true)
         );
         assert!(processes
@@ -2625,8 +2533,8 @@ mod tests {
         let exited_pid = exited.pid_i32();
         let live_pid = live.pid_i32();
         let mut processes = ProcessTable::default();
-        processes.track_or_refresh(exited_pid).unwrap();
-        processes.track_or_refresh(live_pid).unwrap();
+        processes.ensure_tracked(exited_pid);
+        processes.ensure_tracked(live_pid);
 
         crate::process::Process::open(crate::Pid::new(exited_pid).unwrap())
             .unwrap()
@@ -2656,12 +2564,7 @@ mod tests {
             spool,
         ) {
             Ok(recorder) => recorder,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    crate::ErrorKind::Permission | crate::ErrorKind::Unsupported
-                ) || matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) =>
-            {
+            Err(err) if perf_unavailable(&err) => {
                 return;
             }
             Err(err) => panic!("attach recorder: {err}"),
@@ -2903,9 +2806,8 @@ mod tests {
             .resolve_frame(pid_i32, probe_address, FrameMode::User)
             .module_id
             .expect("registered mapping");
-        let state = processes.state_mut(pid_i32);
-        state.image = Some(read_process_image_identity(pid).unwrap());
-        state.start_time = Some(read_process_start_time(pid).unwrap());
+        processes.ensure_tracked(pid_i32);
+        processes.state_mut(pid_i32).image = Some(read_process_image_identity(pid).unwrap());
 
         assert!(
             reconcile_process_image(pid, 123, &mut modules, &mut processes, &mut writer,).unwrap()
@@ -3029,7 +2931,7 @@ mod tests {
             .processes
             .states
             .get(&child_pid)
-            .is_some_and(|state| state.start_time.is_some()));
+            .is_some_and(|state| state.process.is_some()));
         assert!(ctx
             .modules
             .resolve_frame(child_pid, 0x1800, FrameMode::User)
@@ -3162,12 +3064,7 @@ mod tests {
             RecorderOptions::new(SampleRate::hz(1).expect("one hertz is valid")),
         );
         let error = match result {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    crate::ErrorKind::Permission | crate::ErrorKind::Unsupported
-                ) || matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) =>
-            {
+            Err(error) if perf_unavailable(&error) => {
                 return;
             }
             Err(error) => error,
@@ -3603,7 +3500,7 @@ mod recording_lifecycle_tests {
         })
         .unwrap();
         Recorder::finish_attach(
-            crate::Pid::try_from(std::process::id()).unwrap(),
+            ProcessHandle::open(crate::Pid::try_from(std::process::id()).unwrap()),
             AttachMode::OnExec,
             perf,
             writer,
