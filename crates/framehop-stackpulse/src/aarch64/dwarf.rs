@@ -1,6 +1,6 @@
 use gimli::{
     AArch64, CfaRule, Encoding, EvaluationStorage, Reader, ReaderOffset, Register, RegisterRule,
-    UnwindContextStorage, UnwindSection, UnwindTableRow,
+    UnwindContextStorage, UnwindSection, UnwindTableRow, Vendor,
 };
 
 use super::{arch::ArchAarch64, unwind_rule::UnwindRuleAarch64, unwindregs::UnwindRegsAarch64};
@@ -24,6 +24,8 @@ impl DwarfUnwindRegs for UnwindRegsAarch64 {
 }
 
 impl DwarfUnwinding for ArchAarch64 {
+    const CFI_VENDOR: Vendor = Vendor::AArch64;
+
     fn unwind_frame<F, R, UCS, ES>(
         section: &impl UnwindSection<R>,
         unwind_info: &UnwindTableRow<R::Offset, UCS>,

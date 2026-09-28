@@ -5,7 +5,7 @@ use gimli::{
     CfaRule, CieOrFde, DebugFrame, EhFrame, EhFrameHdr, Encoding, EndianSlice, Evaluation,
     EvaluationResult, EvaluationStorage, Expression, LittleEndian, Location, ParsedEhFrameHdr,
     Reader, ReaderOffset, Register, RegisterRule, UnwindContext, UnwindContextStorage,
-    UnwindOffset, UnwindSection, UnwindTableRow, Value,
+    UnwindOffset, UnwindSection, UnwindTableRow, Value, Vendor,
 };
 
 pub(crate) use gimli::BaseAddresses;
@@ -64,6 +64,10 @@ pub(crate) fn register_rule_to_cfa_offset<RO: ReaderOffset>(
 }
 
 pub trait DwarfUnwinding: Arch {
+    /// Selects vendor-specific call frame instructions, such as aarch64's
+    /// `DW_CFA_AARCH64_negate_ra_state`.
+    const CFI_VENDOR: Vendor = Vendor::Default;
+
     fn unwind_frame<F, R, UCS, ES>(
         section: &impl UnwindSection<R>,
         unwind_info: &UnwindTableRow<R::Offset, UCS>,
@@ -166,6 +170,7 @@ where
             UnwindSectionType::EhFrame => {
                 let mut eh_frame = EhFrame::from(unwind_section_data);
                 eh_frame.set_address_size(8);
+                eh_frame.set_vendor(A::CFI_VENDOR);
                 self.unwind_frame_in_section::<_, F, ES>(
                     &eh_frame,
                     lookup_svma,
@@ -178,6 +183,7 @@ where
             UnwindSectionType::DebugFrame => {
                 let mut debug_frame = DebugFrame::from(unwind_section_data);
                 debug_frame.set_address_size(8);
+                debug_frame.set_vendor(A::CFI_VENDOR);
                 self.unwind_frame_in_section::<_, F, ES>(
                     &debug_frame,
                     lookup_svma,
@@ -518,7 +524,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use gimli::{AArch64, DebugFrame, Format, StoreOnHeap, UnwindExpression, X86_64};
 
     use crate::{
@@ -527,6 +533,51 @@ mod tests {
     };
 
     use super::*;
+
+    /// The x86-64 entry CIE after its id: CFA = rsp + 8, return address at CFA - 8.
+    pub(crate) const X86_64_CIE: [u8; 10] = [
+        1,
+        0,
+        1,
+        0x78,
+        X86_64::RA.0 as u8,
+        gimli::DW_CFA_def_cfa.0,
+        X86_64::RSP.0 as u8,
+        8,
+        gimli::DW_CFA_offset.0 | X86_64::RA.0 as u8,
+        1,
+    ];
+
+    /// The AArch64 entry CIE after its id: CFA = sp, return address in x30.
+    pub(crate) const AARCH64_CIE: [u8; 8] = [
+        1,
+        0,
+        4,
+        0x78,
+        AArch64::X30.0 as u8,
+        gimli::DW_CFA_def_cfa.0,
+        AArch64::SP.0 as u8,
+        0,
+    ];
+
+    /// Builds an `.eh_frame` section with `cie` followed by an FDE for `range` that runs
+    /// `instructions`, and returns it with the offset of the FDE.
+    pub(crate) fn eh_frame_with_fde(
+        cie: &[u8],
+        range: Range<u64>,
+        instructions: &[u8],
+    ) -> (Vec<u8>, u32) {
+        let mut data = (4 + cie.len() as u32).to_le_bytes().to_vec();
+        data.extend(0u32.to_le_bytes());
+        data.extend(cie);
+        let fde_offset = data.len() as u32;
+        data.extend((20 + instructions.len() as u32).to_le_bytes());
+        data.extend((fde_offset + 4).to_le_bytes());
+        data.extend(range.start.to_le_bytes());
+        data.extend((range.end - range.start).to_le_bytes());
+        data.extend(instructions);
+        (data, fde_offset)
+    }
 
     #[test]
     fn header_lookup_rejects_addresses_before_its_first_entry() {
@@ -576,14 +627,7 @@ mod tests {
             };
             let mut data = 14u32.to_le_bytes().to_vec();
             data.extend(cie_id.to_le_bytes());
-            data.extend([1, 0, 1, 0x78, X86_64::RA.0 as u8]);
-            data.extend([
-                gimli::DW_CFA_def_cfa.0,
-                X86_64::RSP.0 as u8,
-                8,
-                gimli::DW_CFA_offset.0 | X86_64::RA.0 as u8,
-                1,
-            ]);
+            data.extend(X86_64_CIE);
             let fde_offset = data.len() as u32;
             let cie_pointer = match section_type {
                 UnwindSectionType::EhFrame => fde_offset + 4,
@@ -640,6 +684,37 @@ mod tests {
                 Err(DwarfUnwinderError::FdeFromOffsetFailed(_))
             ));
         }
+    }
+
+    #[test]
+    fn aarch64_return_address_signing_does_not_abort_dwarf_unwinding() {
+        use crate::aarch64::ArchAarch64;
+
+        // CIE with CFA = sp, and an FDE for [0x1000, 0x1040) that toggles the signing state
+        // like `paciasp` in a `-mbranch-protection=pac-ret` prologue.
+        let (data, fde_offset) = eh_frame_with_fde(
+            &AARCH64_CIE,
+            0x1000..0x1040,
+            &[gimli::DW_CFA_AARCH64_negate_ra_state.0],
+        );
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        let mut unwinder = DwarfUnwinder::<_, ArchAarch64, _>::new(
+            EndianSlice::new(&data, LittleEndian),
+            UnwindSectionType::EhFrame,
+            None,
+            &mut context,
+            BaseAddresses::default(),
+            0,
+        );
+        let mut regs = UnwindRegsAarch64::new(0x1024, 0x8000, 0x9000);
+        let result = unwinder.unwind_frame_with_fde::<_, StoreOnHeap>(
+            &mut regs,
+            true,
+            0x1010,
+            fde_offset,
+            &mut |_| Err(()),
+        );
+        assert!(matches!(result, Ok(UnwindResult::ExecRule(_))));
     }
 
     fn encoding() -> Encoding {
