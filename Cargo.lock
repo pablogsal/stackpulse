@@ -2068,6 +2068,7 @@ dependencies = [
  "gimli 0.34.0",
  "goblin",
  "libc",
+ "memchr",
  "memmap2",
  "rustc-hash",
  "tempfile",
