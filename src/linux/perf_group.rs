@@ -122,6 +122,9 @@ pub(super) struct PerfGroup {
     sampling_enabled: bool,
     // Closed poll fds cannot become anchors again before their members are removed.
     retired_poll_fds: BTreeSet<RawFd>,
+    // Inheriting members whose task exited. Descendants may still hold
+    // inherited copies, so they close once the kernel reports POLLHUP.
+    exited_inherit_fds: BTreeSet<RawFd>,
     poll: Poll,
     poll_events: Events,
     frequency: u32,
@@ -232,6 +235,7 @@ impl PerfGroup {
             saw_readable: false,
             sampling_enabled: true,
             retired_poll_fds: BTreeSet::new(),
+            exited_inherit_fds: BTreeSet::new(),
             poll: Poll::new()?,
             poll_events: Events::with_capacity(16),
             frequency: options.frequency,
@@ -541,17 +545,19 @@ impl PerfGroup {
     }
 
     pub(super) fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
-        self.remove_members(|member| {
-            member.perf.target() == tid && !member.perf.inherit().is_enabled()
-        })?;
+        self.remove_members(
+            |member| member.perf.target() == tid,
+            |member| member.perf.inherit().is_enabled(),
+        )?;
         self.tracked_threads.remove(&tid);
-        Ok(())
+        self.retire_hung_up_members()
     }
 
     pub(super) fn remove_process(&mut self, pid: u32) -> io::Result<()> {
-        self.remove_members(|member| {
-            member.owner_pid == pid && member.perf.inherit() != TaskInheritance::Children
-        })?;
+        self.remove_members(
+            |member| member.owner_pid == pid,
+            |member| member.perf.inherit() == TaskInheritance::Children,
+        )?;
         self.tracked_threads.retain(|tid, track| {
             if track.owner_pid == pid {
                 return false;
@@ -561,18 +567,53 @@ impl PerfGroup {
             }
             true
         });
+        self.retire_hung_up_members()
+    }
+
+    /// Close exited inheriting members once no live descendant inherits them.
+    fn retire_hung_up_members(&mut self) -> io::Result<()> {
+        if self.exited_inherit_fds.is_empty() {
+            return Ok(());
+        }
+        let mut pollfds: Vec<_> = self
+            .exited_inherit_fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        crate::state::poll_retry(&mut pollfds, 0)?;
+        for pollfd in pollfds {
+            if pollfd.revents & libc::POLLHUP != 0 {
+                self.retire_member_fd(pollfd.fd)?;
+            } else if pollfd.revents & libc::POLLIN != 0 {
+                // Polling a member consumes its shared ring's wakeup, which
+                // the poll anchor would otherwise have reported.
+                self.saw_readable = true;
+            }
+        }
         Ok(())
     }
 
-    fn remove_members(&mut self, should_remove: impl Fn(&Member) -> bool) -> io::Result<()> {
-        let fds_to_remove: Vec<_> = self
+    /// Retire `owned` members, leaving `inherited` ones to close once hung up.
+    fn remove_members(
+        &mut self,
+        owned: impl Fn(&Member) -> bool,
+        inherited: impl Fn(&Member) -> bool,
+    ) -> io::Result<()> {
+        let (hang_up, retire): (Vec<_>, Vec<_>) = self
             .members
             .iter()
-            .filter_map(|(&fd, member)| should_remove(member).then_some(fd))
-            .collect();
-        for fd in fds_to_remove {
+            .filter(|(_, member)| owned(member))
+            .map(|(&fd, member)| (fd, inherited(member)))
+            .partition(|&(_, inherited)| inherited);
+        for (fd, _) in retire {
             self.retire_member_fd(fd)?;
         }
+        self.exited_inherit_fds
+            .extend(hang_up.into_iter().map(|(fd, _)| fd));
         Ok(())
     }
 
@@ -779,6 +820,7 @@ impl PerfGroup {
         }
         self.members.remove(&fd);
         self.retired_poll_fds.remove(&fd);
+        self.exited_inherit_fds.remove(&fd);
     }
 
     fn retire_member_fd(&mut self, fd: RawFd) -> io::Result<()> {
@@ -1009,6 +1051,8 @@ impl PerfGroup {
     }
 
     pub(super) fn take_lost_records(&mut self) -> io::Result<u64> {
+        // Descendants can exit after their process was removed.
+        self.retire_hung_up_members()?;
         let mut total = self.retired_lost_records;
         for perf in self.perfs() {
             total = checked_loss_sum(total, perf.lost_records()?)?;
@@ -1153,6 +1197,8 @@ fn frequency_for_kernel_max(frequency: u32, mode: FrequencyMode, max_rate: Optio
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
@@ -1741,36 +1787,32 @@ mod tests {
     }
 
     #[test]
-    fn threads_of_non_dumpable_process_are_skipped() {
-        let child = SleepChild::spawn_non_dumpable();
-        let pid = child.pid_u32();
-        if std::fs::read(format!("/proc/{pid}/maps")).is_ok() {
-            // Privileged enough to open counters for it anyway.
-            return;
-        }
+    fn inheriting_members_close_after_their_task_exits() {
         let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
             return;
         };
+        let child = SleepChild::spawn();
+        let pid = child.pid_u32();
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
-        // Only a denial specific to the non-dumpable child is under test, not
-        // perf events being unavailable to this process altogether.
-        let own_pid = std::process::id();
-        if open_fixed_cpu_events(&group, own_pid, own_pid, cpu, 1, TaskInheritance::Threads)
-            .is_none()
-        {
+        let Some(pending) =
+            open_fixed_cpu_events(&group, pid, pid, cpu, 2, TaskInheritance::Children)
+        else {
             return;
-        }
+        };
+        group.register_pending(pending).expect("register events");
+        // A task still holding the events keeps them open, like a descendant
+        // that inherited them from an exited process.
+        group.remove_process(pid).expect("remove process");
+        group.take_lost_records().expect("read lost records");
+        assert_eq!(group.members.len(), 1);
 
-        // After a secure exec closed its counters, a process's threads are
-        // opened explicitly, which the kernel denies.
-        group
-            .open_forked_threads(&[ThreadFork {
-                tid: pid,
-                owner_pid: pid,
-                parent_tid: pid,
-            }])
-            .expect("open forked thread");
-        assert!(group.tracked_threads.is_empty());
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.members.is_empty() {
+            assert!(Instant::now() < deadline, "member outlived its task");
+            group.take_lost_records().expect("read lost records");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn open_fixed_cpu_events(
