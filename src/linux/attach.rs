@@ -170,6 +170,21 @@ fn read_proc_stat(path: &str) -> io::Result<ProcStat> {
     parse_proc_stat(&fs::read(path)?)
 }
 
+/// Parse `Tgid:` from raw `/proc/<pid>/status` bytes; the `Name:` line holds
+/// the kernel command name, which need not be UTF-8.
+fn parse_thread_group_id(status: &[u8]) -> io::Result<u32> {
+    status
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Tgid:"))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc tgid"))
+}
+
+pub(super) fn read_thread_group_id(pid: u32) -> io::Result<u32> {
+    parse_thread_group_id(&fs::read(format!("/proc/{pid}/status"))?)
+}
+
 pub(crate) fn read_process_stat(pid: u32) -> io::Result<ProcStat> {
     read_proc_stat(&format!("/proc/{pid}/stat"))
 }

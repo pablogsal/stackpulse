@@ -8,13 +8,27 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use rustc_hash::FxHashMap;
 
-use super::attach::StoppedProcess;
+use super::attach::{read_thread_group_id, StoppedProcess};
 use super::checked_loss_sum;
 use super::cpu::online_cpu_ids;
 use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
 use crate::state::ProcessHandle;
 
 const MAX_TOTAL_RING_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Reject thread ids: `/proc/<tid>/task` lists the whole thread group, so
+/// attaching to a non-leader thread would open counters for its process while
+/// tracking modules under an id that samples never carry.
+fn validate_process_leader(pid: u32) -> io::Result<()> {
+    let tgid = read_thread_group_id(pid)?;
+    if tgid != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{pid} is a thread of process {tgid}; attach to process {tgid} instead"),
+        ));
+    }
+    Ok(())
+}
 
 struct Member {
     perf: Perf,
@@ -246,6 +260,7 @@ impl PerfGroup {
         process: &mut ProcessHandle,
         attach_mode: AttachMode,
     ) -> io::Result<OpenTransaction> {
+        process.read_checked(validate_process_leader)?;
         self.open_process_with_frequency_mode(process, attach_mode, FrequencyMode::Requested)
     }
 
