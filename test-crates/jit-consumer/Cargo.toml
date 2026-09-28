@@ -11,4 +11,4 @@ resolver = "2"
 
 [dependencies]
 stackpulse-jit = { path = "../../crates/stackpulse-jit" }
-framehop = { package = "framehop-stackpulse", path = "../../crates/framehop-stackpulse", version = "0.17.1", default-features = false, features = ["std"] }
+framehop = { package = "framehop-stackpulse", path = "../../crates/framehop-stackpulse", version = "0.17.2", default-features = false, features = ["std"] }
