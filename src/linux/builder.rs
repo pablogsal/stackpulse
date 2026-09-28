@@ -58,6 +58,10 @@ impl RecorderBuilder {
     }
 
     /// Set the user-stack snapshot size in bytes.
+    ///
+    /// Sizes are rounded up to a multiple of eight bytes. Zero and values
+    /// above [`crate::record::MAX_SAMPLE_USER_STACK`] are rejected when attaching.
+    /// The default is 32 KiB.
     pub fn stack_size(mut self, bytes: u32) -> Self {
         self.options.stack_size = bytes;
         self
@@ -304,17 +308,19 @@ mod tests {
             .unwrap();
         assert_eq!(source.kind(), crate::ErrorKind::InvalidInput);
 
-        let error = Recorder::builder(SampleRate::hz(99).unwrap())
-            .stack_size(u32::MAX)
-            .prepare(process::Launch::new("unused"), spool())
-            .err()
-            .expect("invalid stack size must fail recorder setup");
-        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.io_error().unwrap().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert!(error.to_string().contains("sample_user_stack"));
+        for size in [u32::MAX, 0] {
+            let error = Recorder::builder(SampleRate::hz(99).unwrap())
+                .stack_size(size)
+                .prepare(process::Launch::new("unused"), spool())
+                .err()
+                .expect("invalid stack size must fail recorder setup");
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.io_error().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(error.to_string().contains("sample_user_stack"));
+        }
     }
 
     #[test]

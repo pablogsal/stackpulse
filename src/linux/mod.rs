@@ -2423,6 +2423,12 @@ fn open_perf_group(
     attach_mode: AttachMode,
     options: &RecorderOptions,
 ) -> io::Result<perf_group::PerfGroup> {
+    if options.stack_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sample_user_stack must be at least 1 byte for native unwinding",
+        ));
+    }
     let regs_mask = ConvertRegsNative::regs_mask();
     perf_group::PerfGroup::open(
         process,
