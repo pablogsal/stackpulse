@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use stackpulse::profile::{
     is_python_runtime_basename as is_python_module, AddressSpace, Frame, SymbolOrigin,
 };
-use stackpulse::record::ProcessScope;
+use stackpulse::record::{AttachPolicy, ProcessScope};
 use stackpulse::{Recorder, RecordingSummary, Snapshot, Spool};
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,7 +163,8 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
     let parent_pid = parse_pid_line(&ready, "parent:")?;
     let profile_path = ProfilePath::new("python-children");
 
-    let Some(recorder) = attach_recorder(parent_pid as u32, profile_path.as_ref(), true)? else {
+    let Some(mut recorder) = attach_recorder(parent_pid as u32, profile_path.as_ref(), true)?
+    else {
         return Ok(());
     };
 
@@ -172,7 +173,12 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
     let spawned_child_pid = parse_pid_line(&child_ready, "child:")?;
     let _spawned_child = PidGuard::new(spawned_child_pid);
 
-    let capture = finish_recording(profile_path, recorder, 5)?;
+    // The parent only sleeps once the child exists, so count samples from
+    // here: its own samples while spawning the child could otherwise meet
+    // the target before the child is sampled.
+    recorder.poll(Duration::ZERO)?;
+    let target_samples = recorder.stats().samples + 5;
+    let capture = finish_recording(profile_path, recorder, target_samples)?;
 
     assert!(
         capture
@@ -183,6 +189,30 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
         sample_pids(&capture.reader),
         capture.diagnostics()
     );
+    Ok(())
+}
+
+#[test]
+fn rejects_thread_ids_that_are_not_the_process_id() -> TestResult {
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tid_tx.send(unsafe { libc::gettid() }).unwrap();
+        std::thread::park();
+    });
+    let thread = stackpulse::Pid::try_from(tid_rx.recv()?)?;
+    let profile_path = ProfilePath::new("thread-attach");
+    let spool = Spool::retained(std::fs::File::create(&profile_path)?)?;
+
+    let err = match Recorder::builder(stackpulse::SampleRate::hz(99)?)
+        .attach_policy(AttachPolicy::Running)
+        .attach(thread, spool)
+    {
+        Ok(_) => panic!("attach to thread {thread} should fail"),
+        Err(err) if attach_is_not_allowed(&err) => return skip_or_fail(&err.to_string()),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), stackpulse::ErrorKind::InvalidInput, "{err}");
+    assert!(err.to_string().contains(&std::process::id().to_string()));
     Ok(())
 }
 

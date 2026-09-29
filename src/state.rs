@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
@@ -126,9 +125,118 @@ impl ProcessExitWatcher {
         }
         Ok(ProcessExitState::Running)
     }
+}
 
-    pub(crate) fn is_exited(&self) -> bool {
-        self.exited
+/// A process tracked by numeric PID, with a pidfd pinning its identity.
+///
+/// A PID cannot be recycled while its process is alive or unreaped, so a
+/// PID-based read confirmed by a pidfd that has not reported exit reached this
+/// process. When `pidfd_open` fails (for example `EMFILE` or a seccomp denial)
+/// the process is identified by its `/proc` start time instead: exit is read
+/// from `/proc`, a different or missing start time counts as exit, and
+/// signals go to the numeric PID only while the start time still matches.
+/// Start times have clock-tick resolution, so this fallback cannot tell apart
+/// a reuse within the same tick.
+#[derive(Debug)]
+pub(crate) struct ProcessHandle {
+    pid: Pid,
+    watcher: Option<ProcessExitWatcher>,
+    // Without a watcher, the start time read at open; `None` if unreadable.
+    start_time: Option<u64>,
+}
+
+impl ProcessHandle {
+    pub(crate) fn open(pid: Pid) -> Self {
+        let watcher = ProcessExitWatcher::try_new(pid).ok();
+        let start_time = match watcher {
+            Some(_) => None,
+            None => crate::linux::read_process_stat(pid.get_u32())
+                .ok()
+                .map(|stat| stat.start_time),
+        };
+        Self {
+            pid,
+            watcher,
+            start_time,
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let watcher = match &self.watcher {
+            Some(watcher) => Some(ProcessExitWatcher {
+                pidfd: watcher.pidfd.try_clone()?,
+                exited: watcher.exited,
+            }),
+            None => None,
+        };
+        Ok(Self {
+            pid: self.pid,
+            watcher,
+            start_time: self.start_time,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    pub(crate) fn has_exited(&mut self) -> crate::Result<bool> {
+        if let Some(watcher) = &mut self.watcher {
+            return Ok(watcher.poll()? == ProcessExitState::Exited);
+        }
+        // One read decides both exit and PID reuse.
+        let stat = read_running_proc_stat(self.pid).map_err(crate::Error::target)?;
+        Ok(stat.is_none_or(|stat| Some(stat.start_time) != self.start_time))
+    }
+
+    /// Whether the numeric PID still has the start time read at open.
+    fn start_time_matches(&self) -> io::Result<bool> {
+        match crate::linux::read_process_stat(self.pid.get_u32()) {
+            Ok(stat) => Ok(Some(stat.start_time) == self.start_time),
+            Err(err) if crate::error::is_target_gone_io(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        if let Some(watcher) = &self.watcher {
+            return send_pidfd_signal(watcher.pidfd.as_fd(), signal);
+        }
+        if !self.start_time_matches()? {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        // SAFETY: kill takes scalar arguments.
+        if unsafe { libc::kill(self.pid.get(), signal) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Run a read through the numeric PID, then confirm this process has not
+    /// exited. Fails with `ESRCH` if it has: the read may have reached a new
+    /// process reusing the PID.
+    pub(crate) fn read_checked<T>(
+        &mut self,
+        read: impl FnOnce(u32) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let value = read(self.pid.get_u32());
+        if self.has_exited()? {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        value
+    }
+
+    /// The pidfd to include in a batched exit poll, while exit is unseen.
+    pub(crate) fn poll_fd(&self) -> Option<i32> {
+        self.watcher.as_ref().and_then(ProcessExitWatcher::poll_fd)
+    }
+
+    /// Record a batched poll result for [`Self::poll_fd`]; true on exit.
+    pub(crate) fn observe_revents(&mut self, revents: i16) -> io::Result<bool> {
+        match &mut self.watcher {
+            Some(watcher) => Ok(watcher.observe_revents(revents)? == ProcessExitState::Exited),
+            None => Ok(false),
+        }
     }
 }
 
@@ -160,69 +268,25 @@ pub(crate) fn send_pidfd_signal(pidfd: BorrowedFd<'_>, signal: libc::c_int) -> i
     }
 }
 
-/// Check process liveness through a pidfd when available, otherwise through
-/// `/proc`.
+/// Read `/proc/<pid>/stat` if the process is still running according to it.
 ///
-/// This function never converts an inspection failure into an alive/dead
-/// answer. A pidfd poll failure is returned instead of silently switching to
-/// the PID-reuse-prone `/proc` check.
-///
-/// # Errors
-///
-/// Returns an error when pidfd or `/proc` inspection fails.
-pub fn process_is_alive(watcher: &mut Option<ProcessExitWatcher>, pid: Pid) -> crate::Result<bool> {
-    if let Some(active) = watcher.as_mut() {
-        match active.poll() {
-            Ok(ProcessExitState::Exited) => return Ok(false),
-            Ok(ProcessExitState::Running) => return Ok(true),
-            Err(error) => return Err(error),
-        }
+/// Returns `None` when the thread-group leader has exited and is the last
+/// task of its group, the condition a pidfd reports as exited, or on
+/// `ENOENT`/`ESRCH`. An exited leader keeps its task entry until it is reaped,
+/// so a lone zombie leader is not alive, while one with running sibling
+/// threads is. The state and thread count come from one read of one task, so
+/// an exec from a sibling thread, which takes over the leader's PID, cannot
+/// mix two tasks. The count reads 0 only when the task is released during the
+/// read; that is not taken as exited, and the next check sees the outcome.
+/// Subject to PID reuse; prefer a [`ProcessExitWatcher`] when you have a
+/// long-lived target.
+fn read_running_proc_stat(pid: Pid) -> io::Result<Option<crate::linux::ProcStat>> {
+    match crate::linux::read_process_stat(pid.get_u32()) {
+        Ok(stat) if matches!(stat.state, 'Z' | 'X') && stat.num_threads == 1 => Ok(None),
+        Ok(stat) => Ok(Some(stat)),
+        Err(err) if crate::error::is_target_gone_io(&err) => Ok(None),
+        Err(err) => Err(err),
     }
-    process_exists(pid)
-}
-
-/// Check whether a process is currently observable in `/proc`.
-///
-/// Returns `true` when the thread-group leader directory is present, or when
-/// at least one non-leader thread is still alive (the leader can have exited
-/// while siblings remain). `false` on `ENOENT`/`ESRCH`. Subject to PID reuse;
-/// prefer a [`ProcessExitWatcher`] when you have a long-lived target.
-///
-/// # Errors
-///
-/// Returns an error when `/proc` exists but cannot be inspected reliably.
-pub fn process_exists(pid: Pid) -> crate::Result<bool> {
-    try_process_exists(pid).map_err(crate::Error::target)
-}
-
-pub(crate) fn try_process_exists(pid: Pid) -> io::Result<bool> {
-    let pid = pid.get();
-    let mut tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
-        Ok(tasks) => tasks,
-        Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
-        Err(err) => return Err(err),
-    };
-
-    let mut saw_leader = false;
-    for entry in &mut tasks {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
-            Err(err) => return Err(err),
-        };
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(tid) = file_name.parse::<i32>() else {
-            continue;
-        };
-        if tid != pid {
-            return Ok(true);
-        }
-        saw_leader = true;
-    }
-    Ok(saw_leader)
 }
 
 pub(crate) fn poll_retry(fds: &mut [libc::pollfd], timeout: libc::c_int) -> io::Result<i32> {
@@ -245,7 +309,7 @@ mod tests {
     use super::*;
     use crate::test_support::SleepChild;
     use std::os::unix::process::ExitStatusExt;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn pid(raw: i32) -> Pid {
         Pid::new(raw).expect("positive test pid")
@@ -269,29 +333,38 @@ mod tests {
     }
 
     #[test]
-    fn process_exists_reports_current_and_missing_processes() {
-        assert!(process_exists(pid(std::process::id() as i32)).unwrap());
-        assert!(!process_exists(pid(i32::MAX)).unwrap());
+    fn read_through_a_reusable_pid_is_rejected_once_the_pidfd_exits() {
+        let mut child = SleepChild::spawn();
+        let mut process = ProcessHandle::open(pid(child.pid_i32()));
+        assert_eq!(process.read_checked(|_| Ok(1)).unwrap(), 1);
+        process.signal(libc::SIGKILL).unwrap();
+        child.wait_timeout(Duration::from_secs(2)).unwrap().unwrap();
+
+        // Reaped, so the PID may now name another process: a read that
+        // succeeds through it must not be attributed to this one.
+        let error = process.read_checked(|_| Ok(1)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]
-    fn process_is_alive_uses_proc_fallback_without_watcher() {
-        let mut watcher = None;
-
-        assert!(process_is_alive(&mut watcher, pid(std::process::id() as i32)).unwrap());
-        assert!(!process_is_alive(&mut watcher, pid(i32::MAX)).unwrap());
+    fn proc_fallback_reports_running_and_missing_processes() {
+        assert!(read_running_proc_stat(pid(std::process::id() as i32))
+            .unwrap()
+            .is_some());
+        assert!(read_running_proc_stat(pid(i32::MAX)).unwrap().is_none());
     }
 
     #[test]
-    fn process_is_alive_uses_pidfd_watcher_when_available() {
-        let pid = pid(std::process::id() as i32);
-        let Ok(watcher) = ProcessExitWatcher::try_new(pid) else {
-            return;
-        };
-        let mut watcher = Some(watcher);
-
-        assert!(process_is_alive(&mut watcher, pid).unwrap());
-        assert!(watcher.is_some());
+    fn proc_fallback_treats_zombie_as_exited() {
+        let child = SleepChild::spawn();
+        let pid = pid(child.pid_i32());
+        // SAFETY: the child is owned and not yet reaped, so its pid is valid.
+        assert_eq!(unsafe { libc::kill(pid.get(), libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while read_running_proc_stat(pid).unwrap().is_some() {
+            assert!(Instant::now() < deadline, "zombie reported alive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -320,8 +393,6 @@ mod tests {
             watcher.poll().expect("poll cached exited child"),
             ProcessExitState::Exited
         );
-        let mut watcher = Some(watcher);
-        assert!(!process_is_alive(&mut watcher, pid).unwrap());
     }
 
     #[test]
@@ -357,7 +428,7 @@ mod tests {
             watcher.observe_revents(libc::POLLHUP).unwrap(),
             ProcessExitState::Exited
         );
-        assert!(watcher.is_exited());
+        assert_eq!(watcher.poll().unwrap(), ProcessExitState::Exited);
     }
 
     #[test]

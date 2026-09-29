@@ -176,6 +176,7 @@ fn unwind_captured_stack(
     let mut regs = capture.regs;
     let mut address = FrameAddress::from_instruction_pointer(capture.pc);
     let native_start = stack.len();
+    let cache = process_unwinder.cache.get_or_insert_default();
     stack.push(StackFrame::InstructionPointer(capture.pc, StackMode::User));
     let truncated = loop {
         if stack.len() - native_start >= MAX_NATIVE_UNWIND_FRAMES {
@@ -184,7 +185,7 @@ fn unwind_captured_stack(
         match process_unwinder.unwinder.unwind_frame_with_details(
             address,
             &mut regs,
-            &mut process_unwinder.cache,
+            cache,
             &mut read_stack,
         ) {
             Ok(outcome) => {

@@ -58,6 +58,10 @@ impl RecorderBuilder {
     }
 
     /// Set the user-stack snapshot size in bytes.
+    ///
+    /// Sizes are rounded up to a multiple of eight bytes. Zero and values
+    /// above [`crate::record::MAX_SAMPLE_USER_STACK`] are rejected when attaching.
+    /// The default is 32 KiB.
     pub fn stack_size(mut self, bytes: u32) -> Self {
         self.options.stack_size = bytes;
         self
@@ -71,7 +75,9 @@ impl RecorderBuilder {
     /// 64 KiB stack. Memory is pinned per CPU. Values
     /// requiring more than 256 MiB per CPU are rejected. Zero selects the
     /// default. If mmap fails with `EPERM` or `ENOMEM`, attach progressively
-    /// halves the ring down to the minimum valid capacity. All per-CPU rings
+    /// halves the ring down to the minimum valid capacity, and halves the
+    /// rings of every CPU it is opening when a later CPU still cannot fit
+    /// into the locked memory the earlier ones left. All per-CPU rings
     /// in one recorder also share a 1 GiB aggregate data budget; effective
     /// capacities are available in [`RecordingSummary`].
     pub fn ring_buffer_stacks(mut self, stacks: u32) -> Self {
@@ -222,19 +228,29 @@ impl PreparedRecording {
         self.recorder.take_reader()
     }
     /// Execute the child and transfer ownership of capture and child handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorKind::ProcessLaunch`] when the program cannot be
+    /// executed. A linked reader then reports the same failure instead of
+    /// finishing.
     pub fn start(self) -> crate::Result<(Recorder, process::Child)> {
         let Self { recorder, child } = self;
         match child.unsuspend_and_run() {
             Ok(child) => Ok((recorder, child)),
             Err(error) => {
+                // Publish the failure first; finish would otherwise mark the
+                // empty recording as successfully finished.
+                let failure = Arc::new(error);
+                recorder.publisher.abort(Some(Arc::clone(&failure)));
+                let error = crate::Error::new(failure.kind(), SharedFailure(failure));
                 let cleanup = recorder.finish();
                 match cleanup {
                     Ok(_) => Err(error),
-                    Err(cleanup) => Err(crate::error::with_cleanup_error(
-                        error.into(),
-                        io::Error::other(cleanup),
-                    )
-                    .into()),
+                    Err(cleanup) => Err(crate::Error::new(
+                        error.kind(),
+                        crate::error::with_cleanup_error(error.into(), io::Error::other(cleanup)),
+                    )),
                 }
             }
         }
@@ -264,7 +280,7 @@ pub(super) struct SharedFailure(#[source] pub Arc<crate::Error>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{perf_unavailable, TempDir};
 
     #[test]
     fn prepare_distinguishes_launch_and_recorder_setup_errors() {
@@ -292,16 +308,47 @@ mod tests {
             .unwrap();
         assert_eq!(source.kind(), crate::ErrorKind::InvalidInput);
 
-        let error = Recorder::builder(SampleRate::hz(99).unwrap())
-            .stack_size(u32::MAX)
-            .prepare(process::Launch::new("unused"), spool())
-            .err()
-            .expect("invalid stack size must fail recorder setup");
-        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.io_error().unwrap().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert!(error.to_string().contains("sample_user_stack"));
+        for size in [u32::MAX, 0] {
+            let error = Recorder::builder(SampleRate::hz(99).unwrap())
+                .stack_size(size)
+                .prepare(process::Launch::new("unused"), spool())
+                .err()
+                .expect("invalid stack size must fail recorder setup");
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.io_error().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(error.to_string().contains("sample_user_stack"));
+        }
+    }
+
+    #[test]
+    fn start_reports_exec_failure_as_process_launch() {
+        let directory = TempDir::new("start-exec-errors");
+        let program = directory.path().join("missing-program");
+        let spool =
+            Spool::retained(std::fs::File::create(directory.path().join("capture")).unwrap())
+                .unwrap();
+        let mut prepared = match Recorder::builder(SampleRate::hz(99).unwrap())
+            .prepare(process::Launch::new(&program), spool)
+        {
+            Ok(prepared) => prepared,
+            Err(err) if perf_unavailable(&err) => return,
+            Err(err) => panic!("prepare recording: {err}"),
+        };
+        let mut reader = prepared.take_reader().unwrap();
+
+        let error = prepared.start().expect_err("exec must fail");
+        assert_eq!(error.kind(), crate::ErrorKind::ProcessLaunch);
+        assert!(error.to_string().contains(&*program.to_string_lossy()));
+        let reader_error = loop {
+            match reader.poll(Duration::from_millis(100)) {
+                Ok(crate::spool::ReadStatus::Finished(_)) => panic!("reader finished"),
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(reader_error.kind(), crate::ErrorKind::ProcessLaunch);
     }
 }

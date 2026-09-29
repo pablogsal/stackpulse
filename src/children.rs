@@ -92,7 +92,7 @@ fn descendant_edges_via_stat_from_proc(roots: &[i32], proc_root: &Path) -> Vec<(
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
+        let Ok(stat) = std::fs::read(proc_root.join(pid.to_string()).join("stat")) else {
             continue;
         };
         if let Some(ppid) = parse_parent_pid_from_stat(&stat) {
@@ -122,9 +122,17 @@ fn proc_pid_path(pid: i32) -> std::path::PathBuf {
     Path::new("/proc").join(pid.to_string())
 }
 
-fn parse_parent_pid_from_stat(stat: &str) -> Option<i32> {
-    let after_comm = stat.rfind(')')?;
-    stat.get(after_comm + 2..)?
+/// Return the fields that follow the command name in a `/proc/<pid>/stat` line.
+///
+/// The kernel copies the command name verbatim, so it may contain `)`, spaces
+/// and bytes that are not UTF-8; everything after the last `)` is ASCII.
+pub(crate) fn proc_stat_fields(stat: &[u8]) -> Option<&str> {
+    let after_comm = stat.iter().rposition(|&byte| byte == b')')?;
+    std::str::from_utf8(stat.get(after_comm + 2..)?).ok()
+}
+
+fn parse_parent_pid_from_stat(stat: &[u8]) -> Option<i32> {
+    proc_stat_fields(stat)?
         .split_whitespace()
         .nth(1)?
         .parse::<i32>()
@@ -141,16 +149,16 @@ mod tests {
     #[test]
     fn parse_parent_pid_from_stat_handles_command_names_with_parens() {
         assert_eq!(
-            parse_parent_pid_from_stat("123 (cmd ) with parens) S 456 1 2 3"),
+            parse_parent_pid_from_stat(b"123 (cmd ) with parens) S 456 1 2 3"),
             Some(456)
         );
     }
 
     #[test]
     fn parse_parent_pid_from_stat_rejects_malformed_stat_lines() {
-        assert_eq!(parse_parent_pid_from_stat("123 (cmd S 456"), None);
-        assert_eq!(parse_parent_pid_from_stat("123 (cmd) S"), None);
-        assert_eq!(parse_parent_pid_from_stat("123 (cmd) S nope"), None);
+        assert_eq!(parse_parent_pid_from_stat(b"123 (cmd S 456"), None);
+        assert_eq!(parse_parent_pid_from_stat(b"123 (cmd) S"), None);
+        assert_eq!(parse_parent_pid_from_stat(b"123 (cmd) S nope"), None);
     }
 
     #[test]

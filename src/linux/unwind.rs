@@ -23,8 +23,9 @@ pub(super) struct ProcessUnwinder {
     jit: super::jit::JitRegistry,
     /// Ordinary and JIT unwind tables for this process's current executable code.
     unwinder: NativeUnwinder,
-    /// Unwind-rule cache reused across samples; a forked child starts with an empty cache.
-    cache: NativeCache,
+    /// Unwind-rule cache reused across samples, allocated by the first unwind.
+    /// Forked and exec'd processes start without one until they are sampled.
+    cache: Option<NativeCache>,
     /// Page-aligned user addresses for which mapping rediscovery was already attempted.
     /// Cleared when executable mappings change so uncovered pages can be checked again.
     refreshed_uncovered_pages: FxHashSet<u64>,
@@ -111,7 +112,16 @@ impl ProcessUnwinder {
             elf_sections.remove(module.id);
         }
         if update.mapping_changed {
-            self.jit.mappings_changed();
+            // Runtime discovery reads only file mappings, so anonymous code
+            // changes cannot affect it.
+            if update
+                .retired
+                .iter()
+                .chain(update.active.iter().map(|activation| &activation.module))
+                .any(is_file_mapping)
+            {
+                self.jit.mappings_changed();
+            }
             self.refreshed_uncovered_pages.clear();
         }
     }
@@ -158,6 +168,14 @@ impl ProcessUnwinder {
     }
 }
 
+/// Match runtime discovery, which keeps only mappings with an inode. Linux
+/// reports a file mapping whose path it cannot build with inode 0 and one of
+/// these exact names.
+fn is_file_mapping(module: &ModuleRecord) -> bool {
+    let path = module.path().as_os_str();
+    !module.is_kernel() && (module.inode != 0 || path == "//toolong" || path == "//enomem")
+}
+
 fn refresh_page(pc: u64) -> u64 {
     let page_size = crate::elf::system_page_size();
     pc - pc % page_size
@@ -174,6 +192,18 @@ fn indexed_eh_frame_hdr(section_info: &ElfSectionInfo) -> Option<(Range<u64>, El
     let addr = section_info.eh_frame_hdr_svma?;
     let data = section_info.eh_frame_hdr.as_ref()?;
     let range = svma_range(Some(addr), Some(data))?;
+    let indexed = section_info
+        .eh_frame_hdr_indexed
+        .get_or_init(|| eh_frame_hdr_indexes_eh_frame(section_info, addr, data).is_some());
+    indexed.then(|| (range, data.clone()))
+}
+
+/// Check that every search-table entry resolves to an FDE inside .eh_frame.
+fn eh_frame_hdr_indexes_eh_frame(
+    section_info: &ElfSectionInfo,
+    addr: u64,
+    data: &ElfSectionData,
+) -> Option<()> {
     let eh_frame_range = svma_range(section_info.eh_frame_svma, section_info.eh_frame.as_ref())?;
     let bases = gimli::BaseAddresses::default()
         .set_eh_frame(section_info.eh_frame_svma.unwrap_or_default())
@@ -209,7 +239,7 @@ fn indexed_eh_frame_hdr(section_info: &ElfSectionInfo) -> Option<(Range<u64>, El
         table.pointer_to_offset(fde_pointer).ok()?;
     }
     table.lookup(0, &bases).ok()?;
-    Some((range, data.clone()))
+    Some(())
 }
 
 fn module_to_framehop(
@@ -274,31 +304,33 @@ mod tests {
             super::super::jit::JitRegistry::test_with_module(module, runtime, &mut parent.unwinder);
         parent.refreshed_uncovered_pages.insert(0x9000);
         for _ in 0..2 {
-            let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+            let (outcome, sp) =
+                unwind_overlay_frame(&parent.unwinder, parent.cache.get_or_insert_default());
             assert_eq!(outcome.return_address(), Some(0xbbbb));
             assert_eq!(sp, 0x8030);
         }
-        assert!(parent.cache.stats().hits() > 0);
-        let parent_hits = parent.cache.stats().hits();
+        let parent_hits = parent.cache.as_ref().unwrap().stats().hits();
+        assert!(parent_hits > 0);
         let parent_frame = parent.jit.frame(0x1001).unwrap();
 
         let mut child = parent.inherit_for_fork();
         assert!(child.jit.frame(0x1001).is_none());
         assert!(child.refreshed_uncovered_pages.is_empty());
-        assert_eq!(child.cache.stats().hits(), 0);
-        assert_eq!(child.cache.stats().misses(), 0);
-        let (outcome, sp) = unwind_overlay_frame(&child.unwinder, &mut child.cache);
+        assert!(child.cache.is_none());
+        let (outcome, sp) =
+            unwind_overlay_frame(&child.unwinder, child.cache.get_or_insert_default());
         assert_eq!(outcome.return_address(), Some(0xaaaa));
         assert_eq!(sp, 0x8010);
         assert!(outcome.fallback_reason().is_none());
 
-        assert_eq!(parent.cache.stats().hits(), parent_hits);
+        assert_eq!(parent.cache.as_ref().unwrap().stats().hits(), parent_hits);
         assert_eq!(parent.jit.frame(0x1001), Some(parent_frame));
         assert!(parent.refreshed_uncovered_pages.contains(&0x9000));
-        let (outcome, sp) = unwind_overlay_frame(&parent.unwinder, &mut parent.cache);
+        let (outcome, sp) =
+            unwind_overlay_frame(&parent.unwinder, parent.cache.get_or_insert_default());
         assert_eq!(outcome.return_address(), Some(0xbbbb));
         assert_eq!(sp, 0x8030);
-        assert!(parent.cache.stats().hits() > parent_hits);
+        assert!(parent.cache.as_ref().unwrap().stats().hits() > parent_hits);
     }
 
     #[test]
@@ -384,6 +416,27 @@ mod tests {
     }
 
     #[test]
+    fn only_file_code_mappings_invalidate_runtime_discovery() {
+        let pid = crate::Pid::new(7).unwrap();
+        let anon = ModuleRecord::new(1, pid, 0x7000_0000..0x7000_1000, 0, "//anon").unwrap();
+        let update = |module| ModuleUpdate {
+            active: vec![ModuleActivation {
+                module,
+                source_module_id: None,
+            }],
+            mapping_changed: true,
+            ..ModuleUpdate::default()
+        };
+        let mut unwinder = ProcessUnwinder::default();
+        unwinder.apply_module_update(&update(anon.clone()), &mut ElfSectionCache::default());
+        assert!(!unwinder.jit.maps_read_pending());
+
+        let file = ModuleRecord { inode: 1, ..anon };
+        unwinder.apply_module_update(&update(file), &mut ElfSectionCache::default());
+        assert!(unwinder.jit.maps_read_pending());
+    }
+
+    #[test]
     fn only_indexed_eh_frame_headers_are_forwarded() {
         const VERSION: u8 = 1;
         const ABSPTR: u8 = gimli::constants::DW_EH_PE_absptr.0;
@@ -421,7 +474,7 @@ mod tests {
         overflowing_count.extend_from_slice(&u64::MAX.to_le_bytes());
 
         let section_info = |header, address| {
-            let mut section_info = Arc::unwrap_or_clone(fake_hard_case_section_info());
+            let mut section_info = Arc::try_unwrap(fake_hard_case_section_info()).unwrap();
             section_info.eh_frame_svma = Some(u64::from(EH_FRAME_ADDRESS));
             section_info.eh_frame = Some(ElfSectionData::owned(vec![0; 0x100]));
             section_info.eh_frame_hdr_svma = address;

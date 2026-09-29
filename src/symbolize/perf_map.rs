@@ -34,9 +34,50 @@ enum PerfMapPayload {
     Python { function: Rc<str>, file: Rc<str> },
 }
 
+const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
+
 pub(super) struct PerfMap {
     symbols: Vec<PerfMapSymbol>,
+    /// Largest `end` among `symbols[..=index]`, so lookups can stop walking back early.
+    max_end: Box<[u64]>,
     module: Rc<str>,
+    /// Kept only for maps that may be reloaded.
+    parsed: Option<ParsedPerfMapText>,
+}
+
+/// The complete lines a perf map was parsed from, so a reload can parse only
+/// the lines appended after them.
+struct ParsedPerfMapText {
+    /// Runtimes may rewrite a map in place, so a reload compares these bytes
+    /// with the file instead of trusting the length.
+    text: Vec<u8>,
+    unterminated_start: Option<u64>,
+}
+
+impl PerfMap {
+    fn new(
+        mut symbols: Vec<PerfMapSymbol>,
+        module: Rc<str>,
+        parsed: Option<ParsedPerfMapText>,
+    ) -> Self {
+        // On a reload the earlier lines are already sorted, so this stable sort
+        // merges in the appended ones after any earlier entries with the same start.
+        symbols.sort_by_key(|symbol| symbol.start);
+        let mut running_max = 0;
+        let max_end = symbols
+            .iter()
+            .map(|symbol| {
+                running_max = symbol.end.max(running_max);
+                running_max
+            })
+            .collect();
+        Self {
+            symbols,
+            max_end,
+            module,
+            parsed,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,11 +111,15 @@ pub(super) fn find_perf_map_symbol(
     perf_map: &PerfMap,
     address: u64,
 ) -> Option<(&PerfMapSymbol, &Rc<str>)> {
-    let symbol = perf_map.symbols[..perf_map
+    let candidates = perf_map
         .symbols
-        .partition_point(|symbol| symbol.start <= address)]
+        .partition_point(|symbol| symbol.start <= address);
+    let (symbol, _) = perf_map.symbols[..candidates]
         .iter()
-        .rfind(|symbol| address < symbol.end)?;
+        .zip(&perf_map.max_end[..candidates])
+        .rev()
+        .take_while(|(_, &max_end)| address < max_end)
+        .find(|(symbol, _)| address < symbol.end)?;
     Some((symbol, &perf_map.module))
 }
 
@@ -147,8 +192,14 @@ fn is_perf_map_mapping(path: &str) -> bool {
         || path.starts_with("/SYSV")
 }
 
-pub(super) fn load_perf_map(path: &Path) -> Option<PerfMap> {
-    const MAX_PERF_MAP_SIZE: u64 = 64 * 1024 * 1024;
+/// Loads the perf map at `path`. When `previous` was loaded from the same file
+/// with `reloadable` set and its parsed lines are unchanged, only the lines
+/// appended since are parsed. Only a `reloadable` map keeps its parsed text.
+pub(super) fn load_perf_map(
+    path: &Path,
+    previous: Option<PerfMap>,
+    reloadable: bool,
+) -> Option<PerfMap> {
     let mut file = File::options()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -158,20 +209,58 @@ pub(super) fn load_perf_map(path: &Path) -> Option<PerfMap> {
     if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.len() > MAX_PERF_MAP_SIZE {
         return None;
     }
-    let mut text = String::with_capacity(usize::try_from(metadata.len()).ok()?);
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
     file.by_ref()
         .take(MAX_PERF_MAP_SIZE + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .ok()?;
-    if text.len() as u64 > MAX_PERF_MAP_SIZE {
+    if bytes.len() as u64 > MAX_PERF_MAP_SIZE {
         return None;
     }
-    let mut symbols: Vec<PerfMapSymbol> = text.lines().filter_map(parse_perf_map_line).collect();
-    symbols.sort_by_key(|symbol| symbol.start);
-    Some(PerfMap {
+    let (mut symbols, offset) = match previous {
+        Some(PerfMap {
+            mut symbols,
+            parsed: Some(parsed),
+            ..
+        }) if bytes.starts_with(&parsed.text) => {
+            if let Some(start) = parsed.unterminated_start {
+                // The unterminated last line is parsed again below. Sorting is
+                // stable, so it is the last entry with its start.
+                symbols.remove(symbols.partition_point(|symbol| symbol.start <= start) - 1);
+            }
+            (symbols, parsed.text.len())
+        }
+        _ => (Vec::new(), 0),
+    };
+    let appended = &bytes[offset..];
+    let (complete, unterminated) = appended.split_at(
+        appended
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |index| index + 1),
+    );
+    // Perf-map names are raw bytes, so one invalid name must not discard the
+    // whole map. Both parts end at a line boundary or at the end of the file,
+    // so this matches converting the whole file at once.
+    symbols.extend(
+        String::from_utf8_lossy(complete)
+            .lines()
+            .filter_map(parse_perf_map_line),
+    );
+    let unterminated = String::from_utf8_lossy(unterminated)
+        .lines()
+        .find_map(parse_perf_map_line);
+    let unterminated_start = unterminated.as_ref().map(|symbol| symbol.start);
+    symbols.extend(unterminated);
+    bytes.truncate(offset + complete.len());
+    Some(PerfMap::new(
         symbols,
-        module: path.to_string_lossy().as_ref().into(),
-    })
+        path.to_string_lossy().as_ref().into(),
+        reloadable.then_some(ParsedPerfMapText {
+            text: bytes,
+            unterminated_start,
+        }),
+    ))
 }
 
 fn parse_perf_map_line(line: &str) -> Option<PerfMapSymbol> {
@@ -209,6 +298,38 @@ fn take_ascii_field(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
+
+    fn native_name(perf_map: &PerfMap, address: u64) -> Rc<str> {
+        match &find_perf_map_symbol(perf_map, address).unwrap().0.payload {
+            PerfMapPayload::Native(name) => Rc::clone(name),
+            PerfMapPayload::Python { .. } => panic!("expected native perf-map symbol"),
+        }
+    }
+
+    #[test]
+    fn completed_unterminated_lines_replace_their_partial_entry() {
+        let directory = TempDir::new("perf-map-unterminated");
+        let path = directory.path().join("perf-1.map");
+        std::fs::write(&path, "1000 10 a\n2000 10 na").unwrap();
+        let perf_map = load_perf_map(&path, None, true);
+        std::fs::write(&path, "1000 10 a\n2000 10 name\n").unwrap();
+
+        let perf_map = load_perf_map(&path, perf_map, true).unwrap();
+        assert_eq!(perf_map.symbols.len(), 2);
+        assert_eq!(&*native_name(&perf_map, 0x2000), "name");
+    }
+
+    #[test]
+    fn lookups_walk_back_past_shorter_nested_entries() {
+        let directory = TempDir::new("perf-map-nested");
+        let path = directory.path().join("perf-1.map");
+        std::fs::write(&path, "1000 100 outer\n1010 8 inner\n").unwrap();
+
+        let perf_map = load_perf_map(&path, None, true).unwrap();
+        assert_eq!(&*native_name(&perf_map, 0x1050), "outer");
+        assert!(find_perf_map_symbol(&perf_map, 0x1100).is_none());
+    }
 
     #[test]
     fn python_source_suffix_requires_a_line_number() {
@@ -265,5 +386,16 @@ mod tests {
         ] {
             assert!(parse_perf_map_line(line).is_none(), "accepted {line:?}");
         }
+    }
+
+    #[test]
+    fn invalid_utf8_names_do_not_discard_the_perf_map() {
+        let temp = TempDir::new("perf-map-invalid-utf8");
+        let path = temp.path().join("perf-1.map");
+        std::fs::write(&path, b"1000 10 good\n2000 10 bad_\xff\n").unwrap();
+
+        let perf_map = load_perf_map(&path, None, true).expect("perf map with invalid UTF-8 names");
+        assert_eq!(&*native_name(&perf_map, 0x1000), "good");
+        assert_eq!(&*native_name(&perf_map, 0x2000), "bad_\u{fffd}");
     }
 }

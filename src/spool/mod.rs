@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::fs::{File, OpenOptions};
 #[cfg(any(test, feature = "bench-support"))]
 use std::io::BufWriter;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use integer_encoding::{VarInt, VarIntReader, VarIntWriter};
 use memmap2::Mmap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 mod jit;
 mod live;
@@ -73,8 +74,13 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     // the whole recording. Unpinned frames are resolved against the module
     // set visible at their position in the file, so their cache must be
     // dropped whenever that set changes (write_module / deactivation).
-    pinned_frame_cache: FxHashMap<FrameRecord, u32>,
-    unpinned_frame_cache: FxHashMap<FrameRecord, u32>,
+    // Keyed by the compact on-disk frame encoding. Unpinned kernel frames only
+    // resolve against kernel modules, so their cache survives user module
+    // churn and is dropped only when a kernel module is written or deactivated.
+    pinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    unpinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    kernel_frame_cache: FxHashMap<(u64, u64), u32>,
+    kernel_module_ids: FxHashSet<u32>,
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
     thread_cache: FxHashMap<(i32, u64), u32>,
@@ -142,6 +148,8 @@ impl<W: Write> PerfSpoolWriter<W> {
             writer: SpoolOutput::new(writer),
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
+            kernel_frame_cache: FxHashMap::default(),
+            kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
@@ -181,6 +189,10 @@ impl<W: Write> PerfSpoolWriter<W> {
             jit::write_symbols(&mut self.writer, symbols)?;
         }
         self.unpinned_frame_cache.clear();
+        if module.is_kernel() {
+            self.kernel_module_ids.insert(module.id);
+            self.kernel_frame_cache.clear();
+        }
         Ok(())
     }
 
@@ -238,6 +250,9 @@ impl<W: Write> PerfSpoolWriter<W> {
         self.writer.write_all(&[REC_MODULE_DEACTIVATE_ONE])?;
         self.writer.write_varint(u64::from(module_id))?;
         self.unpinned_frame_cache.clear();
+        if self.kernel_module_ids.remove(&module_id) {
+            self.kernel_frame_cache.clear();
+        }
         Ok(())
     }
 
@@ -276,6 +291,7 @@ impl<W: Write> PerfSpoolWriter<W> {
             writer,
             pinned_frame_cache,
             unpinned_frame_cache,
+            kernel_frame_cache,
             next_frame_id,
             ..
         } = self;
@@ -283,19 +299,25 @@ impl<W: Write> PerfSpoolWriter<W> {
         // they are as durable as module-pinned frames.
         let cache = if frame.module_id.is_some() || frame.is_truncated_stack_marker() {
             pinned_frame_cache
+        } else if frame.mode == FrameMode::Kernel {
+            kernel_frame_cache
         } else {
             unpinned_frame_cache
         };
-        if let Some(&id) = cache.get(frame) {
-            return Ok(id);
-        }
+        // Readers rebuild a frame from its encoding alone, so frames that
+        // encode identically are the same frame to every reader.
+        let key = compact_frame(frame)?;
+        let entry = match cache.entry(key) {
+            Entry::Occupied(entry) => return Ok(*entry.get()),
+            Entry::Vacant(entry) => entry,
+        };
         let id = *next_frame_id;
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
-        let (tag, address) = compact_frame(frame)?;
+        let (tag, address) = key;
         writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
-        cache.insert(*frame, id);
+        entry.insert(id);
         *next_frame_id = next_frame_id
             .checked_add(1)
             .ok_or_else(|| invalid_input("frame id space exhausted"))?;
@@ -310,17 +332,20 @@ impl<W: Write> PerfSpoolWriter<W> {
         let mut prefix = NONE_U32;
         for frame in frames.into_iter().rev() {
             let frame_id = self.intern_frame(&frame)?;
-            let key = (prefix, frame_id);
-            if let Some(&stack_id) = self.stack_cache.get(&key) {
-                prefix = stack_id;
-                continue;
-            }
-            let stack_id = next_spool_id(self.stack_cache.len(), "stack")?;
+            let next_stack_id = self.stack_cache.len();
+            let entry = match self.stack_cache.entry((prefix, frame_id)) {
+                Entry::Occupied(entry) => {
+                    prefix = *entry.get();
+                    continue;
+                }
+                Entry::Vacant(entry) => entry,
+            };
+            let stack_id = next_spool_id(next_stack_id, "stack")?;
             self.writer.write_record(
                 REC_STACK,
                 (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
             )?;
-            self.stack_cache.insert(key, stack_id);
+            entry.insert(stack_id);
             prefix = stack_id;
         }
         Ok((prefix != NONE_U32).then_some(prefix))
@@ -481,9 +506,7 @@ impl<T: Clone> ChunkedFrameContext<T> {
         {
             Arc::make_mut(chunk).push(value);
         } else {
-            let mut chunk = Vec::with_capacity(FRAME_CONTEXT_CHUNK_SIZE);
-            chunk.push(value);
-            chunks.push(Arc::new(chunk));
+            chunks.push(Arc::new(vec![value]));
         }
     }
 
@@ -498,54 +521,84 @@ impl<T: Clone> ChunkedFrameContext<T> {
 pub(crate) struct SpoolFrameModuleContexts {
     frame_module_limits: ChunkedFrameContext<usize>,
     module_deactivated_at: ChunkedFrameContext<Option<usize>>,
+    /// Ascending module indices per owner. Moduleless frames scan only the
+    /// mappings their owner could contain instead of every recorded module.
+    owned_modules: Arc<FxHashMap<ModuleOwner, ChunkedFrameContext<usize>>>,
 }
 
 impl SpoolFrameModuleContexts {
-    fn push_module(&mut self) {
+    fn push_module(&mut self, module_index: usize, owner: ModuleOwner) {
         self.module_deactivated_at.push(None);
+        Arc::make_mut(&mut self.owned_modules)
+            .entry(owner)
+            .or_default()
+            .push(module_index);
+    }
+
+    /// Module indices of `owner` below `module_limit`, newest first.
+    fn owned_modules_before(
+        &self,
+        owner: ModuleOwner,
+        module_limit: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let chunks = self
+            .owned_modules
+            .get(&owner)
+            .map_or(&[][..], |modules| modules.chunks.as_slice());
+        // Indices ascend across chunks, so the chunks starting below the
+        // limit form a prefix and only the last of them can straddle it.
+        let chunks = &chunks[..chunks
+            .partition_point(|chunk| chunk.first().is_some_and(|&index| index < module_limit))];
+        chunks
+            .iter()
+            .rev()
+            .enumerate()
+            .flat_map(move |(position, chunk)| {
+                let len = if position == 0 {
+                    chunk.partition_point(|&index| index < module_limit)
+                } else {
+                    chunk.len()
+                };
+                chunk[..len].iter().rev().copied()
+            })
     }
 
     fn push_frame(&mut self, module_limit: usize) {
         self.frame_module_limits.push(module_limit);
     }
 
-    fn deactivate_process(
-        &mut self,
-        modules: &[ModuleRecord],
-        process_id: i32,
-        deactivated_at: usize,
-    ) {
-        for (module_id, module) in modules.iter().enumerate() {
-            if module.pid().is_some_and(|pid| pid.get() == process_id) {
-                let active = self.module_active(
-                    module_id,
-                    FrameLookupContext {
-                        frame_index: deactivated_at,
-                        module_limit: modules.len(),
-                    },
-                );
-                if active {
-                    self.deactivate_module(module_id, deactivated_at);
-                }
-            }
-        }
-    }
-
     #[expect(
         clippy::expect_used,
         reason = "module contexts are appended atomically with module records"
     )]
-    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) {
-        if self
+    fn deactivate_module(&mut self, module_id: usize, deactivated_at: usize) -> bool {
+        let slot = self
             .module_deactivated_at
-            .get(module_id)
-            .expect("every module has a context")
-            .is_none()
-        {
-            *self
-                .module_deactivated_at
-                .get_mut(module_id)
-                .expect("every module has a context") = Some(deactivated_at);
+            .get_mut(module_id)
+            .expect("every module has a context");
+        let was_active = slot.is_none();
+        if was_active {
+            *slot = Some(deactivated_at);
+        }
+        was_active
+    }
+
+    /// Deactivates every module of `owner` that is still active, passing each
+    /// one's index to `deactivated` in ascending order.
+    fn deactivate_owner(
+        &mut self,
+        owner: ModuleOwner,
+        deactivated_at: usize,
+        mut deactivated: impl FnMut(usize),
+    ) {
+        let owned_modules = Arc::clone(&self.owned_modules);
+        let Some(modules) = owned_modules.get(&owner) else {
+            return;
+        };
+        for &module_id in modules.chunks.iter().flat_map(|chunk| chunk.iter()) {
+            if self.deactivate_module(module_id, deactivated_at) {
+                deactivated(module_id);
+            }
         }
     }
 
@@ -1252,8 +1305,9 @@ fn open_spool_with_range_limit(
         let parsed = (|| -> io::Result<()> {
             match tag {
                 REC_MODULE | REC_JIT_MODULE => {
-                    modules.push(read_module_record(&mut reader, modules.len(), tag)?);
-                    frame_contexts.push_module();
+                    let module = read_module_record(&mut reader, modules.len(), tag)?;
+                    frame_contexts.push_module(modules.len(), module.owner);
+                    modules.push(module);
                 }
                 REC_FRAME => {
                     let module_limit = modules.len();
@@ -1288,7 +1342,11 @@ fn open_spool_with_range_limit(
                 }
                 REC_MODULE_DEACTIVATE => {
                     let process_id = read_pid(&mut reader)?;
-                    frame_contexts.deactivate_process(&modules, process_id.get(), frames.len());
+                    frame_contexts.deactivate_owner(
+                        ModuleOwner::Process(process_id),
+                        frames.len(),
+                        |_| {},
+                    );
                     processes.push(process_id);
                 }
                 REC_MODULE_DEACTIVATE_ONE => {
@@ -1306,7 +1364,7 @@ fn open_spool_with_range_limit(
                 tracing::warn!("spool tail truncated mid-record; keeping {sample_count} samples");
                 break;
             }
-            return Err(err);
+            return Err(record_error(err, tag, record_start));
         }
         if tag == REC_SAMPLE && scan_start.is_none() {
             if let Some(ranges) = &mut sample_ranges {
@@ -1371,7 +1429,35 @@ struct MmapSpoolCursor {
 
 trait SpoolRead {
     fn read_exact_spool(&mut self, buf: &mut [u8]) -> io::Result<()>;
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI>;
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI>;
+}
+
+/// Varint types decoded from spools, with the conversion integer-encoding
+/// applies to the raw `u64` value.
+trait SpoolVarint: VarInt {
+    fn from_raw_varint(raw: u64) -> Option<Self>;
+}
+
+impl SpoolVarint for u64 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        Some(raw)
+    }
+}
+
+impl SpoolVarint for u32 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        u32::try_from(raw).ok()
+    }
+}
+
+impl SpoolVarint for i64 {
+    #[inline]
+    fn from_raw_varint(raw: u64) -> Option<Self> {
+        // Zigzag decoding.
+        Some((raw >> 1) as i64 ^ -((raw & 1) as i64))
+    }
 }
 
 impl MmapSpoolCursor {
@@ -1388,6 +1474,12 @@ impl MmapSpoolCursor {
         self.read_exact_spool(&mut magic)?;
         if magic == *CURRENT_MAGIC {
             Ok(())
+        } else if let [b'S', b'P', b'U', b'L', b'S', b'E', version @ b'0'..=b'9', 0] = magic {
+            Err(invalid_data(format!(
+                "unsupported stackpulse spool format version {} (this reader supports version {})",
+                char::from(version),
+                char::from(CURRENT_MAGIC[6]),
+            )))
         } else {
             Err(invalid_data("invalid stackpulse spool magic"))
         }
@@ -1431,7 +1523,27 @@ impl MmapSpoolCursor {
     }
 
     #[inline]
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
+        // Varints that end within their first nine bytes cannot overflow a
+        // u64, so decode them inline. Longer, out-of-range and truncated
+        // varints take the integer-encoding path below.
+        let bytes = &self.mmap[self.position..];
+        let mut raw = 0_u64;
+        for (index, &byte) in bytes.iter().take(9).enumerate() {
+            raw |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                if let Some(value) = VI::from_raw_varint(raw) {
+                    self.position += index + 1;
+                    return Ok(value);
+                }
+                break;
+            }
+        }
+        self.read_varint_slow()
+    }
+
+    #[cold]
+    fn read_varint_slow<VI: VarInt>(&mut self) -> io::Result<VI> {
         let bytes = &self.mmap[self.position..];
         match VI::decode_var(bytes) {
             Some((value, len)) => {
@@ -1459,7 +1571,7 @@ impl SpoolRead for MmapSpoolCursor {
         Ok(())
     }
 
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
         MmapSpoolCursor::read_varint(self)
     }
 }
@@ -1469,7 +1581,7 @@ impl SpoolRead for &[u8] {
         Read::read_exact(self, buf)
     }
 
-    fn read_varint<VI: VarInt>(&mut self) -> io::Result<VI> {
+    fn read_varint<VI: SpoolVarint>(&mut self) -> io::Result<VI> {
         VarIntReader::read_varint(self)
     }
 }
@@ -1646,16 +1758,19 @@ fn find_unpinned_frame_module<'a>(
     frame: &FrameRecord,
 ) -> Option<FrameModuleRef<'a>> {
     let context = contexts.for_frame_id(frame_id)?;
+    let owner = match frame.mode {
+        FrameMode::Kernel => ModuleOwner::Kernel,
+        FrameMode::User => ModuleOwner::Process(crate::Pid::new(process_id)?),
+        FrameMode::TruncatedStackMarker => return None,
+    };
     let module_limit = context.module_limit.min(modules.len());
-    let module = modules
-        .get(..module_limit)?
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, module)| {
+    let module = contexts
+        .owned_modules_before(owner, module_limit)
+        .find_map(|index| {
             if !contexts.module_active(index, context) {
                 return None;
             }
+            let module = modules.get(index)?;
             module_owns_frame(module, process_id, frame).then_some(module)
         })?;
     frame_module_ref(module, frame)
@@ -1681,6 +1796,15 @@ fn frame_module_ref<'a>(
             .checked_sub(module.start)?
             .checked_add(module.file_offset)?,
     })
+}
+
+/// Locates a record decode error in the file, keeping its kind so it still
+/// reads as corruption.
+fn record_error(err: io::Error, tag: u8, record_start: usize) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("{err} (record tag {tag} at byte offset {record_start})"),
+    )
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -1912,6 +2036,8 @@ mod tests {
             last_timestamp_ns: 0,
             pinned_frame_cache: FxHashMap::default(),
             unpinned_frame_cache: FxHashMap::default(),
+            kernel_frame_cache: FxHashMap::default(),
+            kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
             thread_cache: FxHashMap::default(),
@@ -2102,6 +2228,49 @@ mod tests {
         };
         let _ = std::fs::remove_file(&path);
         assert_eq!(err.kind(), crate::ErrorKind::CorruptSpool);
+    }
+
+    #[test]
+    fn readers_report_where_a_corrupt_record_starts() {
+        let path = temp_spool_path("corrupt-record-offset");
+        PerfSpoolWriter::create(&path, 123, 10)
+            .unwrap()
+            .flush()
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let expected = format!("record tag 238 at byte offset {}", bytes.len());
+        bytes.push(0xee);
+        std::fs::write(&path, &bytes).unwrap();
+        let errors = [Snapshot::open(&path).err(), Tail::open(&path).err()];
+        std::fs::write(&path, b"SPULSE3\0").unwrap();
+        let version = Snapshot::open(&path).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        for err in errors.map(|err| err.unwrap().to_string()) {
+            assert!(err.contains(&expected), "{err}");
+        }
+        assert!(version.contains("unsupported stackpulse spool format version 3"));
+    }
+
+    #[test]
+    fn cursor_varints_match_integer_encoding_decoding() {
+        fn check<VI: SpoolVarint + PartialEq + std::fmt::Debug>(input: &[u8]) {
+            let mmap = crate::test_support::mmap_from_bytes(input);
+            let mut cursor = MmapSpoolCursor::at_position(mmap, 0);
+            let decoded = cursor.read_varint::<VI>().ok();
+            let decoded = decoded.map(|value| (value, cursor.position));
+            assert_eq!(decoded, VI::decode_var(input), "{input:02x?}");
+        }
+
+        // One- and nine-byte fast-path values, a u32 overflow, a ten-byte
+        // value and a truncated varint.
+        for value in [0x7f, (1 << 63) - 1, u64::from(u32::MAX) + 1, u64::MAX] {
+            let bytes = value.encode_var_vec();
+            check::<u64>(&bytes);
+            check::<u32>(&bytes);
+            check::<i64>(&bytes);
+        }
+        check::<u64>(&[0x80, 0x80]);
     }
 
     #[test]
@@ -2502,6 +2671,34 @@ mod tests {
     }
 
     #[test]
+    fn process_deactivation_keeps_earlier_deactivations_across_reused_pids() {
+        let path = temp_spool_path("reused-pid-deactivation");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        let write_module = |writer: &mut PerfSpoolWriter<_>, id, start| {
+            let mut record = module(7, start, start + 0x100, "/lib", false);
+            record.id = id;
+            writer.write_module(&record).unwrap();
+        };
+        write_module(&mut writer, 0, 0x1000);
+        write_module(&mut writer, 1, 0x2000);
+        writer.write_sample_frames(1, 7, 7, [frame(0x10)]).unwrap();
+        writer.write_module_deactivation_one(0).unwrap();
+        writer.write_sample_frames(2, 7, 7, [frame(0x20)]).unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        write_module(&mut writer, 2, 0x3000);
+        writer.write_sample_frames(3, 7, 7, [frame(0x30)]).unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let snapshot = Snapshot::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let deactivated_at = &snapshot.definitions.frame_contexts.module_deactivated_at;
+        let deactivated_at = [0, 1, 2].map(|id| *deactivated_at.get(id).unwrap());
+        assert_eq!(deactivated_at, [Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
     fn reader_resolves_moduleless_frames_before_later_deactivation() {
         let path = temp_spool_path("pre-deactivation-module");
         let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
@@ -2530,6 +2727,37 @@ mod tests {
                 .map(|module| module.module.path.to_str().unwrap()),
             Some("/old")
         );
+    }
+
+    #[test]
+    fn moduleless_frames_resolve_only_to_modules_of_their_owner() {
+        let path = temp_spool_path("moduleless-owner");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        for (id, (process_id, path)) in [(7, "/seven"), (8, "/eight"), (-1, "[kernel]")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut record = module(process_id, 0x1000, 0x2000, path, process_id < 0);
+            record.id = id as u32;
+            writer.write_module(&record).unwrap();
+        }
+        let stack_id = writer
+            .write_sample_frames(1_000, 7, 7, [kernel_frame(0x1100), frame(0x1100)])
+            .unwrap()
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reader = Snapshot::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        for (process_id, user) in [(7, Some("/seven")), (8, Some("/eight")), (9, None)] {
+            let paths: Vec<_> = reader
+                .stack_frame_contexts(crate::Pid::try_from(process_id).unwrap(), stack_id)
+                .unwrap()
+                .map(|context| context.module.map(|m| m.module.path.to_str().unwrap()))
+                .collect();
+            assert_eq!(paths, [Some("[kernel]"), user]);
+        }
     }
 
     #[test]
@@ -2604,6 +2832,43 @@ mod tests {
 
         assert_eq!(first_stack, second_stack);
         assert_eq!(reader.frames(), &[pinned]);
+    }
+
+    fn kernel_frame(abs_ip: u64) -> FrameRecord {
+        FrameRecord {
+            mode: FrameMode::Kernel,
+            ..frame(abs_ip)
+        }
+    }
+
+    #[test]
+    fn writer_keeps_kernel_frames_across_user_module_changes() {
+        let mut writer = writer();
+        let frames = [kernel_frame(0xffff_ffff_c000_0010)];
+        let before = writer.write_sample_frames(1_000, 7, 7, frames).unwrap();
+        writer
+            .write_module(&module(7, 0x1000, 0x2000, "/main", false))
+            .unwrap();
+        writer.write_module_deactivation(7).unwrap();
+        let after = writer.write_sample_frames(2_000, 7, 7, frames).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn module_lookup_after_mapping_change_updates_only_that_process() {
+        let mut table = ModuleTable::default();
+        let mut writer = writer();
+        for process_id in [7, 8] {
+            let lib = module(process_id, 0x1000, 0x2000, "/lib", false);
+            table.intern_module(lib, &mut writer).unwrap();
+        }
+        assert!(table.covers_user_pc(8, 0x1000));
+        let replacement = module(7, 0x1000, 0x2000, "/new", false);
+        let replacement = table.intern_module(replacement, &mut writer).unwrap();
+
+        let resolved = table.resolve_frame(7, 0x1000, FrameMode::User);
+        assert_eq!(resolved.module_id, Some(replacement));
+        assert!(table.covers_user_pc(8, 0x1000));
     }
 
     #[test]

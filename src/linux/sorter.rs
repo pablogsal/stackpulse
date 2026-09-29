@@ -134,6 +134,22 @@ impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
 }
 
 #[cfg(test)]
+impl<G: Clone + Ord, K: Ord, V> EventSorter<G, K, V> {
+    /// Queue an event as if `group` produced it in the round after the
+    /// current one, like a ring read in the last round of a drain.
+    pub(super) fn push_next_round(&mut self, group: G, key: K, value: V) {
+        let sequence = take_sequence(&mut self.next_sequence);
+        self.heap.push(EventHeapItem {
+            group,
+            round: self.round + 1,
+            key,
+            sequence,
+            value,
+        });
+    }
+}
+
+#[cfg(test)]
 impl<G: Clone + Ord, K: Ord, V> Extend<(K, V)> for EventSorter<G, K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (key, value) in iter {

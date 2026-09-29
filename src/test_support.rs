@@ -1,4 +1,5 @@
 use memmap2::{Mmap, MmapOptions};
+use std::ffi::{CStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -78,25 +79,89 @@ pub(crate) fn mmap_from_bytes(bytes: &[u8]) -> Arc<Mmap> {
     Arc::new(mmap.make_read_only().expect("make mmap read-only"))
 }
 
+pub(crate) fn current_test_binary() -> OsString {
+    std::env::current_exe()
+        .expect("current test binary")
+        .into_os_string()
+}
+
+pub(crate) fn ignored_test_args(test_name: &str) -> [OsString; 3] {
+    [
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from(test_name),
+    ]
+}
+
+/// Whether a recorder error means perf events are unavailable, so a test skips.
+pub(crate) fn perf_unavailable(err: &crate::Error) -> bool {
+    matches!(
+        err.kind(),
+        crate::ErrorKind::Permission | crate::ErrorKind::Unsupported
+    ) || matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP))
+}
+
+pub(crate) fn process_handle(pid: u32) -> crate::state::ProcessHandle {
+    crate::state::ProcessHandle::open(crate::Pid::new(pid as i32).expect("positive pid"))
+}
+
 pub(crate) struct SleepChild {
     pid: Option<libc::pid_t>,
 }
 
 impl SleepChild {
     pub(crate) fn spawn() -> Self {
+        Self::spawn_with(true, None)
+    }
+
+    /// Spawn a child that has cleared its dumpable flag before this returns,
+    /// so ptrace access checks deny it even to the same user and
+    /// `/proc/<pid>/maps` is unreadable to unprivileged same-uid observers.
+    pub(crate) fn spawn_non_dumpable() -> Self {
+        Self::spawn_with(false, None)
+    }
+
+    /// Spawn a child whose kernel command name is `name`, which need not be UTF-8.
+    pub(crate) fn spawn_named(name: &CStr) -> Self {
+        Self::spawn_with(true, Some(name))
+    }
+
+    fn spawn_with(dumpable: bool, name: Option<&CStr>) -> Self {
+        let mut ready = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "create ready pipe: {}",
+            io::Error::last_os_error()
+        );
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork test child: {}", io::Error::last_os_error());
         if pid == 0 {
             unsafe {
+                if let Some(name) = name {
+                    libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+                }
                 reset_signal(libc::SIGINT);
                 reset_signal(libc::SIGTERM);
                 let mut mask = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                if !dumpable {
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0);
+                }
+                libc::write(ready[1], [0_u8].as_ptr().cast(), 1);
                 loop {
                     libc::pause();
                 }
             }
+        }
+        // Other test threads may fork and inherit the write end, so wait for
+        // the child's byte rather than for end of file.
+        let mut byte = 0_u8;
+        unsafe {
+            libc::close(ready[1]);
+            libc::read(ready[0], (&raw mut byte).cast(), 1);
+            libc::close(ready[0]);
         }
         Self { pid: Some(pid) }
     }

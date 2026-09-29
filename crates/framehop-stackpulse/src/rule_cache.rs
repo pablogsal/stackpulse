@@ -3,14 +3,12 @@ use alloc::boxed::Box;
 use crate::{unwind_rule::UnwindRule, FramePointerFallbackReason};
 
 const CACHE_ENTRY_COUNT: usize = 509;
-const CACHE_FLAG_WORD_COUNT: usize = CACHE_ENTRY_COUNT.div_ceil(u64::BITS as usize);
 
 pub struct RuleCache<R: UnwindRule> {
     entries: Box<[Option<CacheEntry<R>>; CACHE_ENTRY_COUNT]>,
     fallbacks: Box<[Option<FramePointerFallbackReason>; CACHE_ENTRY_COUNT]>,
-    dwarf_register_defaults: [u64; CACHE_FLAG_WORD_COUNT],
+    dwarf_register_rules: Box<[Option<u64>; CACHE_ENTRY_COUNT]>,
     stats: CacheStats,
-    modules_epoch: u64,
 }
 
 impl<R: UnwindRule> RuleCache<R> {
@@ -18,9 +16,8 @@ impl<R: UnwindRule> RuleCache<R> {
         Self {
             entries: Box::new([None; CACHE_ENTRY_COUNT]),
             fallbacks: Box::new([None; CACHE_ENTRY_COUNT]),
-            dwarf_register_defaults: [0; CACHE_FLAG_WORD_COUNT],
+            dwarf_register_rules: Box::new([None; CACHE_ENTRY_COUNT]),
             stats: CacheStats::new(),
-            modules_epoch: 0,
         }
     }
 
@@ -30,7 +27,6 @@ impl<R: UnwindRule> RuleCache<R> {
         modules_generation: u64,
         is_first_frame: bool,
     ) -> CacheResult<R> {
-        self.set_modules_epoch(modules_generation);
         let slot = ((address % CACHE_ENTRY_COUNT as u64) * 2 + u64::from(is_first_frame))
             % CACHE_ENTRY_COUNT as u64;
         let slot = slot as u16;
@@ -39,13 +35,13 @@ impl<R: UnwindRule> RuleCache<R> {
                 self.stats.miss_empty_slot_count += 1;
             }
             Some(entry) => {
-                if entry.modules_generation == modules_generation as u16 {
+                if entry.modules_generation == modules_generation {
                     if entry.address == address {
                         self.stats.hit_count += 1;
                         return CacheResult::Hit(
                             entry.unwind_rule,
                             self.fallbacks[slot as usize],
-                            self.uses_dwarf_register_defaults(slot),
+                            self.dwarf_register_rules[slot as usize],
                         );
                     } else {
                         self.stats.miss_wrong_address_count += 1;
@@ -67,66 +63,31 @@ impl<R: UnwindRule> RuleCache<R> {
         handle: CacheHandle,
         unwind_rule: R,
         fallback: Option<FramePointerFallbackReason>,
-        uses_dwarf_register_defaults: bool,
+        dwarf_register_rules: Option<u64>,
     ) {
         let CacheHandle {
             slot,
             address,
             modules_generation,
         } = handle;
-        self.set_modules_epoch(modules_generation);
         self.entries[slot as usize] = Some(CacheEntry {
             address,
-            modules_generation: modules_generation as u16,
+            modules_generation,
             unwind_rule,
         });
         self.fallbacks[slot as usize] = fallback;
-        self.set_uses_dwarf_register_defaults(slot, uses_dwarf_register_defaults);
+        self.dwarf_register_rules[slot as usize] = dwarf_register_rules;
     }
 
     /// Returns a snapshot of the cache usage statistics.
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
-
-    #[inline]
-    fn set_modules_epoch(&mut self, modules_generation: u64) {
-        let epoch = modules_generation >> u16::BITS;
-        if self.modules_epoch != epoch {
-            self.reset_modules_epoch(epoch);
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn reset_modules_epoch(&mut self, epoch: u64) {
-        self.entries.fill(None);
-        self.fallbacks.fill(None);
-        self.dwarf_register_defaults.fill(0);
-        self.modules_epoch = epoch;
-    }
-
-    fn uses_dwarf_register_defaults(&self, slot: u16) -> bool {
-        let slot = usize::from(slot);
-        self.dwarf_register_defaults[slot / u64::BITS as usize] & (1 << (slot % u64::BITS as usize))
-            != 0
-    }
-
-    fn set_uses_dwarf_register_defaults(&mut self, slot: u16, value: bool) {
-        let slot = usize::from(slot);
-        let word = &mut self.dwarf_register_defaults[slot / u64::BITS as usize];
-        let mask = 1 << (slot % u64::BITS as usize);
-        if value {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
-    }
 }
 
 pub enum CacheResult<R: UnwindRule> {
     Miss(CacheHandle),
-    Hit(R, Option<FramePointerFallbackReason>, bool),
+    Hit(R, Option<FramePointerFallbackReason>, Option<u64>),
 }
 
 pub struct CacheHandle {
@@ -143,7 +104,9 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug)]
 struct CacheEntry<R: UnwindRule> {
     address: u64,
-    modules_generation: u16,
+    /// The full generation, so that unwinders sharing the cache never see each
+    /// other's rules, even when their generations are far apart.
+    modules_generation: u64,
     unwind_rule: R,
 }
 
@@ -197,27 +160,25 @@ mod tests {
     fn generation_rollover_invalidates_rules_and_metadata() {
         let mut cache = RuleCache::new();
         let address = 0x1234;
-        for generation in [0, 1 << u16::BITS, 0] {
+        for (generation, metadata) in [(0, true), (1 << u16::BITS, false), (0, true)] {
             let CacheResult::Miss(handle) = cache.lookup(address, generation, false) else {
                 panic!("a different generation must not reuse the old rule");
             };
-            assert!(cache.entries.iter().all(Option::is_none));
-            assert!(cache.fallbacks.iter().all(Option::is_none));
-            assert_eq!(cache.dwarf_register_defaults, [0; CACHE_FLAG_WORD_COUNT]);
+            let fallback = metadata.then_some(FramePointerFallbackReason::NoModule);
+            let register_rules = metadata.then_some(0x3ff);
             cache.insert(
                 handle,
                 UnwindRuleX86_64::JustReturn,
-                Some(FramePointerFallbackReason::NoModule),
-                true,
+                fallback,
+                register_rules,
             );
-            assert!(matches!(
-                cache.lookup(address, generation, false),
-                CacheResult::Hit(
-                    UnwindRuleX86_64::JustReturn,
-                    Some(FramePointerFallbackReason::NoModule),
-                    true,
-                )
-            ));
+            let CacheResult::Hit(UnwindRuleX86_64::JustReturn, cached_fallback, cached_rules) =
+                cache.lookup(address, generation, false)
+            else {
+                panic!("the inserted rule must be cached");
+            };
+            assert_eq!(cached_fallback, fallback);
+            assert_eq!(cached_rules, register_rules);
         }
         assert_eq!(cache.stats().hits(), 3);
         assert_eq!(cache.stats().misses(), 3);
@@ -234,11 +195,11 @@ mod tests {
         let CacheResult::Miss(new_handle) = cache.lookup(address, new_generation, false) else {
             panic!("the new generation must miss");
         };
-        cache.insert(new_handle, UnwindRuleX86_64::JustReturn, None, false);
-        cache.insert(old_handle, UnwindRuleX86_64::EndOfStack, None, false);
+        cache.insert(new_handle, UnwindRuleX86_64::JustReturn, None, None);
+        cache.insert(old_handle, UnwindRuleX86_64::EndOfStack, None, None);
         assert!(matches!(
             cache.lookup(address, 7, false),
-            CacheResult::Hit(UnwindRuleX86_64::EndOfStack, None, false)
+            CacheResult::Hit(UnwindRuleX86_64::EndOfStack, None, None)
         ));
         assert!(matches!(
             cache.lookup(address, new_generation, false),
@@ -253,12 +214,12 @@ mod tests {
             let CacheResult::Miss(handle) = cache.lookup(address, generation, false) else {
                 panic!("the address has not been cached");
             };
-            cache.insert(handle, UnwindRuleX86_64::JustReturn, None, false);
+            cache.insert(handle, UnwindRuleX86_64::JustReturn, None, None);
         }
         for (address, generation) in [(0x1000, 42), (0x1001, 43)] {
             assert!(matches!(
                 cache.lookup(address, generation, false),
-                CacheResult::Hit(UnwindRuleX86_64::JustReturn, None, false)
+                CacheResult::Hit(UnwindRuleX86_64::JustReturn, None, None)
             ));
         }
         assert!(matches!(
@@ -269,12 +230,31 @@ mod tests {
         assert_eq!(cache.stats().hits(), 2);
     }
 
+    #[test]
+    fn alternating_generations_across_an_epoch_keep_their_rules() {
+        // Unwinders whose generations straddle an epoch can share one cache.
+        let mut cache = RuleCache::new();
+        let lookups = [(0x1000, 0xffff), (0x1001, 1 << u16::BITS)];
+        for (address, generation) in lookups {
+            let CacheResult::Miss(handle) = cache.lookup(address, generation, false) else {
+                panic!("the address has not been cached");
+            };
+            cache.insert(handle, UnwindRuleX86_64::JustReturn, None, None);
+        }
+        for (address, generation) in lookups {
+            assert!(matches!(
+                cache.lookup(address, generation, false),
+                CacheResult::Hit(UnwindRuleX86_64::JustReturn, None, None)
+            ));
+        }
+    }
+
     // Ensure that the size of Option<CacheEntry<UnwindRuleX86_64>> doesn't change by accident.
     #[test]
     fn test_cache_entry_size() {
         assert_eq!(
             core::mem::size_of::<Option<CacheEntry<UnwindRuleX86_64>>>(),
-            16
+            24
         );
         assert_eq!(
             core::mem::size_of::<Option<CacheEntry<UnwindRuleAarch64>>>(),

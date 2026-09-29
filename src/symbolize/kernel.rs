@@ -48,7 +48,7 @@ pub(super) struct ResolvedKernelSymbol {
 
 #[derive(Clone)]
 pub(super) enum KernelSymbolTable {
-    Full(Arc<[KernelSymbol]>),
+    Full(Arc<FullKernelSymbols>),
     Sparse(Arc<[(u64, KernelSymbol)]>),
 }
 
@@ -57,11 +57,57 @@ impl KernelSymbolTable {
         Self::Sparse(Arc::from([]))
     }
 
+    #[cfg(test)]
+    pub(super) fn full(symbols: &[KernelSymbol]) -> Self {
+        let mut builder = kallsyms::FullKernelSymbolsBuilder::default();
+        for symbol in symbols {
+            let module = symbol.module.as_deref().map(|module| {
+                module
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .as_bytes()
+            });
+            builder
+                .push(symbol.address, symbol.name.as_bytes(), module)
+                .unwrap();
+        }
+        Self::Full(Arc::new(builder.finish()))
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         match self {
-            Self::Full(symbols) => symbols.is_empty(),
+            Self::Full(symbols) => symbols.symbols.is_empty(),
             Self::Sparse(symbols) => symbols.is_empty(),
         }
+    }
+}
+
+/// Every symbol from one kallsyms read, sorted by address. Names share one
+/// arena and module names are interned, so the table costs a handful of
+/// allocations instead of one or two per symbol; the host table lives for the
+/// rest of the process.
+#[derive(Default)]
+pub(super) struct FullKernelSymbols {
+    symbols: Box<[FullKernelSymbol]>,
+    names: Box<str>,
+    modules: Box<[Box<str>]>,
+}
+
+#[derive(Clone, Copy)]
+struct FullKernelSymbol {
+    address: u64,
+    name_start: u32,
+    name_len: u32,
+    module: Option<u32>,
+}
+
+impl FullKernelSymbols {
+    fn find(&self, address: u64) -> Option<(u64, &str, Option<&str>)> {
+        let symbol = *find_by_address(&self.symbols, address, |s| s.address)?;
+        let name_start = symbol.name_start as usize;
+        let name = &self.names[name_start..name_start + symbol.name_len as usize];
+        let module = symbol.module.map(|module| &*self.modules[module as usize]);
+        Some((symbol.address, name, module))
     }
 }
 
@@ -85,18 +131,15 @@ pub(super) fn load_kernel_symbols_from_path(path: &Path) -> io::Result<KernelSym
             "kernel symbol source exceeds 64 MiB",
         ));
     }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_KERNEL_SYMBOL_FILE_SIZE + 1)
-        .read_to_end(&mut data)?;
-    if data.len() as u64 > MAX_KERNEL_SYMBOL_FILE_SIZE {
+    let mut reader = io::BufReader::new(file.take(MAX_KERNEL_SYMBOL_FILE_SIZE + 1));
+    let symbols = kallsyms::parse_full_kernel_symbols(&mut reader)?;
+    if reader.into_inner().limit() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "kernel symbol source exceeds 64 MiB",
         ));
     }
-    Ok(KernelSymbolTable::Full(Arc::from(
-        kallsyms::parse_kernel_symbols(&data).into_boxed_slice(),
-    )))
+    Ok(KernelSymbolTable::Full(Arc::new(symbols)))
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -139,14 +182,24 @@ pub(super) fn resolve_kernel_symbol(
     symbols: &KernelSymbolTable,
     abs_ip: u64,
 ) -> Option<ResolvedKernelSymbol> {
-    let symbol = find_kernel_symbol_in_table(symbols, abs_ip)?;
-    let offset = abs_ip.saturating_sub(symbol.address);
+    let (address, name, module) = match symbols {
+        KernelSymbolTable::Full(symbols) => symbols.find(abs_ip)?,
+        KernelSymbolTable::Sparse(symbols) => {
+            let idx = symbols
+                .binary_search_by_key(&abs_ip, |(address, _)| *address)
+                .ok()?;
+            let symbol = &symbols[idx].1;
+            (
+                symbol.address,
+                symbol.name.as_str(),
+                symbol.module.as_deref(),
+            )
+        }
+    };
+    let offset = abs_ip.saturating_sub(address);
     Some(ResolvedKernelSymbol {
-        name: format_symbol(&symbol.name, offset),
-        module: symbol
-            .module
-            .clone()
-            .unwrap_or_else(|| "[kernel]".to_owned()),
+        name: format_symbol(name, offset),
+        module: module.unwrap_or("[kernel]").to_owned(),
         offset,
     })
 }
@@ -160,17 +213,11 @@ fn format_symbol(name: &str, offset: u64) -> String {
 }
 
 fn find_kernel_symbol(symbols: &[KernelSymbol], address: u64) -> Option<&KernelSymbol> {
-    symbols[..symbols.partition_point(|s| s.address <= address)].last()
+    find_by_address(symbols, address, |s| s.address)
 }
 
-fn find_kernel_symbol_in_table(symbols: &KernelSymbolTable, address: u64) -> Option<&KernelSymbol> {
-    match symbols {
-        KernelSymbolTable::Full(symbols) => find_kernel_symbol(symbols, address),
-        KernelSymbolTable::Sparse(symbols) => symbols
-            .binary_search_by_key(&address, |(address, _)| *address)
-            .ok()
-            .map(|idx| &symbols[idx].1),
-    }
+fn find_by_address<T>(symbols: &[T], address: u64, key: impl Fn(&T) -> u64) -> Option<&T> {
+    symbols[..symbols.partition_point(|s| key(s) <= address)].last()
 }
 
 fn is_kernel_text_symbol(name: &[u8]) -> bool {
@@ -293,19 +340,19 @@ fn warn_kallsyms_unusable(err: Option<&io::Error>) {
 }
 
 pub(super) fn load_shared_kernel_symbols() -> KernelSymbolTable {
-    static KERNEL_SYMBOLS: OnceLock<Arc<[KernelSymbol]>> = OnceLock::new();
+    static KERNEL_SYMBOLS: OnceLock<Arc<FullKernelSymbols>> = OnceLock::new();
     KernelSymbolTable::Full(Arc::clone(KERNEL_SYMBOLS.get_or_init(|| {
         let symbols = match load_kernel_symbols() {
             Ok(symbols) => symbols,
             Err(err) => {
                 warn_kallsyms_unusable(Some(&err));
-                Vec::new()
+                FullKernelSymbols::default()
             }
         };
-        if symbols.is_empty() {
+        if symbols.symbols.is_empty() {
             warn_kallsyms_unusable(None);
         }
-        Arc::from(symbols.into_boxed_slice())
+        Arc::new(symbols)
     })))
 }
 
@@ -314,6 +361,24 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn full_kernel_symbol_table_keeps_the_last_alias_and_its_module() {
+        let dir = TempDir::new("full-kernel-symbols");
+        let path = dir.path().join("kallsyms");
+        let kallsyms = "ffffffff81000000 T _text\n\
+                        ffffffff81000100 t first\n\
+                        ffffffff81000100 t last\t[module]\n";
+        fs::write(&path, kallsyms).unwrap();
+
+        let table = load_kernel_symbols_from_path(&path).unwrap();
+        let symbol = resolve_kernel_symbol(&table, 0xffff_ffff_8100_0104).unwrap();
+        assert_eq!(
+            (symbol.name.as_str(), symbol.module.as_str()),
+            ("last+0x4", "[module]")
+        );
+    }
 
     #[test]
     fn extending_sparse_kernel_symbols_without_addresses_allocates_nothing() {

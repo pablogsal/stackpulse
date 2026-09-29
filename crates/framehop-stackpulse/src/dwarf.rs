@@ -1,11 +1,11 @@
-use core::{marker::PhantomData, ops::Range};
+use core::{cmp::Ordering, marker::PhantomData, ops::Range};
 
 use alloc::vec::Vec;
 use gimli::{
-    CfaRule, CieOrFde, DebugFrame, EhFrame, EhFrameHdr, Encoding, EndianSlice, Evaluation,
+    CfaRule, CieOrFde, DebugFrame, DwEhPe, EhFrame, EhFrameHdr, Encoding, EndianSlice, Evaluation,
     EvaluationResult, EvaluationStorage, Expression, LittleEndian, Location, ParsedEhFrameHdr,
     Reader, ReaderOffset, Register, RegisterRule, UnwindContext, UnwindContextStorage,
-    UnwindOffset, UnwindSection, UnwindTableRow, Value,
+    UnwindOffset, UnwindSection, UnwindTableRow, Value, Vendor,
 };
 
 pub(crate) use gimli::BaseAddresses;
@@ -64,6 +64,10 @@ pub(crate) fn register_rule_to_cfa_offset<RO: ReaderOffset>(
 }
 
 pub trait DwarfUnwinding: Arch {
+    /// Selects vendor-specific call frame instructions, such as aarch64's
+    /// `DW_CFA_AARCH64_negate_ra_state`.
+    const CFI_VENDOR: Vendor = Vendor::Default;
+
     fn unwind_frame<F, R, UCS, ES>(
         section: &impl UnwindSection<R>,
         unwind_info: &UnwindTableRow<R::Offset, UCS>,
@@ -166,6 +170,7 @@ where
             UnwindSectionType::EhFrame => {
                 let mut eh_frame = EhFrame::from(unwind_section_data);
                 eh_frame.set_address_size(8);
+                eh_frame.set_vendor(A::CFI_VENDOR);
                 self.unwind_frame_in_section::<_, F, ES>(
                     &eh_frame,
                     lookup_svma,
@@ -178,6 +183,7 @@ where
             UnwindSectionType::DebugFrame => {
                 let mut debug_frame = DebugFrame::from(unwind_section_data);
                 debug_frame.set_address_size(8);
+                debug_frame.set_vendor(A::CFI_VENDOR);
                 self.unwind_frame_in_section::<_, F, ES>(
                     &debug_frame,
                     lookup_svma,
@@ -398,6 +404,101 @@ impl DwarfCfiIndex {
     }
 }
 
+/// The binary search table of an `.eh_frame_hdr` section in the layout that GNU ld,
+/// gold, lld and mold emit: a 4-byte `.eh_frame` pointer, a `udata4` FDE count and
+/// `datarel | sdata4` rows. We check the header once when the module is added, so
+/// that lookups can search the rows in place instead of re-parsing the header and
+/// decoding every probed row through gimli's generic pointer decoder.
+pub struct EhFrameHdrTable {
+    fde_count: usize,
+    base_svma: u64,
+    eh_frame_hdr_svma: u64,
+    eh_frame_ptr: u64,
+}
+
+impl EhFrameHdrTable {
+    const TABLE_OFFSET: usize = 12;
+    const ROW_SIZE: usize = 8;
+
+    /// Returns `None` for other header layouts, which keep using gimli's lookup.
+    pub fn try_new(
+        eh_frame_hdr_data: &[u8],
+        bases: &BaseAddresses,
+        base_svma: u64,
+    ) -> Option<Self> {
+        let [1, eh_frame_ptr_enc, fde_count_enc, table_enc] = *eh_frame_hdr_data.first_chunk()?
+        else {
+            return None;
+        };
+        if !matches!(
+            DwEhPe(eh_frame_ptr_enc).format(),
+            gimli::DW_EH_PE_udata4 | gimli::DW_EH_PE_sdata4
+        ) || DwEhPe(fde_count_enc) != gimli::DW_EH_PE_udata4
+            || DwEhPe(table_enc) != DwEhPe(gimli::DW_EH_PE_datarel.0 | gimli::DW_EH_PE_sdata4.0)
+        {
+            return None;
+        }
+        let hdr = EhFrameHdr::new(eh_frame_hdr_data, LittleEndian)
+            .parse(bases, 8)
+            .ok()?;
+        let eh_frame_ptr = hdr.eh_frame_ptr().direct().ok()?;
+        let fde_count = u32::from_le_bytes(*eh_frame_hdr_data.get(8..)?.first_chunk()?);
+        let fde_count = usize::try_from(fde_count).ok()?;
+        let table_end = fde_count
+            .checked_mul(Self::ROW_SIZE)?
+            .checked_add(Self::TABLE_OFFSET)?;
+        if fde_count == 0 || table_end > eh_frame_hdr_data.len() {
+            return None;
+        }
+        Some(Self {
+            fde_count,
+            base_svma,
+            eh_frame_hdr_svma: bases.eh_frame_hdr.data?,
+            eh_frame_ptr,
+        })
+    }
+
+    pub fn fde_offset_for_relative_address(
+        &self,
+        eh_frame_hdr_data: &[u8],
+        rel_lookup_address: u32,
+    ) -> Option<u32> {
+        let lookup_svma = self.base_svma + rel_lookup_address as u64;
+        let table = eh_frame_hdr_data.get(Self::TABLE_OFFSET..)?;
+        if lookup_svma < self.read_pointer(table, 0)? {
+            return None;
+        }
+        // Same search as gimli's `EhHdrTable::lookup`, so that tables with duplicate
+        // initial locations resolve to the same row.
+        let mut row = 0;
+        let mut len = self.fde_count;
+        while len > 1 {
+            let pivot = row + len / 2;
+            match self
+                .read_pointer(table, pivot * Self::ROW_SIZE)?
+                .cmp(&lookup_svma)
+            {
+                Ordering::Equal => {
+                    row = pivot;
+                    break;
+                }
+                Ordering::Less => {
+                    row = pivot;
+                    len -= len / 2;
+                }
+                Ordering::Greater => len /= 2,
+            }
+        }
+        let fde_ptr = self.read_pointer(table, row * Self::ROW_SIZE + 4)?;
+        fde_ptr.checked_sub(self.eh_frame_ptr)?.try_into().ok()
+    }
+
+    fn read_pointer(&self, table: &[u8], offset: usize) -> Option<u64> {
+        let value = i32::from_le_bytes(*table.get(offset..)?.first_chunk()?);
+        Some(self.eh_frame_hdr_svma.wrapping_add(value as i64 as u64))
+    }
+}
+
 pub trait DwarfUnwindRegs {
     fn get(&self, register: Register) -> Option<u64>;
 }
@@ -427,6 +528,18 @@ where
     }
 }
 
+/// Iteration limit passed to gimli's `Evaluation::set_max_iterations`, which gimli
+/// provides to stop bad DWARF bytecode from causing a denial of service. Without
+/// it, gimli places no bound on evaluation, so an expression that loops forever
+/// through a backward `DW_OP_skip` or `DW_OP_bra` would never finish. One iteration
+/// is roughly one evaluated operation, and the count covers the whole evaluation,
+/// including after each register or memory resumption. An expression that needs
+/// more iterations fails with `TooManyIterations`, and `eval_expr` returns `None`,
+/// the same as for any other evaluation error. Callers handle that `None` as they
+/// handle any rule they cannot evaluate, which for some register rules means
+/// falling back to a default value rather than failing the frame.
+const MAX_EXPRESSION_ITERATIONS: u32 = 1024;
+
 fn eval_expr<R, F, UR, S>(
     expr: Expression<R>,
     encoding: Encoding,
@@ -440,6 +553,7 @@ where
     S: EvaluationStorage<R>,
 {
     let mut eval = Evaluation::<R, S>::new_in(expr.0, encoding);
+    eval.set_max_iterations(MAX_EXPRESSION_ITERATIONS);
     let mut result = eval.evaluate().ok()?;
     loop {
         match result {
@@ -518,7 +632,9 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use alloc::vec;
+
     use gimli::{AArch64, DebugFrame, Format, StoreOnHeap, UnwindExpression, X86_64};
 
     use crate::{
@@ -527,6 +643,51 @@ mod tests {
     };
 
     use super::*;
+
+    /// The x86-64 entry CIE after its id: CFA = rsp + 8, return address at CFA - 8.
+    pub(crate) const X86_64_CIE: [u8; 10] = [
+        1,
+        0,
+        1,
+        0x78,
+        X86_64::RA.0 as u8,
+        gimli::DW_CFA_def_cfa.0,
+        X86_64::RSP.0 as u8,
+        8,
+        gimli::DW_CFA_offset.0 | X86_64::RA.0 as u8,
+        1,
+    ];
+
+    /// The AArch64 entry CIE after its id: CFA = sp, return address in x30.
+    pub(crate) const AARCH64_CIE: [u8; 8] = [
+        1,
+        0,
+        4,
+        0x78,
+        AArch64::X30.0 as u8,
+        gimli::DW_CFA_def_cfa.0,
+        AArch64::SP.0 as u8,
+        0,
+    ];
+
+    /// Builds an `.eh_frame` section with `cie` followed by an FDE for `range` that runs
+    /// `instructions`, and returns it with the offset of the FDE.
+    pub(crate) fn eh_frame_with_fde(
+        cie: &[u8],
+        range: Range<u64>,
+        instructions: &[u8],
+    ) -> (Vec<u8>, u32) {
+        let mut data = (4 + cie.len() as u32).to_le_bytes().to_vec();
+        data.extend(0u32.to_le_bytes());
+        data.extend(cie);
+        let fde_offset = data.len() as u32;
+        data.extend((20 + instructions.len() as u32).to_le_bytes());
+        data.extend((fde_offset + 4).to_le_bytes());
+        data.extend(range.start.to_le_bytes());
+        data.extend((range.end - range.start).to_le_bytes());
+        data.extend(instructions);
+        (data, fde_offset)
+    }
 
     #[test]
     fn header_lookup_rejects_addresses_before_its_first_entry() {
@@ -565,6 +726,44 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_hdr_table_matches_gimli_lookup() {
+        use crate::x86_64::ArchX86_64;
+
+        // Common layout with duplicate initial locations, at eh_frame_hdr 0x9000.
+        let mut header = vec![1, 0x1b, 0x03, 0x3b];
+        header.extend_from_slice(&0xfc_i32.to_le_bytes());
+        header.extend_from_slice(&5_u32.to_le_bytes());
+        for (address, fde) in [
+            (-0x8000_i32, 0x100_i32),
+            (-0x7000, 0x120),
+            (-0x7000, 0x140),
+            (-0x7000, 0x160),
+            (-0x6000, 0x180),
+        ] {
+            header.extend_from_slice(&address.to_le_bytes());
+            header.extend_from_slice(&fde.to_le_bytes());
+        }
+        let bases = BaseAddresses::default().set_eh_frame_hdr(0x9000);
+        let table = EhFrameHdrTable::try_new(&header, &bases, 0).unwrap();
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        let unwinder = DwarfUnwinder::<_, ArchX86_64, _>::new(
+            EndianSlice::new(&[], LittleEndian),
+            UnwindSectionType::EhFrame,
+            Some(&header),
+            &mut context,
+            bases.clone(),
+            0,
+        );
+        for address in 0..0x4000 {
+            assert_eq!(
+                table.fde_offset_for_relative_address(&header, address),
+                unwinder.get_fde_offset_for_relative_address(address),
+                "{address:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn eh_frame_and_debug_frame_preserve_unwind_and_error_outcomes() {
         use crate::error::UnwinderError;
         use crate::x86_64::{ArchX86_64, UnwindRuleX86_64};
@@ -576,14 +775,7 @@ mod tests {
             };
             let mut data = 14u32.to_le_bytes().to_vec();
             data.extend(cie_id.to_le_bytes());
-            data.extend([1, 0, 1, 0x78, X86_64::RA.0 as u8]);
-            data.extend([
-                gimli::DW_CFA_def_cfa.0,
-                X86_64::RSP.0 as u8,
-                8,
-                gimli::DW_CFA_offset.0 | X86_64::RA.0 as u8,
-                1,
-            ]);
+            data.extend(X86_64_CIE);
             let fde_offset = data.len() as u32;
             let cie_pointer = match section_type {
                 UnwindSectionType::EhFrame => fde_offset + 4,
@@ -612,8 +804,9 @@ mod tests {
                     fde_offset,
                     &mut read_stack,
                 ),
-                Ok(UnwindResult::ExecRuleWithDwarfRegisterDefaults(
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
                     UnwindRuleX86_64::OffsetSp { sp_offset_by_8: 1 },
+                    0,
                 ))
             ));
             assert!(matches!(
@@ -640,6 +833,99 @@ mod tests {
                 Err(DwarfUnwinderError::FdeFromOffsetFailed(_))
             ));
         }
+    }
+
+    #[test]
+    fn aarch64_return_address_signing_does_not_abort_dwarf_unwinding() {
+        use crate::aarch64::ArchAarch64;
+
+        // CIE with CFA = sp, and an FDE for [0x1000, 0x1040) that toggles the signing state
+        // like `paciasp` in a `-mbranch-protection=pac-ret` prologue.
+        let (data, fde_offset) = eh_frame_with_fde(
+            &AARCH64_CIE,
+            0x1000..0x1040,
+            &[gimli::DW_CFA_AARCH64_negate_ra_state.0],
+        );
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        let mut unwinder = DwarfUnwinder::<_, ArchAarch64, _>::new(
+            EndianSlice::new(&data, LittleEndian),
+            UnwindSectionType::EhFrame,
+            None,
+            &mut context,
+            BaseAddresses::default(),
+            0,
+        );
+        let mut regs = UnwindRegsAarch64::new(0x1024, 0x8000, 0x9000);
+        let result = unwinder.unwind_frame_with_fde::<_, StoreOnHeap>(
+            &mut regs,
+            true,
+            0x1010,
+            fde_offset,
+            &mut |_| Err(()),
+        );
+        assert!(matches!(result, Ok(UnwindResult::ExecRule(_))));
+    }
+
+    /// Unwinds a caller frame at `address` with an `.eh_frame` FDE for [0x1000, 0x1010)
+    /// that runs `instructions` after the x86-64 entry CIE.
+    fn unwind_x86_64_fde(
+        instructions: &[u8],
+        address: u32,
+        regs: &mut UnwindRegsX86_64,
+        read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
+    ) -> Result<UnwindResult<crate::x86_64::UnwindRuleX86_64>, DwarfUnwinderError> {
+        use crate::x86_64::ArchX86_64;
+
+        let (data, fde_offset) = eh_frame_with_fde(&X86_64_CIE, 0x1000..0x1010, instructions);
+        let mut context = UnwindContext::<usize, StoreOnHeap>::new_in();
+        DwarfUnwinder::<_, ArchX86_64, _>::new(
+            EndianSlice::new(&data, LittleEndian),
+            UnwindSectionType::EhFrame,
+            None,
+            &mut context,
+            BaseAddresses::default(),
+            0,
+        )
+        .unwind_frame_with_fde::<_, StoreOnHeap>(regs, false, address, fde_offset, read_stack)
+    }
+
+    #[test]
+    fn memory_backed_cfa_below_the_return_address_slot_is_an_error() {
+        // DW_CFA_def_cfa_expression: DW_OP_breg6(RBP) -8; DW_OP_deref
+        let instructions = [gimli::DW_CFA_def_cfa_expression.0, 3, 0x76, 0x78, 0x06];
+        let mut regs = UnwindRegsX86_64::new(0x1000, 0x2000, 0x3000);
+        let mut read_stack = |address| match address {
+            0x2ff8 => Ok(4),
+            _ => Err(()),
+        };
+        assert!(matches!(
+            unwind_x86_64_fde(&instructions, 0x1004, &mut regs, &mut read_stack),
+            Err(DwarfUnwinderError::CouldNotRecoverReturnAddress)
+        ));
+    }
+
+    #[test]
+    fn undefined_return_address_ends_the_stack_even_with_saved_registers() {
+        use crate::x86_64::UnwindRuleX86_64;
+
+        let instructions = [
+            gimli::DW_CFA_undefined.0,
+            X86_64::RA.0 as u8,
+            gimli::DW_CFA_offset.0 | X86_64::RBX.0 as u8,
+            2,
+        ];
+        let mut regs = UnwindRegsX86_64::new(0x1004, 0x2000, 0x3000);
+        let result = unwind_x86_64_fde(&instructions, 0x1004, &mut regs, &mut |_| Ok(0x5555));
+        assert!(
+            matches!(
+                result,
+                Ok(UnwindResult::ExecRuleWithDwarfRegisterRules(
+                    UnwindRuleX86_64::EndOfStack,
+                    0,
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     fn encoding() -> Encoding {
@@ -746,6 +1032,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_rejects_looping_expressions() {
+        // DW_OP_skip -3
+        let expression: &[u8] = &[0x2f, 0xfd, 0xff];
+        let mut section = DebugFrame::from(EndianSlice::new(expression, LittleEndian));
+        section.set_address_size(8);
+        let rule = CfaRule::Expression(UnwindExpression {
+            offset: 0,
+            length: expression.len(),
+        });
+        let regs = UnwindRegsX86_64::new(0x1000, 0x2000, 0x3000);
+        // Evaluate on another thread so that a hang fails the test.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(eval_cfa_rule::<_, _, _, StoreOnHeap>(
+                &section,
+                &rule,
+                encoding(),
+                &regs,
+                &mut |_| Err(()),
+            ))
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(result, Ok(None));
     }
 
     #[test]

@@ -738,6 +738,27 @@ fn changed_mapping_generation_bypasses_poll_throttle_but_incomplete_discovery_do
     assert_eq!(reader.last_poll, last_poll);
 }
 
+/// Fail every remote read as a refused `/proc/<pid>/mem` open does.
+struct DeniedProcess;
+
+impl MemoryReader for DeniedProcess {
+    fn pid(&self) -> i32 {
+        4242
+    }
+    fn read(&self, _address: u64, _bytes: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EACCES))
+    }
+}
+
+#[test]
+fn denied_target_memory_is_reported() {
+    let mut reader = Registry::<_, Arc<[u8]>>::new(DeniedProcess);
+    reader.descriptors = vec![descriptor(0x100, "/app")];
+    reader.descriptor_search_generation = Some(1);
+    reader.refresh(1, &[] as &[TestMapping]);
+    assert!(reader.permission_warned);
+}
+
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn demand_refresh_preserves_unrelated_registrations_until_the_next_poll() {

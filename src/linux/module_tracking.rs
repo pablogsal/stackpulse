@@ -97,7 +97,9 @@ pub(super) fn mmap_is_executable(mmap: &Mmap) -> bool {
 }
 
 pub(super) fn read_existing_maps(pid: u32) -> io::Result<Vec<u8>> {
-    std::fs::read(format!("/proc/{pid}/maps"))
+    std::fs::read(format!("/proc/{pid}/maps")).map_err(|err| {
+        crate::error::AttachError::wrap(crate::error::AttachStep::ReadMaps, pid, err)
+    })
 }
 
 pub(super) fn register_existing_maps_snapshot<W: std::io::Write>(
@@ -115,7 +117,7 @@ pub(super) fn register_existing_maps_snapshot<W: std::io::Write>(
     )
 }
 
-pub(super) fn executable_modules_from_maps(
+pub(crate) fn executable_modules_from_maps(
     pid: u32,
     maps: &(impl AsRef<[u8]> + ?Sized),
 ) -> impl Iterator<Item = ModuleRecord> + '_ {

@@ -8,22 +8,26 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use rustc_hash::FxHashMap;
 
-use super::attach::StoppedProcess;
+use super::attach::{read_thread_group_id, StoppedProcess};
 use super::checked_loss_sum;
 use super::cpu::online_cpu_ids;
-use super::perf_event::{EventRef, EventSource, OutputRing, Perf, PerfOptions, TaskInheritance};
+use super::perf_event::{
+    is_ring_budget_error, minimum_ring_bytes, EventRef, EventSource, OutputRing, Perf, PerfOptions,
+    TaskInheritance,
+};
+use crate::state::ProcessHandle;
 
 const MAX_TOTAL_RING_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Reject pids that would not name a single real process once cast to the
-/// signed `pid_t` that `kill` takes: `0` targets the caller's own process
-/// group, and any value above `i32::MAX` wraps to a negative broadcast pid
-/// (`u32::MAX` becomes `-1`, i.e. "every process we may signal").
-fn validate_target_pid(pid: u32) -> io::Result<()> {
-    if pid == 0 || i32::try_from(pid).is_err() {
+/// Reject thread ids: `/proc/<tid>/task` lists the whole thread group, so
+/// attaching to a non-leader thread would open counters for its process while
+/// tracking modules under an id that samples never carry.
+fn validate_process_leader(pid: u32) -> io::Result<()> {
+    let tgid = read_thread_group_id(pid)?;
+    if tgid != pid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid target pid {pid}"),
+            format!("{pid} is a thread of process {tgid}; attach to process {tgid} instead"),
         ));
     }
     Ok(())
@@ -52,12 +56,6 @@ struct OpenSettings {
 pub(super) struct ThreadFork {
     pub(super) tid: u32,
     pub(super) owner_pid: u32,
-    pub(super) parent_tid: u32,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ProcessFork {
-    pub(super) pid: u32,
     pub(super) parent_tid: u32,
 }
 
@@ -124,6 +122,9 @@ pub(super) struct PerfGroup {
     sampling_enabled: bool,
     // Closed poll fds cannot become anchors again before their members are removed.
     retired_poll_fds: BTreeSet<RawFd>,
+    // Inheriting members whose task exited. Descendants may still hold
+    // inherited copies, so they close once the kernel reports POLLHUP.
+    exited_inherit_fds: BTreeSet<RawFd>,
     poll: Poll,
     poll_events: Events,
     frequency: u32,
@@ -234,6 +235,7 @@ impl PerfGroup {
             saw_readable: false,
             sampling_enabled: true,
             retired_poll_fds: BTreeSet::new(),
+            exited_inherit_fds: BTreeSet::new(),
             poll: Poll::new()?,
             poll_events: Events::with_capacity(16),
             frequency: options.frequency,
@@ -251,30 +253,31 @@ impl PerfGroup {
     }
 
     pub(super) fn open(
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
         options: PerfGroupOptions,
     ) -> io::Result<Self> {
         let mut group = PerfGroup::new(options)?;
-        let _ = group.open_process(pid, attach_mode)?;
+        let _ = group.open_process(process, attach_mode)?;
         Ok(group)
     }
 
     pub(super) fn open_process(
         &mut self,
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
     ) -> io::Result<OpenTransaction> {
-        self.open_process_with_frequency_mode(pid, attach_mode, FrequencyMode::Requested)
+        process.read_checked(validate_process_leader)?;
+        self.open_process_with_frequency_mode(process, attach_mode, FrequencyMode::Requested)
     }
 
     fn open_process_with_frequency_mode(
         &mut self,
-        pid: u32,
+        process: &mut ProcessHandle,
         attach_mode: AttachMode,
         frequency_mode: FrequencyMode,
     ) -> io::Result<OpenTransaction> {
-        validate_target_pid(pid)?;
+        let pid = process.pid().get_u32();
         if attach_mode == AttachMode::StopWhileAttaching && pid == std::process::id() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -283,10 +286,10 @@ impl PerfGroup {
         }
         let frequency = frequency_for_mode(self.frequency, frequency_mode);
         let (stopped_process, threads) = if attach_mode == AttachMode::StopWhileAttaching {
-            let (stopped, threads) = StoppedProcess::new(pid)?;
+            let (stopped, threads) = StoppedProcess::new(process.try_clone()?)?;
             (Some(stopped), threads)
         } else {
-            (None, get_threads(pid)?)
+            (None, process.read_checked(get_threads)?)
         };
         let result = (|| {
             let cpu_ids = online_cpu_ids()?;
@@ -355,10 +358,14 @@ impl PerfGroup {
         }
     }
 
-    pub(super) fn refresh_threads(&mut self, pid: u32) -> io::Result<bool> {
-        let mut threads = match get_threads(pid) {
+    pub(super) fn refresh_threads(&mut self, process: &mut ProcessHandle) -> io::Result<bool> {
+        let pid = process.pid().get_u32();
+        let mut threads = match process.read_checked(get_threads) {
             Ok(threads) => threads,
             Err(err) if crate::error::is_target_gone_io(&err) => return Ok(false),
+            // Under `hidepid=noaccess`, a process that turned non-dumpable
+            // denies its task list; keep the threads already tracked.
+            Err(err) if crate::error::is_access_denied_io(&err) => return Ok(true),
             Err(err) => return Err(err),
         };
         threads.sort_unstable();
@@ -473,85 +480,84 @@ impl PerfGroup {
         Ok(())
     }
 
-    pub(super) fn open_forked_processes(
+    pub(super) fn open_forked_process(
         &mut self,
-        process_forks: &[ProcessFork],
+        process: &mut ProcessHandle,
+        parent_tid: u32,
     ) -> io::Result<()> {
         if !self.inherit_child_processes {
             return Ok(());
         }
 
-        for &ProcessFork { pid, parent_tid } in process_forks {
-            let parent_events_inherit = self
-                .tracked_threads
-                .get(&parent_tid)
-                .is_some_and(|track| track.events_inherit);
-            if parent_events_inherit || self.tracked_threads.contains_key(&pid) {
-                let events_inherit = parent_events_inherit
-                    || self
-                        .tracked_threads
-                        .get(&pid)
-                        .is_some_and(|track| track.events_inherit);
-                self.tracked_threads
-                    .insert(pid, ThreadTrack::new(pid, events_inherit));
-                continue;
-            }
-            match self.open_process_with_frequency_mode(
-                pid,
-                AttachMode::StopWhileAttaching,
-                FrequencyMode::ClampToKernelMax,
-            ) {
-                Ok(opened) => {
-                    if let Err(err) = self.enable_if_running() {
-                        self.rollback_open(opened);
-                        return Err(err);
-                    }
-                }
-                Err(err) if crate::error::is_target_gone_io(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let pid = process.pid().get_u32();
+        let parent_events_inherit = self
+            .tracked_threads
+            .get(&parent_tid)
+            .is_some_and(|track| track.events_inherit);
+        if parent_events_inherit || self.tracked_threads.contains_key(&pid) {
+            let events_inherit = parent_events_inherit
+                || self
+                    .tracked_threads
+                    .get(&pid)
+                    .is_some_and(|track| track.events_inherit);
+            self.tracked_threads
+                .insert(pid, ThreadTrack::new(pid, events_inherit));
+            return Ok(());
         }
-
+        match self.open_process_with_frequency_mode(
+            process,
+            AttachMode::StopWhileAttaching,
+            FrequencyMode::ClampToKernelMax,
+        ) {
+            Ok(opened) => {
+                if let Err(err) = self.enable_if_running() {
+                    self.rollback_open(opened);
+                    return Err(err);
+                }
+            }
+            Err(err) if crate::error::is_target_gone_io(&err) => {}
+            Err(err) => return Err(err),
+        }
         Ok(())
     }
 
     /// Repair process bookkeeping after LOST when only the owning parent
     /// process (not the exact forking TID) can be recovered from /proc.
+    /// Returns the forks that need [`Self::open_forked_process`].
     pub(super) fn recover_forked_processes(
         &mut self,
         process_forks: &[RecoveredProcessFork],
-    ) -> io::Result<()> {
+    ) -> Vec<RecoveredProcessFork> {
         let mut need_explicit_open = Vec::new();
-        for &RecoveredProcessFork { pid, parent_pid } in process_forks {
+        for &fork in process_forks {
             let parent_process_inherits = self
                 .tracked_threads
                 .values()
-                .any(|track| track.owner_pid == parent_pid && track.events_inherit);
+                .any(|track| track.owner_pid == fork.parent_pid && track.events_inherit);
             if parent_process_inherits {
                 self.tracked_threads
-                    .insert(pid, ThreadTrack::new(pid, true));
+                    .insert(fork.pid, ThreadTrack::new(fork.pid, true));
             } else {
-                need_explicit_open.push(ProcessFork {
-                    pid,
-                    parent_tid: parent_pid,
-                });
+                need_explicit_open.push(fork);
             }
         }
-        self.open_forked_processes(&need_explicit_open)
+        need_explicit_open
     }
 
     pub(super) fn remove_thread(&mut self, tid: u32) -> io::Result<()> {
-        self.remove_members(|member| {
-            member.perf.target() == tid && !member.perf.inherit().is_enabled()
-        })?;
+        self.remove_members(
+            |member| member.perf.target() == tid,
+            |member| member.perf.inherit().is_enabled(),
+        )?;
         self.tracked_threads.remove(&tid);
-        Ok(())
+        self.retire_hung_up_members()
     }
 
     pub(super) fn remove_process(&mut self, pid: u32) -> io::Result<()> {
-        self.remove_members(|member| {
-            member.owner_pid == pid && member.perf.inherit() != TaskInheritance::Children
-        })?;
+        self.remove_members(
+            |member| member.owner_pid == pid,
+            |member| member.perf.inherit() == TaskInheritance::Children,
+        )?;
         self.tracked_threads.retain(|tid, track| {
             if track.owner_pid == pid {
                 return false;
@@ -561,18 +567,53 @@ impl PerfGroup {
             }
             true
         });
+        self.retire_hung_up_members()
+    }
+
+    /// Close exited inheriting members once no live descendant inherits them.
+    fn retire_hung_up_members(&mut self) -> io::Result<()> {
+        if self.exited_inherit_fds.is_empty() {
+            return Ok(());
+        }
+        let mut pollfds: Vec<_> = self
+            .exited_inherit_fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        crate::state::poll_retry(&mut pollfds, 0)?;
+        for pollfd in pollfds {
+            if pollfd.revents & libc::POLLHUP != 0 {
+                self.retire_member_fd(pollfd.fd)?;
+            } else if pollfd.revents & libc::POLLIN != 0 {
+                // Polling a member consumes its shared ring's wakeup, which
+                // the poll anchor would otherwise have reported.
+                self.saw_readable = true;
+            }
+        }
         Ok(())
     }
 
-    fn remove_members(&mut self, should_remove: impl Fn(&Member) -> bool) -> io::Result<()> {
-        let fds_to_remove: Vec<_> = self
+    /// Retire `owned` members, leaving `inherited` ones to close once hung up.
+    fn remove_members(
+        &mut self,
+        owned: impl Fn(&Member) -> bool,
+        inherited: impl Fn(&Member) -> bool,
+    ) -> io::Result<()> {
+        let (hang_up, retire): (Vec<_>, Vec<_>) = self
             .members
             .iter()
-            .filter_map(|(&fd, member)| should_remove(member).then_some(fd))
-            .collect();
-        for fd in fds_to_remove {
+            .filter(|(_, member)| owned(member))
+            .map(|(&fd, member)| (fd, inherited(member)))
+            .partition(|&(_, inherited)| inherited);
+        for (fd, _) in retire {
             self.retire_member_fd(fd)?;
         }
+        self.exited_inherit_fds
+            .extend(hang_up.into_iter().map(|(fd, _)| fd));
         Ok(())
     }
 
@@ -585,38 +626,82 @@ impl PerfGroup {
         pending: &mut PendingEvents,
     ) -> io::Result<bool> {
         let checkpoint = pending.perfs.len();
-        let result = (|| {
-            let mut inherits = false;
-            let per_cpu_budget = MAX_TOTAL_RING_BUFFER_BYTES
-                / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
-            for &cpu in cpu_ids {
-                let remaining =
-                    MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
-                let opened = self.open_perf(
-                    target,
-                    cpu,
-                    OpenSettings {
-                        attach_mode,
-                        inherit: self.task_inheritance(),
-                        frequency,
-                        maximum_ring_bytes: per_cpu_budget.min(remaining),
-                    },
-                    pending,
-                )?;
-                match opened {
-                    OpenedEvent::Member { member, inherit } => {
-                        inherits |= inherit.is_enabled();
-                        pending.perfs.push(member);
-                    }
-                    OpenedEvent::Output { inherit } => inherits |= inherit.is_enabled(),
-                }
-            }
-            Ok(inherits)
-        })();
-        if result.is_err() {
+        let output_checkpoint = pending.outputs.len();
+        let allocated_ring_bytes = pending.allocated_ring_bytes;
+        let kernel_excluded = pending.kernel_excluded;
+        let mut ring_cap_bytes = MAX_TOTAL_RING_BUFFER_BYTES;
+        loop {
+            let result = self.open_cpu_perfs(
+                target,
+                cpu_ids,
+                attach_mode,
+                frequency,
+                ring_cap_bytes,
+                pending,
+            );
+            let Err(err) = result else {
+                return result;
+            };
             pending.perfs.truncate(checkpoint);
+            // The kernel charges every CPU's ring to one per-user budget, so
+            // full-size rings on the first CPUs can leave nothing for later
+            // ones even after their own fallback. Reopen this task's new rings
+            // at half the size until they all fit.
+            let largest_new_ring = pending.outputs[output_checkpoint..]
+                .iter()
+                .map(OutputRing::capacity_bytes)
+                .max()
+                .unwrap_or(0);
+            if !is_ring_budget_error(&err)
+                || !minimum_ring_bytes(self.stack_size)
+                    .is_ok_and(|minimum| largest_new_ring > minimum)
+            {
+                return Err(err);
+            }
+            for output in pending.outputs.drain(output_checkpoint..) {
+                pending.cpu_outputs.remove(&output.cpu());
+            }
+            pending.allocated_ring_bytes = allocated_ring_bytes;
+            pending.kernel_excluded = kernel_excluded;
+            ring_cap_bytes = largest_new_ring / 2;
         }
-        result
+    }
+
+    fn open_cpu_perfs(
+        &self,
+        target: TaskTarget,
+        cpu_ids: &[u32],
+        attach_mode: AttachMode,
+        frequency: u64,
+        ring_cap_bytes: u64,
+        pending: &mut PendingEvents,
+    ) -> io::Result<bool> {
+        let mut inherits = false;
+        let per_cpu_budget =
+            MAX_TOTAL_RING_BUFFER_BYTES / u64::try_from(cpu_ids.len().max(1)).unwrap_or(u64::MAX);
+        for &cpu in cpu_ids {
+            let remaining =
+                MAX_TOTAL_RING_BUFFER_BYTES.saturating_sub(pending.allocated_ring_bytes);
+            let opened = self.open_perf(
+                target,
+                cpu,
+                OpenSettings {
+                    attach_mode,
+                    inherit: self.task_inheritance(),
+                    frequency,
+                    maximum_ring_bytes: per_cpu_budget.min(remaining).min(ring_cap_bytes),
+                },
+                pending,
+            )?;
+            match opened {
+                OpenedEvent::Member { member, inherit } => {
+                    inherits |= inherit.is_enabled();
+                    pending.perfs.push(member);
+                }
+                OpenedEvent::Output { inherit } => inherits |= inherit.is_enabled(),
+            }
+        }
+        Ok(inherits)
     }
 
     fn try_open_thread_perfs(
@@ -629,7 +714,16 @@ impl PerfGroup {
     ) -> io::Result<Option<bool>> {
         match self.open_task_perfs(target, cpu_ids, attach_mode, frequency, pending) {
             Ok(inherits) => Ok(Some(inherits)),
-            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            // EACCES: access to the thread is denied, as once its process
+            // turned non-dumpable. Skip it like a gone thread.
+            Err(err)
+                if matches!(
+                    crate::error::find_raw_os_error(&err),
+                    Some(libc::ESRCH | libc::EACCES)
+                ) =>
+            {
+                Ok(None)
+            }
             Err(err) => Err(err),
         }
     }
@@ -726,6 +820,7 @@ impl PerfGroup {
         }
         self.members.remove(&fd);
         self.retired_poll_fds.remove(&fd);
+        self.exited_inherit_fds.remove(&fd);
     }
 
     fn retire_member_fd(&mut self, fd: RawFd) -> io::Result<()> {
@@ -956,6 +1051,8 @@ impl PerfGroup {
     }
 
     pub(super) fn take_lost_records(&mut self) -> io::Result<u64> {
+        // Descendants can exit after their process was removed.
+        self.retire_hung_up_members()?;
         let mut total = self.retired_lost_records;
         for perf in self.perfs() {
             total = checked_loss_sum(total, perf.lost_records()?)?;
@@ -1100,9 +1197,12 @@ fn frequency_for_kernel_max(frequency: u32, mode: FrequencyMode, max_rate: Optio
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::super::cpu::parse_cpu_list;
     use super::super::perf_event::MAX_SAMPLE_USER_STACK;
     use super::*;
+    use crate::test_support::{current_test_binary, ignored_test_args, process_handle, SleepChild};
 
     const TEST_OPTIONS: PerfGroupOptions = PerfGroupOptions {
         frequency: 1,
@@ -1333,22 +1433,12 @@ mod tests {
         .expect("create perf group");
 
         let err = group
-            .open_process(pid, AttachMode::OnExec)
+            .open_process(&mut process_handle(pid), AttachMode::OnExec)
             .expect_err("invalid stack size should fail before opening perf events");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(group.tracked_threads.is_empty());
         assert!(group.members.is_empty());
-    }
-
-    #[test]
-    fn open_rejects_invalid_pid_before_tracking_process() {
-        let err = match PerfGroup::open(0, AttachMode::OnExec, TEST_OPTIONS) {
-            Ok(_) => panic!("pid 0 should be rejected"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1363,10 +1453,7 @@ mod tests {
             .insert(100, ThreadTrack::new(100, true));
 
         group
-            .open_forked_processes(&[ProcessFork {
-                pid: 200,
-                parent_tid: 100,
-            }])
+            .open_forked_process(&mut process_handle(200), 100)
             .expect("track inherited child process");
 
         assert!(group.tracked_threads.contains_key(&200));
@@ -1388,12 +1475,12 @@ mod tests {
             .tracked_threads
             .insert(101, ThreadTrack::new(100, true));
 
-        group
+        assert!(group
             .recover_forked_processes(&[RecoveredProcessFork {
                 pid: 200,
                 parent_pid: 100,
             }])
-            .expect("recover inherited child process");
+            .is_empty());
 
         assert_eq!(
             group.tracked_threads.get(&200),
@@ -1415,7 +1502,7 @@ mod tests {
             .insert(stale_tid, ThreadTrack::new(pid, true));
 
         group
-            .refresh_threads(pid)
+            .refresh_threads(&mut process_handle(pid))
             .expect("refresh live test process");
 
         assert!(!group.tracked_threads.contains_key(&stale_tid));
@@ -1427,10 +1514,7 @@ mod tests {
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
 
         group
-            .open_forked_processes(&[ProcessFork {
-                pid: 200,
-                parent_tid: 100,
-            }])
+            .open_forked_process(&mut process_handle(200), 100)
             .expect("ignore forked process");
 
         assert!(group.tracked_threads.is_empty());
@@ -1702,6 +1786,35 @@ mod tests {
         assert!(group.members.is_empty());
     }
 
+    #[test]
+    fn inheriting_members_close_after_their_task_exits() {
+        let Some(cpu) = online_cpu_ids().expect("online CPUs").into_iter().next() else {
+            return;
+        };
+        let child = SleepChild::spawn();
+        let pid = child.pid_u32();
+        let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
+        let Some(pending) =
+            open_fixed_cpu_events(&group, pid, pid, cpu, 2, TaskInheritance::Children)
+        else {
+            return;
+        };
+        group.register_pending(pending).expect("register events");
+        // A task still holding the events keeps them open, like a descendant
+        // that inherited them from an exited process.
+        group.remove_process(pid).expect("remove process");
+        group.take_lost_records().expect("read lost records");
+        assert_eq!(group.members.len(), 1);
+
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.members.is_empty() {
+            assert!(Instant::now() < deadline, "member outlived its task");
+            group.take_lost_records().expect("read lost records");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn open_fixed_cpu_events(
         group: &PerfGroup,
         target_tid: u32,
@@ -1738,13 +1851,72 @@ mod tests {
     }
 
     #[test]
+    fn attach_fits_every_cpu_ring_into_a_shared_mapping_budget() {
+        let helper = "linux::perf_group::tests::stackpulse_perf_group_helper_shared_ring_budget";
+        let output = std::process::Command::new(current_test_binary())
+            .args(ignored_test_args(helper))
+            .output()
+            .expect("run shared ring budget helper");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // Runs in its own process because the address space limit applies to
+    // every thread. The limit leaves room for half-size rings on every CPU but
+    // for full-size rings on only some of them.
+    #[test]
+    #[ignore]
+    fn stackpulse_perf_group_helper_shared_ring_budget() {
+        let options = PerfGroupOptions {
+            stack_size: 32 * 1024,
+            ring_stacks: super::super::DEFAULT_RING_BUFFER_STACKS,
+            ..TEST_OPTIONS
+        };
+        let page_size = crate::elf::system_page_size();
+        let ring_bytes =
+            u64::from(options.stack_size).max(page_size) * u64::from(options.ring_stacks);
+        let cpu_ids = online_cpu_ids().expect("online CPUs");
+        let mut group = PerfGroup::new(options).expect("create perf group");
+        let pid = std::process::id();
+        if open_fixed_cpu_events(&group, pid, pid, cpu_ids[0], 1, TaskInheritance::Threads)
+            .is_none()
+        {
+            return;
+        }
+        let status = fs::read_to_string("/proc/self/status").expect("read process status");
+        let mapped_kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSize:")?.trim().strip_suffix("kB"))
+            .and_then(|size| size.trim().parse().ok())
+            .expect("parse VmSize");
+        let budget = cpu_ids.len() as u64 * (ring_bytes / 2 + page_size) + 1024 * 1024;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is valid storage for one rlimit value.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) }, 0);
+        limit.rlim_cur = (mapped_kib * 1024 + budget).min(limit.rlim_max);
+        // SAFETY: limit is an initialized rlimit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+
+        group
+            .open_process(&mut process_handle(pid), AttachMode::OnExec)
+            .expect("open process within the ring budget");
+    }
+
+    #[test]
     fn rollback_removes_exact_open_transaction() {
         let mut group = PerfGroup::new(TEST_OPTIONS).expect("create perf group");
-        let opened = match group.open_process(std::process::id(), AttachMode::OnExec) {
-            Ok(opened) => opened,
-            Err(err) if perf_open_can_be_skipped(&err) => return,
-            Err(err) => panic!("open process: {err}"),
-        };
+        let opened =
+            match group.open_process(&mut process_handle(std::process::id()), AttachMode::OnExec) {
+                Ok(opened) => opened,
+                Err(err) if perf_open_can_be_skipped(&err) => return,
+                Err(err) => panic!("open process: {err}"),
+            };
         assert!(!group.outputs.is_empty());
 
         group.rollback_open(opened);
@@ -1837,13 +2009,6 @@ mod tests {
             frequency_for_kernel_max(123, FrequencyMode::ClampToKernelMax, None),
             123
         );
-    }
-
-    #[test]
-    fn target_pid_validation_rejects_unsafe_pids() {
-        assert!(validate_target_pid(0).is_err());
-        assert!(validate_target_pid(u32::MAX).is_err());
-        assert!(validate_target_pid(std::process::id()).is_ok());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use stackpulse_jit::elf::{collect_load_segments, find_section_header, find_secti
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 type Result<T> = std::io::Result<T>;
 
@@ -127,6 +128,7 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
         eh_frame: eh_frame.map(|(_, data)| data),
         eh_frame_hdr_svma: eh_frame_hdr.as_ref().map(|(addr, _)| *addr),
         eh_frame_hdr: eh_frame_hdr.map(|(_, data)| data),
+        eh_frame_hdr_indexed: OnceLock::new(),
         got_svma: find_section_range(".got", &elf),
         load_segments: collect_load_segments(&elf).into_boxed_slice(),
     })

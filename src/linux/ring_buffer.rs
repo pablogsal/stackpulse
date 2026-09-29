@@ -168,9 +168,14 @@ impl RingRecord {
         }
     }
 
-    pub(super) fn detach_bytes(&mut self) -> AlignedBytes {
+    /// Copies at most the first `len` bytes out of the mapping so the ring
+    /// space can be released. Wrapped records already own their bytes.
+    pub(super) fn detach_bytes(&mut self, len: usize) -> AlignedBytes {
         match &mut self.storage {
-            RingRecordStorage::Mapped { .. } => AlignedBytes::from_unaligned_bytes(self.as_bytes()),
+            RingRecordStorage::Mapped { .. } => {
+                let bytes = self.as_bytes();
+                AlignedBytes::from_unaligned_bytes(&bytes[..len.min(bytes.len())])
+            }
             RingRecordStorage::Owned(bytes) => std::mem::take(bytes),
         }
     }

@@ -61,6 +61,17 @@ impl ExactImageStore {
         identity: ElfFileIdentity,
     ) {
         let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        // A child mapping registered before its fork record is published again
+        // as an alias of the parent's module. Release the entry it replaces: a
+        // leaked reference would outlive the image and hand its token to a
+        // later image allocated at the same address.
+        if let Some(previous) = store.by_module.get(&module_id) {
+            if Arc::ptr_eq(&previous.image, &image) {
+                return;
+            }
+            store.remove_entry(module_id);
+            store.order.retain(|id| *id != module_id);
+        }
         let token = store.add_ref(&sections, &image);
         let retained = RetainedElfImage {
             sections,
@@ -68,8 +79,7 @@ impl ExactImageStore {
             token,
             identity,
         };
-        let previous = store.by_module.insert(module_id, retained);
-        debug_assert!(previous.is_none(), "module image IDs are never reused");
+        store.by_module.insert(module_id, retained);
         store.order.push_back(module_id);
         while store.by_module.len() > MAX_EXACT_IMAGE_ALIASES
             || store.image_refs.len() > MAX_SHARED_ELF_IMAGES
@@ -91,6 +101,21 @@ impl ExactImageStore {
                 retained.identity,
             );
         }
+    }
+
+    /// Return retained module entries, queued module IDs and image references.
+    #[cfg(test)]
+    pub(crate) fn retained_counts(&self) -> (usize, usize, usize) {
+        let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            store.by_module.len(),
+            store.order.len(),
+            store
+                .image_refs
+                .values()
+                .map(|(references, _, _)| references)
+                .sum(),
+        )
     }
 }
 
@@ -129,8 +154,12 @@ impl ExactImageStoreInner {
 #[derive(Default)]
 pub(crate) struct ElfSectionCache {
     by_module: FxHashMap<u32, CachedElfImage>,
-    by_image: FxHashMap<ElfImageIdentity, SharedElfImage>,
-    image_order: VecDeque<ElfImageIdentity>,
+    // Keyed by the identity of the descriptor that was opened, not of the
+    // process that mapped it: the retained descriptor pins the inode, so the
+    // same identity names the same file in every process and namespace,
+    // including processes that have already exited.
+    by_image: FxHashMap<ElfFileIdentity, SharedElfImage>,
+    image_order: VecDeque<ElfFileIdentity>,
     retained_owned_bytes: usize,
     open_failures: FxHashMap<u32, u8>,
     next_image_token: u64,
@@ -179,26 +208,6 @@ struct ElfFileIdentity {
     changed_nanoseconds: i64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum ElfImageIdentity {
-    Namespaced {
-        file: ElfFileIdentity,
-        mount_namespace: u64,
-    },
-    Process {
-        file: ElfFileIdentity,
-        process_id: crate::Pid,
-    },
-}
-
-impl ElfImageIdentity {
-    fn file(&self) -> &ElfFileIdentity {
-        match self {
-            Self::Namespaced { file, .. } | Self::Process { file, .. } => file,
-        }
-    }
-}
-
 pub(crate) struct LoadedElfMapping {
     pub(crate) image_base: Option<ModuleImageBase>,
     pub(crate) sections: Arc<ElfSectionInfo>,
@@ -228,6 +237,14 @@ impl ElfSectionCache {
         }
     }
 
+    /// Whether the recorder found the target's `[vdso]` mapping `module_id`
+    /// byte-for-byte equal to the local vDSO.
+    pub(crate) fn holds_local_vdso(&self, module_id: u32) -> bool {
+        self.exact_images
+            .as_ref()
+            .is_some_and(|images| images.get(module_id).is_some())
+    }
+
     pub(crate) fn load_mapping(
         &mut self,
         module: &ModuleRecord,
@@ -251,6 +268,11 @@ impl ElfSectionCache {
 
         let (image, exact) = if module.path() == Path::new(VDSO_PATH) {
             let bytes = local_vdso_bytes().ok_or(ElfLoadError::Unsupported)?;
+            // Only the recorder reads the live target's vDSO. It publishes the
+            // local image for its live readers when the bytes are identical.
+            let exact = (self.publish_exact_images && target_vdso_is_local(module, &bytes))
+                .then(|| local_vdso_image().cloned())
+                .flatten();
             (
                 CachedElfImage {
                     sections: Arc::new(
@@ -258,11 +280,13 @@ impl ElfSectionCache {
                             .map_err(|_| ElfLoadError::Unsupported)?,
                     ),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
-                    image: Weak::new(),
-                    identity: None,
+                    image: exact.as_ref().map_or_else(Weak::new, Arc::downgrade),
+                    identity: exact
+                        .as_ref()
+                        .and_then(|image| elf_file_identity(module, image.file())),
                     trusted: false,
                 },
-                None,
+                exact,
             )
         } else if let Some(retained) = self
             .exact_images
@@ -283,10 +307,8 @@ impl ElfSectionCache {
             self.ensure_open_attempt_allowed(module.id)?;
             let file =
                 Arc::new(open_module_file(module).ok_or_else(|| self.failed_open(module.id))?);
-            let file_identity =
+            let identity =
                 elf_file_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
-            let identity = elf_image_identity(module, file_identity)
-                .ok_or_else(|| self.failed_open(module.id))?;
             let cached = self.by_image.get(&identity).map(|shared| {
                 let retained_image = Arc::clone(&shared.image);
                 (
@@ -294,7 +316,7 @@ impl ElfSectionCache {
                         sections: Arc::clone(&shared.sections),
                         token: shared.token,
                         image: Arc::downgrade(&retained_image),
-                        identity: Some(identity.file().clone()),
+                        identity: Some(identity.clone()),
                         trusted: false,
                     },
                     retained_image,
@@ -311,7 +333,7 @@ impl ElfSectionCache {
                     sections: Arc::new(self.parse_file(&file, module.path())?),
                     token: self.take_image_token().ok_or(ElfLoadError::Unsupported)?,
                     image: Arc::downgrade(&exact),
-                    identity: Some(identity.file().clone()),
+                    identity: Some(identity.clone()),
                     trusted: false,
                 };
                 self.insert_shared_image(
@@ -385,7 +407,7 @@ impl ElfSectionCache {
         load_elf_sections_from_file(file, path).map_err(|_| ElfLoadError::Unsupported)
     }
 
-    fn insert_shared_image(&mut self, identity: ElfImageIdentity, image: SharedElfImage) {
+    fn insert_shared_image(&mut self, identity: ElfFileIdentity, image: SharedElfImage) {
         let owned_bytes = image.owned_bytes;
         if owned_bytes > MAX_SHARED_ELF_OWNED_BYTES {
             return;
@@ -406,12 +428,12 @@ impl ElfSectionCache {
         }
     }
 
-    fn touch_shared_image(&mut self, identity: &ElfImageIdentity) {
+    fn touch_shared_image(&mut self, identity: &ElfFileIdentity) {
         self.image_order.retain(|cached| cached != identity);
         self.image_order.push_back(identity.clone());
     }
 
-    fn remove_shared_image(&mut self, identity: &ElfImageIdentity) -> Option<SharedElfImage> {
+    fn remove_shared_image(&mut self, identity: &ElfFileIdentity) -> Option<SharedElfImage> {
         let image = self.by_image.remove(identity)?;
         self.debit_shared_image(&image);
         Some(image)
@@ -445,14 +467,31 @@ impl ElfSectionCache {
         let file = Arc::new(open_module_file(module).ok_or_else(|| self.failed_open(module.id))?);
         let identity =
             elf_file_identity(module, &file).ok_or_else(|| self.failed_open(module.id))?;
-        let shared_identity = elf_image_identity(module, identity.clone());
+        let image = self
+            .by_module
+            .get_mut(&module.id)
+            .ok_or(ElfLoadError::Unsupported)?;
+        if image.identity.as_ref() != Some(&identity) {
+            return Err(ElfLoadError::Unsupported);
+        }
+        // Another mapping of the same file may have reacquired it since.
+        if let Some(shared) = self.by_image.get(&identity) {
+            let exact = Arc::clone(&shared.image);
+            image.image = Arc::downgrade(&exact);
+            self.touch_shared_image(&identity);
+            self.open_failures.remove(&module.id);
+            return Ok(exact);
+        }
         let current_sections = self.parse_file(&file, module.path())?;
         let shared = {
             let image = self
                 .by_module
                 .get_mut(&module.id)
                 .ok_or(ElfLoadError::Unsupported)?;
-            if image.identity.as_ref() != Some(&identity) || *image.sections != current_sections {
+            // The cached sections still map the inode named by this identity,
+            // so both views read the same page cache. Comparing their bytes
+            // would only fault in every mapped section page.
+            if !image.sections.same_layout(&current_sections) {
                 return Err(ElfLoadError::Unsupported);
             }
             let exact = Arc::new(NativeImage::new(Arc::clone(&file)));
@@ -460,9 +499,7 @@ impl ElfSectionCache {
             SharedElfImage::from_cached(image, exact)
         };
         let exact = Arc::clone(&shared.image);
-        if let Some(shared_identity) = shared_identity {
-            self.insert_shared_image(shared_identity, shared);
-        }
+        self.insert_shared_image(identity, shared);
         self.open_failures.remove(&module.id);
         Ok(exact)
     }
@@ -529,23 +566,6 @@ fn elf_image_owned_bytes(sections: &ElfSectionInfo) -> usize {
     owned
 }
 
-fn elf_image_identity(module: &ModuleRecord, file: ElfFileIdentity) -> Option<ElfImageIdentity> {
-    let pid = module.pid()?;
-    let mount_namespace = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
-        .ok()
-        .map(|metadata| metadata.ino());
-    Some(match mount_namespace {
-        Some(mount_namespace) => ElfImageIdentity::Namespaced {
-            file,
-            mount_namespace,
-        },
-        None => ElfImageIdentity::Process {
-            file,
-            process_id: pid,
-        },
-    })
-}
-
 fn elf_file_identity(module: &ModuleRecord, file: &File) -> Option<ElfFileIdentity> {
     let metadata = file.metadata().ok()?;
     Some(ElfFileIdentity {
@@ -560,7 +580,7 @@ fn elf_file_identity(module: &ModuleRecord, file: &File) -> Option<ElfFileIdenti
     })
 }
 
-fn local_vdso_bytes() -> Option<Arc<[u8]>> {
+pub(crate) fn local_vdso_bytes() -> Option<Arc<[u8]>> {
     const MAX_MAPPED_ELF_SIZE: u64 = 16 * 1024 * 1024;
     static VDSO: OnceLock<Arc<[u8]>> = OnceLock::new();
 
@@ -587,6 +607,58 @@ fn local_vdso_bytes() -> Option<Arc<[u8]>> {
     Some(bytes)
 }
 
+/// This process's `[vdso]` mapping as a module record.
+#[cfg(test)]
+pub(crate) fn current_vdso_module() -> ModuleRecord {
+    let maps = std::fs::read("/proc/self/maps").unwrap();
+    let mut modules =
+        crate::linux::module_tracking::executable_modules_from_maps(std::process::id(), &maps);
+    modules
+        .find(|module| *module.path == *Path::new(VDSO_PATH))
+        .expect("current process has a vDSO mapping")
+}
+
+/// Whether the target's `[vdso]` mapping holds exactly the local vDSO's bytes.
+fn target_vdso_is_local(module: &ModuleRecord, local: &[u8]) -> bool {
+    let Some(pid) = module.pid() else {
+        return false;
+    };
+    if module.end.checked_sub(module.start) != u64::try_from(local.len()).ok() {
+        return false;
+    }
+    let mut bytes = vec![0; local.len()];
+    File::open(format!("/proc/{pid}/mem"))
+        .and_then(|memory| memory.read_exact_at(&mut bytes, module.start))
+        .is_ok_and(|()| *bytes == *local)
+}
+
+/// Return the local vDSO as a file image.
+///
+/// Symbol backends that open images by path cannot read a target's vDSO, so
+/// the local copy used for unwinding is written once to a memfd.
+pub(crate) fn local_vdso_image() -> Option<&'static Arc<NativeImage>> {
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    static IMAGE: OnceLock<Option<Arc<NativeImage>>> = OnceLock::new();
+
+    let bytes = local_vdso_bytes()?;
+    IMAGE
+        .get_or_init(|| {
+            // SAFETY: the name is NUL-terminated and the flags are scalar.
+            let raw_fd =
+                unsafe { libc::memfd_create(c"stackpulse-vdso".as_ptr(), libc::MFD_CLOEXEC) };
+            if raw_fd < 0 {
+                return None;
+            }
+            // SAFETY: a nonnegative memfd_create result is a newly owned file descriptor.
+            let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            file.write_all(&bytes).ok()?;
+            Some(Arc::new(NativeImage::new(Arc::new(file))))
+        })
+        .as_ref()
+}
+
 #[cfg(test)]
 fn module_path_matches_inode(module: &ModuleRecord) -> bool {
     open_module_file(module).is_some()
@@ -610,8 +682,28 @@ fn open_module_file_with_mapping_path(
     // win over a textual pathname that may now refer to a replacement file or
     // resolve in a different mount namespace. The pathname remains a useful
     // fallback after the process exits and map_files disappears.
-    validated_module_file(map_file, module, true)
-        .or_else(|| validated_module_file(module.path(), module, false))
+    if let Some(file) = validated_module_file(map_file, module, true) {
+        return Some(file);
+    }
+    // map_files needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN. Without it,
+    // resolve the pathname in the target's root before the recorder's, and
+    // reach a replaced main executable through /proc/<pid>/exe. Those two
+    // candidates are only tried when the recorded inode and device are both
+    // known, so each is accepted only on an exact identity match.
+    let path = module.path();
+    let identity_known =
+        module.inode != 0 && (module.device_major != 0 || module.device_minor != 0);
+    let pid = module.pid().filter(|_| identity_known);
+    pid.and_then(|pid| {
+        let relative_path = path.strip_prefix("/").ok()?;
+        let target_path = PathBuf::from(format!("/proc/{pid}/root")).join(relative_path);
+        validated_module_file(&target_path, module, false)
+    })
+    .or_else(|| validated_module_file(path, module, false))
+    .or_else(|| {
+        let executable = PathBuf::from(format!("/proc/{}/exe", pid?));
+        validated_module_file(&executable, module, true)
+    })
 }
 
 fn validated_module_file(
@@ -668,52 +760,31 @@ mod tests {
     }
 
     fn empty_sections() -> Arc<ElfSectionInfo> {
-        Arc::new(ElfSectionInfo {
-            base_svma: 0,
-            text_svma: None,
-            text_file_range: None,
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: Box::default(),
-        })
+        Arc::new(ElfSectionInfo::default())
     }
 
     fn exact_image(file: Arc<File>) -> Arc<NativeImage> {
         Arc::new(NativeImage::new(file))
     }
 
-    fn namespaced_identity(inode: u64, size: u64, mount_namespace: u64) -> ElfImageIdentity {
-        ElfImageIdentity::Namespaced {
-            file: ElfFileIdentity {
-                device: 1,
-                inode,
-                inode_generation: 0,
-                size,
-                modified_seconds: 0,
-                modified_nanoseconds: 0,
-                changed_seconds: 0,
-                changed_nanoseconds: 0,
-            },
-            mount_namespace,
+    fn file_identity(inode: u64, size: u64) -> ElfFileIdentity {
+        ElfFileIdentity {
+            device: 1,
+            inode,
+            inode_generation: 0,
+            size,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
         }
     }
 
     #[test]
     fn image_base_is_not_guessed_when_mapping_cannot_be_correlated() {
         let section_info = ElfSectionInfo {
-            base_svma: 0,
             text_svma: Some(0x1000..0x2000),
             text_file_range: Some(0x1000..0x2000),
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
             load_segments: vec![LoadSegment {
                 p_offset: 0,
                 p_filesz: 0x5000,
@@ -722,6 +793,7 @@ mod tests {
                 p_flags: 0x5,
             }]
             .into_boxed_slice(),
+            ..Default::default()
         };
         let module = ModuleRecord {
             jit_symbols: None,
@@ -881,8 +953,7 @@ mod tests {
             inode_generation: 0,
             path: path.as_path().into(),
         };
-        let first_identity =
-            elf_image_identity(&module, elf_file_identity(&module, &first_file).unwrap()).unwrap();
+        let first_identity = elf_file_identity(&module, &first_file).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::write(&path, b"other").unwrap();
@@ -890,8 +961,7 @@ mod tests {
         second_file
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        let second_identity =
-            elf_image_identity(&module, elf_file_identity(&module, &second_file).unwrap()).unwrap();
+        let second_identity = elf_file_identity(&module, &second_file).unwrap();
 
         assert_ne!(first_identity, second_identity);
     }
@@ -965,15 +1035,7 @@ mod tests {
         assert!(cache.by_module[&module.id].image.upgrade().is_none());
         cache.by_module.get_mut(&module.id).unwrap().sections = Arc::new(ElfSectionInfo {
             base_svma: u64::MAX,
-            text_svma: None,
-            text_file_range: None,
-            text: None,
-            eh_frame_svma: None,
-            eh_frame: None,
-            eh_frame_hdr_svma: None,
-            eh_frame_hdr: None,
-            got_svma: None,
-            load_segments: Box::default(),
+            ..Default::default()
         });
 
         assert_eq!(
@@ -1090,12 +1152,12 @@ mod tests {
         let sections = empty_sections();
         let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
-        for mount_namespace in 0..=MAX_SHARED_ELF_IMAGES as u64 {
+        for inode in 0..=MAX_SHARED_ELF_IMAGES as u64 {
             cache.insert_shared_image(
-                namespaced_identity(mount_namespace, 1, mount_namespace),
+                file_identity(inode, 1),
                 SharedElfImage {
                     sections: Arc::clone(&sections),
-                    token: mount_namespace,
+                    token: inode,
                     image: Arc::clone(&image),
                     owned_bytes: 1,
                 },
@@ -1115,7 +1177,7 @@ mod tests {
             1,
             Arc::clone(&sections),
             Arc::clone(&image),
-            namespaced_identity(1, 1, 1).file().clone(),
+            file_identity(1, 1),
         );
         let module = ModuleRecord {
             jit_symbols: None,
@@ -1145,13 +1207,31 @@ mod tests {
     }
 
     #[test]
+    fn republishing_an_exact_image_keeps_one_reference_per_module() {
+        let store = ExactImageStore::default();
+        let sections = empty_sections();
+        let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
+        store.insert(
+            1,
+            Arc::clone(&sections),
+            Arc::clone(&image),
+            file_identity(1, 1),
+        );
+        let token = store.get(1).unwrap().token;
+
+        store.insert(1, sections, image, file_identity(1, 1));
+        assert_eq!(store.get(1).unwrap().token, token);
+        assert_eq!(store.retained_counts(), (1, 1, 1));
+    }
+
+    #[test]
     fn shared_image_cache_refreshes_recently_used_images() {
         let sections = empty_sections();
         let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         for inode in 0..MAX_SHARED_ELF_IMAGES as u64 {
             cache.insert_shared_image(
-                namespaced_identity(inode, 1, 1),
+                file_identity(inode, 1),
                 SharedElfImage {
                     sections: Arc::clone(&sections),
                     token: inode,
@@ -1160,10 +1240,10 @@ mod tests {
                 },
             );
         }
-        let first = namespaced_identity(0, 1, 1);
+        let first = file_identity(0, 1);
         cache.touch_shared_image(&first);
         cache.insert_shared_image(
-            namespaced_identity(MAX_SHARED_ELF_IMAGES as u64, 1, 1),
+            file_identity(MAX_SHARED_ELF_IMAGES as u64, 1),
             SharedElfImage {
                 sections,
                 token: MAX_SHARED_ELF_IMAGES as u64,
@@ -1173,13 +1253,13 @@ mod tests {
         );
 
         assert!(cache.by_image.contains_key(&first));
-        assert!(!cache.by_image.contains_key(&namespaced_identity(1, 1, 1)));
+        assert!(!cache.by_image.contains_key(&file_identity(1, 1)));
     }
 
     #[test]
     fn shared_image_cache_honors_its_byte_budget() {
         let sections = empty_sections();
-        let identity = |inode| namespaced_identity(inode, 1, 1);
+        let identity = |inode| file_identity(inode, 1);
         let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         for inode in 1..=3 {
@@ -1202,7 +1282,7 @@ mod tests {
     #[test]
     fn oversized_owned_image_is_not_shared() {
         let sections = empty_sections();
-        let identity = namespaced_identity(1, 190 * 1024 * 1024, 1);
+        let identity = file_identity(1, 190 * 1024 * 1024);
         let image = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let mut cache = ElfSectionCache::default();
         cache.by_module.insert(
@@ -1211,7 +1291,7 @@ mod tests {
                 sections: Arc::clone(&sections),
                 token: 1,
                 image: Arc::downgrade(&image),
-                identity: Some(identity.file().clone()),
+                identity: Some(identity.clone()),
                 trusted: false,
             },
         );
@@ -1235,13 +1315,13 @@ mod tests {
     #[test]
     fn large_file_backed_image_is_charged_only_for_owned_data() {
         let sections = empty_sections();
-        let identity = namespaced_identity(1, 190 * 1024 * 1024, 1);
+        let identity = file_identity(1, 190 * 1024 * 1024);
         let exact = exact_image(Arc::new(File::open("/bin/true").unwrap()));
         let image = CachedElfImage {
             sections,
             token: 1,
             image: Arc::downgrade(&exact),
-            identity: Some(identity.file().clone()),
+            identity: Some(identity.clone()),
             trusted: false,
         };
         let owned_bytes = elf_image_owned_bytes(&image.sections);
@@ -1258,15 +1338,9 @@ mod tests {
         let shared: Arc<[u8]> = vec![0_u8; 4096].into();
         let separate: Arc<[u8]> = vec![0_u8; 1024].into();
         let sections = ElfSectionInfo {
-            base_svma: 0,
-            text_svma: None,
-            text_file_range: None,
             text: ElfSectionData::owned_range(Arc::clone(&shared), 0..1024),
-            eh_frame_svma: None,
             eh_frame: ElfSectionData::owned_range(shared, 1024..4096),
-            eh_frame_hdr_svma: None,
             eh_frame_hdr: ElfSectionData::owned_range(separate, 0..1024),
-            got_svma: None,
             load_segments: vec![LoadSegment {
                 p_offset: 0,
                 p_filesz: 1,
@@ -1275,6 +1349,7 @@ mod tests {
                 p_flags: 0,
             }]
             .into_boxed_slice(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1317,23 +1392,7 @@ mod tests {
 
     #[test]
     fn loads_vdso_elf_from_the_target_mapping() {
-        let maps = std::fs::read("/proc/self/maps").unwrap();
-        let region = crate::proc_maps::parse_iter(&maps)
-            .find(|region| region.path == Path::new("[vdso]"))
-            .expect("current process has a vDSO mapping");
-        let module = ModuleRecord {
-            jit_symbols: None,
-            id: 1,
-            owner: user_owner(i32::try_from(std::process::id()).unwrap()),
-            start: region.address.start,
-            end: region.address.end,
-            file_offset: region.file_offset,
-            inode: region.inode,
-            device_major: region.device_major,
-            device_minor: region.device_minor,
-            inode_generation: 0,
-            path: Path::new("[vdso]").into(),
-        };
+        let module = current_vdso_module();
 
         let loaded = ElfSectionCache::default()
             .load_mapping(&module)
@@ -1341,5 +1400,39 @@ mod tests {
 
         assert!(loaded.image_base.is_some());
         assert!(!loaded.sections.load_segments.is_empty());
+    }
+
+    #[test]
+    fn replaced_executable_is_opened_through_the_process_image() {
+        let temp = TempDir::new("native-module-replaced-exe");
+        let path = temp.path().join("sleep");
+        // Copy in a child process: a writable descriptor held here could leak
+        // into a concurrently forked test child and make its exec fail.
+        let copied = std::process::Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&path)
+            .status();
+        assert!(copied.unwrap().success());
+        let mut child = std::process::Command::new(&path).arg("30").spawn().unwrap();
+        let pid = child.id();
+        // uutils sleep exits at startup if its executable is already deleted.
+        for _ in 0..500 {
+            if crate::linux::read_process_stat(pid).unwrap().state == 'S' {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let maps = std::fs::read(format!("/proc/{pid}/maps")).unwrap();
+        let module = crate::linux::module_tracking::executable_modules_from_maps(pid, &maps)
+            .find(|module| *module.path == *path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+
+        let opened =
+            open_module_file_with_mapping_path(&module, Path::new("/proc/self/map_files/0-0"));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(opened.unwrap().metadata().unwrap().ino(), module.inode);
     }
 }

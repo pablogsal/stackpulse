@@ -85,22 +85,15 @@ impl UnwindRuleX86_64 {
     }
 }
 
-impl UnwindRule for UnwindRuleX86_64 {
-    type UnwindRegs = UnwindRegsX86_64;
-
-    fn rule_for_stub_functions() -> Self {
-        UnwindRuleX86_64::JustReturn
-    }
-    fn rule_for_function_start() -> Self {
-        UnwindRuleX86_64::JustReturn
-    }
-    fn fallback_rule() -> Self {
-        UnwindRuleX86_64::UseFramePointer
-    }
-
-    fn exec<F>(
+impl UnwindRuleX86_64 {
+    /// Executes the rule. With `from_dwarf_row`, the rule was translated from a DWARF CFI
+    /// row and follows the full DWARF evaluation in `x86_64::dwarf`: the caller's RBP stays
+    /// unchanged when its slot cannot be read, and a CFA of RBP + 16 only has to advance the
+    /// unwind rather than move the stack pointer up.
+    fn exec_impl<F>(
         self,
         is_first_frame: bool,
+        from_dwarf_row: bool,
         regs: &mut UnwindRegsX86_64,
         read_stack: &mut F,
     ) -> Result<Option<u64>, Error>
@@ -150,9 +143,10 @@ impl UnwindRule for UnwindRuleX86_64 {
                     .ok_or(Error::IntegerOverflow)?;
                 let new_bp = match read_stack(bp_location) {
                     Ok(new_bp) => new_bp,
-                    Err(()) if is_first_frame && bp_location < sp => {
-                        // Ignore errors when reading beyond the stack pointer in the first frame.
-                        // These negative offsets are sometimes seen in x86_64 epilogues, where
+                    Err(()) if from_dwarf_row || (is_first_frame && bp_location < sp) => {
+                        // DWARF rows keep the current RBP on any read error, like the full
+                        // evaluation does. Other rules ignore errors when reading beyond the
+                        // stack pointer in the first frame. These negative offsets are sometimes seen in x86_64 epilogues, where
                         // a bunch of registers are popped one after the other, and the compiler
                         // doesn't always set the already-popped register to "unchanged" (because
                         // doing so would take up extra space in the dwarf information).
@@ -211,10 +205,19 @@ impl UnwindRule for UnwindRuleX86_64 {
                     return Ok(None);
                 }
                 let new_sp = bp.checked_add(16).ok_or(Error::IntegerOverflow)?;
-                if new_sp <= sp {
+                let moved_backwards = if from_dwarf_row {
+                    !is_first_frame && new_sp < sp
+                } else {
+                    new_sp <= sp
+                };
+                if moved_backwards {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
-                let new_bp = read_stack(bp).map_err(|_| Error::CouldNotReadStack(bp))?;
+                let new_bp = match read_stack(bp) {
+                    Ok(new_bp) => new_bp,
+                    Err(()) if from_dwarf_row => bp,
+                    Err(()) => return Err(Error::CouldNotReadStack(bp)),
+                };
                 // new_bp is the caller's bp. If the caller uses frame pointers, then bp should be
                 // a valid frame pointer and we could do a coherency check on new_bp to make sure
                 // it's moving in the right direction. But if the caller is using bp as a general
@@ -244,8 +247,9 @@ impl UnwindRule for UnwindRuleX86_64 {
                 (sp.checked_add(8).ok_or(Error::IntegerOverflow)?, new_bp)
             }
         };
-        let return_address =
-            read_stack(new_sp - 8).map_err(|_| Error::CouldNotReadStack(new_sp - 8))?;
+        let return_address_location = new_sp.checked_sub(8).ok_or(Error::IntegerOverflow)?;
+        let return_address = read_stack(return_address_location)
+            .map_err(|_| Error::CouldNotReadStack(return_address_location))?;
         if return_address == 0 {
             return Ok(None);
         }
@@ -261,8 +265,22 @@ impl UnwindRule for UnwindRuleX86_64 {
         regs.set_bp(new_bp);
         Ok(Some(return_address))
     }
+}
 
-    fn exec_with_dwarf_register_defaults<F>(
+impl UnwindRule for UnwindRuleX86_64 {
+    type UnwindRegs = UnwindRegsX86_64;
+
+    fn rule_for_stub_functions() -> Self {
+        UnwindRuleX86_64::JustReturn
+    }
+    fn rule_for_function_start() -> Self {
+        UnwindRuleX86_64::JustReturn
+    }
+    fn fallback_rule() -> Self {
+        UnwindRuleX86_64::UseFramePointer
+    }
+
+    fn exec<F>(
         self,
         is_first_frame: bool,
         regs: &mut UnwindRegsX86_64,
@@ -271,17 +289,88 @@ impl UnwindRule for UnwindRuleX86_64 {
     where
         F: FnMut(u64) -> Result<u64, ()>,
     {
-        let preserved = [Reg::RBX, Reg::R12, Reg::R13, Reg::R14, Reg::R15]
-            .map(|register| (register, regs.get_if_set(register)));
-        let return_address = self.exec(is_first_frame, regs, read_stack)?;
+        self.exec_impl(is_first_frame, false, regs, read_stack)
+    }
+
+    fn exec_with_dwarf_register_rules<F>(
+        self,
+        register_rules: u64,
+        is_first_frame: bool,
+        regs: &mut UnwindRegsX86_64,
+        read_stack: &mut F,
+    ) -> Result<Option<u64>, Error>
+    where
+        F: FnMut(u64) -> Result<u64, ()>,
+    {
+        let preserved = DWARF_CALLEE_SAVED_REGISTERS.map(|register| regs.get_if_set(register));
+        let return_address = self.exec_impl(is_first_frame, true, regs, read_stack)?;
         if return_address.is_some() {
-            for (register, value) in preserved {
+            let cfa = regs.sp();
+            for (index, (register, value)) in DWARF_CALLEE_SAVED_REGISTERS
+                .into_iter()
+                .zip(preserved)
+                .enumerate()
+            {
+                let value = match DwarfRegisterRule::unpack(register_rules, index) {
+                    DwarfRegisterRule::SameValue => value,
+                    DwarfRegisterRule::Undefined => None,
+                    DwarfRegisterRule::Offset { cfa_offset_by_8 } => cfa
+                        .checked_add_signed(i64::from(cfa_offset_by_8) * 8)
+                        .and_then(|address| read_stack(address).ok()),
+                };
                 if let Some(value) = value {
                     regs.set(register, value);
                 }
             }
         }
         Ok(return_address)
+    }
+}
+
+/// The callee-saved registers that DWARF CFI rows can recover through a cached rule, in the
+/// order in which their rules are packed.
+pub(crate) const DWARF_CALLEE_SAVED_REGISTERS: [Reg; 5] =
+    [Reg::RBX, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+
+/// How a DWARF CFI row recovers one of the `DWARF_CALLEE_SAVED_REGISTERS`. The rules of a
+/// row are packed into ten bits per register, so that zero is the DWARF default of keeping
+/// every callee-saved register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DwarfRegisterRule {
+    /// The caller has the same value as the callee.
+    SameValue,
+    /// The value in the caller is unknown.
+    Undefined,
+    /// The caller's value is stored at CFA + 8 * `cfa_offset_by_8`.
+    Offset { cfa_offset_by_8: i8 },
+}
+
+impl DwarfRegisterRule {
+    const PACKED_BITS: usize = 10;
+
+    pub(crate) fn pack(rules: [Self; DWARF_CALLEE_SAVED_REGISTERS.len()]) -> u64 {
+        rules
+            .into_iter()
+            .enumerate()
+            .fold(0, |packed, (index, rule)| {
+                let bits = match rule {
+                    Self::SameValue => 0,
+                    Self::Undefined => 1 << 8,
+                    Self::Offset { cfa_offset_by_8 } => 2 << 8 | u64::from(cfa_offset_by_8 as u8),
+                };
+                packed | bits << (index * Self::PACKED_BITS)
+            })
+    }
+
+    fn unpack(packed: u64, index: usize) -> Self {
+        let bits = packed >> (index * Self::PACKED_BITS);
+        match (bits >> 8) & 0b11 {
+            1 => Self::Undefined,
+            2 => Self::Offset {
+                cfa_offset_by_8: bits as u8 as i8,
+            },
+            _ => Self::SameValue,
+        }
     }
 }
 
@@ -407,8 +496,12 @@ mod test {
         regs.set(Reg::RBX, 0xbb);
         regs.set(Reg::R12, 0xcc);
 
-        let res = UnwindRuleX86_64::OffsetSp { sp_offset_by_8: 1 }
-            .exec_with_dwarf_register_defaults(true, &mut regs, &mut read_stack);
+        let res = UnwindRuleX86_64::OffsetSp { sp_offset_by_8: 1 }.exec_with_dwarf_register_rules(
+            0,
+            true,
+            &mut regs,
+            &mut read_stack,
+        );
 
         assert_eq!(res, Ok(Some(0x100200)));
         assert_eq!(regs.get_if_set(Reg::RAX), None);

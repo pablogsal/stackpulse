@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "framehop-stackpulse"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "arrayvec",
  "cfg-if",
@@ -2068,6 +2068,7 @@ dependencies = [
  "gimli 0.34.0",
  "goblin",
  "libc",
+ "memchr",
  "memmap2",
  "rustc-hash",
  "tempfile",

@@ -13,6 +13,7 @@ use nix::fcntl::OFlag;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, pipe2, read, write, ForkResult, Pid as NixPid};
 
+use crate::state::ProcessHandle;
 use crate::Pid;
 
 unsafe extern "C" {
@@ -25,13 +26,23 @@ unsafe extern "C" {
 pub struct SuspendedLaunchedProcess {
     pid: NixPid,
     public_pid: Pid,
-    pipes: Option<SuspendPipes>,
+    program: OsString,
+    suspended: Option<Suspended>,
 }
 
 #[derive(Debug)]
-struct SuspendPipes {
+struct Suspended {
+    process: ProcessHandle,
     resume_tx: OwnedFd,
     exec_error_rx: OwnedFd,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to execute `{}`: {source}", program.to_string_lossy())]
+struct ExecError {
+    program: OsString,
+    #[source]
+    source: io::Error,
 }
 
 impl SuspendedLaunchedProcess {
@@ -77,7 +88,10 @@ impl SuspendedLaunchedProcess {
                 Ok(Self {
                     pid: child,
                     public_pid,
-                    pipes: Some(SuspendPipes {
+                    program: command_name.to_owned(),
+                    suspended: Some(Suspended {
+                        // Race-free: only this parent can reap the child.
+                        process: ProcessHandle::open(public_pid),
                         resume_tx: resume_sp,
                         exec_error_rx: execerr_rp,
                     }),
@@ -97,23 +111,31 @@ impl SuspendedLaunchedProcess {
     ///
     /// # Errors
     ///
-    /// Returns an error when the child cannot be resumed or `exec` fails.
+    /// Returns [`crate::ErrorKind::ProcessLaunch`] naming the program when the
+    /// child cannot be resumed or `exec` fails.
     pub fn unsuspend_and_run(mut self) -> crate::Result<RunningProcess> {
-        let result = self.unsuspend_inner().map_err(crate::Error::from);
+        let result = self.unsuspend_inner();
         if result.is_err() {
             // Reap the child on any failure after we took ownership of the
-            // pipes; Drop's reap path is gated on the pipes still being Some.
+            // pipes; Drop's reap path is gated on `suspended` still being Some.
             reap(self.pid);
         }
-        result
+        result.map_err(|source| {
+            let program = std::mem::take(&mut self.program);
+            crate::Error::new(
+                crate::ErrorKind::ProcessLaunch,
+                ExecError { program, source },
+            )
+        })
     }
 
     fn unsuspend_inner(&mut self) -> io::Result<RunningProcess> {
-        let SuspendPipes {
+        let Suspended {
+            process,
             resume_tx,
             exec_error_rx,
         } = self
-            .pipes
+            .suspended
             .take()
             .ok_or_else(|| io::Error::other("process was already resumed"))?;
 
@@ -151,7 +173,7 @@ impl SuspendedLaunchedProcess {
         }
 
         Ok(RunningProcess {
-            public_pid: self.public_pid,
+            process,
             state: ChildState::Running,
         })
     }
@@ -170,6 +192,13 @@ impl SuspendedLaunchedProcess {
                 // Parent gave up (closed pipe without signaling); exit silently.
                 Ok(0) => Self::exit_child(0),
                 Ok(_) => {
+                    // Match std::process::Command: the Rust runtime ignores
+                    // SIGPIPE, which would otherwise survive exec. Like
+                    // Command, keep the forking thread's signal mask.
+                    // SAFETY: signal is async-signal-safe.
+                    unsafe {
+                        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                    }
                     // SAFETY: argv and envp are null-terminated pointer arrays.
                     // Their C strings remain alive until exec or exit_child.
                     let _ = unsafe {
@@ -234,10 +263,17 @@ fn process_exit_status(status: WaitStatus) -> io::Result<ExitStatus> {
 
 impl Drop for SuspendedLaunchedProcess {
     fn drop(&mut self) {
-        if self.pipes.take().is_none() {
+        let Some(suspended) = self.suspended.take() else {
             return;
+        };
+        // Suspended children forked later inherit our resume pipe, so the
+        // child may never see EOF. Kill it only from the parent: a forked copy
+        // of this handle gets ECHILD and must leave the owner's child alone.
+        if let Ok(WaitStatus::StillAlive) = waitpid_retry(self.pid, Some(WaitPidFlag::WNOHANG)) {
+            let _ = suspended.process.signal(libc::SIGKILL);
+            drop(suspended);
+            reap(self.pid);
         }
-        reap(self.pid);
     }
 }
 
@@ -253,7 +289,7 @@ fn cstring_from_os_str(os_str: &OsStr) -> io::Result<CString> {
 /// A launched process that is now running.
 #[must_use = "dropping without wait may leave the child running"]
 pub struct RunningProcess {
-    public_pid: Pid,
+    process: ProcessHandle,
     state: ChildState,
 }
 
@@ -266,7 +302,7 @@ enum ChildState {
 impl std::fmt::Debug for RunningProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunningProcess")
-            .field("pid", &self.public_pid)
+            .field("pid", &self.process.pid())
             .field("state", &self.state)
             .finish()
     }
@@ -275,14 +311,13 @@ impl std::fmt::Debug for RunningProcess {
 impl RunningProcess {
     /// Return the stable identity of this child, including after it exits.
     pub fn pid(&self) -> Pid {
-        self.public_pid
+        self.process.pid()
     }
 
     /// Send SIGKILL to a child that has not been reaped.
     pub fn kill(&mut self) -> crate::Result<()> {
         if let ChildState::Running = self.state {
-            nix::sys::signal::kill(self.nix_pid(), nix::sys::signal::Signal::SIGKILL)
-                .map_err(nix_error)?;
+            self.process.signal(libc::SIGKILL)?;
         }
         Ok(())
     }
@@ -324,7 +359,7 @@ impl RunningProcess {
     }
 
     fn nix_pid(&self) -> NixPid {
-        NixPid::from_raw(self.public_pid.get())
+        NixPid::from_raw(self.process.pid().get())
     }
 }
 
@@ -368,10 +403,11 @@ fn build_env(env_vars: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{current_test_binary, ignored_test_args, TempDir};
     use nix::sys::signal::Signal;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -380,20 +416,6 @@ mod tests {
     const PATH_HELPER: &str = "linux::process::tests::stackpulse_process_helper_path_override";
     const CHILD_PATH_ENV: &str = "STACKPULSE_CHILD_PATH";
     const PATH_EXECUTABLE: &str = "stackpulse-child-path-executable";
-
-    fn current_test_binary() -> OsString {
-        std::env::current_exe()
-            .expect("current test binary")
-            .into_os_string()
-    }
-
-    fn ignored_test_args(test_name: &str) -> [OsString; 3] {
-        [
-            OsString::from("--ignored"),
-            OsString::from("--exact"),
-            OsString::from(test_name),
-        ]
-    }
 
     #[test]
     fn dropping_suspended_launch_reaps_child() {
@@ -408,6 +430,24 @@ mod tests {
             waitpid(pid, Some(WaitPidFlag::WNOHANG)),
             Err(Errno::ECHILD)
         ));
+    }
+
+    #[test]
+    fn dropping_suspended_launch_does_not_wait_for_later_siblings() {
+        let launch = || {
+            SuspendedLaunchedProcess::launch_in_suspended_state(OsStr::new("unused"), &[], &[])
+                .expect("launch suspended child")
+        };
+        let first = launch();
+        // The second child inherits the first child's resume pipe.
+        let _second = launch();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(first);
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(3)).is_ok());
     }
 
     #[test]
@@ -497,6 +537,20 @@ mod tests {
     }
 
     #[test]
+    fn launched_child_restores_default_sigpipe() {
+        let status = Launch::new("/bin/sh")
+            .args(["-c", "kill -PIPE $$; exit 0"])
+            .suspend()
+            .expect("launch suspended child")
+            .unsuspend_and_run()
+            .expect("resume child")
+            .wait()
+            .expect("wait child");
+
+        assert_eq!(status.signal(), Some(libc::SIGPIPE));
+    }
+
+    #[test]
     fn exit_status_preserves_signal_and_core_dump() {
         let pid = NixPid::from_raw(42);
         let status = process_exit_status(WaitStatus::Signaled(pid, Signal::SIGTERM, true))
@@ -519,7 +573,7 @@ mod tests {
     #[test]
     fn try_wait_reports_missing_child() {
         let mut process = RunningProcess {
-            public_pid: Pid::new(i32::MAX).unwrap(),
+            process: ProcessHandle::open(Pid::new(i32::MAX).unwrap()),
             state: ChildState::Running,
         };
 
@@ -617,6 +671,9 @@ mod tests {
 pub type Child = RunningProcess;
 
 /// Supported launch inputs for a child that waits before exec.
+///
+/// As with `std::process::Command`, the child starts with the default
+/// `SIGPIPE` disposition and inherits the calling thread's signal mask.
 #[derive(Clone, Debug)]
 pub struct Launch {
     program: OsString,

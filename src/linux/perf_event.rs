@@ -22,6 +22,7 @@ use super::ring_buffer::{RingBuffer, RingRecord};
 #[cfg(test)]
 use super::DEFAULT_RING_BUFFER_STACKS;
 use super::{invalid_data, normalized_ring_stacks};
+use crate::error::{AttachError, AttachStep};
 
 /// Maximum accepted `sample_stack_user` request, in bytes. The kernel may
 /// return fewer bytes so the complete perf record still fits its size field.
@@ -204,7 +205,11 @@ impl PerfOptions {
             plan.requested_exp,
             plan.fallback_exp,
             |page_exp| self.open_counter_with_page_exp(page_exp),
-            |opened, page_exp| RingBuffer::new(opened.counter.file(), page_exp),
+            |opened, page_exp| {
+                RingBuffer::new(opened.counter.file(), page_exp).map_err(|err| {
+                    AttachError::wrap(AttachStep::PerfRingMmap { cpu: self.cpu }, self.pid, err)
+                })
+            },
         )?;
         let OpenedCounter {
             counter,
@@ -241,7 +246,7 @@ impl PerfOptions {
 
     fn open_counter_with_page_exp(&self, page_exp: u8) -> io::Result<OpenedCounter> {
         let opts = self.perf_open_opts(ring_wakeup_bytes(page_exp)?);
-        match self.open_counter_once(&opts) {
+        let opened = match self.open_counter_once(&opts) {
             Ok((counter, include_kernel)) => Ok(OpenedCounter {
                 counter,
                 inherit: self.inherit,
@@ -260,7 +265,16 @@ impl PerfOptions {
                     })
             }
             Err(err) => Err(err),
-        }
+        };
+        // Every errno-based fallback has run; explain a pre-6.0 kernel's
+        // EINVAL, then name the target for the caller.
+        opened.map_err(|err| {
+            AttachError::wrap(
+                AttachStep::PerfEventOpen { cpu: self.cpu },
+                self.pid,
+                classify_open_error(err, lost_format_supported),
+            )
+        })
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -280,27 +294,17 @@ impl PerfOptions {
     }
 
     fn open_counter_once(&self, opts: &Opts) -> io::Result<(Counter, bool)> {
-        with_guest_exclusion_fallback(opts, |opts| {
-            with_kernel_exclusion_fallback(
-                self.include_kernel,
-                || self.open_event_counter(opts),
-                || {
-                    let mut user_opts = opts.clone();
-                    user_opts.exclude.kernel = true;
-                    self.open_event_counter(&user_opts)
-                },
-            )
-        })
-    }
-
-    fn open_event_counter(&self, opts: &Opts) -> io::Result<Counter> {
+        let software =
+            |opts: &Opts| open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts);
         match self.event_source {
-            EventSource::HwCpuCycles => with_software_event_fallback(
-                || open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts),
-                || open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts),
+            EventSource::HwCpuCycles => with_cycle_event_fallbacks(
+                opts,
+                self.include_kernel,
+                |opts| open_counter_for_event(Hardware::CpuCycle, self.pid, self.cpu, opts),
+                software,
             ),
             EventSource::SwCpuClock => {
-                open_counter_for_event(Software::CpuClock, self.pid, self.cpu, opts)
+                with_exclusion_fallbacks(opts, self.include_kernel, software)
             }
         }
     }
@@ -465,6 +469,78 @@ fn is_inherit_thread_error(err: &io::Error) -> bool {
     )
 }
 
+fn with_cycle_event_fallbacks<T>(
+    opts: &Opts,
+    include_kernel: bool,
+    hardware: impl Fn(&Opts) -> io::Result<T>,
+    software: impl Fn(&Opts) -> io::Result<T>,
+) -> io::Result<(T, bool)> {
+    // Exhaust the hardware retries before switching events: some PMUs only
+    // need guest events excluded, while one without a sampling interrupt
+    // keeps failing with EOPNOTSUPP and must fall back to cpu-clock.
+    with_software_event_fallback(
+        || with_exclusion_fallbacks(opts, include_kernel, hardware),
+        || with_exclusion_fallbacks(opts, include_kernel, software),
+    )
+}
+
+fn with_exclusion_fallbacks<T>(
+    opts: &Opts,
+    include_kernel: bool,
+    open: impl Fn(&Opts) -> io::Result<T>,
+) -> io::Result<(T, bool)> {
+    with_guest_exclusion_fallback(opts, |opts| {
+        with_kernel_exclusion_fallback(
+            include_kernel,
+            || open(opts),
+            || {
+                let mut user_opts = opts.clone();
+                user_opts.exclude.kernel = true;
+                open(&user_opts)
+            },
+        )
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "perf_event_open rejected PERF_FORMAT_LOST; StackPulse requires Linux 6.0 or newer: {source}"
+)]
+struct LostFormatUnsupported {
+    #[source]
+    source: io::Error,
+}
+
+fn classify_open_error(err: io::Error, lost_format_supported: impl FnOnce() -> bool) -> io::Error {
+    if err.raw_os_error() == Some(libc::EINVAL) && !lost_format_supported() {
+        return io::Error::new(
+            io::ErrorKind::Unsupported,
+            LostFormatUnsupported { source: err },
+        );
+    }
+    err
+}
+
+/// Kernels before Linux 6.0 reject `PERF_FORMAT_LOST` with the same `EINVAL`
+/// as any other invalid attribute, so compare minimal counters with and
+/// without it. Anything but a clean split keeps the original error. Not
+/// cached: this runs only on a failed open, and a transient failure such as
+/// `EMFILE` must not decide later attempts.
+fn lost_format_supported() -> bool {
+    let open = |lost_records| {
+        let mut opts = Opts {
+            exclude: perf_event_open::config::Priv {
+                kernel: true,
+                ..Default::default()
+            },
+            ..Opts::default()
+        };
+        opts.stat_format.lost_records = lost_records;
+        Counter::new(Software::CpuClock, (Proc::CURRENT, Cpu::ALL), &opts)
+    };
+    !(open(false).is_ok() && open(true).is_err_and(|err| err.raw_os_error() == Some(libc::EINVAL)))
+}
+
 fn with_software_event_fallback<T>(
     hardware: impl FnOnce() -> io::Result<T>,
     software: impl FnOnce() -> io::Result<T>,
@@ -473,7 +549,7 @@ fn with_software_event_fallback<T>(
         Err(err)
             if matches!(
                 err.raw_os_error(),
-                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO)
+                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO | libc::EOPNOTSUPP)
             ) =>
         {
             software()
@@ -513,7 +589,7 @@ fn with_guest_exclusion_fallback<T>(
 
 const RING_WAKEUP_FRACTION: u64 = 8;
 const MAX_RING_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_PERF_RECORD_BYTES: u64 = u16::MAX as u64;
+pub(super) const MAX_PERF_RECORD_BYTES: u64 = u16::MAX as u64;
 
 fn ring_buffer_page_exp(stack_size: u32, ring_stacks: u32) -> io::Result<u8> {
     ring_buffer_page_exp_for_page_size(stack_size, ring_stacks, crate::elf::system_page_size())
@@ -568,6 +644,21 @@ fn ring_buffer_budget_page_exp(maximum_bytes: u64) -> io::Result<u8> {
     Ok((u64::BITS - 1 - pages.leading_zeros()) as u8)
 }
 
+/// Smallest ring capacity that `open_ring` falls back to for `stack_size`.
+pub(super) fn minimum_ring_bytes(stack_size: u32) -> io::Result<u64> {
+    Ok(crate::elf::system_page_size() << ring_buffer_page_exp(stack_size, 1)?)
+}
+
+/// Whether a ring mmap failed because the locked or mapped memory budget
+/// ran out, so a smaller ring may still fit. Looks through attach context
+/// wrappers, which hide the errno from `raw_os_error`.
+pub(super) fn is_ring_budget_error(error: &io::Error) -> bool {
+    matches!(
+        crate::error::find_raw_os_error(error),
+        Some(libc::EPERM | libc::ENOMEM)
+    )
+}
+
 fn open_ring_with_fallback<C, R>(
     requested_exp: u8,
     fallback_exp: u8,
@@ -578,10 +669,7 @@ fn open_ring_with_fallback<C, R>(
     loop {
         let counter = open_counter(page_exp)?;
         match open_ring(&counter, page_exp) {
-            Err(error)
-                if page_exp > fallback_exp
-                    && matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOMEM)) =>
-            {
+            Err(error) if page_exp > fallback_exp && is_ring_budget_error(&error) => {
                 page_exp -= 1;
             }
             Ok(ring) => return Ok((counter, ring)),
@@ -767,6 +855,15 @@ impl SampleRecordLayout {
         })
     }
 
+    fn end(&self) -> usize {
+        [&self.user_regs, &self.user_stack, &self.call_chain]
+            .into_iter()
+            .flatten()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn sample<'a>(&self, bytes: &'a [u8]) -> Option<RingSampleRef<'a>> {
         Some(RingSampleRef {
             user_regs: match &self.user_regs {
@@ -818,7 +915,9 @@ impl RingSample {
         let RingSampleStorage::Ring(record) = &mut self.storage else {
             return;
         };
-        let detached = record.detach_bytes();
+        // Records reserve the full requested user stack, but a detached sample
+        // only reads its layout ranges, so the unused stack tail stays behind.
+        let detached = record.detach_bytes(self.layout.end());
         self.storage = RingSampleStorage::Detached(detached);
     }
 }
@@ -1510,27 +1609,29 @@ mod tests {
         bytes[len - size_of::<u64>()..len].copy_from_slice(&dyn_len.to_ne_bytes());
     }
 
+    /// Drain the ring-backed sample at the start of `ring`, with its time.
+    fn read_ring_sample(ring: &mut RingBuffer, user_regs: usize) -> (RingSample, Option<u64>) {
+        let parser = Arc::new(stack_sample_parser(user_regs));
+        let end = ring.snapshot_head();
+        EventDrain {
+            ring,
+            parser: &parser,
+            end,
+        }
+        .next_event(&mut |event| match event.record {
+            EventRecord::RingSample { sample, metadata } => (sample, metadata.time),
+            _ => panic!("expected ring-backed sample"),
+        })
+        .expect("read ring sample")
+        .expect("ring sample")
+    }
+
     #[test]
     fn detached_ring_sample_releases_tail_and_remains_parseable() {
         let spec = stack_sample_spec(64);
-        let parser = Arc::new(stack_sample_parser(spec.user_regs));
         let bytes = build_bench_sample_record(&spec, 3);
         let mut ring = super::super::ring_buffer::mock_ring(0, bytes.as_bytes());
-        let (mut sample, time) = {
-            let end = ring.snapshot_head();
-            let mut drain = EventDrain {
-                ring: &mut ring,
-                parser: &parser,
-                end,
-            };
-            drain
-                .next_event(&mut |event| match event.record {
-                    EventRecord::RingSample { sample, metadata } => (sample, metadata.time),
-                    _ => panic!("expected ring-backed sample"),
-                })
-                .expect("read ring sample")
-                .expect("ring sample")
-        };
+        let (mut sample, time) = read_ring_sample(&mut ring, spec.user_regs);
 
         assert_eq!(super::super::ring_buffer::test_tail(&ring), 0);
         sample.detach();
@@ -1543,6 +1644,21 @@ mod tests {
             .expect("detached sample parses");
         assert_eq!(time, Some(1_700_000_000_000_000 + 3_000));
         assert_eq!(stack_len, 64);
+    }
+
+    #[test]
+    fn detached_ring_sample_keeps_its_used_stack_bytes() {
+        let spec = stack_sample_spec(32 * 1024);
+        let mut bytes = build_bench_sample_record(&spec, 5);
+        set_dynamic_stack_size(&mut bytes, 4_093);
+        let mut ring = super::super::ring_buffer::mock_ring(0, bytes.as_bytes());
+        let (mut sample, _) = read_ring_sample(&mut ring, spec.user_regs);
+        sample.detach();
+
+        let stack_len = sample
+            .with_sample(|sample| sample.user_stack.map(<[u8]>::len))
+            .expect("detached sample parses");
+        assert_eq!(stack_len, Some(4_093));
     }
 
     #[test]
@@ -1832,6 +1948,15 @@ mod tests {
     }
 
     #[test]
+    fn rejected_lost_format_is_reported_as_an_unsupported_kernel() {
+        let err = classify_open_error(io::Error::from_raw_os_error(libc::EINVAL), || false);
+        assert!(err.to_string().contains("Linux 6.0"), "{err}");
+        let err = crate::Error::from(err);
+        assert_eq!(err.kind(), crate::ErrorKind::Unsupported);
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
     fn guest_exclusion_fallback_is_bounded_and_preserves_retry_error() {
         let mut opts = Opts::default();
         opts.exclude.guest = true;
@@ -1857,6 +1982,20 @@ mod tests {
         .expect_err("preserve retry error");
         assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn cycle_fallbacks_use_cpu_clock_when_hardware_cannot_sample() {
+        let (value, kernel_enabled) = with_cycle_event_fallbacks(
+            &Opts::default(),
+            true,
+            |_| Err::<u32, _>(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            |_| Ok(7),
+        )
+        .expect("fall back to cpu-clock");
+
+        assert_eq!(value, 7);
+        assert!(kernel_enabled);
     }
 
     #[test]

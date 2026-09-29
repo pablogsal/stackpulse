@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 use nix::fcntl::{fallocate, FallocateFlags};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use crate::native_module::ExactImageStore;
 
 use super::{
-    decode_spool_record, invalid_data, next_source_id, DecodedSpoolRecord, MmapSpoolCursor,
-    SampleRecord, SpoolDefinitions, ThreadRecord,
+    decode_spool_record, invalid_data, next_source_id, record_error, DecodedSpoolRecord,
+    MmapSpoolCursor, ModuleOwner, SampleRecord, SpoolDefinitions, ThreadRecord,
 };
 
 const MAX_BATCH_SAMPLES: usize = 16 * 1024;
@@ -45,7 +45,6 @@ pub struct Tail {
     observed_process_set: FxHashSet<crate::Pid>,
     retired_processes: Vec<crate::Pid>,
     retired_modules: Vec<u32>,
-    active_modules_by_process: FxHashMap<crate::Pid, Vec<usize>>,
     kernel_mappings_changed: bool,
     more_available: bool,
     exact_images: Option<ExactImageStore>,
@@ -152,7 +151,6 @@ impl Tail {
             observed_process_set: FxHashSet::default(),
             retired_processes: Vec::new(),
             retired_modules: Vec::new(),
-            active_modules_by_process: FxHashMap::default(),
             kernel_mappings_changed: false,
             more_available: false,
             exact_images,
@@ -333,6 +331,7 @@ impl Tail {
     fn parse_available(&mut self) -> io::Result<bool> {
         let mut cursor = MmapSpoolCursor::at_position(Arc::clone(&self.mmap), self.position);
         loop {
+            let record_start = cursor.position;
             let record = match decode_spool_record(
                 &mut cursor,
                 &self.definitions.modules,
@@ -346,7 +345,10 @@ impl Tail {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof && cursor.at_eof() => {
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let tag = cursor.mmap[record_start];
+                    return Err(record_error(error, tag, record_start));
+                }
             };
             let ends_batch = matches!(
                 &record,
@@ -357,13 +359,11 @@ impl Tail {
                     let process = module.pid();
                     let module_index = self.definitions.modules.len();
                     self.kernel_mappings_changed |= module.is_kernel();
+                    self.definitions
+                        .frame_contexts
+                        .push_module(module_index, module.owner);
                     self.definitions.modules.push(module);
-                    self.definitions.frame_contexts.push_module();
                     if let Some(process) = process {
-                        self.active_modules_by_process
-                            .entry(process)
-                            .or_default()
-                            .push(module_index);
                         self.observe_process(process);
                     }
                 }
@@ -385,17 +385,13 @@ impl Tail {
                     self.observe_process(record.process_id);
                 }
                 DecodedSpoolRecord::DeactivateProcess(process_id) => {
-                    for module_index in self
-                        .active_modules_by_process
-                        .remove(&process_id)
-                        .unwrap_or_default()
-                    {
-                        self.retired_modules
-                            .push(self.definitions.modules[module_index].id);
-                        self.definitions
-                            .frame_contexts
-                            .deactivate_module(module_index, self.definitions.frames.len());
-                    }
+                    let definitions = &mut self.definitions;
+                    let retired = &mut self.retired_modules;
+                    definitions.frame_contexts.deactivate_owner(
+                        ModuleOwner::Process(process_id),
+                        definitions.frames.len(),
+                        |module_index| retired.push(definitions.modules[module_index].id),
+                    );
                     self.observe_process(process_id);
                     self.retired_processes.push(process_id);
                 }
@@ -408,12 +404,6 @@ impl Tail {
                         .frame_contexts
                         .deactivate_module(module_id, self.definitions.frames.len());
                     if let Some(process) = process {
-                        if let Some(modules) = self.active_modules_by_process.get_mut(&process) {
-                            modules.retain(|&active| active != module_id);
-                            if modules.is_empty() {
-                                self.active_modules_by_process.remove(&process);
-                            }
-                        }
                         self.observe_process(process);
                     }
                 }
