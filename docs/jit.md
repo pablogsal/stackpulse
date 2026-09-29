@@ -17,7 +17,7 @@ symbolization backend. StackPulse exposes the same types as `stackpulse::jit`.
 Disabling StackPulse's default features still selects custom symbolization;
 recording remains available.
 
-Native profilers can depend directly on `stackpulse-jit = "0.1.0"`. They supply
+Native profilers can depend directly on `stackpulse-jit = "0.1.1"`. They supply
 their existing memory reader and mapping snapshot, then install the returned
 `framehop-stackpulse` 0.17 modules. Mapping generations, sample capture, unwind
 retries, and symbol lifetimes remain the caller's responsibility. A custom

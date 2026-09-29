@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.2 - 2026-09-29
+
 ### Fixed
 
 - Keep recordings running when a tracked process becomes non-dumpable, warning and retaining its last known mappings. A privileged exec can still stop kernel sampling of that target.
