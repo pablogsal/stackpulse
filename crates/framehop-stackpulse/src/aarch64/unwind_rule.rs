@@ -235,11 +235,10 @@ impl UnwindRule for UnwindRuleAarch64 {
                     .ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
-
-                if new_fp == 0 {
-                    return Ok(None);
-                }
-                if new_fp <= fp || new_sp <= sp {
+                // These offsets come from DWARF, so new_fp is the caller's x29 as saved by this
+                // function. The caller may use x29 as a general purpose register, in which case
+                // any value (including zero) is valid, so we leave new_fp unchecked.
+                if new_sp <= sp {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
                 regs.set_sp_is_fp_derived(false);

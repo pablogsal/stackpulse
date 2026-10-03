@@ -512,7 +512,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use gimli::{AArch64, DebugFrame, Format, StoreOnHeap, UnwindExpression, X86_64};
 
     use crate::{
@@ -521,6 +521,34 @@ mod tests {
     };
 
     use super::*;
+
+    pub(crate) const AARCH64_CIE: [u8; 8] = [
+        1,
+        0,
+        4,
+        0x78,
+        AArch64::X30.0 as u8,
+        gimli::DW_CFA_def_cfa.0,
+        AArch64::SP.0 as u8,
+        0,
+    ];
+
+    pub(crate) fn eh_frame_with_fde(
+        cie: &[u8],
+        range: Range<u64>,
+        instructions: &[u8],
+    ) -> (Vec<u8>, u32) {
+        let mut data = (4 + cie.len() as u32).to_le_bytes().to_vec();
+        data.extend(0u32.to_le_bytes());
+        data.extend(cie);
+        let fde_offset = data.len() as u32;
+        data.extend((20 + instructions.len() as u32).to_le_bytes());
+        data.extend((fde_offset + 4).to_le_bytes());
+        data.extend(range.start.to_le_bytes());
+        data.extend((range.end - range.start).to_le_bytes());
+        data.extend(instructions);
+        (data, fde_offset)
+    }
 
     #[test]
     fn eh_frame_and_debug_frame_preserve_unwind_and_error_outcomes() {
