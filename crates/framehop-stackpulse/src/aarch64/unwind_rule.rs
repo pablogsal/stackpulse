@@ -224,6 +224,9 @@ impl UnwindRule for UnwindRuleAarch64 {
                 fp_storage_offset_from_fp_by_8,
                 lr_storage_offset_from_fp_by_8,
             } => {
+                if fp == 0 {
+                    return Ok(None);
+                }
                 let sp_offset_from_fp = u64::from(sp_offset_from_fp_by_8) * 8;
                 let new_sp = fp
                     .checked_add(sp_offset_from_fp)
@@ -240,7 +243,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                     .ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
-                // These offsets come from DWARF, so new_fp is the caller's x29 as saved by this
+                // These offsets come from unwind metadata, so new_fp is the caller's x29 as saved by this
                 // function. The caller may use x29 as a general purpose register, in which case
                 // any value (including zero) is valid, so we leave new_fp unchecked.
                 if new_sp <= sp {
@@ -296,6 +299,11 @@ mod test {
         for rule in [
             UnwindRuleAarch64::NoOpIfFirstFrameOtherwiseFp,
             UnwindRuleAarch64::UseFramePointer,
+            UnwindRuleAarch64::UseFramepointerWithOffsets {
+                sp_offset_from_fp_by_8: 2,
+                fp_storage_offset_from_fp_by_8: 0,
+                lr_storage_offset_from_fp_by_8: 1,
+            },
         ] {
             let mut regs = UnwindRegsAarch64::new(0x100300, 0x1000, 0);
             let original_regs = regs;
