@@ -132,13 +132,18 @@ impl UnwindRule for UnwindRuleAarch64 {
                 lr_storage_offset_from_sp_by_8,
             } => {
                 let fp_storage_offset = i64::from(fp_storage_offset_from_sp_by_8) * 8;
-                // Frame-pointer fallback estimates the caller SP as `fp + 16`.
-                // Use DWARF's saved-x29 offset to correct that estimate.
-                let sp = if regs.sp_is_fp_derived()
-                    && fp != 0
-                    && sp.checked_add_signed(fp_storage_offset) != Some(fp)
-                {
-                    fp.checked_add_signed(-fp_storage_offset).unwrap_or(sp)
+                // A fallback SP is an estimate. An SP-relative saved-x29 slot
+                // that holds the current x29 proves the caller retained its
+                // ancestor's frame pointer; keep SP in that case. Otherwise an
+                // established frame pointer can locate the saved register slot.
+                // Never let this recovery move SP backwards.
+                let saved_fp_location = sp.checked_add_signed(fp_storage_offset);
+                let inherited_fp =
+                    saved_fp_location.and_then(|address| read_stack(address).ok()) == Some(fp);
+                let sp = if regs.sp_is_fp_derived() && fp != 0 && !inherited_fp {
+                    fp.checked_add_signed(-fp_storage_offset)
+                        .filter(|candidate| *candidate > sp)
+                        .unwrap_or(sp)
                 } else {
                     sp
                 };
@@ -339,6 +344,52 @@ mod test {
         assert_eq!(regs.sp(), 0x110);
         assert_eq!(regs.fp(), 0x200);
         assert!(!regs.sp_is_fp_derived());
+    }
+
+    #[test]
+    fn sp_relative_rule_preserves_an_inherited_frame_pointer_after_fallback() {
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x90, 0x200);
+        regs.set_sp_is_fp_derived(true);
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 2,
+            fp_storage_offset_from_sp_by_8: 0,
+            lr_storage_offset_from_sp_by_8: 1,
+        };
+        let mut read_stack = |address| match address {
+            0x90 => Ok(0x200),
+            0x98 => Ok(0x22010),
+            // Following the inherited x29 would silently skip this caller.
+            0x200 => Ok(0x300),
+            0x208 => Ok(0x33010),
+            _ => Err(()),
+        };
+        assert_eq!(
+            rule.exec(false, &mut regs, &mut read_stack),
+            Ok(Some(0x22010))
+        );
+        assert_eq!((regs.sp(), regs.fp()), (0xb0, 0x200));
+        assert!(!regs.sp_is_fp_derived());
+    }
+
+    #[test]
+    fn sp_relative_rule_never_reanchors_below_the_current_sp() {
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x90, 0x98);
+        regs.set_sp_is_fp_derived(true);
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 2,
+            fp_storage_offset_from_sp_by_8: 2,
+            lr_storage_offset_from_sp_by_8: 3,
+        };
+        let mut read_stack = |address| match address {
+            0xa0 => Ok(0x200),
+            0xa8 => Ok(0x22010),
+            _ => Err(()),
+        };
+        assert_eq!(
+            rule.exec(false, &mut regs, &mut read_stack),
+            Ok(Some(0x22010))
+        );
+        assert_eq!((regs.sp(), regs.fp()), (0xb0, 0x200));
     }
 
     #[test]
