@@ -74,8 +74,8 @@ fn load_elf_sections(data: ElfFileData, path: &Path) -> Result<ElfSectionInfo> {
     // and relocation sections; on a cold page cache those can be several MB per
     // library and block the sample loop for seconds in CI containers.
     let parse_err = |source| ElfParseError::new(path, source).into_io_error();
-    let header = Elf::parse_header(bytes).map_err(&parse_err)?;
-    let mut elf = Elf::lazy_parse(header).map_err(&parse_err)?;
+    let header = Elf::parse_header(bytes).map_err(parse_err)?;
+    let mut elf = Elf::lazy_parse(header).map_err(parse_err)?;
 
     let container = if elf.is_64 {
         Container::Big

@@ -143,6 +143,7 @@ impl RecorderBuilder {
                 if let Err(error) = recorder.attach_process(child, mode) {
                     recorder.check_failure().map_err(|_| error)?;
                 }
+                recorder.drain_events(DrainMode::Consume)?;
             }
         }
         Ok(recorder)

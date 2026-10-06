@@ -193,6 +193,72 @@ fn follows_python_child_processes_when_enabled() -> TestResult {
 }
 
 #[test]
+fn drains_samples_while_attaching_existing_descendants() -> TestResult {
+    let python = match python_for_tests() {
+        Some(python) => python,
+        None => return skip_or_fail("python3 was not found"),
+    };
+    let (listener, port) = listener()?;
+    let script = format!(
+        r#"
+import os
+import socket
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10000)"])
+sock = socket.create_connection(("127.0.0.1", {port}))
+sock.sendall(f"parent:{{os.getpid()}}\nchild:{{child.pid}}\nready\n".encode())
+value = 0
+while True:
+    value = (value + 31) % 1000003
+"#
+    );
+    let parent = python_command(&python)
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let _parent = ChildGuard::new(parent);
+    let mut stream = accept(&listener)?;
+    let ready = read_until(&mut stream, b"ready\n", READY_TIMEOUT)?;
+    let parent_pid = parse_pid_line(&ready, "parent:")?;
+    let child_pid = parse_pid_line(&ready, "child:")?;
+    let _child = PidGuard::new(child_pid);
+
+    struct SlowWriter;
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for policy in [AttachPolicy::Running, AttachPolicy::StopWhileAttaching] {
+        let recorder = match Recorder::builder(stackpulse::SampleRate::hz(99)?)
+            .scope(ProcessScope::Descendants)
+            .attach_policy(policy)
+            .attach_writer(stackpulse::Pid::new(parent_pid).unwrap(), SlowWriter)
+        {
+            Ok(recorder) => recorder,
+            Err(err) if attach_is_not_allowed(&err) => return skip_or_fail(&err.to_string()),
+            Err(err) => return Err(err.into()),
+        };
+        assert!(
+            recorder.stats().samples > 0,
+            "{policy:?} attachment should consume samples before the caller polls"
+        );
+        recorder.finish()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn rejects_thread_ids_that_are_not_the_process_id() -> TestResult {
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
