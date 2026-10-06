@@ -688,7 +688,6 @@ pub(crate) type NativeSymbolizerFactory =
 
 /// Factory for StackPulse's bundled Wholesym backend.
 #[cfg(feature = "builtin-wholesym")]
-#[must_use]
 pub(crate) fn default_native_symbolizer_factory() -> NativeSymbolizerFactory {
     let shared = Rc::new(RefCell::new(None));
     Box::new(move |_pid| {
