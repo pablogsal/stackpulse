@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.3 - 2026-10-07
+
+### Fixed
+
+- Drain perf events after each descendant attachment, reducing sample loss while attaching to large existing process trees.
+
 ## 0.12.2 - 2026-09-29
 
 ### Fixed
