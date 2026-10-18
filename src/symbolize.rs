@@ -143,6 +143,7 @@ struct ModuleMetadata {
     path: Option<std::rc::Rc<str>>,
     basename_start: usize,
     is_python_runtime: bool,
+    jit_index: jit::SymbolIndex,
 }
 
 fn format_hex_suffix(prefix: &str, value: u64) -> String {
@@ -245,6 +246,7 @@ fn module_metadata(record: &ModuleRecord) -> ModuleMetadata {
         path: None,
         basename_start,
         is_python_runtime: crate::is_python_module(&path[basename_start..]),
+        jit_index: jit::SymbolIndex::default(),
     }
 }
 
@@ -1375,9 +1377,16 @@ impl Symbolizer {
             return;
         }
 
-        let pinned_module = frame.module_id.and_then(|id| self.modules.get(id));
-        if let Some(resolved) = pinned_module.and_then(|module| {
-            jit::resolve_frame(module, process_id, frame.abs_ip, &mut self.jit_strings)
+        let pinned_module = frame
+            .module_id
+            .and_then(|id| self.modules.get_with_metadata(id));
+        if let Some(resolved) = pinned_module.and_then(|(module, metadata)| {
+            metadata.jit_index.resolve_frame(
+                module,
+                process_id,
+                frame.abs_ip,
+                &mut self.jit_strings,
+            )
         }) {
             self.pending_frames.push(PendingFrame {
                 cache_key,
@@ -1389,7 +1398,9 @@ impl Symbolizer {
             return;
         }
 
-        if let Some(module) = pinned_module.filter(|module| !perf_map_module_allowed(module)) {
+        if let Some((module, _)) =
+            pinned_module.filter(|(module, _)| !perf_map_module_allowed(module))
+        {
             let module = (module.id, frame.file_relative_ip);
             let native = self.prepare_native_lookup(process_id, module.0, frame.abs_ip);
             self.pending_frames.push(PendingFrame {

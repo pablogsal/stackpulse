@@ -411,6 +411,24 @@ pub fn module(
 }
 
 #[doc(hidden)]
+pub fn with_jit_symbols(
+    mut module: ModuleRecord,
+    symbols: impl IntoIterator<Item = (std::ops::Range<u64>, String)>,
+) -> ModuleRecord {
+    let mut symbols: Vec<_> = symbols
+        .into_iter()
+        .map(|(range, name)| crate::spool::model::JitSymbol {
+            start: range.start,
+            end: range.end,
+            name: name.into(),
+        })
+        .collect();
+    symbols.sort_by_key(|symbol| symbol.start);
+    module.jit_symbols = Some(symbols.into());
+    module
+}
+
+#[doc(hidden)]
 pub fn kernel_module(
     id: u32,
     addresses: std::ops::Range<u64>,
