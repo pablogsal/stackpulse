@@ -3,9 +3,53 @@
 use std::cell::OnceCell;
 use std::rc::Rc;
 
-use crate::profile::{AddressSpace, Frame, FrameFlags, NativeFrame, NativeSymbol, SymbolOrigin};
-use crate::spool::ModuleRecord;
+use crate::profile::{
+    AddressSpace, Frame, FrameFlags, NativeFrame, NativeSymbol, NativeSymbolName, SymbolOrigin,
+};
+use crate::spool::{model::JitSymbol, ModuleRecord};
 use crate::symbols::SymbolStrings;
+
+/// Reuse prepared metadata for consecutive addresses in one generated function.
+#[derive(Default)]
+pub(super) struct SymbolCache {
+    last_symbol: Option<((u32, usize), CachedSymbol)>,
+    strings: SymbolStrings,
+}
+
+struct CachedSymbol {
+    name: NativeSymbolName,
+    module: Rc<str>,
+}
+
+impl CachedSymbol {
+    fn resolve(&self) -> NativeSymbol {
+        NativeSymbol::from_name(self.name.clone(), Rc::clone(&self.module))
+    }
+}
+
+impl SymbolCache {
+    pub(super) fn clear(&mut self) {
+        self.last_symbol = None;
+    }
+
+    fn symbol(&mut self, module: &ModuleRecord, index: usize, symbol: &JitSymbol) -> NativeSymbol {
+        let key = (module.id, index);
+        if let Some((cached_key, symbol)) = &self.last_symbol {
+            if *cached_key == key {
+                return symbol.resolve();
+            }
+        }
+        let name = self.strings.intern(&symbol.name);
+        let path = self.strings.intern(module.path.to_string_lossy().as_ref());
+        let symbol = CachedSymbol {
+            name: NativeSymbolName::new(name),
+            module: path,
+        };
+        let resolved = symbol.resolve();
+        self.last_symbol = Some((key, symbol));
+        resolved
+    }
+}
 
 /// One index per immutable recorded module, built only when a JIT frame needs it.
 #[derive(Default)]
@@ -21,7 +65,7 @@ impl SymbolIndex {
         module: &ModuleRecord,
         process_id: i32,
         abs_ip: u64,
-        strings: &mut SymbolStrings,
+        cache: &mut SymbolCache,
     ) -> Option<Frame> {
         if module.pid().is_none_or(|pid| pid.get() != process_id) {
             return None;
@@ -41,16 +85,18 @@ impl SymbolIndex {
         let symbol = symbols[..candidates]
             .iter()
             .zip(&max_end[..candidates])
+            .enumerate()
             .rev()
-            .take_while(|(_, &end)| abs_ip < end)
-            .find_map(|(symbol, _)| (abs_ip < symbol.end).then_some(symbol));
-        let name: std::rc::Rc<str> = symbol.map_or_else(
-            || address_name(abs_ip),
-            |symbol| strings.intern(&symbol.name),
-        );
-        let offset = symbol.map_or(0, |symbol| abs_ip - symbol.start);
-        let module_name = strings.intern(module.path.to_string_lossy().as_ref());
-        let native_symbol = NativeSymbol::new(name, module_name).with_offset(offset);
+            .take_while(|(_, (_, end))| abs_ip < **end)
+            .find_map(|(index, (symbol, _))| (abs_ip < symbol.end).then_some((index, symbol)));
+        let native_symbol = if let Some((index, symbol)) = symbol {
+            cache
+                .symbol(module, index, symbol)
+                .with_offset(abs_ip - symbol.start)
+        } else {
+            let path = cache.strings.intern(module.path.to_string_lossy().as_ref());
+            NativeSymbol::new(address_name(abs_ip), path)
+        };
         Some(Frame::Native(NativeFrame {
             pc: abs_ip,
             symbol: Some(native_symbol),
@@ -78,7 +124,6 @@ fn address_name(address: u64) -> Rc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::model::JitSymbol;
 
     #[test]
     fn address_names_use_one_allocation_at_every_hex_digit_boundary() {
@@ -103,7 +148,7 @@ mod tests {
             ModuleRecord::new(0, crate::Pid::new(7).unwrap(), 0x1000..0x2000, 0, "[jit]").unwrap();
         module.jit_symbols = Some([].into());
         let Frame::Native(frame) = index
-            .resolve_frame(&module, 7, 0x1108, &mut SymbolStrings::default())
+            .resolve_frame(&module, 7, 0x1108, &mut SymbolCache::default())
             .unwrap()
         else {
             panic!("expected a native JIT frame");
@@ -135,14 +180,14 @@ mod tests {
         );
         assert_eq!(
             index
-                .resolve_frame(&module, 7, 0x1108, &mut SymbolStrings::default())
+                .resolve_frame(&module, 7, 0x1108, &mut SymbolCache::default())
                 .unwrap()
                 .name(),
             Some("inner")
         );
         assert_eq!(
             index
-                .resolve_frame(&module, 7, 0x1120, &mut SymbolStrings::default())
+                .resolve_frame(&module, 7, 0x1120, &mut SymbolCache::default())
                 .unwrap()
                 .name(),
             Some("outer")
@@ -162,7 +207,7 @@ mod tests {
             }]
             .into(),
         );
-        let mut strings = SymbolStrings::default();
+        let mut strings = SymbolCache::default();
         let Frame::Native(first) = index
             .resolve_frame(&module, 7, 0x1000, &mut strings)
             .unwrap()
@@ -207,7 +252,7 @@ mod tests {
             .into(),
         );
         let index = SymbolIndex::default();
-        let mut strings = SymbolStrings::default();
+        let mut strings = SymbolCache::default();
         assert!(index
             .resolve_frame(&module, 8, 0x1010, &mut strings)
             .is_none());
@@ -238,5 +283,99 @@ mod tests {
                 assert_eq!(symbol.offset, 0);
             }
         }
+    }
+
+    #[test]
+    fn symbol_cache_preserves_module_identity_and_symbol_classification() {
+        let modules = [
+            (0, "_PyEval_EvalFrameDefault".repeat(8)),
+            (1, "ordinary".repeat(32)),
+            (2, "short".to_owned()),
+        ]
+        .map(|(id, name)| {
+            let mut module = ModuleRecord::new(
+                id,
+                crate::Pid::new(7).unwrap(),
+                0x1000..0x2000,
+                0,
+                format!("[jit-{id}]"),
+            )
+            .unwrap();
+            module.jit_symbols = Some(
+                [JitSymbol {
+                    start: 0x1000,
+                    end: 0x2000,
+                    name: name.into(),
+                }]
+                .into(),
+            );
+            module
+        });
+        let indexes = std::array::from_fn::<_, 3, _>(|_| SymbolIndex::default());
+        let mut cache = SymbolCache::default();
+        for module_id in [0, 1, 2, 0] {
+            let module = &modules[module_id];
+            let index = &indexes[module_id];
+            for offset in [0, 8, 16] {
+                let Frame::Native(frame) = index
+                    .resolve_frame(module, 7, 0x1000 + offset, &mut cache)
+                    .unwrap()
+                else {
+                    panic!("expected native frame");
+                };
+                let symbol = frame.symbol.unwrap();
+                assert_eq!(symbol.offset, offset);
+                assert_eq!(symbol.module.as_ref(), format!("[jit-{}]", module.id));
+                assert_eq!(symbol.is_eval_frame(), module.id == 0);
+                assert_eq!(symbol.inline_depth(), 0);
+                assert!(!symbol.is_hidden_by_default());
+            }
+            if module_id == 2 {
+                let (key, _) = cache.last_symbol.as_ref().unwrap();
+                assert_eq!(*key, (2, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_the_cached_symbol_preserves_live_names() {
+        let count = 3;
+        let mut module = ModuleRecord::new(
+            0,
+            crate::Pid::new(7).unwrap(),
+            0x1000..0x1000 + count as u64,
+            0,
+            "[jit]",
+        )
+        .unwrap();
+        module.jit_symbols = Some(
+            (0..count)
+                .map(|index| JitSymbol {
+                    start: 0x1000 + index as u64,
+                    end: 0x1001 + index as u64,
+                    name: format!("function_{index}").repeat(16).into(),
+                })
+                .collect(),
+        );
+        let index = SymbolIndex::default();
+        let mut cache = SymbolCache::default();
+        let first = index.resolve_frame(&module, 7, 0x1000, &mut cache).unwrap();
+        for offset in 1..count {
+            let frame = index
+                .resolve_frame(&module, 7, 0x1000 + offset as u64, &mut cache)
+                .unwrap();
+            assert_eq!(
+                frame.name(),
+                Some(format!("function_{offset}").repeat(16).as_str())
+            );
+        }
+        assert_eq!(first.name(), Some("function_0".repeat(16).as_str()));
+        assert_eq!(
+            index.resolve_frame(&module, 7, 0x1000, &mut cache).unwrap(),
+            first
+        );
+        cache.clear();
+        assert!(cache.last_symbol.is_none());
+        assert_eq!(first.name(), Some("function_0".repeat(16).as_str()));
     }
 }

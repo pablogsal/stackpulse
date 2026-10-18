@@ -23,7 +23,7 @@ use crate::profile::{
 use crate::symbols::default_native_symbolizer_factory;
 use crate::symbols::{
     erase_native_symbolizer, normalized_module_path, ErasedNativeSymbolizer,
-    NativeSymbolizerFactory, SymbolStrings,
+    NativeSymbolizerFactory,
 };
 pub use crate::symbols::{
     NativeBatch, NativeFileIdentity, NativeImage, NativeImageId, NativeImageSource, NativeLookup,
@@ -91,7 +91,7 @@ pub struct Symbolizer {
     identity: u64,
     source_id: Option<u64>,
     modules: SymbolizerModules,
-    jit_strings: SymbolStrings,
+    jit_symbols: jit::SymbolCache,
     perf_map_processes: PerfMapProcesses,
     perf_map_dir: PathBuf,
     elf_sections: ElfSectionCache,
@@ -772,7 +772,7 @@ impl Symbolizer {
             identity: NEXT_SYMBOLIZER_ID.fetch_add(1, Ordering::Relaxed),
             source_id: None,
             modules,
-            jit_strings: SymbolStrings::default(),
+            jit_symbols: jit::SymbolCache::default(),
             perf_map_processes,
             perf_map_dir,
             elf_sections: ElfSectionCache::default(),
@@ -1015,6 +1015,7 @@ impl Symbolizer {
         self.frame_cache.clear();
         self.resolved_frames.clear();
         self.resolved_frame_ids.clear();
+        self.jit_symbols.clear();
         self.clear_stack_resolution_cache();
     }
 
@@ -1385,7 +1386,7 @@ impl Symbolizer {
                 module,
                 process_id,
                 frame.abs_ip,
-                &mut self.jit_strings,
+                &mut self.jit_symbols,
             )
         }) {
             self.pending_frames.push(PendingFrame {

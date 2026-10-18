@@ -149,6 +149,23 @@ pub struct SourceLocation {
     pub function_start_column: Option<u32>,
 }
 
+/// A shared name and the classification derived from that name.
+#[derive(Clone)]
+pub(crate) struct NativeSymbolName {
+    text: Rc<str>,
+    is_eval_frame: bool,
+}
+
+impl NativeSymbolName {
+    pub(crate) fn new(text: impl Into<Rc<str>>) -> Self {
+        let text = text.into();
+        Self {
+            is_eval_frame: crate::symbols::is_eval_frame(&text),
+            text,
+        }
+    }
+}
+
 /// A resolved native or kernel symbol.
 ///
 /// One [`NativeFrame`] may resolve to multiple `NativeSymbol`s when inline
@@ -183,12 +200,15 @@ impl NativeSymbol {
     /// Construct a symbol with unknown source positions and zero function offset.
     #[must_use]
     pub fn new(name: impl Into<Rc<str>>, module: impl Into<Rc<str>>) -> Self {
-        let name = name.into();
+        Self::from_name(NativeSymbolName::new(name), module.into())
+    }
+
+    pub(crate) fn from_name(name: NativeSymbolName, module: Rc<str>) -> Self {
         Self {
-            is_eval_frame: crate::symbols::is_eval_frame(&name),
-            name,
+            is_eval_frame: name.is_eval_frame,
+            name: name.text,
             source: SourceLocation::default(),
-            module: module.into(),
+            module,
             offset: 0,
             inline_depth: 0,
             is_hidden_by_default: false,

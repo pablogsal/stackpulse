@@ -407,6 +407,35 @@ fn bench_jit_symbolization(c: &mut Criterion) {
         bench_support::with_jit_symbols(module, [(0x1000..0x2000, "f".repeat(4_096))]),
         frames(0x1000..0x2000),
     ));
+    let module =
+        bench_support::module(0, pid, 0x1000..0x2000, 0, "[jit]").expect("valid JIT module");
+    cases.push((
+        "shared_short_name".to_owned(),
+        bench_support::with_jit_symbols(module, [(0x1000..0x2000, "function".to_owned())]),
+        frames(0x1000..0x2000),
+    ));
+    for count in [4_096_u64, 16_384] {
+        let module = bench_support::module(0, pid, 0x1000..0x1000 + count * 16, 0, "[jit]")
+            .expect("valid JIT module");
+        let module = bench_support::with_jit_symbols(
+            module,
+            (0..count).map(|index| {
+                let start = 0x1000 + index * 16;
+                (start..start + 8, format!("function_{index}"))
+            }),
+        );
+        let frames = (0..2)
+            .flat_map(|offset| {
+                (0..count).map(move |index| FrameRecord {
+                    module_id: Some(0),
+                    file_relative_ip: index * 16 + offset,
+                    abs_ip: 0x1000 + index * 16 + offset,
+                    mode: FrameMode::User,
+                })
+            })
+            .collect();
+        cases.push((format!("named_{count}"), module, frames));
+    }
 
     let mut group = c.benchmark_group("stackpulse_cpu/symbolize/gdb_jit");
     group.sampling_mode(SamplingMode::Flat);
