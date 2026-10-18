@@ -313,6 +313,13 @@ impl DescriptorDiscovery {
     }
 }
 
+struct ParsedImage {
+    identity: FileIdentity,
+    image: Option<DescriptorImage>,
+    // Keep the inode alive while other mappings reuse this file's result.
+    _file: File,
+}
+
 fn image_descriptors(
     pid: i32,
     path: &Path,
@@ -320,11 +327,12 @@ fn image_descriptors(
 ) -> (Vec<JitDescriptorLocation>, bool) {
     let mut locations = Vec::new();
     let mut complete = true;
+    let mut parsed = None;
     for module in modules
         .iter()
         .filter(|module| module.path() == path && module.executable())
     {
-        match image_descriptor(pid, module, modules) {
+        match image_descriptor(pid, module, modules, &mut parsed) {
             Ok(Some(location)) => locations.push(location),
             Ok(None) => {}
             Err(_) => complete = false,
@@ -337,6 +345,7 @@ fn image_descriptor(
     pid: i32,
     module: &impl Mapping,
     modules: &[impl Mapping],
+    parsed: &mut Option<ParsedImage>,
 ) -> std::io::Result<Option<JitDescriptorLocation>> {
     let path = module.path();
     let mapped_path = format!(
@@ -357,9 +366,15 @@ fn image_descriptor(
         {
             return Err(std::io::Error::other("mapped image identity changed"));
         }
-        Ok(file)
+        Ok((
+            file,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        ))
     };
-    let file = open(Path::new(&mapped_path)).or_else(|error| {
+    let (file, identity) = open(Path::new(&mapped_path)).or_else(|error| {
         if module.deleted() {
             return Err(error);
         }
@@ -367,10 +382,21 @@ fn image_descriptor(
         let target_path = PathBuf::from(format!("/proc/{pid}/root")).join(relative_path);
         open(&target_path).or_else(|_| open(path))
     })?;
-    // SAFETY: Concurrent mutation or truncation of a loaded image is outside
-    // the supported process-image contract. The mapping lives through parsing.
-    let mmap = unsafe { Mmap::map(&file) }?;
-    let Ok(Some(image)) = parse_descriptor(&mmap) else {
+    if parsed
+        .as_ref()
+        .is_none_or(|cached| cached.identity != identity)
+    {
+        // SAFETY: Concurrent mutation or truncation of a loaded image is outside
+        // the supported process-image contract. The mapping lives through parsing.
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let image = parse_descriptor(&mmap).ok().flatten();
+        *parsed = Some(ParsedImage {
+            identity,
+            image,
+            _file: file,
+        });
+    }
+    let Some(image) = parsed.as_ref().and_then(|cached| cached.image.as_ref()) else {
         return Ok(None);
     };
     let mut segments = collect_program_load_segments(&image.program_headers);
