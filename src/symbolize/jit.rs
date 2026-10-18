@@ -1,6 +1,7 @@
 //! Resolve pinned generated-code frames from symbols captured during recording.
 
 use std::cell::OnceCell;
+use std::rc::Rc;
 
 use crate::profile::{AddressSpace, Frame, FrameFlags, NativeFrame, NativeSymbol, SymbolOrigin};
 use crate::spool::ModuleRecord;
@@ -44,7 +45,7 @@ impl SymbolIndex {
             .take_while(|(_, &end)| abs_ip < end)
             .find_map(|(symbol, _)| (abs_ip < symbol.end).then_some(symbol));
         let name: std::rc::Rc<str> = symbol.map_or_else(
-            || format!("<0x{abs_ip:x}>").into(),
+            || address_name(abs_ip),
             |symbol| strings.intern(&symbol.name),
         );
         let offset = symbol.map_or(0, |symbol| abs_ip - symbol.start);
@@ -60,10 +61,40 @@ impl SymbolIndex {
     }
 }
 
+fn address_name(address: u64) -> Rc<str> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digits = (u64::BITS - address.leading_zeros()).max(1).div_ceil(4) as usize;
+    let mut bytes = *b"<0x0000000000000000>";
+    for index in 0..digits {
+        let nibble = (address >> ((digits - index - 1) * 4)) & 0xf;
+        bytes[3 + index] = HEX[nibble as usize];
+    }
+    bytes[3 + digits] = b'>';
+    String::from_utf8_lossy(&bytes[..digits + 4])
+        .as_ref()
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spool::model::JitSymbol;
+
+    #[test]
+    fn address_names_use_one_allocation_at_every_hex_digit_boundary() {
+        let addresses = [0, u64::MAX].into_iter().chain((0..16).flat_map(|digits| {
+            let boundary = 1_u64 << (digits * 4);
+            [boundary - 1, boundary, boundary + 1]
+        }));
+        for address in addresses {
+            let mut name = None;
+            let allocations = allocation_counter::measure(|| {
+                name = Some(address_name(address));
+            });
+            assert_eq!(allocations.count_total, 1);
+            assert_eq!(name.unwrap().as_ref(), format!("<0x{address:x}>"));
+        }
+    }
 
     #[test]
     fn unnamed_jit_code_retains_its_origin() {
