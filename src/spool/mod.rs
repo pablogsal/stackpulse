@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::fs::{File, OpenOptions};
 #[cfg(any(test, feature = "bench-support"))]
 use std::io::BufWriter;
@@ -282,18 +283,23 @@ impl<W: Write> PerfSpoolWriter<W> {
 
     fn intern_thread(&mut self, process_id: i32, thread_id: u64) -> io::Result<u32> {
         let key = (process_id, thread_id);
-        if let Some(&id) = self.thread_cache.get(&key) {
-            return Ok(id);
-        }
+        let at_capacity = self.thread_cache.len() >= MAX_THREAD_CACHE_ENTRIES;
+        let entry = match self.thread_cache.entry(key) {
+            Entry::Occupied(entry) => return Ok(*entry.get()),
+            Entry::Vacant(entry) => entry,
+        };
         let id = next_spool_id(self.next_thread_id as usize, "thread")?;
         self.writer.write_record(
             REC_THREAD,
             (u64::from(id), i64::from(process_id), thread_id),
         )?;
-        if self.thread_cache.len() >= MAX_THREAD_CACHE_ENTRIES {
+        if at_capacity {
+            let key = entry.into_key();
             self.thread_cache.clear();
+            self.thread_cache.insert(key, id);
+        } else {
+            entry.insert(id);
         }
-        self.thread_cache.insert(key, id);
         self.next_thread_id += 1;
         Ok(id)
     }
@@ -319,19 +325,24 @@ impl<W: Write> PerfSpoolWriter<W> {
         // Readers rebuild a frame from its encoding alone, so frames that
         // encode identically are the same frame to every reader.
         let key = compact_frame(frame)?;
-        if let Some(&id) = cache.get(&key) {
-            return Ok(id);
-        }
+        let at_capacity = cache.len() >= MAX_FRAME_CACHE_ENTRIES;
+        let entry = match cache.entry(key) {
+            Entry::Occupied(entry) => return Ok(*entry.get()),
+            Entry::Vacant(entry) => entry,
+        };
         let id = *next_frame_id;
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
         let (tag, address) = key;
         writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
-        if cache.len() >= MAX_FRAME_CACHE_ENTRIES {
+        if at_capacity {
+            let key = entry.into_key();
             cache.clear();
+            cache.insert(key, id);
+        } else {
+            entry.insert(id);
         }
-        cache.insert(key, id);
         *next_frame_id = next_frame_id
             .checked_add(1)
             .ok_or_else(|| invalid_input("frame id space exhausted"))?;
@@ -347,19 +358,26 @@ impl<W: Write> PerfSpoolWriter<W> {
         for frame in frames.into_iter().rev() {
             let frame_id = self.intern_frame(&frame)?;
             let key = (prefix, frame_id);
-            if let Some(&stack_id) = self.stack_cache.get(&key) {
-                prefix = stack_id;
-                continue;
-            }
+            let at_capacity = self.stack_cache.len() >= MAX_STACK_CACHE_ENTRIES;
+            let entry = match self.stack_cache.entry(key) {
+                Entry::Occupied(entry) => {
+                    prefix = *entry.get();
+                    continue;
+                }
+                Entry::Vacant(entry) => entry,
+            };
             let stack_id = next_spool_id(self.next_stack_id as usize, "stack")?;
             self.writer.write_record(
                 REC_STACK,
                 (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
             )?;
-            if self.stack_cache.len() >= MAX_STACK_CACHE_ENTRIES {
+            if at_capacity {
+                let key = entry.into_key();
                 self.stack_cache.clear();
+                self.stack_cache.insert(key, stack_id);
+            } else {
+                entry.insert(stack_id);
             }
-            self.stack_cache.insert(key, stack_id);
             self.next_stack_id += 1;
             prefix = stack_id;
         }
