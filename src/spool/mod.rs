@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::fs::{File, OpenOptions};
 #[cfg(any(test, feature = "bench-support"))]
 use std::io::BufWriter;
@@ -49,6 +48,11 @@ const REC_MODULE_DEACTIVATE: u8 = 7;
 const REC_MODULE_DEACTIVATE_ONE: u8 = 8;
 const REC_JIT_MODULE: u8 = 9;
 const MAX_REPLAY_SAMPLE_RANGES: usize = 512 * 1024;
+// These caches only avoid duplicate definitions. Readers retain every emitted
+// definition, so a cache miss can safely assign a fresh, increasing id.
+const MAX_FRAME_CACHE_ENTRIES: usize = 64 * 1024;
+const MAX_STACK_CACHE_ENTRIES: usize = 256 * 1024;
+const MAX_THREAD_CACHE_ENTRIES: usize = 16 * 1024;
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_source_id() -> u64 {
@@ -70,8 +74,8 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     writer: SpoolOutput<W>,
     last_timestamp_ns: u64,
     // Frames pinned to a module id resolve through that id on the read side
-    // regardless of surrounding module records, so they are interned once for
-    // the whole recording. Unpinned frames are resolved against the module
+    // regardless of surrounding module records, so their cache can be reused
+    // across module changes. Unpinned frames are resolved against the module
     // set visible at their position in the file, so their cache must be
     // dropped whenever that set changes (write_module / deactivation).
     // Keyed by the compact on-disk frame encoding. Unpinned kernel frames only
@@ -83,7 +87,9 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     kernel_module_ids: FxHashSet<u32>,
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
+    next_stack_id: u32,
     thread_cache: FxHashMap<(i32, u64), u32>,
+    next_thread_id: u32,
 }
 
 #[cfg(any(test, feature = "bench-support"))]
@@ -152,7 +158,9 @@ impl<W: Write> PerfSpoolWriter<W> {
             kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
+            next_stack_id: 0,
             thread_cache: FxHashMap::default(),
+            next_thread_id: 0,
             last_timestamp_ns: 0,
         };
         writer.writer.write_all(CURRENT_MAGIC)?;
@@ -277,12 +285,16 @@ impl<W: Write> PerfSpoolWriter<W> {
         if let Some(&id) = self.thread_cache.get(&key) {
             return Ok(id);
         }
-        let id = next_spool_id(self.thread_cache.len(), "thread")?;
+        let id = next_spool_id(self.next_thread_id as usize, "thread")?;
         self.writer.write_record(
             REC_THREAD,
             (u64::from(id), i64::from(process_id), thread_id),
         )?;
+        if self.thread_cache.len() >= MAX_THREAD_CACHE_ENTRIES {
+            self.thread_cache.clear();
+        }
         self.thread_cache.insert(key, id);
+        self.next_thread_id += 1;
         Ok(id)
     }
 
@@ -307,17 +319,19 @@ impl<W: Write> PerfSpoolWriter<W> {
         // Readers rebuild a frame from its encoding alone, so frames that
         // encode identically are the same frame to every reader.
         let key = compact_frame(frame)?;
-        let entry = match cache.entry(key) {
-            Entry::Occupied(entry) => return Ok(*entry.get()),
-            Entry::Vacant(entry) => entry,
-        };
+        if let Some(&id) = cache.get(&key) {
+            return Ok(id);
+        }
         let id = *next_frame_id;
         if id == NONE_U32 {
             return Err(invalid_input("frame id space exhausted"));
         }
         let (tag, address) = key;
         writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
-        entry.insert(id);
+        if cache.len() >= MAX_FRAME_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, id);
         *next_frame_id = next_frame_id
             .checked_add(1)
             .ok_or_else(|| invalid_input("frame id space exhausted"))?;
@@ -332,20 +346,21 @@ impl<W: Write> PerfSpoolWriter<W> {
         let mut prefix = NONE_U32;
         for frame in frames.into_iter().rev() {
             let frame_id = self.intern_frame(&frame)?;
-            let next_stack_id = self.stack_cache.len();
-            let entry = match self.stack_cache.entry((prefix, frame_id)) {
-                Entry::Occupied(entry) => {
-                    prefix = *entry.get();
-                    continue;
-                }
-                Entry::Vacant(entry) => entry,
-            };
-            let stack_id = next_spool_id(next_stack_id, "stack")?;
+            let key = (prefix, frame_id);
+            if let Some(&stack_id) = self.stack_cache.get(&key) {
+                prefix = stack_id;
+                continue;
+            }
+            let stack_id = next_spool_id(self.next_stack_id as usize, "stack")?;
             self.writer.write_record(
                 REC_STACK,
                 (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
             )?;
-            entry.insert(stack_id);
+            if self.stack_cache.len() >= MAX_STACK_CACHE_ENTRIES {
+                self.stack_cache.clear();
+            }
+            self.stack_cache.insert(key, stack_id);
+            self.next_stack_id += 1;
             prefix = stack_id;
         }
         Ok((prefix != NONE_U32).then_some(prefix))
@@ -2040,7 +2055,9 @@ mod tests {
             kernel_module_ids: FxHashSet::default(),
             next_frame_id: 0,
             stack_cache: FxHashMap::default(),
+            next_stack_id: 0,
             thread_cache: FxHashMap::default(),
+            next_thread_id: 0,
         }
     }
 
@@ -2074,6 +2091,174 @@ mod tests {
         path.push(format!("stackpulse-{name}-{}.spool", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn bounded_writer_caches_preserve_samples_in_all_readers() {
+        let dir = crate::test_support::TempDir::new("bounded-writer-caches");
+        let path = dir.path().join("profile.spool");
+        let mut writer = PerfSpoolWriter::create(&path, 123, 10).unwrap();
+        writer
+            .write_module(&module(7, 0, u64::MAX, "/pinned", false))
+            .unwrap();
+        // Each sample adds three stack nodes and one entry to each frame cache.
+        // Revisit earlier addresses after every cache has been cleared.
+        let unique_samples = MAX_STACK_CACHE_ENTRIES / 3 + 1;
+        let sample_count = unique_samples + 16;
+        let frames = |index: usize| {
+            let address = (index % unique_samples + 1) as u64;
+            [
+                FrameRecord {
+                    module_id: Some(0),
+                    ..frame(address)
+                },
+                frame(address),
+                kernel_frame(address),
+            ]
+        };
+        let timestamp = |index: usize| (index as u64 ^ 1) * 1_000;
+        let thread = |index: usize| (index % (MAX_THREAD_CACHE_ENTRIES + 1) + 1) as u64;
+        for index in 0..sample_count {
+            writer
+                .write_sample_frames(timestamp(index), 7, thread(index), frames(index))
+                .unwrap();
+            assert!(writer.pinned_frame_cache.len() <= MAX_FRAME_CACHE_ENTRIES);
+            assert!(writer.unpinned_frame_cache.len() <= MAX_FRAME_CACHE_ENTRIES);
+            assert!(writer.kernel_frame_cache.len() <= MAX_FRAME_CACHE_ENTRIES);
+            assert!(writer.stack_cache.len() <= MAX_STACK_CACHE_ENTRIES);
+            assert!(writer.thread_cache.len() <= MAX_THREAD_CACHE_ENTRIES);
+        }
+        assert!(writer.next_frame_id as usize > 3 * MAX_FRAME_CACHE_ENTRIES);
+        assert!(writer.next_stack_id as usize > MAX_STACK_CACHE_ENTRIES);
+        assert!(writer.next_thread_id as usize > MAX_THREAD_CACHE_ENTRIES);
+        writer.flush().unwrap();
+        drop(writer);
+
+        let check = |index: usize, sample: Sample<'_>| {
+            assert_eq!(sample.sample().timestamp_ns, timestamp(index));
+            assert_eq!(sample.pid().get(), 7);
+            assert_eq!(sample.tid().get() as u64, thread(index));
+            assert!(sample.stack().raw_frames().copied().eq(frames(index)));
+        };
+        let snapshot = Snapshot::open(&path).unwrap();
+        assert_eq!(snapshot.raw_samples().len(), sample_count);
+        for (index, sample) in snapshot.samples().enumerate() {
+            check(index, sample);
+        }
+        for replay in [
+            Replay::open(&path).unwrap(),
+            Replay::from_opened(
+                open_spool_with_range_limit(&path, SampleStorage::Replay, 0).unwrap(),
+            ),
+        ] {
+            assert_eq!(replay.sample_count(), sample_count);
+            for (index, sample) in replay.samples().enumerate() {
+                check(index, sample);
+            }
+        }
+        let mut tail = Tail::open(&path).unwrap();
+        let mut index = 0;
+        loop {
+            let batch = tail.poll().unwrap();
+            for sample in batch.samples() {
+                check(index, sample);
+                index += 1;
+            }
+            if !batch.has_more() {
+                break;
+            }
+        }
+        assert_eq!(index, sample_count);
+    }
+
+    #[test]
+    fn writer_reuses_cache_hits_at_capacity() {
+        let mut writer = PerfSpoolWriter::from_writer(io::sink(), 0, 0).unwrap();
+        for address in 0..MAX_FRAME_CACHE_ENTRIES as u64 {
+            writer.intern_frame(&frame(address)).unwrap();
+            writer.intern_frame(&kernel_frame(address)).unwrap();
+            writer
+                .intern_frame(&FrameRecord {
+                    module_id: Some(0),
+                    ..frame(address)
+                })
+                .unwrap();
+        }
+        writer
+            .intern_stack(std::iter::repeat_n(frame(0), MAX_STACK_CACHE_ENTRIES))
+            .unwrap();
+        for thread in 1..=MAX_THREAD_CACHE_ENTRIES as u64 {
+            writer.intern_thread(7, thread).unwrap();
+        }
+        let ids = (
+            writer.next_frame_id,
+            writer.next_stack_id,
+            writer.next_thread_id,
+        );
+        for timestamp in 0..10 {
+            assert_eq!(
+                writer
+                    .write_sample_frames(timestamp, 7, 1, [frame(0); 4])
+                    .unwrap(),
+                Some(3)
+            );
+            writer.intern_frame(&kernel_frame(0)).unwrap();
+            writer
+                .intern_frame(&FrameRecord {
+                    module_id: Some(0),
+                    ..frame(0)
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            ids,
+            (
+                writer.next_frame_id,
+                writer.next_stack_id,
+                writer.next_thread_id
+            )
+        );
+        assert_eq!(writer.pinned_frame_cache.len(), MAX_FRAME_CACHE_ENTRIES);
+        assert_eq!(writer.unpinned_frame_cache.len(), MAX_FRAME_CACHE_ENTRIES);
+        assert_eq!(writer.kernel_frame_cache.len(), MAX_FRAME_CACHE_ENTRIES);
+        assert_eq!(writer.stack_cache.len(), MAX_STACK_CACHE_ENTRIES);
+        assert_eq!(writer.thread_cache.len(), MAX_THREAD_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn writer_ids_do_not_wrap_after_cache_eviction() {
+        let mut writer = writer();
+        writer.next_frame_id = NONE_U32 - 1;
+        writer.next_stack_id = NONE_U32 - 1;
+        writer.next_thread_id = NONE_U32 - 1;
+        assert_eq!(
+            writer.write_sample_frames(1, 7, 11, [frame(1)]).unwrap(),
+            Some(NONE_U32 - 1)
+        );
+        assert_eq!(
+            writer.write_sample_frames(2, 7, 11, [frame(1)]).unwrap(),
+            Some(NONE_U32 - 1)
+        );
+        let position = writer.position();
+        writer.stack_cache.clear();
+        writer.thread_cache.clear();
+        assert_eq!(
+            writer.intern_stack([frame(1)]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            writer.intern_thread(7, 11).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        writer.unpinned_frame_cache.clear();
+        assert_eq!(
+            writer.intern_frame(&frame(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(writer.position(), position);
+        assert_eq!(writer.next_frame_id, NONE_U32);
+        assert_eq!(writer.next_stack_id, NONE_U32);
+        assert_eq!(writer.next_thread_id, NONE_U32);
     }
 
     #[test]
@@ -4122,6 +4307,12 @@ mod output_tests {
                 .unwrap_err();
             assert_eq!(error.to_string(), "sink failed");
             assert_eq!(writer.last_timestamp_ns, 0);
+            assert_eq!(
+                writer.next_frame_id as usize,
+                writer.unpinned_frame_cache.len()
+            );
+            assert_eq!(writer.next_stack_id as usize, writer.stack_cache.len());
+            assert_eq!(writer.next_thread_id as usize, writer.thread_cache.len());
             assert!(writer.write_sample_frames(1, 7, 11, [frame]).is_err());
             assert_eq!(writer.position() as usize, header_len + budget);
             assert_eq!(
