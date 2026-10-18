@@ -73,6 +73,41 @@ pub fn write_spool_samples_to_memory(
 }
 
 #[doc(hidden)]
+pub fn write_spool_with_module_updates(
+    modules: &[ModuleRecord],
+    samples: &[BenchSpoolSample],
+    samples_per_update: usize,
+    modules_per_update: usize,
+) -> crate::Result<usize> {
+    let mut writer = PerfSpoolWriter::from_writer(
+        Vec::new(),
+        FIXTURE_START_TIMESTAMP_US,
+        FIXTURE_SAMPLE_INTERVAL_US,
+    )?;
+    for module in modules {
+        writer.write_module(module)?;
+    }
+    let mut module = modules[0].clone();
+    module.id = modules.iter().map(|module| module.id).max().unwrap_or(0);
+    for chunk in samples.chunks(samples_per_update) {
+        for sample in chunk {
+            writer.write_sample_frames(
+                sample.timestamp_ns,
+                sample.process_id,
+                sample.thread_id,
+                sample.frames.iter().copied(),
+            )?;
+        }
+        for _ in 0..modules_per_update {
+            module.id += 1;
+            writer.write_module(&module)?;
+        }
+    }
+    writer.flush()?;
+    Ok(writer.into_inner().len())
+}
+
+#[doc(hidden)]
 pub fn write_spool_samples_to_path(
     path: impl AsRef<Path>,
     modules: &[ModuleRecord],
