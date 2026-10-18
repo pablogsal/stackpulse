@@ -274,7 +274,7 @@ fn bench_spool_iteration(c: &mut Criterion) {
 }
 
 fn bench_spool_write(c: &mut Criterion) {
-    let mut cases: Vec<_> = SPOOL_SCENARIOS
+    let cases: Vec<_> = SPOOL_SCENARIOS
         .iter()
         .map(|spec| {
             let bytes = fs::metadata(ensure_spool_fixture(*spec))
@@ -307,67 +307,6 @@ fn bench_spool_write(c: &mut Criterion) {
             black_box(checksum)
         });
     });
-    let full_cache = ScenarioSpec {
-        name: "frame_cache_at_capacity",
-        samples: 8192,
-        unique_stacks: 4096,
-        stack_depth: 16,
-        ..SPOOL_SCENARIOS[0]
-    };
-    let recursive = ScenarioSpec {
-        name: "recursive_stacks",
-        samples: 2048,
-        unique_stacks: 1,
-        stack_depth: 128,
-        ..SPOOL_SCENARIOS[0]
-    };
-    let mut recursive_case = materialize_spool_case(recursive);
-    for sample in &mut recursive_case.samples {
-        let frame = sample.frames[0];
-        sample.frames.fill(frame);
-    }
-    cases.push((full_cache, 0, 0, materialize_spool_case(full_cache)));
-    cases.push((recursive, 0, 0, recursive_case));
-    for (spec, capacity, _, case) in &cases {
-        group.throughput(Throughput::Elements(spec.samples as u64 * WRITE_BATCH));
-        group.bench_function(spec.name, |b| {
-            b.iter(|| {
-                let mut checksum = 0usize;
-                for _ in 0..WRITE_BATCH {
-                    checksum = checksum.wrapping_add(
-                        bench_support::write_spool_samples_to_memory(
-                            black_box(&case.modules),
-                            black_box(&case.python_runtime_records),
-                            black_box(&case.samples),
-                            *capacity,
-                        )
-                        .expect("write synthetic samples through real spool writer"),
-                    );
-                }
-                black_box(checksum)
-            });
-        });
-    }
-    let (_, _, _, case) = &cases[0];
-    for (name, samples_per_update, modules_per_update) in [
-        ("module_updates", 64, 1),
-        ("module_update_bursts", 1024, 128),
-    ] {
-        group.throughput(Throughput::Elements(case.samples.len() as u64));
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                black_box(
-                    bench_support::write_spool_with_module_updates(
-                        black_box(&case.modules),
-                        black_box(&case.samples),
-                        samples_per_update,
-                        modules_per_update,
-                    )
-                    .expect("write samples between module updates"),
-                )
-            });
-        });
-    }
     group.finish();
 }
 

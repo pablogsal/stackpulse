@@ -71,14 +71,6 @@ struct StackNodeRecord {
     depth: usize,
 }
 
-#[derive(Clone, Copy)]
-struct CachedFrame {
-    id: u32,
-    // Readers retain emitted nodes, so this hint survives stack-cache eviction.
-    last_prefix: u32,
-    last_stack: u32,
-}
-
 pub(crate) struct PerfSpoolWriter<W: Write> {
     writer: SpoolOutput<W>,
     last_timestamp_ns: u64,
@@ -90,9 +82,9 @@ pub(crate) struct PerfSpoolWriter<W: Write> {
     // Keyed by the compact on-disk frame encoding. Unpinned kernel frames only
     // resolve against kernel modules, so their cache survives user module
     // churn and is dropped only when a kernel module is written or deactivated.
-    pinned_frame_cache: FxHashMap<(u64, u64), CachedFrame>,
-    unpinned_frame_cache: FxHashMap<(u64, u64), CachedFrame>,
-    kernel_frame_cache: FxHashMap<(u64, u64), CachedFrame>,
+    pinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    unpinned_frame_cache: FxHashMap<(u64, u64), u32>,
+    kernel_frame_cache: FxHashMap<(u64, u64), u32>,
     kernel_module_ids: FxHashSet<u32>,
     next_frame_id: u32,
     stack_cache: FxHashMap<(u32, u32), u32>,
@@ -312,21 +304,49 @@ impl<W: Write> PerfSpoolWriter<W> {
         Ok(id)
     }
 
-    #[cfg(test)]
     fn intern_frame(&mut self, frame: &FrameRecord) -> io::Result<u32> {
-        let cache = frame_cache(
-            frame,
-            &mut self.pinned_frame_cache,
-            &mut self.unpinned_frame_cache,
-            &mut self.kernel_frame_cache,
-        );
-        intern_frame(
-            &mut self.writer,
-            cache,
-            &mut self.next_frame_id,
-            compact_frame(frame)?,
-        )
-        .map(|entry| entry.id)
+        let Self {
+            writer,
+            pinned_frame_cache,
+            unpinned_frame_cache,
+            kernel_frame_cache,
+            next_frame_id,
+            ..
+        } = self;
+        // Truncated-stack markers resolve context-free on the read side, so
+        // they are as durable as module-pinned frames.
+        let cache = if frame.module_id.is_some() || frame.is_truncated_stack_marker() {
+            pinned_frame_cache
+        } else if frame.mode == FrameMode::Kernel {
+            kernel_frame_cache
+        } else {
+            unpinned_frame_cache
+        };
+        // Readers rebuild a frame from its encoding alone, so frames that
+        // encode identically are the same frame to every reader.
+        let key = compact_frame(frame)?;
+        let at_capacity = cache.len() >= MAX_FRAME_CACHE_ENTRIES;
+        let entry = match cache.entry(key) {
+            Entry::Occupied(entry) => return Ok(*entry.get()),
+            Entry::Vacant(entry) => entry,
+        };
+        let id = *next_frame_id;
+        if id == NONE_U32 {
+            return Err(invalid_input("frame id space exhausted"));
+        }
+        let (tag, address) = key;
+        writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
+        if at_capacity {
+            let key = entry.into_key();
+            cache.clear();
+            cache.insert(key, id);
+        } else {
+            entry.insert(id);
+        }
+        *next_frame_id = next_frame_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("frame id space exhausted"))?;
+        Ok(id)
     }
 
     fn intern_stack<I>(&mut self, frames: I) -> io::Result<Option<u32>>
@@ -336,106 +356,33 @@ impl<W: Write> PerfSpoolWriter<W> {
     {
         let mut prefix = NONE_U32;
         for frame in frames.into_iter().rev() {
-            let cache = frame_cache(
-                &frame,
-                &mut self.pinned_frame_cache,
-                &mut self.unpinned_frame_cache,
-                &mut self.kernel_frame_cache,
-            );
-            let cached = intern_frame(
-                &mut self.writer,
-                cache,
-                &mut self.next_frame_id,
-                compact_frame(&frame)?,
-            )?;
-            if cached.last_prefix == prefix && cached.last_stack != NONE_U32 {
-                prefix = cached.last_stack;
-                continue;
-            }
-            let key = (prefix, cached.id);
+            let frame_id = self.intern_frame(&frame)?;
+            let key = (prefix, frame_id);
             let at_capacity = self.stack_cache.len() >= MAX_STACK_CACHE_ENTRIES;
-            let stack_id = match self.stack_cache.entry(key) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let stack_id = next_spool_id(self.next_stack_id as usize, "stack")?;
-                    self.writer.write_record(
-                        REC_STACK,
-                        (u64::from(stack_id), u64::from(prefix), u64::from(cached.id)),
-                    )?;
-                    if at_capacity {
-                        let key = entry.into_key();
-                        self.stack_cache.clear();
-                        self.stack_cache.insert(key, stack_id);
-                    } else {
-                        entry.insert(stack_id);
-                    }
-                    self.next_stack_id += 1;
-                    stack_id
+            let entry = match self.stack_cache.entry(key) {
+                Entry::Occupied(entry) => {
+                    prefix = *entry.get();
+                    continue;
                 }
+                Entry::Vacant(entry) => entry,
             };
-            cached.last_prefix = prefix;
-            cached.last_stack = stack_id;
+            let stack_id = next_spool_id(self.next_stack_id as usize, "stack")?;
+            self.writer.write_record(
+                REC_STACK,
+                (u64::from(stack_id), u64::from(prefix), u64::from(frame_id)),
+            )?;
+            if at_capacity {
+                let key = entry.into_key();
+                self.stack_cache.clear();
+                self.stack_cache.insert(key, stack_id);
+            } else {
+                entry.insert(stack_id);
+            }
+            self.next_stack_id += 1;
             prefix = stack_id;
         }
         Ok((prefix != NONE_U32).then_some(prefix))
     }
-}
-
-fn frame_cache<'a>(
-    frame: &FrameRecord,
-    pinned: &'a mut FxHashMap<(u64, u64), CachedFrame>,
-    unpinned: &'a mut FxHashMap<(u64, u64), CachedFrame>,
-    kernel: &'a mut FxHashMap<(u64, u64), CachedFrame>,
-) -> &'a mut FxHashMap<(u64, u64), CachedFrame> {
-    // Truncated-stack markers and pinned frames have no module-context dependency.
-    if frame.module_id.is_some() || frame.is_truncated_stack_marker() {
-        pinned
-    } else if frame.mode == FrameMode::Kernel {
-        kernel
-    } else {
-        unpinned
-    }
-}
-
-fn intern_frame<'a, W: Write>(
-    writer: &mut SpoolOutput<W>,
-    cache: &'a mut FxHashMap<(u64, u64), CachedFrame>,
-    next_frame_id: &mut u32,
-    key: (u64, u64),
-) -> io::Result<&'a mut CachedFrame> {
-    // Check full-cache misses before borrowing the entry to return. A failed
-    // write must leave the previous entries available.
-    let cached = if cache.len() >= MAX_FRAME_CACHE_ENTRIES && !cache.contains_key(&key) {
-        let cached = write_frame(writer, *next_frame_id, key)?;
-        cache.clear();
-        cache.entry(key).or_insert(cached)
-    } else {
-        match cache.entry(key) {
-            Entry::Occupied(entry) => return Ok(entry.into_mut()),
-            Entry::Vacant(entry) => {
-                let cached = write_frame(writer, *next_frame_id, key)?;
-                entry.insert(cached)
-            }
-        }
-    };
-    *next_frame_id += 1;
-    Ok(cached)
-}
-
-fn write_frame<W: Write>(
-    writer: &mut SpoolOutput<W>,
-    id: u32,
-    (tag, address): (u64, u64),
-) -> io::Result<CachedFrame> {
-    if id == NONE_U32 {
-        return Err(invalid_input("frame id space exhausted"));
-    }
-    writer.write_record(REC_FRAME, (u64::from(id), tag, address))?;
-    Ok(CachedFrame {
-        id,
-        last_prefix: NONE_U32,
-        last_stack: NONE_U32,
-    })
 }
 
 /// Reader for spool files written by [`crate::Recorder`].
@@ -2243,54 +2190,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_frames_distinguish_stack_prefixes() {
-        let dir = crate::test_support::TempDir::new("frame-stack-prefix");
-        let path = dir.path().join("profile.spool");
-        let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
-        let stacks = [
-            [frame(1), frame(2)],
-            [frame(1), frame(3)],
-            [frame(1), frame(2)],
-        ];
-        let mut ids = Vec::new();
-        for (timestamp, frames) in stacks.into_iter().enumerate() {
-            ids.push(
-                writer
-                    .write_sample_frames(timestamp as u64, 7, 11, frames)
-                    .unwrap(),
-            );
-        }
-        assert_ne!(ids[0], ids[1]);
-        assert_eq!(ids[0], ids[2]);
-        writer.flush().unwrap();
-        let snapshot = Snapshot::open(&path).unwrap();
-        assert_eq!(snapshot.raw_samples().len(), stacks.len());
-        for (sample, frames) in snapshot.samples().zip(stacks) {
-            assert!(sample.stack().raw_frames().copied().eq(frames));
-        }
-    }
-
-    #[test]
-    fn cached_frames_reuse_emitted_nodes_after_stack_cache_eviction() {
-        let dir = crate::test_support::TempDir::new("frame-stack-eviction");
-        let path = dir.path().join("profile.spool");
-        let mut writer = PerfSpoolWriter::create(&path, 0, 1).unwrap();
-        let frames = [frame(1), frame(2)];
-        let first = writer.write_sample_frames(1, 7, 11, frames).unwrap();
-        writer.stack_cache.clear();
-        let second = writer.write_sample_frames(2, 7, 11, frames).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(writer.next_frame_id, 2);
-        assert_eq!(writer.next_stack_id, 2);
-        writer.flush().unwrap();
-        let snapshot = Snapshot::open(&path).unwrap();
-        assert_eq!(snapshot.raw_samples().len(), 2);
-        for sample in snapshot.samples() {
-            assert!(sample.stack().raw_frames().copied().eq(frames));
-        }
-    }
-
-    #[test]
     fn writer_reuses_cache_hits_at_capacity() {
         let mut writer = PerfSpoolWriter::from_writer(io::sink(), 0, 0).unwrap();
         for address in 0..MAX_FRAME_CACHE_ENTRIES as u64 {
@@ -2360,9 +2259,6 @@ mod tests {
         );
         let position = writer.position();
         writer.stack_cache.clear();
-        for frame in writer.unpinned_frame_cache.values_mut() {
-            frame.last_stack = NONE_U32;
-        }
         writer.thread_cache.clear();
         assert_eq!(
             writer.intern_stack([frame(1)]).unwrap_err().kind(),
