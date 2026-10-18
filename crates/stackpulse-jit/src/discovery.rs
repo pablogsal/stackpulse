@@ -1,10 +1,12 @@
 //! Locate GDB registries in the executable and loaded ELF images.
 use super::{FileIdentity, Mapping};
-use crate::elf::{collect_load_segments, compute_vma_bias, find_load_contribution_for_file_range};
+use crate::elf::{
+    collect_program_load_segments, compute_vma_bias, find_load_contribution_for_file_range,
+};
 use goblin::container::Ctx;
 use goblin::elf::dynamic::Dynamic;
-use goblin::elf::section_header::{SHN_UNDEF, SHT_SYMTAB};
-use goblin::elf::{Elf, ProgramHeader, SectionHeader};
+use goblin::elf::section_header::{SHN_UNDEF, SHT_DYNSYM, SHT_SYMTAB};
+use goblin::elf::{Elf, ProgramHeader, RelocSection, SectionHeader, Sym, Symtab};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap as HashMap;
 use std::fs::File;
@@ -12,6 +14,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const JIT_DESCRIPTOR_SYMBOL: &str = "__jit_debug_descriptor";
+mod hash;
+#[cfg(test)]
+mod lookup_tests;
+
 /// Resolved target address of the descriptor and the image that defines it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct JitDescriptorLocation {
@@ -24,79 +30,142 @@ pub(super) struct JitDescriptorLocation {
     pub(super) owner_identity: Option<FileIdentity>,
 }
 
-/// Whether a symbol can be named after the descriptor.
-///
-/// Most loaded images do not define the descriptor, and a full parse indexes
-/// every symbol name. Static symbol names come from the string table linked by
-/// SHT_SYMTAB. If the name does not occur in those bytes or in the dynamic
-/// strings, no symbol has it. A table that cannot be located or parsed is
-/// treated as a possible match.
-fn may_name_descriptor(bytes: &[u8]) -> bool {
-    let Ok(header) = Elf::parse_header(bytes) else {
-        return true;
-    };
-    let (Ok(container), Ok(endianness)) = (header.container(), header.endianness()) else {
-        return true;
-    };
-    let ctx = Ctx::new(container, endianness);
-    let Ok(section_headers) =
-        SectionHeader::parse(bytes, header.e_shoff as usize, header.e_shnum as usize, ctx)
-    else {
-        return true;
-    };
-    let static_names = section_headers
-        .iter()
-        .filter(|section| section.sh_type == SHT_SYMTAB)
-        .any(|section| {
-            section_headers
-                .get(section.sh_link as usize)
-                .is_none_or(|sh| names_may_contain_descriptor(bytes, sh.sh_offset, sh.sh_size))
-        });
-    if static_names {
-        return true;
-    }
-    let Ok(program_headers) =
-        ProgramHeader::parse(bytes, header.e_phoff as usize, header.e_phnum as usize, ctx)
-    else {
-        return true;
-    };
-    dynamic_strings_may_name_descriptor(bytes, &program_headers, ctx)
+struct DescriptorImage {
+    symbol: u64,
+    program_header_offset: u64,
+    program_headers: Vec<ProgramHeader>,
 }
 
-/// Whether a dynamic symbol can be named after the descriptor.
-///
-/// Dynamic symbol names come from the DT_STRTAB table bounded by DT_STRSZ,
-/// which PT_DYNAMIC locates for the loader and for goblin's full parse. If the
-/// name does not occur in those bytes, no dynamic symbol has it. A table that
-/// cannot be located is treated as a possible match.
-fn dynamic_strings_may_name_descriptor(
+/// Prefer the exported descriptor without decoding unrelated ELF metadata.
+/// Static-only descriptors still work in executables linked without -rdynamic.
+fn parse_descriptor(bytes: &[u8]) -> goblin::error::Result<Option<DescriptorImage>> {
+    let header = Elf::parse_header(bytes)?;
+    let ctx = Ctx::new(header.container()?, header.endianness()?);
+    let program_headers =
+        ProgramHeader::parse(bytes, header.e_phoff as usize, header.e_phnum as usize, ctx)?;
+    let dynamic = Dynamic::parse(bytes, &program_headers, ctx)?;
+    let mut symbol = None;
+    if let Some(dynamic) = &dynamic {
+        if dynamic.info.gnu_hash.is_some() || dynamic.info.hash.is_some() {
+            symbol = hash::descriptor_symbol(bytes, dynamic, ctx)
+                .map_err(|message| goblin::error::Error::Malformed(message.into()))?;
+        }
+    }
+    if symbol.is_none() {
+        let sections =
+            SectionHeader::parse(bytes, header.e_shoff as usize, header.e_shnum as usize, ctx)?;
+        if let Some(dynamic) =
+            dynamic.filter(|dynamic| dynamic.info.gnu_hash.is_none() && dynamic.info.hash.is_none())
+        {
+            symbol = unhashed_dynamic_symbol(bytes, &dynamic, &sections, ctx)?;
+        }
+        if symbol.is_none() {
+            if let Some(section) = sections
+                .iter()
+                .rfind(|section| section.sh_type == SHT_SYMTAB)
+            {
+                if section.sh_entsize != Sym::size(ctx.container) as u64 {
+                    return Err(goblin::error::Error::Malformed(
+                        "invalid static symbol entry size".into(),
+                    ));
+                }
+                let names = sections.get(section.sh_link as usize).ok_or_else(|| {
+                    goblin::error::Error::Malformed("invalid static string table link".into())
+                })?;
+                let names = table_bytes(bytes, names.sh_offset, names.sh_size)?;
+                symbol = scan_symbols(bytes, section.sh_offset, section.sh_size, names, ctx)?;
+            }
+        }
+    }
+    Ok(symbol.map(|symbol| DescriptorImage {
+        symbol,
+        program_header_offset: header.e_phoff,
+        program_headers,
+    }))
+}
+
+fn table_bytes(bytes: &[u8], offset: u64, size: u64) -> goblin::error::Result<&[u8]> {
+    usize::try_from(offset)
+        .ok()
+        .zip(usize::try_from(size).ok())
+        .and_then(|(offset, size)| bytes.get(offset..)?.get(..size))
+        .ok_or_else(|| goblin::error::Error::Malformed("ELF table outside file".into()))
+}
+
+fn scan_symbols(
     bytes: &[u8],
-    program_headers: &[ProgramHeader],
+    offset: u64,
+    size: u64,
+    names: &[u8],
     ctx: Ctx,
-) -> bool {
-    let dynamic = match Dynamic::parse(bytes, program_headers, ctx) {
-        Ok(Some(dynamic)) => dynamic,
-        // Without PT_DYNAMIC there are no dynamic symbols.
-        Ok(None) => return false,
-        Err(_) => return true,
-    };
-    // goblin translates DT_STRTAB through PT_LOAD and reports 0 when absent.
-    if dynamic.info.strtab == 0 {
-        return true;
+) -> goblin::error::Result<Option<u64>> {
+    if memchr::memmem::find(names, JIT_DESCRIPTOR_SYMBOL.as_bytes()).is_none() {
+        return Ok(None);
     }
-    names_may_contain_descriptor(bytes, dynamic.info.strtab as u64, dynamic.info.strsz as u64)
+    let table = table_bytes(bytes, offset, size)?;
+    if !table.len().is_multiple_of(Sym::size(ctx.container)) {
+        return Err(goblin::error::Error::Malformed(
+            "truncated ELF symbol table".into(),
+        ));
+    }
+    let symbols = Symtab::parse(table, 0, table.len() / Sym::size(ctx.container), ctx)?;
+    Ok(symbols.iter().find_map(|symbol| {
+        let name = names.get(symbol.st_name..)?;
+        let tail = name.strip_prefix(JIT_DESCRIPTOR_SYMBOL.as_bytes())?;
+        (symbol.st_shndx != SHN_UNDEF as usize && (tail.is_empty() || tail[0] == 0))
+            .then_some(symbol.st_value)
+    }))
 }
 
-/// Whether the `size` bytes of names at `offset` can contain the descriptor
-/// name. A table outside the file is treated as a possible match.
-fn names_may_contain_descriptor(bytes: &[u8], offset: u64, size: u64) -> bool {
-    bytes
-        .get(offset as usize..)
-        .and_then(|names| names.get(..size as usize))
-        .is_none_or(|names| memchr::memmem::find(names, JIT_DESCRIPTOR_SYMBOL.as_bytes()).is_some())
+/// Hashless images need a symbol count from sections or dynamic relocations.
+fn unhashed_dynamic_symbol(
+    bytes: &[u8],
+    dynamic: &Dynamic,
+    sections: &[SectionHeader],
+    ctx: Ctx,
+) -> goblin::error::Result<Option<u64>> {
+    let info = &dynamic.info;
+    let names = table_bytes(bytes, info.strtab as u64, info.strsz as u64)?;
+    if memchr::memmem::find(names, JIT_DESCRIPTOR_SYMBOL.as_bytes()).is_none() {
+        return Ok(None);
+    }
+    let symbol_size = Sym::size(ctx.container);
+    if info.syment != symbol_size {
+        return Err(goblin::error::Error::Malformed(
+            "invalid dynamic symbol entry size".into(),
+        ));
+    }
+    if let Some(section) = sections
+        .iter()
+        .find(|section| section.sh_type == SHT_DYNSYM && section.sh_offset == info.symtab as u64)
+    {
+        return scan_symbols(bytes, section.sh_offset, section.sh_size, names, ctx);
+    }
+    let mut count = 0;
+    for (offset, size, is_rela) in [
+        (info.rela, info.relasz, true),
+        (info.rel, info.relsz, false),
+        (
+            info.jmprel,
+            info.pltrelsz,
+            info.pltrel == goblin::elf::dynamic::DT_RELA,
+        ),
+    ] {
+        for relocation in RelocSection::parse(bytes, offset, size, is_rela, ctx)?.iter() {
+            count = count.max(relocation.r_sym as u64 + 1);
+        }
+    }
+    let size = count.checked_mul(symbol_size as u64).ok_or_else(|| {
+        goblin::error::Error::Malformed("dynamic symbol table size overflow".into())
+    })?;
+    if size == 0 {
+        return Ok(None);
+    }
+    scan_symbols(bytes, info.symtab as u64, size, names, ctx)
 }
 
 /// Find a descriptor definition in the static or dynamic symbol table.
+#[cfg(test)]
 fn descriptor_symbol(elf: &goblin::elf::Elf<'_>) -> Option<u64> {
     [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)]
         .into_iter()
@@ -118,12 +187,9 @@ fn executable_descriptor(pid: i32) -> std::io::Result<Option<JitDescriptorLocati
     // SAFETY: Concurrent mutation or truncation of a loaded image is outside
     // the supported process-image contract. The mapping lives through parsing.
     let mmap = unsafe { Mmap::map(&file) }?;
-    if !may_name_descriptor(&mmap) {
-        return Ok(None);
-    }
-    let elf =
-        goblin::elf::Elf::parse(&mmap).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let Some(symbol) = descriptor_symbol(&elf) else {
+    let Some(image) =
+        parse_descriptor(&mmap).map_err(|error| std::io::Error::other(error.to_string()))?
+    else {
         return Ok(None);
     };
     let auxv = std::fs::read(format!("/proc/{pid}/auxv"))?;
@@ -140,14 +206,14 @@ fn executable_descriptor(pid: i32) -> std::io::Result<Option<JitDescriptorLocati
             }
         })
         .ok_or_else(|| std::io::Error::other("missing AT_PHDR"))?;
-    let phdr_svma = elf
+    let phdr_svma = image
         .program_headers
         .iter()
         .find_map(|segment| {
             if segment.p_type == goblin::elf::program_header::PT_PHDR {
                 Some(segment.p_vaddr)
             } else if segment.p_type == goblin::elf::program_header::PT_LOAD {
-                let offset = elf.header.e_phoff.checked_sub(segment.p_offset)?;
+                let offset = image.program_header_offset.checked_sub(segment.p_offset)?;
                 if offset < segment.p_filesz {
                     segment.p_vaddr.checked_add(offset)
                 } else {
@@ -159,7 +225,7 @@ fn executable_descriptor(pid: i32) -> std::io::Result<Option<JitDescriptorLocati
         })
         .ok_or_else(|| std::io::Error::other("missing ELF program headers"))?;
     Ok(Some(JitDescriptorLocation {
-        address: phdr_avma.wrapping_sub(phdr_svma).wrapping_add(symbol),
+        address: phdr_avma.wrapping_sub(phdr_svma).wrapping_add(image.symbol),
         owner: path,
         owner_file_offset: None,
         owner_identity: None,
@@ -304,16 +370,10 @@ fn image_descriptor(
     // SAFETY: Concurrent mutation or truncation of a loaded image is outside
     // the supported process-image contract. The mapping lives through parsing.
     let mmap = unsafe { Mmap::map(&file) }?;
-    if !may_name_descriptor(&mmap) {
-        return Ok(None);
-    }
-    let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
+    let Ok(Some(image)) = parse_descriptor(&mmap) else {
         return Ok(None);
     };
-    let Some(symbol_value) = descriptor_symbol(&elf) else {
-        return Ok(None);
-    };
-    let mut segments = collect_load_segments(&elf);
+    let mut segments = collect_program_load_segments(&image.program_headers);
     segments.retain(|segment| segment.p_flags & goblin::elf::program_header::PF_X != 0);
     let mapping_span = module.range().end.saturating_sub(module.range().start);
     if let Some(segment) =
@@ -325,7 +385,7 @@ fn image_descriptor(
             module.file_offset(),
             module.range().start,
         );
-        let address = bias.wrapping_add(symbol_value);
+        let address = bias.wrapping_add(image.symbol);
         if let Some(mapping) = modules.iter().find(|mapping| {
             mapping.path() == path
                 && mapping.deleted() == module.deleted()
@@ -422,8 +482,10 @@ mod tests {
         // Keep only the null section header; PT_DYNAMIC still names the descriptor.
         bytes[0x3c..0x3e].copy_from_slice(&1_u16.to_le_bytes());
         bytes[0x3e..0x40].fill(0);
-        assert!(may_name_descriptor(&bytes));
-        assert!(descriptor_symbol(&Elf::parse(&bytes).unwrap()).is_some());
+        assert_eq!(
+            parse_descriptor(&bytes).unwrap().map(|image| image.symbol),
+            descriptor_symbol(&Elf::parse(&bytes).unwrap())
+        );
     }
 
     #[test]

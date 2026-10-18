@@ -273,8 +273,13 @@ pub fn compute_vma_bias(
 }
 
 pub fn collect_load_segments(elf: &Elf) -> Vec<LoadSegment> {
-    let mut segments: Vec<_> = elf
-        .program_headers
+    collect_program_load_segments(&elf.program_headers)
+}
+
+pub(crate) fn collect_program_load_segments(
+    headers: &[goblin::elf::ProgramHeader],
+) -> Vec<LoadSegment> {
+    let mut segments: Vec<_> = headers
         .iter()
         .filter(|ph| ph.p_type == PT_LOAD)
         .map(|ph| LoadSegment {
