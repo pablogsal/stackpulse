@@ -18,7 +18,6 @@ use wholesym::{
     SymbolMap as WholeSymbolMap,
 };
 
-#[cfg(feature = "builtin-wholesym")]
 use rustc_hash::FxHashSet;
 #[cfg(feature = "builtin-wholesym")]
 use std::cell::RefCell;
@@ -916,7 +915,7 @@ struct SymbolizerWrapper {
     symbol_maps: HashMap<NativeImageId, Option<WholeSymbolMap>>,
 
     /// Strings shared by the symbols resolved from each loaded image.
-    image_strings: HashMap<NativeImageId, ImageStrings>,
+    image_strings: HashMap<NativeImageId, SymbolStrings>,
 
     mappings: HashSet<u32>,
     image_mapping_counts: HashMap<NativeImageId, usize>,
@@ -976,18 +975,15 @@ fn build_native_symbol(
     }
 }
 
-/// Function names and source paths handed out for one image, so every PC in
-/// the same function shares one allocation instead of copying the strings.
-#[cfg(feature = "builtin-wholesym")]
+/// Function names and paths shared by resolved frames.
 #[derive(Default)]
-struct ImageStrings {
+pub(crate) struct SymbolStrings {
     strings: FxHashSet<Rc<str>>,
     prune_at: usize,
 }
 
-#[cfg(feature = "builtin-wholesym")]
-impl ImageStrings {
-    fn intern(&mut self, value: &str) -> Rc<str> {
+impl SymbolStrings {
+    pub(crate) fn intern(&mut self, value: &str) -> Rc<str> {
         if let Some(value) = self.strings.get(value) {
             return Rc::clone(value);
         }
@@ -1012,7 +1008,7 @@ impl ImageStrings {
 fn build_native_symbols_from_wholesym_parts(
     symbol_name: String,
     frames: Option<Vec<wholesym::FrameDebugInfo>>,
-    strings: &mut ImageStrings,
+    strings: &mut SymbolStrings,
     module: &Rc<str>,
     function_offset: u64,
     is_python_runtime: bool,
@@ -1260,7 +1256,7 @@ mod tests {
             let symbols = build_native_symbols_from_wholesym_parts(
                 fallback.into(),
                 frames,
-                &mut ImageStrings::default(),
+                &mut SymbolStrings::default(),
                 &module,
                 17,
                 true,
@@ -1289,7 +1285,7 @@ mod tests {
             let symbols = build_native_symbols_from_wholesym_parts(
                 fallback.into(),
                 Some(frames),
-                &mut ImageStrings::default(),
+                &mut SymbolStrings::default(),
                 &module,
                 17,
                 true,
@@ -1636,6 +1632,19 @@ mod tests {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[test]
+    fn shared_symbol_strings_release_unused_names_and_keep_live_names() {
+        let mut strings = SymbolStrings::default();
+        let retained = strings.intern("retained");
+        let unused = Rc::downgrade(&strings.intern("unused"));
+        for index in 0..128 {
+            strings.intern(&format!("temporary-{index}"));
+        }
+        assert!(unused.upgrade().is_none());
+        assert!(Rc::ptr_eq(&retained, &strings.intern("retained")));
+        assert!(strings.strings.len() <= 4);
+    }
 
     fn symbol(name: &str) -> NativeSymbol {
         NativeSymbol::new(name, "module")

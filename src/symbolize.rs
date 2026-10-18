@@ -23,7 +23,7 @@ use crate::profile::{
 use crate::symbols::default_native_symbolizer_factory;
 use crate::symbols::{
     erase_native_symbolizer, normalized_module_path, ErasedNativeSymbolizer,
-    NativeSymbolizerFactory,
+    NativeSymbolizerFactory, SymbolStrings,
 };
 pub use crate::symbols::{
     NativeBatch, NativeFileIdentity, NativeImage, NativeImageId, NativeImageSource, NativeLookup,
@@ -91,6 +91,7 @@ pub struct Symbolizer {
     identity: u64,
     source_id: Option<u64>,
     modules: SymbolizerModules,
+    jit_strings: SymbolStrings,
     perf_map_processes: PerfMapProcesses,
     perf_map_dir: PathBuf,
     elf_sections: ElfSectionCache,
@@ -769,6 +770,7 @@ impl Symbolizer {
             identity: NEXT_SYMBOLIZER_ID.fetch_add(1, Ordering::Relaxed),
             source_id: None,
             modules,
+            jit_strings: SymbolStrings::default(),
             perf_map_processes,
             perf_map_dir,
             elf_sections: ElfSectionCache::default(),
@@ -1373,10 +1375,10 @@ impl Symbolizer {
             return;
         }
 
-        let pinned_module = frame.module_id.and_then(|id| self.module_by_id(id));
-        if let Some(resolved) =
-            pinned_module.and_then(|module| jit::resolve_frame(module, process_id, frame.abs_ip))
-        {
+        let pinned_module = frame.module_id.and_then(|id| self.modules.get(id));
+        if let Some(resolved) = pinned_module.and_then(|module| {
+            jit::resolve_frame(module, process_id, frame.abs_ip, &mut self.jit_strings)
+        }) {
             self.pending_frames.push(PendingFrame {
                 cache_key,
                 frame,
