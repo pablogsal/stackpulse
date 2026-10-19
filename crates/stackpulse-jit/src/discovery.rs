@@ -359,20 +359,18 @@ fn image_descriptor(
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
         let metadata = file.metadata()?;
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
         if !metadata.is_file()
-            || module.file_identity().is_some_and(|identity| {
-                metadata.ino() != identity.inode || metadata.dev() != identity.device
-            })
+            || module
+                .file_identity()
+                .is_some_and(|expected| expected != identity)
         {
             return Err(std::io::Error::other("mapped image identity changed"));
         }
-        Ok((
-            file,
-            FileIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
-        ))
+        Ok((file, identity))
     };
     let (file, identity) = open(Path::new(&mapped_path)).or_else(|error| {
         if module.deleted() {
