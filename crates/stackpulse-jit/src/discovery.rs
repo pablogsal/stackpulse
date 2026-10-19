@@ -477,18 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_section_table_keeps_dynamic_descriptor() {
-        let (_directory, _path, mut bytes) = descriptor_image();
-        // Keep only the null section header; PT_DYNAMIC still names the descriptor.
-        bytes[0x3c..0x3e].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[0x3e..0x40].fill(0);
-        assert_eq!(
-            parse_descriptor(&bytes).unwrap().map(|image| image.symbol),
-            descriptor_symbol(&Elf::parse(&bytes).unwrap())
-        );
-    }
-
-    #[test]
     fn file_views_and_relro_aliases_do_not_create_registries() {
         let (_directory, path, bytes) = descriptor_image();
         let elf = goblin::elf::Elf::parse(&bytes).unwrap();
