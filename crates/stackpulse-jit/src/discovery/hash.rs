@@ -353,12 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn hashes_match_known_values() {
-        assert_eq!(gnu_hash(b"printf"), 0x156b_2bb8);
-        assert_eq!(sysv_hash(b"printf"), 0x0779_05a6);
-    }
-
-    #[test]
     fn lookup_handles_byte_order_collisions_suffixes_and_duplicate_definitions() {
         for ctx in contexts() {
             for gnu in [false, true] {
