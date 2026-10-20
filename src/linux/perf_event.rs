@@ -14,7 +14,7 @@ use perf_event_open::count::Counter;
 use perf_event_open::event::hw::Hardware;
 use perf_event_open::event::sw::Software;
 use perf_event_open::event::Event as PerfOpenEvent;
-use perf_event_open::sample::record::{Priv, Record, RecordId, UnsafeParser};
+use perf_event_open::sample::record::{Parser, Priv, Record, RecordId};
 use perf_event_open_sys::bindings as sys;
 
 use super::aligned_bytes::{is_u64_aligned, AlignedBytes};
@@ -148,8 +148,8 @@ impl PerfRecordLayout {
         opts.stat_format.lost_records = true;
     }
 
-    fn parser(self) -> UnsafeParser {
-        UnsafeParser {
+    fn parser(self) -> Parser {
+        Parser {
             sample_id_all: true,
             sample_type: sample_type_bits(
                 self.callchain,
@@ -361,7 +361,7 @@ impl PerfOptions {
         opts
     }
 
-    fn record_parser(&self) -> UnsafeParser {
+    fn record_parser(&self) -> Parser {
         self.record_layout().parser()
     }
 }
@@ -369,7 +369,7 @@ impl PerfOptions {
 pub(super) struct OutputRing {
     perf: Perf,
     ring: RingBuffer,
-    parser: Arc<UnsafeParser>,
+    parser: Arc<Parser>,
 }
 
 impl OutputRing {
@@ -755,7 +755,7 @@ impl Perf {
 
 pub(super) struct EventDrain<'a> {
     ring: &'a mut RingBuffer,
-    parser: &'a Arc<UnsafeParser>,
+    parser: &'a Arc<Parser>,
     end: u64,
 }
 
@@ -1093,7 +1093,7 @@ impl PerfRecordHeader {
     }
 }
 
-fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
+fn parse_aligned_event_record(bytes: &[u8], parser: &Parser) -> Option<(Priv, Record)> {
     if !is_u64_aligned(bytes) || !PerfRecordHeader::from_bytes(bytes)?.matches_len(bytes) {
         return None;
     }
@@ -1104,7 +1104,7 @@ fn parse_aligned_event_record(bytes: &[u8], parser: &UnsafeParser) -> Option<(Pr
     Some((privilege, record))
 }
 
-fn parse_event_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv, Record)> {
+fn parse_event_record_bytes(bytes: &[u8], parser: &Parser) -> Option<(Priv, Record)> {
     if is_u64_aligned(bytes) {
         return parse_aligned_event_record(bytes, parser);
     }
@@ -1114,7 +1114,7 @@ fn parse_event_record_bytes(bytes: &[u8], parser: &UnsafeParser) -> Option<(Priv
 
 fn parse_sample_record<'a>(
     bytes: &'a [u8],
-    parser: &perf_event_open::sample::record::UnsafeParser,
+    parser: &Parser,
 ) -> Option<(Priv, SampleRecordRef<'a>)> {
     if !is_u64_aligned(bytes) {
         return None;
@@ -1189,7 +1189,7 @@ fn parse_common_sample_fields<'a>(
 
 fn parse_stack_sample_fields<'a>(
     sample_type: u64,
-    parser: &perf_event_open::sample::record::UnsafeParser,
+    parser: &Parser,
     cursor: &mut ByteCursor<'a>,
     sample: &mut SampleRecordRef<'a>,
 ) -> Option<()> {
@@ -1205,7 +1205,7 @@ fn parse_stack_sample_fields<'a>(
 
 fn parse_user_regs_sample<'a>(
     sample_type: u64,
-    parser: &perf_event_open::sample::record::UnsafeParser,
+    parser: &Parser,
     cursor: &mut ByteCursor<'a>,
     sample: &mut SampleRecordRef<'a>,
 ) -> Option<()> {
@@ -1270,7 +1270,7 @@ fn is_callchain_marker(address: u64) -> bool {
 
 #[cfg(any(test, feature = "bench-support"))]
 pub(super) struct BenchSampleBatch {
-    parser: Arc<perf_event_open::sample::record::UnsafeParser>,
+    parser: Arc<Parser>,
     records: Vec<AlignedBytes>,
     event_bytes: usize,
     frames_per_sample: usize,
@@ -1292,7 +1292,7 @@ pub(super) struct BenchSampleBatchSpec {
 #[cfg(any(test, feature = "bench-support"))]
 impl BenchSampleBatch {
     pub(super) fn new(spec: BenchSampleBatchSpec) -> Self {
-        let parser = Arc::new(perf_event_open::sample::record::UnsafeParser {
+        let parser = Arc::new(Parser {
             sample_id_all: false,
             sample_type: sample_type_bits(true, true, true),
             read_format: 0,
@@ -1592,8 +1592,8 @@ mod tests {
         }
     }
 
-    fn stack_sample_parser(user_regs: usize) -> UnsafeParser {
-        UnsafeParser {
+    fn stack_sample_parser(user_regs: usize) -> Parser {
+        Parser {
             sample_id_all: false,
             sample_type: sample_type_bits(true, true, true),
             read_format: 0,
@@ -2009,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_record_layout_matches_the_unsafe_parser() {
+    fn configured_record_layout_matches_the_parser() {
         for (callchain, reg_mask, stack_size) in [
             (false, 0, 0),
             (true, 0, 0),
