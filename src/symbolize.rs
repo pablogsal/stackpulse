@@ -91,6 +91,7 @@ pub struct Symbolizer {
     identity: u64,
     source_id: Option<u64>,
     modules: SymbolizerModules,
+    jit_symbols: jit::SymbolCache,
     perf_map_processes: PerfMapProcesses,
     perf_map_dir: PathBuf,
     elf_sections: ElfSectionCache,
@@ -142,6 +143,7 @@ struct ModuleMetadata {
     path: Option<std::rc::Rc<str>>,
     basename_start: usize,
     is_python_runtime: bool,
+    jit_index: jit::SymbolIndex,
 }
 
 fn format_hex_suffix(prefix: &str, value: u64) -> String {
@@ -244,6 +246,7 @@ fn module_metadata(record: &ModuleRecord) -> ModuleMetadata {
         path: None,
         basename_start,
         is_python_runtime: crate::is_python_module(&path[basename_start..]),
+        jit_index: jit::SymbolIndex::default(),
     }
 }
 
@@ -723,7 +726,11 @@ impl Symbolizer {
         }
         symbolizer.tracks_perf_map_updates = reader.is_growing();
         symbolizer.spool_frame_contexts = Some(reader.frame_module_contexts());
-        let frame_count = reader.frames().len();
+        let frame_count = symbolizer
+            .resolution_cache_limit
+            .map_or(reader.frames().len(), |limit| {
+                reader.frames().len().min(limit)
+            });
         symbolizer.frame_cache.reserve(frame_count);
         symbolizer.resolved_frames.reserve(frame_count);
         symbolizer.resolved_frame_ids.reserve(frame_count);
@@ -765,6 +772,7 @@ impl Symbolizer {
             identity: NEXT_SYMBOLIZER_ID.fetch_add(1, Ordering::Relaxed),
             source_id: None,
             modules,
+            jit_symbols: jit::SymbolCache::default(),
             perf_map_processes,
             perf_map_dir,
             elf_sections: ElfSectionCache::default(),
@@ -1007,6 +1015,7 @@ impl Symbolizer {
         self.frame_cache.clear();
         self.resolved_frames.clear();
         self.resolved_frame_ids.clear();
+        self.jit_symbols.clear();
         self.clear_stack_resolution_cache();
     }
 
@@ -1369,10 +1378,17 @@ impl Symbolizer {
             return;
         }
 
-        let pinned_module = frame.module_id.and_then(|id| self.module_by_id(id));
-        if let Some(resolved) =
-            pinned_module.and_then(|module| jit::resolve_frame(module, process_id, frame.abs_ip))
-        {
+        let pinned_module = frame
+            .module_id
+            .and_then(|id| self.modules.get_with_metadata(id));
+        if let Some(resolved) = pinned_module.and_then(|(module, metadata)| {
+            metadata.jit_index.resolve_frame(
+                module,
+                process_id,
+                frame.abs_ip,
+                &mut self.jit_symbols,
+            )
+        }) {
             self.pending_frames.push(PendingFrame {
                 cache_key,
                 frame,
@@ -1383,7 +1399,9 @@ impl Symbolizer {
             return;
         }
 
-        if let Some(module) = pinned_module.filter(|module| !perf_map_module_allowed(module)) {
+        if let Some((module, _)) =
+            pinned_module.filter(|(module, _)| !perf_map_module_allowed(module))
+        {
             let module = (module.id, frame.file_relative_ip);
             let native = self.prepare_native_lookup(process_id, module.0, frame.abs_ip);
             self.pending_frames.push(PendingFrame {
@@ -3519,6 +3537,35 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn live_symbolizer_reservation_is_bounded_after_reader_advances() {
+        let temp = crate::test_support::TempDir::new("live-cache-reservation");
+        let path = temp.path().join("recording.spool");
+        let mut writer = PerfSpoolWriter::create(&path, 0, 10).unwrap();
+        let count = 4 * LIVE_RESOLVED_FRAME_LIMIT;
+        for index in 0..count {
+            writer
+                .write_sample_frames(index as u64, 7, 7, [frame(0x1000 + index as u64)])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let mut tail = Tail::open(&path).unwrap();
+        while tail.poll().unwrap().has_more() {}
+        assert_eq!(tail.frames().len(), count);
+        let symbolizer = tail
+            .symbolizer()
+            .disable_perf_maps()
+            .kernel_symbols(KernelSymbolSource::Disabled)
+            .build()
+            .unwrap();
+        assert!(symbolizer.resolved_frames.is_empty());
+        assert!(symbolizer.resolved_frames.capacity() <= LIVE_RESOLVED_FRAME_LIMIT);
+        assert!(symbolizer.resolved_frame_ids.capacity() <= LIVE_RESOLVED_FRAME_LIMIT);
+        // Hash tables round their allocation up to a power of two.
+        assert!(symbolizer.frame_cache.capacity() < 2 * LIVE_RESOLVED_FRAME_LIMIT);
     }
 
     #[test]

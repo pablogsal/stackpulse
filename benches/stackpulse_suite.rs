@@ -115,6 +115,7 @@ criterion_group! {
         bench_spool_iteration,
         bench_spool_write,
         bench_symbolization,
+        bench_jit_symbolization,
         bench_helpers,
         bench_live_perf_events
 }
@@ -367,6 +368,96 @@ fn bench_live_perf_events(c: &mut Criterion) {
         });
     });
     recorder.finish();
+}
+
+fn bench_jit_symbolization(c: &mut Criterion) {
+    let pid = stackpulse::Pid::new(7).expect("positive benchmark pid");
+    let frames = |addresses: std::ops::Range<u64>| {
+        addresses
+            .map(|address| FrameRecord {
+                module_id: Some(0),
+                file_relative_ip: address - 0x1000,
+                abs_ip: address,
+                mode: FrameMode::User,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut cases = Vec::new();
+    for count in [1_000_u64, 10_000, 100_000] {
+        let gap_start = 0x1000 + count * 16;
+        let module = bench_support::module(0, pid, 0x1000..gap_start + 2_000, 0, "[jit]")
+            .expect("valid JIT module");
+        let module = bench_support::with_jit_symbols(
+            module,
+            (0..count).map(|index| {
+                let start = 0x1000 + index * 16;
+                (start..start + 8, format!("function_{index}"))
+            }),
+        );
+        cases.push((
+            format!("gaps_{count}"),
+            module,
+            frames(gap_start..gap_start + 2_000),
+        ));
+    }
+    let module =
+        bench_support::module(0, pid, 0x1000..0x2000, 0, "[jit]").expect("valid JIT module");
+    cases.push((
+        "shared_long_name".to_owned(),
+        bench_support::with_jit_symbols(module, [(0x1000..0x2000, "f".repeat(4_096))]),
+        frames(0x1000..0x2000),
+    ));
+    let module =
+        bench_support::module(0, pid, 0x1000..0x2000, 0, "[jit]").expect("valid JIT module");
+    cases.push((
+        "shared_short_name".to_owned(),
+        bench_support::with_jit_symbols(module, [(0x1000..0x2000, "function".to_owned())]),
+        frames(0x1000..0x2000),
+    ));
+    for count in [4_096_u64, 16_384] {
+        let module = bench_support::module(0, pid, 0x1000..0x1000 + count * 16, 0, "[jit]")
+            .expect("valid JIT module");
+        let module = bench_support::with_jit_symbols(
+            module,
+            (0..count).map(|index| {
+                let start = 0x1000 + index * 16;
+                (start..start + 8, format!("function_{index}"))
+            }),
+        );
+        let frames = (0..2)
+            .flat_map(|offset| {
+                (0..count).map(move |index| FrameRecord {
+                    module_id: Some(0),
+                    file_relative_ip: index * 16 + offset,
+                    abs_ip: 0x1000 + index * 16 + offset,
+                    mode: FrameMode::User,
+                })
+            })
+            .collect();
+        cases.push((format!("named_{count}"), module, frames));
+    }
+
+    let mut group = c.benchmark_group("stackpulse_cpu/symbolize/gdb_jit");
+    group.sampling_mode(SamplingMode::Flat);
+    for (name, module, frames) in cases {
+        group.throughput(Throughput::Elements(frames.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let mut symbolizer =
+                    bench_support::symbolizer_for_modules(std::slice::from_ref(&module))
+                        .disable_perf_maps()
+                        .kernel_symbols(stackpulse::symbolize::KernelSymbolSource::Disabled)
+                        .build()
+                        .expect("build JIT symbolizer");
+                black_box(score_resolved_frame_slice(
+                    &mut symbolizer,
+                    pid.get(),
+                    &frames,
+                ))
+            });
+        });
+    }
+    group.finish();
 }
 
 fn bench_symbolization(c: &mut Criterion) {
